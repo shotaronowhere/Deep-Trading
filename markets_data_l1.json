@@ -1,0 +1,2856 @@
+{
+  "marketsData": {
+    "0xMiden/miden-vm": {
+      "outcomeToken": "0x16ff309b1252dd54048f8273a9c79de5af37fda8",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x16ff309b1252dd54048f8273a9c79de5af37fda8",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "857575396819876258032",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-857575396819876258032"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "857575396819876258032"
+            }
+          ]
+        }
+      ]
+    },
+    "ApeWorX/ape": {
+      "outcomeToken": "0x5bcde47a6b7a6387aa05be3201e07b9315d3d5cf",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x5bcde47a6b7a6387aa05be3201e07b9315d3d5cf",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "971386905805863445452",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-971386905805863445452"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "971386905805863445452"
+            }
+          ]
+        }
+      ]
+    },
+    "Certora/CertoraProver": {
+      "outcomeToken": "0xb24d1d2d947da4a11cd8ae9150ada4b4eee9ab0a",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb24d1d2d947da4a11cd8ae9150ada4b4eee9ab0a",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "965625493066843322696",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-965625493066843322696"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "965625493066843322696"
+            }
+          ]
+        }
+      ]
+    },
+    "ChainSafe/bls": {
+      "outcomeToken": "0x4758b5c746715f59166701020778108ab4c594e7",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x4758b5c746715f59166701020778108ab4c594e7",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1269750321048783716524",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1269750321048783716524"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1269750321048783716524"
+            }
+          ]
+        }
+      ]
+    },
+    "ChainSafe/lodestar": {
+      "outcomeToken": "0x314b9e28e09968e19a070482cdc65676a33f1703",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x314b9e28e09968e19a070482cdc65676a33f1703",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1268115635359200222783",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1268115635359200222783"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1268115635359200222783"
+            }
+          ]
+        }
+      ]
+    },
+    "Commit-Boost/commit-boost-client": {
+      "outcomeToken": "0xefaa6da356481ec7003642cca775eaf46c29da3b",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xefaa6da356481ec7003642cca775eaf46c29da3b",
+          "liquidity": "772511886483318696515",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "772511886483318696515"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-772511886483318696515"
+            }
+          ]
+        }
+      ]
+    },
+    "Consensys/gnark-crypto": {
+      "outcomeToken": "0x1e39d33827a7c628484404e91a0fce3fe438d22f",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x1e39d33827a7c628484404e91a0fce3fe438d22f",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1308022219861911369320",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1308022219861911369320"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1308022219861911369320"
+            }
+          ]
+        }
+      ]
+    },
+    "Consensys/teku": {
+      "outcomeToken": "0xa74b5297b1e6f59a30da630b95dfe1d9f6978d23",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xa74b5297b1e6f59a30da630b95dfe1d9f6978d23",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "894400136932637843007",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-894400136932637843007"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "894400136932637843007"
+            }
+          ]
+        }
+      ]
+    },
+    "Cyfrin/aderyn": {
+      "outcomeToken": "0x73b87970a558eeb57d799689b0fdb0eefddf675f",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x73b87970a558eeb57d799689b0fdb0eefddf675f",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "573184780292615396972",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-573184780292615396972"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "573184780292615396972"
+            }
+          ]
+        }
+      ]
+    },
+    "DefiLlama/DefiLlama-Adapters": {
+      "outcomeToken": "0xc78af2717d664baafe2721a0a88697042e8c20b2",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xc78af2717d664baafe2721a0a88697042e8c20b2",
+          "liquidity": "1303521519337437455546",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "1303521519337437455546"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-1303521519337437455546"
+            }
+          ]
+        }
+      ]
+    },
+    "DefiLlama/chainlist": {
+      "outcomeToken": "0x43573f1d0c0c4ab57181a903460f0918fa0a2c66",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x43573f1d0c0c4ab57181a903460f0918fa0a2c66",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "746562830794455585570",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-746562830794455585570"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "746562830794455585570"
+            }
+          ]
+        }
+      ]
+    },
+    "EspressoSystems/jellyfish": {
+      "outcomeToken": "0x3f975ba472db4b5f16464044c732107441ea2172",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x3f975ba472db4b5f16464044c732107441ea2172",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "827432906430974670057",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-827432906430974670057"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "827432906430974670057"
+            }
+          ]
+        }
+      ]
+    },
+    "Invalid result": {
+      "outcomeToken": "0xd1ebfedd9a6480e0407552eb521270c6ddc837b0",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": []
+    },
+    "LFDT-web3j/web3j": {
+      "outcomeToken": "0x23c7cf9bdecc48b601c493fb1fc3e8dd33ecb972",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x23c7cf9bdecc48b601c493fb1fc3e8dd33ecb972",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1286135351132768844354",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1286135351132768844354"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1286135351132768844354"
+            }
+          ]
+        }
+      ]
+    },
+    "Nethereum/Nethereum": {
+      "outcomeToken": "0xab171e15706bdcd4c5dd62a729a52cc234d5bd50",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xab171e15706bdcd4c5dd62a729a52cc234d5bd50",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1279405050433883755621",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1279405050433883755621"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1279405050433883755621"
+            }
+          ]
+        }
+      ]
+    },
+    "NethermindEth/juno": {
+      "outcomeToken": "0x9efd2e7c0a53797a44578235db008e88e89c4d1f",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x9efd2e7c0a53797a44578235db008e88e89c4d1f",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "558572973230080948474",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-558572973230080948474"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "558572973230080948474"
+            }
+          ]
+        }
+      ]
+    },
+    "NethermindEth/nethermind": {
+      "outcomeToken": "0x3bb5e27c3806d01854b2b87f2d3a1d638bd245f2",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x3bb5e27c3806d01854b2b87f2d3a1d638bd245f2",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "932729546775544265567",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-932729546775544265567"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "932729546775544265567"
+            }
+          ]
+        }
+      ]
+    },
+    "NomicFoundation/hardhat": {
+      "outcomeToken": "0x8cb4ef9dba24db79b61508ce26818323a64270d0",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x8cb4ef9dba24db79b61508ce26818323a64270d0",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "622322431561625286840",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-622322431561625286840"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "622322431561625286840"
+            }
+          ]
+        }
+      ]
+    },
+    "OffchainLabs/prysm": {
+      "outcomeToken": "0x9516f6c861678f64ef5fb0425ca91834187102cc",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x9516f6c861678f64ef5fb0425ca91834187102cc",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "558338353526196896763",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-558338353526196896763"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "558338353526196896763"
+            }
+          ]
+        }
+      ]
+    },
+    "OffchainLabs/stylus-sdk-rs": {
+      "outcomeToken": "0x8aad605ef88bcd1bf3001f58aec3c44eb7c96c15",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x8aad605ef88bcd1bf3001f58aec3c44eb7c96c15",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "739665189122211743565",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-739665189122211743565"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "739665189122211743565"
+            }
+          ]
+        }
+      ]
+    },
+    "OpenZeppelin/openzeppelin-contracts": {
+      "outcomeToken": "0xa2c7116f1595988da9ace2e5301255a3b60baabf",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xa2c7116f1595988da9ace2e5301255a3b60baabf",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "513503292205085177556",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-513503292205085177556"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "513503292205085177556"
+            }
+          ]
+        }
+      ]
+    },
+    "Other repositories not present on the market created on November 26, 2025": {
+      "outcomeToken": "0x63a4f76ef5846f68d069054c271465b7118e8ed9",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": []
+    },
+    "Plonky3/Plonky3": {
+      "outcomeToken": "0x9661548c5488922d067d4dd0734c398ab027345b",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x9661548c5488922d067d4dd0734c398ab027345b",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1079990251327006302970",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1079990251327006302970"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1079990251327006302970"
+            }
+          ]
+        }
+      ]
+    },
+    "TrueBlocks/trueblocks-core": {
+      "outcomeToken": "0x37cc4dae5cda72db589c3cf27292f860594a7d07",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x37cc4dae5cda72db589c3cf27292f860594a7d07",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1074866526163757962017",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1074866526163757962017"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1074866526163757962017"
+            }
+          ]
+        }
+      ]
+    },
+    "Vectorized/solady": {
+      "outcomeToken": "0xdff787350b325c4f50580632dece396359ffe622",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xdff787350b325c4f50580632dece396359ffe622",
+          "liquidity": "1118374817871386400022",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "1118374817871386400022"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-1118374817871386400022"
+            }
+          ]
+        }
+      ]
+    },
+    "a16z/halmos": {
+      "outcomeToken": "0xd8f5543cd3272a8f38da096096902e55ec6f4cf7",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xd8f5543cd3272a8f38da096096902e55ec6f4cf7",
+          "liquidity": "870265666923074277898",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "870265666923074277898"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-870265666923074277898"
+            }
+          ]
+        }
+      ]
+    },
+    "a16z/helios": {
+      "outcomeToken": "0x753e05eba7dee050ed37013a993f3ea3c39076ed",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x753e05eba7dee050ed37013a993f3ea3c39076ed",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "721583703207135698192",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-721583703207135698192"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "721583703207135698192"
+            }
+          ]
+        }
+      ]
+    },
+    "aestus-relay/mev-boost-relay": {
+      "outcomeToken": "0x1910104b540e03d519b3474c2aa7bf856f89bf09",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x1910104b540e03d519b3474c2aa7bf856f89bf09",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "758303944152931830335",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-758303944152931830335"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "758303944152931830335"
+            }
+          ]
+        }
+      ]
+    },
+    "alloy-rs/alloy": {
+      "outcomeToken": "0xb73a76f913604d32b3ed6980c94d4933ef39fce0",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xb73a76f913604d32b3ed6980c94d4933ef39fce0",
+          "liquidity": "741355030022103843467",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "741355030022103843467"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-741355030022103843467"
+            }
+          ]
+        }
+      ]
+    },
+    "argotorg/act": {
+      "outcomeToken": "0x8ff31b15a8f1496533b80129d04f559f6b4008ee",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x8ff31b15a8f1496533b80129d04f559f6b4008ee",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "469445642551554407319",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-469445642551554407319"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "469445642551554407319"
+            }
+          ]
+        }
+      ]
+    },
+    "argotorg/fe": {
+      "outcomeToken": "0x6be7c0560288b7ff3caac9b96fbf2475539867c6",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x6be7c0560288b7ff3caac9b96fbf2475539867c6",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "565451072989284457171",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-565451072989284457171"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "565451072989284457171"
+            }
+          ]
+        }
+      ]
+    },
+    "argotorg/hevm": {
+      "outcomeToken": "0x273c7e1c1f35f0e10d5415b75797c5eded198deb",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x273c7e1c1f35f0e10d5415b75797c5eded198deb",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1110378264864967854781",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1110378264864967854781"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1110378264864967854781"
+            }
+          ]
+        }
+      ]
+    },
+    "argotorg/solidity": {
+      "outcomeToken": "0xadbc709c9360c04dd28978fbf6d659511ffeaf2c",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xadbc709c9360c04dd28978fbf6d659511ffeaf2c",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "515419339770122673557",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-515419339770122673557"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "515419339770122673557"
+            }
+          ]
+        }
+      ]
+    },
+    "argotorg/sourcify": {
+      "outcomeToken": "0x04cb5b0abfda7971b666a6aadf74b2f922ba14dd",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x04cb5b0abfda7971b666a6aadf74b2f922ba14dd",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1173755916587111683356",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1173755916587111683356"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1173755916587111683356"
+            }
+          ]
+        }
+      ]
+    },
+    "arkworks-rs/algebra": {
+      "outcomeToken": "0xf5f562a91251d95b22106ffae92e63ae365bfde7",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xf5f562a91251d95b22106ffae92e63ae365bfde7",
+          "liquidity": "1333025678268032504338",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "1333025678268032504338"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-1333025678268032504338"
+            }
+          ]
+        }
+      ]
+    },
+    "axiom-crypto/snark-verifier": {
+      "outcomeToken": "0xeb8374ce3f0259193d6342161825381d84d23946",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xeb8374ce3f0259193d6342161825381d84d23946",
+          "liquidity": "717530007623710716275",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "717530007623710716275"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-717530007623710716275"
+            }
+          ]
+        }
+      ]
+    },
+    "blockscout/blockscout": {
+      "outcomeToken": "0x87a4df822364bd9516309b4bd28774a9dd719ad7",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x87a4df822364bd9516309b4bd28774a9dd719ad7",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1106809657602763950232",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1106809657602763950232"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1106809657602763950232"
+            }
+          ]
+        }
+      ]
+    },
+    "dappnode/DAppNode": {
+      "outcomeToken": "0x6e313fcb8aae34ed27705987031c671a5b7389e1",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x6e313fcb8aae34ed27705987031c671a5b7389e1",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "849434048798627719187",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-849434048798627719187"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "849434048798627719187"
+            }
+          ]
+        }
+      ]
+    },
+    "deepfunding/dependency-graph": {
+      "outcomeToken": "0xdd9d1ee0099fa2e4dbe12441b7d9f1d06b98df1d",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xdd9d1ee0099fa2e4dbe12441b7d9f1d06b98df1d",
+          "liquidity": "501073598396636791710",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "501073598396636791710"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-501073598396636791710"
+            }
+          ]
+        }
+      ]
+    },
+    "dl-solarity/solidity-lib": {
+      "outcomeToken": "0x8da04b9b10c0244a6255bd3532153b5fc5a00b5c",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x8da04b9b10c0244a6255bd3532153b5fc5a00b5c",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "490382398603090270387",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-490382398603090270387"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "490382398603090270387"
+            }
+          ]
+        }
+      ]
+    },
+    "edb-rs/edb": {
+      "outcomeToken": "0x6f2f4544cb7a0152b4a417dc9c8d5c7e4bbd2953",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x6f2f4544cb7a0152b4a417dc9c8d5c7e4bbd2953",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "743967620651429555692",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-743967620651429555692"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "743967620651429555692"
+            }
+          ]
+        }
+      ]
+    },
+    "erigontech/erigon": {
+      "outcomeToken": "0x8516e7c7b076ce3c64dc9b6d445a53a4b98b635b",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x8516e7c7b076ce3c64dc9b6d445a53a4b98b635b",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "756327289097514790320",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-756327289097514790320"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "756327289097514790320"
+            }
+          ]
+        }
+      ]
+    },
+    "erigontech/silkworm": {
+      "outcomeToken": "0x9deccb080da5d4d512d699baaecb477c25f41232",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x9deccb080da5d4d512d699baaecb477c25f41232",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "965463212401927426347",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-965463212401927426347"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "965463212401927426347"
+            }
+          ]
+        }
+      ]
+    },
+    "eth-infinitism/account-abstraction": {
+      "outcomeToken": "0xe568f7f2277d3c4fc907c31067d93047264976c9",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xe568f7f2277d3c4fc907c31067d93047264976c9",
+          "liquidity": "1339923284114229813118",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "1339923284114229813118"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-1339923284114229813118"
+            }
+          ]
+        }
+      ]
+    },
+    "ethdebug/format": {
+      "outcomeToken": "0xe1422481c9e4e1add3152c291c02816978965e8c",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xe1422481c9e4e1add3152c291c02816978965e8c",
+          "liquidity": "554916587514472913938",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "554916587514472913938"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-554916587514472913938"
+            }
+          ]
+        }
+      ]
+    },
+    "ethereum-lists/chains": {
+      "outcomeToken": "0x29f5f7d32f0cdf100871ce83ccfa649c38bffc2e",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x29f5f7d32f0cdf100871ce83ccfa649c38bffc2e",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1133934404484726075812",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1133934404484726075812"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1133934404484726075812"
+            }
+          ]
+        }
+      ]
+    },
+    "ethereum/EIPs": {
+      "outcomeToken": "0x97ff3dcae5e97b235ff987c00df672313145ff2c",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x97ff3dcae5e97b235ff987c00df672313145ff2c",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "565474822759205306702",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-565474822759205306702"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "565474822759205306702"
+            }
+          ]
+        }
+      ]
+    },
+    "ethereum/consensus-specs": {
+      "outcomeToken": "0x2a4196b00e9a72469989be54cf05dc2d1a575541",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x2a4196b00e9a72469989be54cf05dc2d1a575541",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "548398116626140053219",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-548398116626140053219"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "548398116626140053219"
+            }
+          ]
+        }
+      ]
+    },
+    "ethereum/execution-apis": {
+      "outcomeToken": "0xcd3c92d6a33c468a5c26714078d192c0c8327ce1",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xcd3c92d6a33c468a5c26714078d192c0c8327ce1",
+          "liquidity": "869734171912422616922",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "869734171912422616922"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-869734171912422616922"
+            }
+          ]
+        }
+      ]
+    },
+    "ethereum/go-ethereum": {
+      "outcomeToken": "0x5bcdfca3f241791f3d6372385924178f59618238",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x5bcdfca3f241791f3d6372385924178f59618238",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "480497235281505238087",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-480497235281505238087"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "480497235281505238087"
+            }
+          ]
+        }
+      ]
+    },
+    "ethereum/js-ethereum-cryptography": {
+      "outcomeToken": "0xd7d4ad44055d280fbe2d47798416088312b86a5d",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xd7d4ad44055d280fbe2d47798416088312b86a5d",
+          "liquidity": "1085407377558222325486",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "1085407377558222325486"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-1085407377558222325486"
+            }
+          ]
+        }
+      ]
+    },
+    "ethereum/py_ecc": {
+      "outcomeToken": "0x1a00b4a468ea03bee07957db5bbd575aeccd5e9d",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x1a00b4a468ea03bee07957db5bbd575aeccd5e9d",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1234164964931951424877",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1234164964931951424877"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1234164964931951424877"
+            }
+          ]
+        }
+      ]
+    },
+    "ethereum/web3.py": {
+      "outcomeToken": "0xca213142321206d48ac05ac203642db6cfd51174",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xca213142321206d48ac05ac203642db6cfd51174",
+          "liquidity": "1088864227256107914977",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "1088864227256107914977"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-1088864227256107914977"
+            }
+          ]
+        }
+      ]
+    },
+    "ethers-io/ethers.js": {
+      "outcomeToken": "0x6c2f3d829fafd53e643f0c8224e978eb656cf158",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x6c2f3d829fafd53e643f0c8224e978eb656cf158",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "657069109797172067023",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-657069109797172067023"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "657069109797172067023"
+            }
+          ]
+        }
+      ]
+    },
+    "ethpandaops/checkpointz": {
+      "outcomeToken": "0xb59c7177295899822ce01ccb639e52364a8c15f8",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb59c7177295899822ce01ccb639e52364a8c15f8",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "611714206661798756777",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-611714206661798756777"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "611714206661798756777"
+            }
+          ]
+        }
+      ]
+    },
+    "ethpandaops/ethereum-helm-charts": {
+      "outcomeToken": "0xee30585e017fe3a8ccb58146263202c27ed25186",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xee30585e017fe3a8ccb58146263202c27ed25186",
+          "liquidity": "668472033907676848828",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "668472033907676848828"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-668472033907676848828"
+            }
+          ]
+        }
+      ]
+    },
+    "ethpandaops/ethereum-package": {
+      "outcomeToken": "0x2d15ef0666bb4d126d80c5cdfcd4ffefd8159e97",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x2d15ef0666bb4d126d80c5cdfcd4ffefd8159e97",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "416758241528661599170",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-416758241528661599170"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "416758241528661599170"
+            }
+          ]
+        }
+      ]
+    },
+    "ethstaker/eth-docker": {
+      "outcomeToken": "0x108905d6f9839f9376760bf4ef0ad393dbdf8715",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x108905d6f9839f9376760bf4ef0ad393dbdf8715",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1009465642911095223502",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1009465642911095223502"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1009465642911095223502"
+            }
+          ]
+        }
+      ]
+    },
+    "ethstaker/ethstaker-deposit-cli": {
+      "outcomeToken": "0xf30cca6619671bb48f319998079ed6cbf144b95a",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xf30cca6619671bb48f319998079ed6cbf144b95a",
+          "liquidity": "718738458669422419813",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "718738458669422419813"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-718738458669422419813"
+            }
+          ]
+        }
+      ]
+    },
+    "evmts/tevm-monorepo": {
+      "outcomeToken": "0x546b74db993b788eca029f34f7b0f399485a2987",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x546b74db993b788eca029f34f7b0f399485a2987",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "447249513703860905325",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-447249513703860905325"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "447249513703860905325"
+            }
+          ]
+        }
+      ]
+    },
+    "flashbots/mev-boost": {
+      "outcomeToken": "0xc56eded5a3fc18e3391cdbac25ef7b36cc321d11",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xc56eded5a3fc18e3391cdbac25ef7b36cc321d11",
+          "liquidity": "788543061885799480387",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "788543061885799480387"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-788543061885799480387"
+            }
+          ]
+        }
+      ]
+    },
+    "flashbots/mev-boost-relay": {
+      "outcomeToken": "0x766fb92f9c1eb346aaa3c465ee50629abe03d062",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x766fb92f9c1eb346aaa3c465ee50629abe03d062",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1143168737845038430752",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1143168737845038430752"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1143168737845038430752"
+            }
+          ]
+        }
+      ]
+    },
+    "flashbots/rbuilder": {
+      "outcomeToken": "0x284f208d1bd06954afae181bd6612e8a3303b8a8",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x284f208d1bd06954afae181bd6612e8a3303b8a8",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1270348619181153886475",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1270348619181153886475"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1270348619181153886475"
+            }
+          ]
+        }
+      ]
+    },
+    "foundry-rs/foundry": {
+      "outcomeToken": "0xb202159c00692815de270aa4a55b456d2f580bbe",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb202159c00692815de270aa4a55b456d2f580bbe",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "466152285245640619767",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-466152285245640619767"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "466152285245640619767"
+            }
+          ]
+        }
+      ]
+    },
+    "grandinetech/grandine": {
+      "outcomeToken": "0x57c12162498848f048a36d633541b433f39e60df",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x57c12162498848f048a36d633541b433f39e60df",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "733676536862253816996",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-733676536862253816996"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "733676536862253816996"
+            }
+          ]
+        }
+      ]
+    },
+    "herumi/mcl": {
+      "outcomeToken": "0xb88fa1d8b2880f60945e8ef94c577fdb163f8c6e",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xb88fa1d8b2880f60945e8ef94c577fdb163f8c6e",
+          "liquidity": "1178611389477199281161",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "1178611389477199281161"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-1178611389477199281161"
+            }
+          ]
+        }
+      ]
+    },
+    "holiman/goevmlab": {
+      "outcomeToken": "0xe5c4d0b9be3f15e9e6542908563ca45ecf093241",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xe5c4d0b9be3f15e9e6542908563ca45ecf093241",
+          "liquidity": "652881306259670843579",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "652881306259670843579"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-652881306259670843579"
+            }
+          ]
+        }
+      ]
+    },
+    "hyperledger/besu": {
+      "outcomeToken": "0x07b8af578a2d600c162febce50408315101a7fa9",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x07b8af578a2d600c162febce50408315101a7fa9",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "977724442460223653171",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-977724442460223653171"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "977724442460223653171"
+            }
+          ]
+        }
+      ]
+    },
+    "intellij-solidity/intellij-solidity": {
+      "outcomeToken": "0x74139250467b13356904ea9df94f7235dae540f4",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x74139250467b13356904ea9df94f7235dae540f4",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "958345900565669232819",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-958345900565669232819"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "958345900565669232819"
+            }
+          ]
+        }
+      ]
+    },
+    "ipsilon/evmone": {
+      "outcomeToken": "0x41ad3e0fbe4342a818e0a34d13657fedbbc6637b",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x41ad3e0fbe4342a818e0a34d13657fedbbc6637b",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1129557006390017692285",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1129557006390017692285"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1129557006390017692285"
+            }
+          ]
+        }
+      ]
+    },
+    "l2beat/l2beat": {
+      "outcomeToken": "0x508d470adcc2a5dfccce790d94c821c787f85c2f",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x508d470adcc2a5dfccce790d94c821c787f85c2f",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1287554224076878336867",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1287554224076878336867"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1287554224076878336867"
+            }
+          ]
+        }
+      ]
+    },
+    "lambdaclass/ethrex": {
+      "outcomeToken": "0xcb9c84806a4297494105a2d975cfac6bade8e971",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xcb9c84806a4297494105a2d975cfac6bade8e971",
+          "liquidity": "525300399054732898419",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "525300399054732898419"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-525300399054732898419"
+            }
+          ]
+        }
+      ]
+    },
+    "lambdaclass/lambda_ethereum_consensus\\t": {
+      "outcomeToken": "0xe44745929509da3bf632638c1db00c6cb52a2a42",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xe44745929509da3bf632638c1db00c6cb52a2a42",
+          "liquidity": "397001565420610276575",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "397001565420610276575"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-397001565420610276575"
+            }
+          ]
+        }
+      ]
+    },
+    "lambdaclass/lambdaworks": {
+      "outcomeToken": "0xa071e28f0b5c9a17f48ca05110c2485411702e62",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xa071e28f0b5c9a17f48ca05110c2485411702e62",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "591421203730265981534",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-591421203730265981534"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "591421203730265981534"
+            }
+          ]
+        }
+      ]
+    },
+    "libp2p/libp2p": {
+      "outcomeToken": "0x73d0ded76ab2f0e1870f9dd6908ab6308c640560",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x73d0ded76ab2f0e1870f9dd6908ab6308c640560",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "999278711313245986849",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-999278711313245986849"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "999278711313245986849"
+            }
+          ]
+        }
+      ]
+    },
+    "otterscan/otterscan": {
+      "outcomeToken": "0x3eb78288cd0422a4fec883042ed899bc3aab6c36",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x3eb78288cd0422a4fec883042ed899bc3aab6c36",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "811480166634626917045",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-811480166634626917045"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "811480166634626917045"
+            }
+          ]
+        }
+      ]
+    },
+    "paradigmxyz/reth": {
+      "outcomeToken": "0xe8fabb1a6738bcab0ed3e00f9d8be1cb68b5e9f9",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xe8fabb1a6738bcab0ed3e00f9d8be1cb68b5e9f9",
+          "liquidity": "1092845366570658243228",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "1092845366570658243228"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-1092845366570658243228"
+            }
+          ]
+        }
+      ]
+    },
+    "paulmillr/noble-curves": {
+      "outcomeToken": "0x104283847e3f6055997e830244dff1cd3d5c140e",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x104283847e3f6055997e830244dff1cd3d5c140e",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1306469730885005060493",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1306469730885005060493"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1306469730885005060493"
+            }
+          ]
+        }
+      ]
+    },
+    "powdr-labs/powdr": {
+      "outcomeToken": "0x39b0695054c19e657ad951c8c762fff449c1b7ce",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x39b0695054c19e657ad951c8c762fff449c1b7ce",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "573590056736943231477",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-573590056736943231477"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "573590056736943231477"
+            }
+          ]
+        }
+      ]
+    },
+    "protofire/solhint": {
+      "outcomeToken": "0x8fe1418aee1ea6136f1353bb55168fe1f079e896",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x8fe1418aee1ea6136f1353bb55168fe1f079e896",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1205205576260832256468",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1205205576260832256468"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1205205576260832256468"
+            }
+          ]
+        }
+      ]
+    },
+    "remix-project-org/remix-project": {
+      "outcomeToken": "0xb46e4591e7190bc9cee4330b3f197f9e96cc3b73",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xb46e4591e7190bc9cee4330b3f197f9e96cc3b73",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "776089207773463634435",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-776089207773463634435"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "776089207773463634435"
+            }
+          ]
+        }
+      ]
+    },
+    "risc0/risc0-ethereum": {
+      "outcomeToken": "0x4a63afa749862e62c8a4d60c5c27854babd260fe",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x4a63afa749862e62c8a4d60c5c27854babd260fe",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "824505169440039034221",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-824505169440039034221"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "824505169440039034221"
+            }
+          ]
+        }
+      ]
+    },
+    "safe-global/safe-smart-account": {
+      "outcomeToken": "0x14e47362043567695e73cb63ff13fda698db0d93",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x14e47362043567695e73cb63ff13fda698db0d93",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1097112768029296288008",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1097112768029296288008"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1097112768029296288008"
+            }
+          ]
+        }
+      ]
+    },
+    "scaffold-eth/scaffold-eth-2": {
+      "outcomeToken": "0x8db56ba900e69dfa9badb5de0fb9978b64fcc5b2",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x8db56ba900e69dfa9badb5de0fb9978b64fcc5b2",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1164081095678612665828",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1164081095678612665828"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1164081095678612665828"
+            }
+          ]
+        }
+      ]
+    },
+    "shazow/whatsabi": {
+      "outcomeToken": "0x32d4d346263030926ed7e4b106189212cd8a5a65",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x32d4d346263030926ed7e4b106189212cd8a5a65",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1112958671014689424649",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1112958671014689424649"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1112958671014689424649"
+            }
+          ]
+        }
+      ]
+    },
+    "sigp/lighthouse": {
+      "outcomeToken": "0x81f16d9428a955f889b11b440b9b64cd1cf20ed0",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x81f16d9428a955f889b11b440b9b64cd1cf20ed0",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "669330952209818674962",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-669330952209818674962"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "669330952209818674962"
+            }
+          ]
+        }
+      ]
+    },
+    "skalenetwork/libBLS": {
+      "outcomeToken": "0x453a045052fa1d4ec9ccf458e6cc5868e89ce4c4",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x453a045052fa1d4ec9ccf458e6cc5868e89ce4c4",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "670762645806797805209",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-670762645806797805209"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "670762645806797805209"
+            }
+          ]
+        }
+      ]
+    },
+    "smartcontracts/simple-optimism-node": {
+      "outcomeToken": "0x959dabe9bde10c9a588d18c0ecbb5b2625ed1618",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x959dabe9bde10c9a588d18c0ecbb5b2625ed1618",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "914605142812262610847",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-914605142812262610847"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "914605142812262610847"
+            }
+          ]
+        }
+      ]
+    },
+    "status-im/nimbus-eth2": {
+      "outcomeToken": "0x3bdbc84e6926f299f7ccfd0b264115065b597f59",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x3bdbc84e6926f299f7ccfd0b264115065b597f59",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1111076229957812146244",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1111076229957812146244"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1111076229957812146244"
+            }
+          ]
+        }
+      ]
+    },
+    "succinctlabs/op-succinct": {
+      "outcomeToken": "0x76df8ee922702bb5ff3c029321dc96f9936c7bf6",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x76df8ee922702bb5ff3c029321dc96f9936c7bf6",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "906609330906143919737",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-906609330906143919737"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "906609330906143919737"
+            }
+          ]
+        }
+      ]
+    },
+    "succinctlabs/rsp": {
+      "outcomeToken": "0xa7725bf35f6d101e06685706a6c1b3658b489311",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xa7725bf35f6d101e06685706a6c1b3658b489311",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "542383498583178170932",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-542383498583178170932"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "542383498583178170932"
+            }
+          ]
+        }
+      ]
+    },
+    "succinctlabs/sp1": {
+      "outcomeToken": "0x6c22612f17abafd420f904d1a8f71d3113a339f2",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x6c22612f17abafd420f904d1a8f71d3113a339f2",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "904325832028841163533",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-904325832028841163533"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "904325832028841163533"
+            }
+          ]
+        }
+      ]
+    },
+    "supranational/blst": {
+      "outcomeToken": "0x7357ff8c4bcf17dda3f39aa474716ac0c5f1b6c5",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x7357ff8c4bcf17dda3f39aa474716ac0c5f1b6c5",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "903744700888836930643",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-903744700888836930643"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "903744700888836930643"
+            }
+          ]
+        }
+      ]
+    },
+    "swiss-knife-xyz/swiss-knife": {
+      "outcomeToken": "0xf0e5dbc84bebfdec05ddf576cc6077e3ec7960e1",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "token1": "0xf0e5dbc84bebfdec05ddf576cc6077e3ec7960e1",
+          "liquidity": "505366125824903412261",
+          "ticks": [
+            {
+              "tickIdx": "16095",
+              "liquidityNet": "505366125824903412261"
+            },
+            {
+              "tickIdx": "512",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "92108",
+              "liquidityNet": "-505366125824903412261"
+            }
+          ]
+        }
+      ]
+    },
+    "taikoxyz/taiko-mono": {
+      "outcomeToken": "0xaeb6712b5a8a61ef368fca0e08ebaaafa6d6610a",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0xaeb6712b5a8a61ef368fca0e08ebaaafa6d6610a",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1266360785971687783691",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1266360785971687783691"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1266360785971687783691"
+            }
+          ]
+        }
+      ]
+    },
+    "vyperlang/titanoboa": {
+      "outcomeToken": "0x807ee88e54c7c2d66aa98840f4a67ca7f1fbcaf6",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": [
+        {
+          "token0": "0x807ee88e54c7c2d66aa98840f4a67ca7f1fbcaf6",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "529926442052969777415",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-529926442052969777415"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "529926442052969777415"
+            }
+          ]
+        }
+      ]
+    },
+    "vyperlang/vyper": {
+      "outcomeToken": "0x21dfdba32462e9ed2fbd64e85ec57542924f430b",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x21dfdba32462e9ed2fbd64e85ec57542924f430b",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1229382708726404286241",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1229382708726404286241"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1229382708726404286241"
+            }
+          ]
+        }
+      ]
+    },
+    "wealdtech/ethdo": {
+      "outcomeToken": "0x025eacc0518b6099d9355c5d18ed7808c2b61a58",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x025eacc0518b6099d9355c5d18ed7808c2b61a58",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "1189808177292882413321",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-1189808177292882413321"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "1189808177292882413321"
+            }
+          ]
+        }
+      ]
+    },
+    "wevm/viem": {
+      "outcomeToken": "0x30885f75c2c0037d1e4cd754641c8a5b1d6450b9",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x30885f75c2c0037d1e4cd754641c8a5b1d6450b9",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "990288761349895010534",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-990288761349895010534"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "990288761349895010534"
+            }
+          ]
+        }
+      ]
+    },
+    "wighawag/hardhat-deploy": {
+      "outcomeToken": "0x690cdbb4e870c2072136cdee590b8cc4ae1be3cb",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+      "pools": [
+        {
+          "token0": "0x690cdbb4e870c2072136cdee590b8cc4ae1be3cb",
+          "token1": "0xb5b2dc7fd34c249f4be7fb1fcea07950784229e0",
+          "liquidity": "863224772119945130379",
+          "ticks": [
+            {
+              "tickIdx": "-16096",
+              "liquidityNet": "-863224772119945130379"
+            },
+            {
+              "tickIdx": "-513",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-887272",
+              "liquidityNet": "0"
+            },
+            {
+              "tickIdx": "-92109",
+              "liquidityNet": "863224772119945130379"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
