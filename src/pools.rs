@@ -12,6 +12,7 @@ use uniswap_v3_math::{
 };
 
 use crate::markets::{MARKETS_L1, MarketData, Pool};
+use crate::predictions::PREDICTIONS_L1;
 
 /// Price scale factor: 10^18 (18 decimals of precision)
 const PRICE_SCALE: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
@@ -49,6 +50,62 @@ pub fn sqrt_price_x96_to_price_outcome(
         // outcome is token0, quote is token1 -> price = token1/token0
         sqrt_price_x96_to_price(sqrt_price_x96)
     }
+}
+
+/// Entry in the profitability result: how much the prediction exceeds the market price.
+#[derive(Debug, Clone)]
+pub struct ProfitabilityEntry {
+    pub market_name: &'static str,
+    pub prediction: f64,
+    pub market_price: f64,
+    pub diff: f64,
+}
+
+/// Returns the difference between predictions (PREDICTIONS_L1) and current
+/// outcome prices for each matched market. Matches by market name (case-insensitive).
+///
+/// `slot0_results` should come from `fetch_all_slot0`.
+pub fn profitability(slot0_results: &[(Slot0Result, &MarketData)]) -> Vec<ProfitabilityEntry> {
+    let mut entries = Vec::new();
+
+    for prediction in PREDICTIONS_L1.iter() {
+        let pred_name = prediction.market.to_lowercase();
+
+        // Find the matching slot0 result by market name
+        let Some((slot0, market)) = slot0_results
+            .iter()
+            .find(|(_, m)| m.name.trim_end_matches("\\t").to_lowercase() == pred_name)
+        else {
+            continue;
+        };
+
+        let pool = match market.pool.as_ref() {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let is_token1_outcome =
+            pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+
+        let price = match sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)
+        {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let price_f64: f64 = price.to_string().parse::<f64>().unwrap() / 1e18;
+        let diff = (prediction.prediction - price_f64) / price_f64;
+
+        entries.push(ProfitabilityEntry {
+            market_name: market.name,
+            prediction: prediction.prediction,
+            market_price: price_f64,
+            diff,
+        });
+    }
+
+    entries.sort_by(|a, b| b.diff.total_cmp(&a.diff));
+    entries
 }
 
 // Multicall3 contract interface
@@ -395,5 +452,25 @@ mod tests {
         let markets = collect_markets_with_pools();
         println!("Collected {} markets with pools", markets.len());
         assert!(!markets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_profitability() {
+        dotenvy::dotenv().ok();
+        let rpc_url = std::env::var("RPC").expect("RPC environment variable not set");
+        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+
+        let slot0_results = fetch_all_slot0(provider).await.unwrap();
+        let entries = profitability(&slot0_results);
+
+        println!("Profitability for {} matched markets:", entries.len());
+        for entry in &entries {
+            println!(
+                "  {}: prediction={:.4}, market_price={:.4}, diff={:+.4}",
+                entry.market_name, entry.prediction, entry.market_price, entry.diff
+            );
+        }
+
+        assert!(!entries.is_empty());
     }
 }
