@@ -7,9 +7,49 @@ use alloy::{
 use alloy_primitives::{I256, U256};
 use futures_util::future;
 use std::str::FromStr;
-use uniswap_v3_math::{swap_math::compute_swap_step, tick, tick_math::get_sqrt_ratio_at_tick};
+use uniswap_v3_math::{
+    full_math::mul_div, swap_math::compute_swap_step, tick, tick_math::get_sqrt_ratio_at_tick,
+};
 
 use crate::markets::{MARKETS_L1, MarketData, Pool};
+
+/// Price scale factor: 10^18 (18 decimals of precision)
+const PRICE_SCALE: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
+const TWO_96: U256 = U256::from_limbs([0, 0x1_0000_0000, 0, 0]); // 2^96
+
+/// Converts sqrtPriceX96 to price (token1/token0) scaled by 10^18.
+/// Returns None on overflow (shouldn't happen with valid sqrtPriceX96).
+pub fn sqrt_price_x96_to_price(sqrt_price_x96: U256) -> Option<U256> {
+    // price = sqrtPriceX96² / 2^192
+    // price_scaled = sqrtPriceX96² * 10^18 / 2^192
+    //              = mul_div(sqrtPriceX96, sqrtPriceX96 * 10^18, 2^192)
+    let scaled = sqrt_price_x96.checked_mul(PRICE_SCALE)?;
+    mul_div(sqrt_price_x96, scaled, TWO_96 * TWO_96).ok()
+}
+
+/// Converts sqrtPriceX96 to inverse price (token0/token1) scaled by 10^18.
+/// Returns None on overflow or division by zero.
+pub fn sqrt_price_x96_to_inv_price(sqrt_price_x96: U256) -> Option<U256> {
+    // inv_price = 2^192 / sqrtPriceX96²
+    // inv_price_scaled = 2^192 * 10^18 / sqrtPriceX96²
+    // Compute as: mul_div(2^96, 2^96, sqrtPriceX96) * 10^18 / sqrtPriceX96
+    let intermediate = mul_div(TWO_96, TWO_96, sqrt_price_x96).ok()?;
+    mul_div(intermediate, PRICE_SCALE, sqrt_price_x96).ok()
+}
+
+/// Returns price of outcome token in quote token, scaled by 10^18.
+pub fn sqrt_price_x96_to_price_outcome(
+    sqrt_price_x96: U256,
+    is_token1_outcome: bool,
+) -> Option<U256> {
+    if is_token1_outcome {
+        // outcome is token1, quote is token0 -> price = token0/token1 = 1/price
+        sqrt_price_x96_to_inv_price(sqrt_price_x96)
+    } else {
+        // outcome is token0, quote is token1 -> price = token1/token0
+        sqrt_price_x96_to_price(sqrt_price_x96)
+    }
+}
 
 // Multicall3 contract interface
 sol! {
@@ -131,7 +171,7 @@ pub fn simulate_swap(
 }
 
 /// Convenience: simulate buying outcome tokens with quote tokens (exact input)
-pub fn simulate_swap_direction(
+pub fn simulate_buy(
     pool: &Pool,
     sqrt_price_x96: U256,
     quote_token: &str,
@@ -240,40 +280,114 @@ mod tests {
         let results = fetch_all_slot0(provider).await.unwrap();
 
         println!("Fetched {} pool slot0 results", results.len());
-        for (slot0, market) in results.iter().take(10) {
+        let mut total_price = U256::ZERO;
+        for (slot0, market) in results.iter().take(1000) {
             let pool = market.pool.as_ref().unwrap();
-
+            let price = sqrt_price_x96_to_price_outcome(
+                slot0.sqrt_price_x96,
+                pool.token1.to_lowercase() == market.outcome_token.to_lowercase(),
+            )
+            .unwrap();
+            total_price += price;
+            // Convert to f64 for display (price is scaled by 10^18)
+            let price_f64: f64 = price.to_string().parse::<f64>().unwrap() / 1e18;
             println!(
-                "Pool {}: tick={}, token0={}, token1={}, sqrtPriceX96={}, liquidity={}",
+                "Pool {}: tick={}, token0={}, token1={}, sqrtPriceX96={}, liquidity={}, price={}",
                 slot0.pool_id,
                 slot0.tick,
                 pool.token0,
                 pool.token1,
                 slot0.sqrt_price_x96,
-                pool.liquidity
-            );
-
-            // Simulate buying outcome with 1e15 quote tokens (exact input)
-            let result = simulate_swap_direction(
-                pool,
-                slot0.sqrt_price_x96,
-                market.quote_token,
-                I256::try_from(-1_000_000_000_000_000i128).unwrap(),
-            )
-            .unwrap();
-            println!(
-                "Swap 1e15 quote: amount_in(zeikomi)={}, amount_out={}, crossed={}",
-                result.amount_in + result.fee_amount,
-                result.amount_out,
-                result.crossed_tick
-            );
-            // print outcome token and quote token addresses
-            println!(
-                "    outcome_token={}, quote_token={}",
-                market.outcome_token, market.quote_token
+                pool.liquidity,
+                price_f64
             );
         }
-        assert!(!results.is_empty());
+        let total_f64: f64 = total_price.to_string().parse::<f64>().unwrap() / 1e18;
+        println!("Total price: {}", total_f64);
+
+        if total_f64 < 1.0 {
+            println!("Arbitrage opportunity detected!");
+
+            // Binary search for optimal amount to buy (exact output)
+            // We want to find the max amount where sum of price_next <= 1.0 and no tick crossed
+            let mut lo: u128 = 1;
+            let mut hi: u128 = 1_000_000_000_000_000_000_000u128; // 1000 tokens max
+            let mut best_amount: u128 = 0;
+            let mut best_cost: u128 = 0;
+
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+
+                // Simulate buying `mid` amount of each outcome token
+                let mut valid = true;
+                let mut total_cost: u128 = 0;
+                let mut sum_price_next = U256::ZERO;
+
+                for (slot0, market) in results.iter() {
+                    let pool = market.pool.as_ref().unwrap();
+                    let is_token1_outcome =
+                        pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+
+                    // Exact output: negative amount
+                    let amount = I256::try_from(mid).unwrap().checked_neg().unwrap();
+                    let result = match simulate_buy(pool, slot0.sqrt_price_x96, market.quote_token, amount) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            valid = false;
+                            break;
+                        }
+                    };
+
+                    if result.crossed_tick {
+                        valid = false;
+                        break;
+                    }
+
+                    let price_next =
+                        sqrt_price_x96_to_price_outcome(result.sqrt_price_next, is_token1_outcome)
+                            .unwrap_or(U256::MAX);
+                    sum_price_next += price_next;
+                    total_cost += (result.amount_in + result.fee_amount).to::<u128>();
+                }
+
+                // Check if sum of prices <= 1.0 (using PRICE_SCALE for precision)
+                if valid && sum_price_next <= PRICE_SCALE {
+                    best_amount = mid;
+                    best_cost = total_cost;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+
+            println!(
+                "Optimal amount: {} (cost: {}, profit: {})",
+                best_amount,
+                best_cost,
+                if best_amount > best_cost { best_amount - best_cost } else { 0 }
+            );
+
+            // Print final state for each pool at optimal amount
+            if best_amount > 0 {
+                let amount = I256::try_from(best_amount).unwrap().checked_neg().unwrap();
+                for (slot0, market) in results.iter() {
+                    let pool = market.pool.as_ref().unwrap();
+                    let result = simulate_buy(pool, slot0.sqrt_price_x96, market.quote_token, amount).unwrap();
+                    let is_token1_outcome =
+                        pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+                    let price_next =
+                        sqrt_price_x96_to_price_outcome(result.sqrt_price_next, is_token1_outcome).unwrap();
+                    let price_f64: f64 = price_next.to_string().parse::<f64>().unwrap() / 1e18;
+                    println!(
+                        "  outcome={}: cost={}, price_next={:.6}, crossed={}",
+                        market.outcome_token,
+                        result.amount_in + result.fee_amount,
+                        price_f64,
+                        result.crossed_tick
+                    );
+                }
+            }
+        }
     }
 
     #[test]
