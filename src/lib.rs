@@ -6,7 +6,8 @@ use std::fs::File;
 use std::io::BufWriter;
 
 pub mod markets;
-pub mod weights;
+pub mod predictions;
+pub mod pools;
 
 sol! {
     #[sol(rpc)]
@@ -31,6 +32,8 @@ struct ApiMarket {
     market_id: Option<String>,  // L1 has this, L2 doesn't
     pool: Option<Pool>,         // L1 uses single pool
     pools: Option<Vec<Pool>>,   // L2 uses pools array
+    up_pool: Option<Pool>,      // Originality uses upPool/downPool
+    down_pool: Option<Pool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -64,6 +67,10 @@ struct OutputMarket {
     #[serde(skip_serializing_if = "Option::is_none")]
     market_id: Option<String>,
     pools: Vec<Pool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    up_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    down_token: Option<String>,
 }
 
 impl From<ApiResponse> for OutputFile {
@@ -79,17 +86,35 @@ impl From<ApiResponse> for OutputFile {
 
 impl From<ApiMarket> for OutputMarket {
     fn from(api: ApiMarket) -> Self {
-        // Collect all pools: L1 has single pool, L2 has pools array
+        // Extract up/down tokens before consuming the pools
+        let up_token = api.up_pool.as_ref().map(|p| p.token1.clone());
+        let down_token = api.down_pool.as_ref().map(|p| p.token1.clone());
+
+        // Collect all pools: L1 has single pool, L2 has pools array, originality has upPool/downPool
         let pools: Vec<Pool> = api
             .pool
             .into_iter()
             .chain(api.pools.into_iter().flatten())
+            .chain(api.up_pool)
+            .chain(api.down_pool)
             .collect();
 
+        // L1: id is outcomeToken, market_id is provided separately
+        // L2/Originality: id is marketId (no separate outcomeToken)
+        let (outcome_token, market_id) = if api.market_id.is_some() {
+            // L1 case: id is the outcome token
+            (api.id, api.market_id)
+        } else {
+            // L2/Originality case: id is the market ID, no outcome token
+            (String::new(), Some(api.id))
+        };
+
         Self {
-            outcome_token: api.id,
-            market_id: api.market_id,
+            outcome_token,
+            market_id,
             pools,
+            up_token,
+            down_token,
         }
     }
 }
@@ -127,6 +152,14 @@ mod tests {
     async fn test_prepare_l2() {
         let url: &str = "https://deep.seer.pm/.netlify/functions/get-l2-markets-data";
         let name = "markets_data_l2.json";
+        let result = prepare(url, name).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_originality() {
+        let url: &str = "https://deep.seer.pm/.netlify/functions/get-originality-markets-data";
+        let name = "markets_data_originality.json";
         let result = prepare(url, name).await;
         assert!(result.is_ok());
     }

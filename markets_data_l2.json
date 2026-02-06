@@ -1,7 +1,8 @@
 {
   "marketsData": {
     "0xmiden/miden-vm": {
-      "outcomeToken": "0xa7cfa81a9b3538fd7e1351767a2e6a157e7fe232",
+      "outcomeToken": "",
+      "marketId": "0xa7cfa81a9b3538fd7e1351767a2e6a157e7fe232",
       "pools": [
         {
           "token0": "0x5734bc6cff44f2728ed009130630dc1dc7ad27eb",
@@ -1041,7 +1042,8 @@
       ]
     },
     "a16z/halmos": {
-      "outcomeToken": "0x605a6acfb1e4f00e8b8a84ceb85fc1ccd447f776",
+      "outcomeToken": "",
+      "marketId": "0x605a6acfb1e4f00e8b8a84ceb85fc1ccd447f776",
       "pools": [
         {
           "token0": "0x42b5242b0f29a9b1c4f4c9db183688d45899f26b",
@@ -1213,7 +1215,8 @@
       ]
     },
     "a16z/helios": {
-      "outcomeToken": "0xc4dd59d768f7a3b66ba0071f77df837e33d2b325",
+      "outcomeToken": "",
+      "marketId": "0xc4dd59d768f7a3b66ba0071f77df837e33d2b325",
       "pools": [
         {
           "token0": "0x776b1ca4e9ac177c78a4ba9c75055bd4a2a48366",
@@ -2208,7 +2211,8 @@
       ]
     },
     "aestus-relay/mev-boost-relay": {
-      "outcomeToken": "0x2dea76c54193880c5765c9f87153cb13668dc276",
+      "outcomeToken": "",
+      "marketId": "0x2dea76c54193880c5765c9f87153cb13668dc276",
       "pools": [
         {
           "token0": "0x01344c164368fd39dc8cd4f25abe5bd227068643",
@@ -2828,7 +2832,8 @@
       ]
     },
     "alloy-rs/alloy": {
-      "outcomeToken": "0x84a4a712716d4d00eb25f11a1f22b1f1ffd26193",
+      "outcomeToken": "",
+      "marketId": "0x84a4a712716d4d00eb25f11a1f22b1f1ffd26193",
       "pools": [
         {
           "token0": "0x928c9ebd7391ed55f3068bd41cbddb7142dd5c86",
@@ -3073,7 +3078,8 @@
       ]
     },
     "apeworx/ape": {
-      "outcomeToken": "0xf00713b07d31521930d7a28bb081ca10d34a0d12",
+      "outcomeToken": "",
+      "marketId": "0xf00713b07d31521930d7a28bb081ca10d34a0d12",
       "pools": [
         {
           "token0": "0x7138539537e0330b5e9b235f76c16b5aa409f4f3",
@@ -3648,7 +3654,8 @@
       ]
     },
     "argotorg/fe": {
-      "outcomeToken": "0xf93c838e4b5dc163320ca1bd2d23a4f59ad6e57c",
+      "outcomeToken": "",
+      "marketId": "0xf93c838e4b5dc163320ca1bd2d23a4f59ad6e57c",
       "pools": [
         {
           "token0": "0x78e2e7d6acc9ad509a6dd739dc8f56ede5f355a7",
@@ -4568,7 +4575,8 @@
       ]
     },
     "argotorg/hevm": {
-      "outcomeToken": "0xdf01b04b36a49423eddbdabbde7609f06200c824",
+      "outcomeToken": "",
+      "marketId": "0xdf01b04b36a49423eddbdabbde7609f06200c824",
       "pools": [
         {
           "token0": "0x7ef7f46f7fa5ba980f3888dd172ecf6075b3a3b1",
@@ -4753,7 +4761,8 @@
       ]
     },
     "argotorg/solidity": {
-      "outcomeToken": "0xd93c5e4333aa876d97268e33525a7b21076b1ee0",
+      "outcomeToken": "",
+      "marketId": "0xd93c5e4333aa876d97268e33525a7b21076b1ee0",
       "pools": [
         {
           "token0": "0x9d2e4cebe927d4c56cbf389a91713a1d8ce14865",
@@ -4953,7 +4962,8 @@
       ]
     },
     "argotorg/sourcify": {
-      "outcomeToken": "0x0bac793a5d2fc558d767e2dd10db22393b8f725d",
+      "outcomeToken": "",
+      "marketId": "0x0bac793a5d2fc558d767e2dd10db22393b8f725d",
       "pools": [
         {
           "token0": "0x074665980b01f541091bdfe6e9a3fda3285e152f",
@@ -5903,7 +5913,8 @@
       ]
     },
     "arkworks-rs/algebra": {
-      "outcomeToken": "0xae2f0192431b2291068972e725390fe5941f018d",
+      "outcomeToken": "",
+      "marketId": "0xae2f0192431b2291068972e725390fe5941f018d",
       "pools": [
         {
           "token0": "0x04c9d4c81d997c91b74e3be08c53ed3b2b8efae3",
@@ -5983,7 +5994,8 @@
       ]
     },
     "axiom-crypto/snark-verifier": {
-      "outcomeToken": "0x0a0431ee25e4e7f1f2273f5d0aa9b412e2ce6f73",
+      "outcomeToken": "",
+      "marketId": "0x0a0431ee25e4e7f1f2273f5d0aa9b412e2ce6f73",
       "pools": [
         {
           "token0": "0x4e90e7f2f82e942fbb5f783736b8a961bdd16bf4",
@@ -6714,7 +6726,8 @@
       ]
     },
     "blockscout/blockscout": {
-      "outcomeToken": "0x5dc9efa5a100916625ae76a4ceba1cd4c4495e53",
+      "outcomeToken": "",
+      "marketId": "0x5dc9efa5a100916625ae76a4ceba1cd4c4495e53",
       "pools": [
         {
           "token0": "0x169e57f34fac8cd04e735f42ea9a89ef8a5f9c59",
@@ -7769,7 +7782,8 @@
       ]
     },
     "certora/certoraprover": {
-      "outcomeToken": "0x19eca77ffb46070098b5dfd9c5ea7a334eaebd23",
+      "outcomeToken": "",
+      "marketId": "0x19eca77ffb46070098b5dfd9c5ea7a334eaebd23",
       "pools": [
         {
           "token0": "0x1f6f6ceedb1122c8d06f27bf432b3628026d5464",
@@ -8764,7 +8778,8 @@
       ]
     },
     "chainsafe/bls": {
-      "outcomeToken": "0x659e8cab4113ecb377e139e732fe7a36cadbb8d6",
+      "outcomeToken": "",
+      "marketId": "0x659e8cab4113ecb377e139e732fe7a36cadbb8d6",
       "pools": [
         {
           "token0": "0x531c62b748aa1d69a125903a93386ab2e458a8ca",
@@ -9204,7 +9219,8 @@
       ]
     },
     "chainsafe/lodestar": {
-      "outcomeToken": "0x6d931dcb61ea8be387311b35addca487c8c98175",
+      "outcomeToken": "",
+      "marketId": "0x6d931dcb61ea8be387311b35addca487c8c98175",
       "pools": [
         {
           "token0": "0x37cfa10675fcb7341bd8c0f823bb52d07d30865d",
@@ -10259,7 +10275,8 @@
       ]
     },
     "commit-boost/commit-boost-client": {
-      "outcomeToken": "0x6d4c3438fb691f0dbbb39bc4207316becad62a2a",
+      "outcomeToken": "",
+      "marketId": "0x6d4c3438fb691f0dbbb39bc4207316becad62a2a",
       "pools": [
         {
           "token0": "0x674d0b47fb33a88a6a6d0ca60fa82e6055de9d46",
@@ -10801,7 +10818,8 @@
       ]
     },
     "consensys/gnark-crypto": {
-      "outcomeToken": "0xf0abc0bb14f4f9def9bffb8204a574012f840279",
+      "outcomeToken": "",
+      "marketId": "0xf0abc0bb14f4f9def9bffb8204a574012f840279",
       "pools": [
         {
           "token0": "0x576c731f3db1cd339f2945470310a90f750a3690",
@@ -10971,7 +10989,8 @@
       ]
     },
     "consensys/teku": {
-      "outcomeToken": "0xac9b90b6c6a0fdf50aca5e4986026b2291c9f3bc",
+      "outcomeToken": "",
+      "marketId": "0xac9b90b6c6a0fdf50aca5e4986026b2291c9f3bc",
       "pools": [
         {
           "token0": "0x7e783ad37dd07c1aa6a0ab34e17e77831f963137",
@@ -11693,7 +11712,8 @@
       ]
     },
     "cyfrin/aderyn": {
-      "outcomeToken": "0xa113f4bf19e6b8c3dff9167a9913a6a2b09d896e",
+      "outcomeToken": "",
+      "marketId": "0xa113f4bf19e6b8c3dff9167a9913a6a2b09d896e",
       "pools": [
         {
           "token0": "0xda4be0af013253f3cadb918629dfba24231be4de",
@@ -12748,7 +12768,8 @@
       ]
     },
     "deepfunding/dependency-graph": {
-      "outcomeToken": "0x4372476dbf4a549713a760c012ebf2d3d2c8e86f",
+      "outcomeToken": "",
+      "marketId": "0x4372476dbf4a549713a760c012ebf2d3d2c8e86f",
       "pools": [
         {
           "token0": "0x023777eeb448c0f06bfcc430f759ed0546c2edcd",
@@ -13140,7 +13161,8 @@
       ]
     },
     "defillama/chainlist": {
-      "outcomeToken": "0xa7450768c1011f4265bc2178dc6bc2a398e861a5",
+      "outcomeToken": "",
+      "marketId": "0xa7450768c1011f4265bc2178dc6bc2a398e861a5",
       "pools": [
         {
           "token0": "0xa218b66008a4702b07514a592896c91b79b54d06",
@@ -13370,7 +13392,8 @@
       ]
     },
     "defillama/defillama-adapters": {
-      "outcomeToken": "0x24bf3c6f3971ff4649343c288bc0253b10288d33",
+      "outcomeToken": "",
+      "marketId": "0x24bf3c6f3971ff4649343c288bc0253b10288d33",
       "pools": [
         {
           "token0": "0x309c162863820738db147e35820b11c701e4a3bd",
@@ -14035,7 +14058,8 @@
       ]
     },
     "dl-solarity/solidity-lib": {
-      "outcomeToken": "0xd50d6a88e1a9a306520f9ca031935a9e28576418",
+      "outcomeToken": "",
+      "marketId": "0xd50d6a88e1a9a306520f9ca031935a9e28576418",
       "pools": [
         {
           "token0": "0x1fba8bdfcf394a83394960f1686a45119635b548",
@@ -14610,7 +14634,8 @@
       ]
     },
     "edb-rs/edb": {
-      "outcomeToken": "0x3f7f03b24be9fc40563c223ceb89aa4d986c20c3",
+      "outcomeToken": "",
+      "marketId": "0x3f7f03b24be9fc40563c223ceb89aa4d986c20c3",
       "pools": [
         {
           "token0": "0x2a5904691089edbd42be69d60d111eeceb495907",
@@ -15665,7 +15690,8 @@
       ]
     },
     "erigontech/erigon": {
-      "outcomeToken": "0xfc55632c29667105a8414f201050457e13fe9ba5",
+      "outcomeToken": "",
+      "marketId": "0xfc55632c29667105a8414f201050457e13fe9ba5",
       "pools": [
         {
           "token0": "0x29f0cc842a3082fea2eea7d8c678799664ec6694",
@@ -16720,7 +16746,8 @@
       ]
     },
     "erigontech/silkworm": {
-      "outcomeToken": "0x14f88260d29e0adb3e3664eb2807dae956323332",
+      "outcomeToken": "",
+      "marketId": "0x14f88260d29e0adb3e3664eb2807dae956323332",
       "pools": [
         {
           "token0": "0x2c02fd6390a7199f2e9fb90af94755b4c40e42bc",
@@ -16980,7 +17007,8 @@
       ]
     },
     "espressosystems/jellyfish": {
-      "outcomeToken": "0xba661a5d02621f78958a0a311d9779e25541abba",
+      "outcomeToken": "",
+      "marketId": "0xba661a5d02621f78958a0a311d9779e25541abba",
       "pools": [
         {
           "token0": "0x72bc96d610010afee0141eb9a35e94b55fc6580a",
@@ -17210,7 +17238,8 @@
       ]
     },
     "eth-infinitism/account-abstraction": {
-      "outcomeToken": "0x7fd05cd494a8a42d812c5f00877cd1e9dc0451f6",
+      "outcomeToken": "",
+      "marketId": "0x7fd05cd494a8a42d812c5f00877cd1e9dc0451f6",
       "pools": [
         {
           "token0": "0x140368ff70ef2ba0f5ec6d04fb89b775e59c91f5",
@@ -17635,7 +17664,8 @@
       ]
     },
     "ethdebug/format": {
-      "outcomeToken": "0xe68cd707cf225059be2ec7c14de3805ccd004506",
+      "outcomeToken": "",
+      "marketId": "0xe68cd707cf225059be2ec7c14de3805ccd004506",
       "pools": [
         {
           "token0": "0x3f5d7cadeb2ff24c07745e347a7ac9ccb99b3d08",
@@ -18690,7 +18720,8 @@
       ]
     },
     "ethereum/consensus-specs": {
-      "outcomeToken": "0x63d13e651e21966c38b3fccbfd56053e5effce5b",
+      "outcomeToken": "",
+      "marketId": "0x63d13e651e21966c38b3fccbfd56053e5effce5b",
       "pools": [
         {
           "token0": "0x073add0055a9652dc814e1b77a070f9ba8ab0d16",
@@ -18980,7 +19011,8 @@
       ]
     },
     "ethereum/eips": {
-      "outcomeToken": "0xcaa3e69bdd8f877ee6e44dd00345f36051aab4ea",
+      "outcomeToken": "",
+      "marketId": "0xcaa3e69bdd8f877ee6e44dd00345f36051aab4ea",
       "pools": [
         {
           "token0": "0xb0cc327b1f467b6ad49cf602183ea7dc6d3dee08",
@@ -19612,7 +19644,8 @@
       ]
     },
     "ethereum/execution-apis": {
-      "outcomeToken": "0x18aa18739e0a6d3a986d96f5cacc48a58c815002",
+      "outcomeToken": "",
+      "marketId": "0x18aa18739e0a6d3a986d96f5cacc48a58c815002",
       "pools": [
         {
           "token0": "0x4662c461467aad203640d22ed323e4cd44ccf85a",
@@ -19842,7 +19875,8 @@
       ]
     },
     "ethereum/go-ethereum": {
-      "outcomeToken": "0x17ed3c4f107dc1ac27723f0bff277ace5d082af3",
+      "outcomeToken": "",
+      "marketId": "0x17ed3c4f107dc1ac27723f0bff277ace5d082af3",
       "pools": [
         {
           "token0": "0x5937d4be6c5f639ee1f3f4d6026a246fb77b11e7",
@@ -20807,7 +20841,8 @@
       ]
     },
     "ethereum/js-ethereum-cryptography": {
-      "outcomeToken": "0x5acc96b58c49608899b44da71cf99b499046624a",
+      "outcomeToken": "",
+      "marketId": "0x5acc96b58c49608899b44da71cf99b499046624a",
       "pools": [
         {
           "token0": "0x6822ff9c0753e4397032315bae7f9a105e09c482",
@@ -21862,7 +21897,8 @@
       ]
     },
     "ethereum/web3.py": {
-      "outcomeToken": "0x0ef330c9fc1b0ed340a60523817fdbfd0657af5b",
+      "outcomeToken": "",
+      "marketId": "0x0ef330c9fc1b0ed340a60523817fdbfd0657af5b",
       "pools": [
         {
           "token0": "0x73db561bc2b4c53a24fc46b430c855c12eef9b4b",
@@ -22062,7 +22098,8 @@
       ]
     },
     "ethers-io/ethers.js": {
-      "outcomeToken": "0xdd22def3fada5f74e63e696c549cb7203d060572",
+      "outcomeToken": "",
+      "marketId": "0xdd22def3fada5f74e63e696c549cb7203d060572",
       "pools": [
         {
           "token0": "0x3b768ffddd532582f5ac738bfcf29bc8340044c6",
@@ -22427,7 +22464,8 @@
       ]
     },
     "ethpandaops/checkpointz": {
-      "outcomeToken": "0xf82b0f686d1ac809dffc03ce94f0d06589aba33e",
+      "outcomeToken": "",
+      "marketId": "0xf82b0f686d1ac809dffc03ce94f0d06589aba33e",
       "pools": [
         {
           "token0": "0xa4e315f25026315af4886ea24412c60fa51c2f31",
@@ -22777,7 +22815,8 @@
       ]
     },
     "ethstaker/eth-docker": {
-      "outcomeToken": "0x93ce13bd39fd6f4eaaea1963e5672c9146a688c4",
+      "outcomeToken": "",
+      "marketId": "0x93ce13bd39fd6f4eaaea1963e5672c9146a688c4",
       "pools": [
         {
           "token0": "0x102aaaac525be878bf28b6ed6c537ccc9365fad7",
@@ -22962,7 +23001,8 @@
       ]
     },
     "ethstaker/ethstaker-deposit-cli": {
-      "outcomeToken": "0x63dd0ff719bf4f605ecd84dafb9d8b978d7f6531",
+      "outcomeToken": "",
+      "marketId": "0x63dd0ff719bf4f605ecd84dafb9d8b978d7f6531",
       "pools": [
         {
           "token0": "0xa736832b35466cd8915e1b15ee3dfe39efee62c0",
@@ -23723,7 +23763,8 @@
       ]
     },
     "evmts/tevm-monorepo": {
-      "outcomeToken": "0x64c7bb481364beb5442c3e9c4f0bad771771168f",
+      "outcomeToken": "",
+      "marketId": "0x64c7bb481364beb5442c3e9c4f0bad771771168f",
       "pools": [
         {
           "token0": "0x45abc93643ef8c90fb6c4b8617bc54e4816dc577",
@@ -24613,7 +24654,8 @@
       ]
     },
     "flashbots/mev-boost": {
-      "outcomeToken": "0xf3ef3cb3d2ae16e20fd1ede0a2e917553d78041c",
+      "outcomeToken": "",
+      "marketId": "0xf3ef3cb3d2ae16e20fd1ede0a2e917553d78041c",
       "pools": [
         {
           "token0": "0xccb048c43bf30c5c78ff8b9617beee33befa6665",
@@ -25308,7 +25350,8 @@
       ]
     },
     "flashbots/mev-boost-relay": {
-      "outcomeToken": "0xe535d4c32991294b0ba462df8d53a3aa3fe128f9",
+      "outcomeToken": "",
+      "marketId": "0xe535d4c32991294b0ba462df8d53a3aa3fe128f9",
       "pools": [
         {
           "token0": "0x2018fac1c9395a9ef2f6d75ab057ad369050a8da",
@@ -25808,7 +25851,8 @@
       ]
     },
     "flashbots/rbuilder": {
-      "outcomeToken": "0x8ab6848681a4be430df6bc9f27d11eb0c325f685",
+      "outcomeToken": "",
+      "marketId": "0x8ab6848681a4be430df6bc9f27d11eb0c325f685",
       "pools": [
         {
           "token0": "0xb51b9b80170c73f2d47168e219b6442d19dde86b",
@@ -26863,7 +26907,8 @@
       ]
     },
     "foundry-rs/foundry": {
-      "outcomeToken": "0x7c85c8992b7201dff406611707d3de52769e7a7d",
+      "outcomeToken": "",
+      "marketId": "0x7c85c8992b7201dff406611707d3de52769e7a7d",
       "pools": [
         {
           "token0": "0x497740eb1c20f5edf37930849cdc15e14324b782",
@@ -27918,7 +27963,8 @@
       ]
     },
     "grandinetech/grandine": {
-      "outcomeToken": "0x643fec6504b17348847a147f713a4d478f7d2a06",
+      "outcomeToken": "",
+      "marketId": "0x643fec6504b17348847a147f713a4d478f7d2a06",
       "pools": [
         {
           "token0": "0x2b09f55f2c63532b9ef78862b034ce2d904d27dd",
@@ -28973,7 +29019,8 @@
       ]
     },
     "holiman/goevmlab": {
-      "outcomeToken": "0x006dc6ff3762aed60bdc58c0f59c07ad71cbc7e5",
+      "outcomeToken": "",
+      "marketId": "0x006dc6ff3762aed60bdc58c0f59c07ad71cbc7e5",
       "pools": [
         {
           "token0": "0x7026a37fc9fb4038a2366ca7295040679298de62",
@@ -29533,7 +29580,8 @@
       ]
     },
     "hyperledger/besu": {
-      "outcomeToken": "0xe9b911c851ab746f628fabe71733f5bd2574eeef",
+      "outcomeToken": "",
+      "marketId": "0xe9b911c851ab746f628fabe71733f5bd2574eeef",
       "pools": [
         {
           "token0": "0x0eea804a32c0b374f9e0364539f29c3f49d093d8",
@@ -30219,7 +30267,8 @@
       ]
     },
     "ipsilon/evmone": {
-      "outcomeToken": "0xbeebf80ded191b95c861ea776e871974b7a2dac6",
+      "outcomeToken": "",
+      "marketId": "0xbeebf80ded191b95c861ea776e871974b7a2dac6",
       "pools": [
         {
           "token0": "0x934959bae0c608f5b3da6be1072e308235d76601",
@@ -30254,7 +30303,8 @@
       ]
     },
     "l2beat/l2beat": {
-      "outcomeToken": "0x4b1f41198859b82cf1b75fde904f63560fa4c6d7",
+      "outcomeToken": "",
+      "marketId": "0x4b1f41198859b82cf1b75fde904f63560fa4c6d7",
       "pools": [
         {
           "token0": "0x392a240b0306ce7695a891731d4fa0701da99309",
@@ -31309,7 +31359,8 @@
       ]
     },
     "lambdaclass/ethrex": {
-      "outcomeToken": "0x6d73a032dfb9f138264906e492125de7e2e1cbf1",
+      "outcomeToken": "",
+      "marketId": "0x6d73a032dfb9f138264906e492125de7e2e1cbf1",
       "pools": [
         {
           "token0": "0x34ce6c3cc87adcbaf8f3a6f0d89cd67f88e9aeb1",
@@ -32364,7 +32415,8 @@
       ]
     },
     "lambdaclass/lambda_ethereum_consensus": {
-      "outcomeToken": "0xaa48a1a1ed967222202c3ebc7a849a909fcce29a",
+      "outcomeToken": "",
+      "marketId": "0xaa48a1a1ed967222202c3ebc7a849a909fcce29a",
       "pools": [
         {
           "token0": "0x36f951dfe3fadee90c5fb2bd031cb84897a2fa27",
@@ -33074,7 +33126,8 @@
       ]
     },
     "lambdaclass/lambdaworks": {
-      "outcomeToken": "0x4784c4dbf2358ef3aa456103509558140e5fd751",
+      "outcomeToken": "",
+      "marketId": "0x4784c4dbf2358ef3aa456103509558140e5fd751",
       "pools": [
         {
           "token0": "0x522be6ae7af5b5d3c14f02b764b48be5552574b8",
@@ -33685,7 +33738,8 @@
       ]
     },
     "nethereum/nethereum": {
-      "outcomeToken": "0xeb7b5f5ddab15999ed62258c1da736b6442cb6b4",
+      "outcomeToken": "",
+      "marketId": "0xeb7b5f5ddab15999ed62258c1da736b6442cb6b4",
       "pools": [
         {
           "token0": "0x0ab006660534deb4a9c59bc9bb9d0735f094a778",
@@ -34170,7 +34224,8 @@
       ]
     },
     "nethermindeth/juno": {
-      "outcomeToken": "0x71996a7a2fe21ec7a49c827d0e8c71604ca3b743",
+      "outcomeToken": "",
+      "marketId": "0x71996a7a2fe21ec7a49c827d0e8c71604ca3b743",
       "pools": [
         {
           "token0": "0x3cb824d4d235b75da9f96dafe8dfc15e9a3b7d67",
@@ -35225,7 +35280,8 @@
       ]
     },
     "nethermindeth/nethermind": {
-      "outcomeToken": "0x99f4f318525605107127a5e57ff2e16a40c2b1fa",
+      "outcomeToken": "",
+      "marketId": "0x99f4f318525605107127a5e57ff2e16a40c2b1fa",
       "pools": [
         {
           "token0": "0x20eb0c9888b8e0b7f6d53ea463ea18a315c7dc66",
@@ -35974,7 +36030,8 @@
       ]
     },
     "nomicfoundation/hardhat": {
-      "outcomeToken": "0xf19b4c84a87d83936fb814bb85c7f5412635c543",
+      "outcomeToken": "",
+      "marketId": "0xf19b4c84a87d83936fb814bb85c7f5412635c543",
       "pools": [
         {
           "token0": "0x7dd3e5e895d3e82762dc119d744044ab866cdd66",
@@ -37029,7 +37086,8 @@
       ]
     },
     "offchainlabs/prysm": {
-      "outcomeToken": "0x3c1378c71ccb8bcb932df4fc90d339fbbb15d972",
+      "outcomeToken": "",
+      "marketId": "0x3c1378c71ccb8bcb932df4fc90d339fbbb15d972",
       "pools": [
         {
           "token0": "0x8153295fe3f4d89a7e6e7c50a9c767b6a39836d8",
@@ -38084,7 +38142,8 @@
       ]
     },
     "offchainlabs/stylus-sdk-rs": {
-      "outcomeToken": "0x51dd36916e9b3a71adb3a213e3cda5fdd556c551",
+      "outcomeToken": "",
+      "marketId": "0x51dd36916e9b3a71adb3a213e3cda5fdd556c551",
       "pools": [
         {
           "token0": "0x1af510a20e3279f7fe15a3350e01aa174c0acec0",
@@ -39139,7 +39198,8 @@
       ]
     },
     "openzeppelin/openzeppelin-contracts": {
-      "outcomeToken": "0x92c19eee45abc8af72f778038dc3719bf66dd0cb",
+      "outcomeToken": "",
+      "marketId": "0x92c19eee45abc8af72f778038dc3719bf66dd0cb",
       "pools": [
         {
           "token0": "0x5e6564d8e2066a26ea250741e952502d6c72c684",
@@ -39639,7 +39699,8 @@
       ]
     },
     "otterscan/otterscan": {
-      "outcomeToken": "0x51c1a6fa3964e897262dba50c0020a5129f0f9d3",
+      "outcomeToken": "",
+      "marketId": "0x51c1a6fa3964e897262dba50c0020a5129f0f9d3",
       "pools": [
         {
           "token0": "0x0bf6f3763bbf3c5515d0c6aa2e094627de4bf0cd",
@@ -40694,7 +40755,8 @@
       ]
     },
     "paradigmxyz/reth": {
-      "outcomeToken": "0x3dbcb10c9d52dc7b3dbe14b9e776cc518188b561",
+      "outcomeToken": "",
+      "marketId": "0x3dbcb10c9d52dc7b3dbe14b9e776cc518188b561",
       "pools": [
         {
           "token0": "0xaeb87b64650e5c0ce8d38ff0b76dd8465e339099",
@@ -41614,7 +41676,8 @@
       ]
     },
     "powdr-labs/powdr": {
-      "outcomeToken": "0x5bb3d776ddbb28e38852f2b9408041771899295f",
+      "outcomeToken": "",
+      "marketId": "0x5bb3d776ddbb28e38852f2b9408041771899295f",
       "pools": [
         {
           "token0": "0xa49b71331b81ee1379c06a45571380da5a0e7285",
@@ -42354,7 +42417,8 @@
       ]
     },
     "protofire/solhint": {
-      "outcomeToken": "0x362a114832ee0fd39ed5d35d5b5dc927687dcac9",
+      "outcomeToken": "",
+      "marketId": "0x362a114832ee0fd39ed5d35d5b5dc927687dcac9",
       "pools": [
         {
           "token0": "0x74100a8c456ab4b6e5b186ce5165c0de2f93d170",
@@ -42944,7 +43008,8 @@
       ]
     },
     "remix-project-org/remix-project": {
-      "outcomeToken": "0x38c981fba7e1d3d0138983672124dd2e96bf6e57",
+      "outcomeToken": "",
+      "marketId": "0x38c981fba7e1d3d0138983672124dd2e96bf6e57",
       "pools": [
         {
           "token0": "0x4512979960023c2fc5373d9daf39a5a7ea62de03",
@@ -43999,7 +44064,8 @@
       ]
     },
     "risc0/risc0-ethereum": {
-      "outcomeToken": "0xd03c0ffd97028ba93d03e2975fbe1cf6d4c0cc41",
+      "outcomeToken": "",
+      "marketId": "0xd03c0ffd97028ba93d03e2975fbe1cf6d4c0cc41",
       "pools": [
         {
           "token0": "0xb7bb2ad48cb0378e34e1841241d9dda40a472ff0",
@@ -45054,7 +45120,8 @@
       ]
     },
     "safe-global/safe-smart-account": {
-      "outcomeToken": "0xb9f2ba3872af32257ef9697d37d701d39b3805f2",
+      "outcomeToken": "",
+      "marketId": "0xb9f2ba3872af32257ef9697d37d701d39b3805f2",
       "pools": [
         {
           "token0": "0x67d89196f021d80425af2b81b7ffd5c04c577d63",
@@ -45419,7 +45486,8 @@
       ]
     },
     "scaffold-eth/scaffold-eth-2": {
-      "outcomeToken": "0x4fdf42187e2ef1056b68f810f716bcc8083c4377",
+      "outcomeToken": "",
+      "marketId": "0x4fdf42187e2ef1056b68f810f716bcc8083c4377",
       "pools": [
         {
           "token0": "0x3e18bf75c16acf7bb2d5bd71807c4951a0e11753",
@@ -46144,7 +46212,8 @@
       ]
     },
     "shazow/whatsabi": {
-      "outcomeToken": "0xb8997c2b670a5939d920b5c5f22a4e63da835ecd",
+      "outcomeToken": "",
+      "marketId": "0xb8997c2b670a5939d920b5c5f22a4e63da835ecd",
       "pools": [
         {
           "token0": "0x61825b9849d1e01759741962cf0b89ca5f330c34",
@@ -46404,7 +46473,8 @@
       ]
     },
     "sigp/lighthouse": {
-      "outcomeToken": "0xc6c306aecc1d8650e24c2985ff98c1db0207ae7c",
+      "outcomeToken": "",
+      "marketId": "0xc6c306aecc1d8650e24c2985ff98c1db0207ae7c",
       "pools": [
         {
           "token0": "0x6ef17478ed605af3f8954ed652ea8d58ecb776a6",
@@ -47459,7 +47529,8 @@
       ]
     },
     "status-im/nimbus-eth2": {
-      "outcomeToken": "0x0dae81122de86703941779f89810c1afee07e4f2",
+      "outcomeToken": "",
+      "marketId": "0x0dae81122de86703941779f89810c1afee07e4f2",
       "pools": [
         {
           "token0": "0x0fd22f039b8ee97e5099cbfce4b1a4daaade7a01",
@@ -48166,7 +48237,8 @@
       ]
     },
     "succinctlabs/op-succinct": {
-      "outcomeToken": "0x06bbd280258d37bdbfe7e2b50404504b3f84dc8e",
+      "outcomeToken": "",
+      "marketId": "0x06bbd280258d37bdbfe7e2b50404504b3f84dc8e",
       "pools": [
         {
           "token0": "0x537cd956ce28dcfb752d6e00daae1809a6cee8a4",
@@ -49221,7 +49293,8 @@
       ]
     },
     "succinctlabs/rsp": {
-      "outcomeToken": "0xcc1abb7589a4160a5b2d770f5a3daac6869f9c23",
+      "outcomeToken": "",
+      "marketId": "0xcc1abb7589a4160a5b2d770f5a3daac6869f9c23",
       "pools": [
         {
           "token0": "0x1c5292f151267ca6a19b87e0759234e369c9beac",
@@ -50276,7 +50349,8 @@
       ]
     },
     "succinctlabs/sp1": {
-      "outcomeToken": "0xf185fc564087c19fb8b2b33196c3ae5ab2dd6735",
+      "outcomeToken": "",
+      "marketId": "0xf185fc564087c19fb8b2b33196c3ae5ab2dd6735",
       "pools": [
         {
           "token0": "0x3d3d8a8e0402ba63e68da7ea1a79b4b5849a258f",
@@ -51331,7 +51405,8 @@
       ]
     },
     "supranational/blst": {
-      "outcomeToken": "0x5c351b7cd4c4b92c783cf79f117258e63c781124",
+      "outcomeToken": "",
+      "marketId": "0x5c351b7cd4c4b92c783cf79f117258e63c781124",
       "pools": [
         {
           "token0": "0x11ceeacbe1e3dc73bba1d1ade359690571770f4f",
@@ -51456,7 +51531,8 @@
       ]
     },
     "swiss-knife-xyz/swiss-knife": {
-      "outcomeToken": "0xdda8f33284e8d3d897da43587a6d987ca926b010",
+      "outcomeToken": "",
+      "marketId": "0xdda8f33284e8d3d897da43587a6d987ca926b010",
       "pools": [
         {
           "token0": "0xd680f5c763dfd24f1f60e9b0760b8a7776d1895d",
@@ -52511,7 +52587,8 @@
       ]
     },
     "taikoxyz/taiko-mono": {
-      "outcomeToken": "0xb7215d9614d5d6bd5a48a85981ea0047609f5c10",
+      "outcomeToken": "",
+      "marketId": "0xb7215d9614d5d6bd5a48a85981ea0047609f5c10",
       "pools": [
         {
           "token0": "0x5362776219f0622bb6eae43b2dc71eb6bf7f6b0e",
@@ -53566,7 +53643,8 @@
       ]
     },
     "trueblocks/trueblocks-core": {
-      "outcomeToken": "0xd7211b993e8dec38cad4ef9879b676dd05ac2f11",
+      "outcomeToken": "",
+      "marketId": "0xd7211b993e8dec38cad4ef9879b676dd05ac2f11",
       "pools": [
         {
           "token0": "0x8f0d0ef1c6b2ac5ab3aeff52c684b7d5bec73751",
@@ -53721,7 +53799,8 @@
       ]
     },
     "vyperlang/titanoboa": {
-      "outcomeToken": "0x3bc9ebae468efb888432f728cbc04a5b278fe173",
+      "outcomeToken": "",
+      "marketId": "0x3bc9ebae468efb888432f728cbc04a5b278fe173",
       "pools": [
         {
           "token0": "0x34a74fa1b928f71713f86b0d4a0e8e564e067222",
@@ -54116,7 +54195,8 @@
       ]
     },
     "vyperlang/vyper": {
-      "outcomeToken": "0xf6fe42a3782871fbb7d6122eae39af9cd3fe96d0",
+      "outcomeToken": "",
+      "marketId": "0xf6fe42a3782871fbb7d6122eae39af9cd3fe96d0",
       "pools": [
         {
           "token0": "0x5519820bfd953de0847b6f661a5ec5dc463090d5",
@@ -54271,7 +54351,8 @@
       ]
     },
     "wealdtech/ethdo": {
-      "outcomeToken": "0x3dbc308bd09a861cb2c0beeea16058613f0e6430",
+      "outcomeToken": "",
+      "marketId": "0x3dbc308bd09a861cb2c0beeea16058613f0e6430",
       "pools": [
         {
           "token0": "0x248d8b7481126273819e1384d38a48599ef427d6",
@@ -54657,7 +54738,8 @@
       ]
     },
     "wevm/viem": {
-      "outcomeToken": "0xb82bd6149762cd8de842d94ee5d1f9d74890a3c7",
+      "outcomeToken": "",
+      "marketId": "0xb82bd6149762cd8de842d94ee5d1f9d74890a3c7",
       "pools": [
         {
           "token0": "0x88ea8cbaa1e7ca8cd1bd89832aed341bea85066d",
@@ -55082,7 +55164,8 @@
       ]
     },
     "wighawag/hardhat-deploy": {
-      "outcomeToken": "0xd6392eefe9ed0500e0aa0182656cd6d465707165",
+      "outcomeToken": "",
+      "marketId": "0xd6392eefe9ed0500e0aa0182656cd6d465707165",
       "pools": [
         {
           "token0": "0xa2091290df758fce0cc6f929febbbc8f13feb2b7",

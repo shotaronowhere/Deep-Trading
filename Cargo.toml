@@ -14,7 +14,7 @@ reqwest = { version = "0.13.1", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.49.0", features = ["full"] }
-uniswap-v3-sdk = { version = "6.0.0", features = ["extensions", "std"] }
+uniswap_v3_math = "0.6.2"
 
 [build-dependencies]
 alloy = { version = "1.5.2", features = ["full"] }

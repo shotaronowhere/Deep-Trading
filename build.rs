@@ -3,7 +3,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fmt::Write;
 use std::fs;
@@ -12,6 +12,11 @@ use std::path::Path;
 // Uniswap V3 Factory getPool call
 sol! {
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+}
+
+// Market parentWrappedOutcome call (for L2 base token resolution)
+sol! {
+    function parentWrappedOutcome() external view returns (address wrapped1155, bytes data);
 }
 
 // Multicall3 contract interface
@@ -41,14 +46,30 @@ const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a1739
 const FEE_TIER: u32 = 100;
 const MULTICALL_BATCH_SIZE: usize = 16000;
 
+// L1 base token (hardcoded)
+const L1_QUOTE_TOKEN: &str = "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0";
+
 // --- Structs for CSV parsing ---
 
 #[derive(Debug, Deserialize)]
-struct WeightRecord {
+struct L1PredictionRecord {
     repo: String,
-    #[serde(rename = "pareant")]
+    #[serde(rename = "parent")]
     _parent: String,
     weight: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct L2PredictionRecord {
+    dependency: String,
+    repo: String,
+    weight: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OriginalityRecord {
+    repo: String,
+    originality: f64,
 }
 
 // --- Structs for JSON parsing ---
@@ -65,6 +86,8 @@ struct MarketInfo {
     market_id: Option<String>,
     outcome_token: String,
     pools: Option<Vec<PoolInfo>>,
+    up_token: Option<String>,
+    down_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,8 +108,8 @@ struct PoolInfo {
 // Tick with resolved data (filtered for non-zero liquidityNet)
 #[derive(Clone)]
 struct ResolvedTick {
-    tick_idx: String,
-    liquidity_net: String,
+    tick_idx: i32,
+    liquidity_net: i128,
 }
 
 // Pool with resolved pool_id from factory
@@ -119,42 +142,156 @@ fn parse_pool_address(result: &Multicall3::Result) -> Option<String> {
 }
 
 
-fn generate_weights_rs(csv_path: &Path, output_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut reader = csv::Reader::from_path(csv_path)?;
-    let mut weights = Vec::new();
+/// Format f64 to always include a decimal point (for valid Rust float literals)
+fn format_f64(f: f64) -> String {
+    let s = f.to_string();
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
 
-    for result in reader.deserialize() {
-        let record: WeightRecord = result?;
+fn generate_predictions_rs(
+    l1_csv_path: &Path,
+    l2_csv_path: &Path,
+    originality_csv_path: &Path,
+    output_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Parse and validate L1 predictions
+    let mut l1_predictions = Vec::new();
+    let mut seen_l1_markets = HashSet::new();
+    let mut reader = csv::Reader::from_path(l1_csv_path)?;
+    for (i, result) in reader.deserialize().enumerate() {
+        let record: L1PredictionRecord = result?;
+        let row = i + 2; // 1-indexed, skip header
         let repo = record.repo.trim();
         let market = repo.strip_prefix("https://github.com/").unwrap_or(repo);
-        weights.push((market.to_string(), record.weight));
+        if record.weight < 0.0 {
+            panic!("l1-predictions.csv row {}: weight cannot be negative", row);
+        }
+        if !seen_l1_markets.insert(market.to_string()) {
+            panic!("l1-predictions.csv row {}: duplicate market '{}'", row, market);
+        }
+        l1_predictions.push((market.to_string(), record.weight));
+    }
+
+    // Parse and validate L2 predictions
+    let mut l2_predictions = Vec::new();
+    let mut seen_l2_pairs = HashSet::new();
+    let mut reader = csv::Reader::from_path(l2_csv_path)?;
+    for (i, result) in reader.deserialize().enumerate() {
+        let record: L2PredictionRecord = result?;
+        let row = i + 2;
+        if record.weight < 0.0 {
+            panic!("l2-predictions.csv row {}: weight cannot be negative", row);
+        }
+        let pair = (record.dependency.clone(), record.repo.clone());
+        if !seen_l2_pairs.insert(pair) {
+            panic!(
+                "l2-predictions.csv row {}: duplicate dependency '{}' for repo '{}'",
+                row, record.dependency, record.repo
+            );
+        }
+        l2_predictions.push((record.dependency, record.repo, record.weight));
+    }
+
+    // Parse and validate originality predictions
+    let mut originality_predictions = Vec::new();
+    let mut seen_originality_markets = HashSet::new();
+    let mut reader = csv::Reader::from_path(originality_csv_path)?;
+    for (i, result) in reader.deserialize().enumerate() {
+        let record: OriginalityRecord = result?;
+        let row = i + 2;
+        let repo = record.repo.trim();
+        let market = repo.strip_prefix("https://github.com/").unwrap_or(repo);
+        if record.originality < 0.0 || record.originality > 1.0 {
+            panic!(
+                "originality-predictions.csv row {}: originality must be in [0, 1], got {}",
+                row, record.originality
+            );
+        }
+        if !seen_originality_markets.insert(market.to_string()) {
+            panic!("originality-predictions.csv row {}: duplicate market '{}'", row, market);
+        }
+        originality_predictions.push((market.to_string(), record.originality));
     }
 
     let mut output = String::new();
-    writeln!(&mut output, "// Auto-generated from weights.csv - do not edit manually\n")?;
+    writeln!(&mut output, "// Auto-generated from prediction CSVs - do not edit manually\n")?;
+
+    // L1 Prediction struct and array
     writeln!(&mut output, "#[derive(Debug, Clone, Copy)]")?;
-    writeln!(&mut output, "pub struct Weight {{")?;
+    writeln!(&mut output, "pub struct Prediction {{")?;
     writeln!(&mut output, "    pub market: &'static str,")?;
     writeln!(&mut output, "    pub prediction: f64,")?;
     writeln!(&mut output, "}}\n")?;
+
     writeln!(
         &mut output,
-        "pub static WEIGHTS: [Weight; {}] = [",
-        weights.len()
+        "pub static PREDICTIONS_L1: [Prediction; {}] = [",
+        l1_predictions.len()
     )?;
-
-    for (repo, weight) in &weights {
+    for (market, weight) in &l1_predictions {
         writeln!(
             &mut output,
-            "    Weight {{ market: \"{}\", prediction: {} }},",
-            repo, weight
+            "    Prediction {{ market: \"{}\", prediction: {} }},",
+            market, format_f64(*weight)
         )?;
     }
+    writeln!(&mut output, "];\n")?;
 
+    // L2 Prediction struct and array
+    writeln!(&mut output, "#[derive(Debug, Clone, Copy)]")?;
+    writeln!(&mut output, "pub struct PredictionL2 {{")?;
+    writeln!(&mut output, "    pub dependency: &'static str,")?;
+    writeln!(&mut output, "    pub repo: &'static str,")?;
+    writeln!(&mut output, "    pub prediction: f64,")?;
+    writeln!(&mut output, "}}\n")?;
+
+    writeln!(
+        &mut output,
+        "pub static PREDICTIONS_L2: [PredictionL2; {}] = [",
+        l2_predictions.len()
+    )?;
+    for (dependency, repo, weight) in &l2_predictions {
+        writeln!(
+            &mut output,
+            "    PredictionL2 {{ dependency: \"{}\", repo: \"{}\", prediction: {} }},",
+            dependency, repo, format_f64(*weight)
+        )?;
+    }
+    writeln!(&mut output, "];\n")?;
+
+    // Originality struct and array
+    writeln!(&mut output, "#[derive(Debug, Clone, Copy)]")?;
+    writeln!(&mut output, "pub struct Originality {{")?;
+    writeln!(&mut output, "    pub market: &'static str,")?;
+    writeln!(&mut output, "    pub originality: f64,")?;
+    writeln!(&mut output, "}}\n")?;
+
+    writeln!(
+        &mut output,
+        "pub static ORIGINALITY: [Originality; {}] = [",
+        originality_predictions.len()
+    )?;
+    for (market, originality) in &originality_predictions {
+        writeln!(
+            &mut output,
+            "    Originality {{ market: \"{}\", originality: {} }},",
+            market, format_f64(*originality)
+        )?;
+    }
     writeln!(&mut output, "];")?;
 
     fs::write(output_path, output)?;
-    println!("cargo::warning=Generated {} with {} weights", output_path.display(), weights.len());
+    println!(
+        "cargo::warning=Generated {} with {} L1, {} L2, {} originality predictions",
+        output_path.display(),
+        l1_predictions.len(),
+        l2_predictions.len(),
+        originality_predictions.len()
+    );
 
     Ok(())
 }
@@ -163,6 +300,7 @@ fn generate_weights_rs(csv_path: &Path, output_path: &Path) -> Result<(), Box<dy
 fn generate_markets_l1_array(
     markets: &BTreeMap<String, MarketInfo>,
     resolved_pools: &BTreeMap<String, Vec<ResolvedPool>>,
+    quote_token: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut output = String::new();
     let mut tick_definitions = String::new();
@@ -203,7 +341,7 @@ fn generate_markets_l1_array(
                     for tick in &pool.ticks {
                         writeln!(
                             &mut tick_definitions,
-                            "    Tick {{ tick_idx: \"{}\", liquidity_net: \"{}\" }},",
+                            "    Tick {{ tick_idx: {}, liquidity_net: {} }},",
                             tick.tick_idx, tick.liquidity_net
                         )?;
                     }
@@ -224,6 +362,7 @@ fn generate_markets_l1_array(
             }
         }
 
+        writeln!(&mut market_entries, "        quote_token: \"{}\",", quote_token)?;
         writeln!(&mut market_entries, "    }},")?;
     }
 
@@ -242,10 +381,11 @@ fn generate_markets_l1_array(
     Ok(output)
 }
 
-// Generate L2 markets array (multiple pools per market) - single pass
-fn generate_markets_l2_array(
+// Generate originality markets array (multiple pools per market: upPool, downPool)
+fn generate_markets_originality_array(
     markets: &BTreeMap<String, MarketInfo>,
     resolved_pools: &BTreeMap<String, Vec<ResolvedPool>>,
+    quote_token: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut output = String::new();
     let mut pool_definitions = String::new();
@@ -258,6 +398,86 @@ fn generate_markets_l2_array(
         let market_id = market_data.market_id.as_deref().unwrap_or("");
 
         let pool_ref = if let Some(pools) = resolved_pools.get(name).filter(|p| !p.is_empty()) {
+            let static_name = format!("POOLS_ORI_{}", safe_name.to_uppercase());
+
+            // Generate tick arrays for each pool first
+            for (pool_idx, pool) in pools.iter().enumerate() {
+                if !pool.ticks.is_empty() {
+                    let tick_static_name = format!("TICKS_ORI_{}_{}", safe_name.to_uppercase(), pool_idx);
+                    writeln!(&mut pool_definitions, "static {}: [Tick; {}] = [", tick_static_name, pool.ticks.len())?;
+                    for tick in &pool.ticks {
+                        writeln!(&mut pool_definitions,
+                            "    Tick {{ tick_idx: {}, liquidity_net: {} }},",
+                            tick.tick_idx, tick.liquidity_net
+                        )?;
+                    }
+                    writeln!(&mut pool_definitions, "];")?;
+                }
+            }
+
+            // Generate pool array
+            writeln!(&mut pool_definitions, "static {}: [Pool; {}] = [", static_name, pools.len())?;
+            for (pool_idx, pool) in pools.iter().enumerate() {
+                let pool_id_str = pool.pool_id.as_deref().unwrap_or("");
+                let liquidity_str = pool.liquidity.as_deref().unwrap_or("");
+                let ticks_ref = if pool.ticks.is_empty() {
+                    "&[]".to_string()
+                } else {
+                    format!("&TICKS_ORI_{}_{}", safe_name.to_uppercase(), pool_idx)
+                };
+                writeln!(&mut pool_definitions,
+                    "    Pool {{ token0: \"{}\", token1: \"{}\", pool_id: \"{}\", liquidity: \"{}\", ticks: {} }},",
+                    pool.token0, pool.token1, pool_id_str, liquidity_str, ticks_ref
+                )?;
+            }
+            writeln!(&mut pool_definitions, "];")?;
+            format!("&{}", static_name)
+        } else {
+            "&[]".to_string()
+        };
+
+        let up_token = market_data.up_token.as_deref().unwrap_or("");
+        let down_token = market_data.down_token.as_deref().unwrap_or("");
+
+        writeln!(&mut market_entries, "    MarketDataOriginality {{")?;
+        writeln!(&mut market_entries, "        name: \"{}\",", lower_name)?;
+        writeln!(&mut market_entries, "        market_id: \"{}\",", market_id)?;
+        writeln!(&mut market_entries, "        pools: {},", pool_ref)?;
+        writeln!(&mut market_entries, "        up_token: \"{}\",", up_token)?;
+        writeln!(&mut market_entries, "        down_token: \"{}\",", down_token)?;
+        writeln!(&mut market_entries, "        quote_token: \"{}\",", quote_token)?;
+        writeln!(&mut market_entries, "    }},")?;
+    }
+
+    output.push_str(&pool_definitions);
+    if !pool_definitions.is_empty() {
+        writeln!(&mut output)?;
+    }
+    writeln!(&mut output, "pub static MARKETS_ORIGINALITY: [MarketDataOriginality; {}] = [", markets.len())?;
+    output.push_str(&market_entries);
+    writeln!(&mut output, "];")?;
+
+    Ok(output)
+}
+
+// Generate L2 markets array (multiple pools per market) - single pass
+fn generate_markets_l2_array(
+    markets: &BTreeMap<String, MarketInfo>,
+    resolved_pools: &BTreeMap<String, Vec<ResolvedPool>>,
+    quote_tokens: &BTreeMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut output = String::new();
+    let mut pool_definitions = String::new();
+    let mut market_entries = String::new();
+
+    for (name, market_data) in markets {
+        let escaped_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+        let lower_name = escaped_name.to_lowercase();
+        let safe_name = lower_name.replace(['/', '-', '.', '\\'], "_");
+        let market_id = market_data.market_id.as_deref().unwrap_or("");
+        let quote_token = quote_tokens.get(name).map(|s| s.as_str()).unwrap_or("");
+
+        let pool_ref = if let Some(pools) = resolved_pools.get(name).filter(|p| !p.is_empty()) {
             let static_name = format!("POOLS_{}", safe_name.to_uppercase());
 
             // Generate tick arrays for each pool first
@@ -267,7 +487,7 @@ fn generate_markets_l2_array(
                     writeln!(&mut pool_definitions, "static {}: [Tick; {}] = [", tick_static_name, pool.ticks.len())?;
                     for tick in &pool.ticks {
                         writeln!(&mut pool_definitions,
-                            "    Tick {{ tick_idx: \"{}\", liquidity_net: \"{}\" }},",
+                            "    Tick {{ tick_idx: {}, liquidity_net: {} }},",
                             tick.tick_idx, tick.liquidity_net
                         )?;
                     }
@@ -301,6 +521,7 @@ fn generate_markets_l2_array(
         writeln!(&mut market_entries, "        market_id: \"{}\",", market_id)?;
         writeln!(&mut market_entries, "        outcome_token: \"{}\",", market_data.outcome_token)?;
         writeln!(&mut market_entries, "        pools: {},", pool_ref)?;
+        writeln!(&mut market_entries, "        quote_token: \"{}\",", quote_token)?;
         writeln!(&mut market_entries, "    }},")?;
     }
 
@@ -322,10 +543,13 @@ fn filter_ticks(pool: &PoolInfo) -> Vec<ResolvedTick> {
         .map(|ticks| {
             ticks
                 .iter()
-                .filter(|t| t.liquidity_net != "0")
-                .map(|t| ResolvedTick {
-                    tick_idx: t.tick_idx.clone(),
-                    liquidity_net: t.liquidity_net.clone(),
+                .filter_map(|t| {
+                    let liquidity_net: i128 = t.liquidity_net.parse().ok()?;
+                    if liquidity_net == 0 {
+                        return None;
+                    }
+                    let tick_idx: i32 = t.tick_idx.parse().ok()?;
+                    Some(ResolvedTick { tick_idx, liquidity_net })
                 })
                 .collect()
         })
@@ -341,6 +565,10 @@ fn build_single_call<'a>(
     call_infos: &mut Vec<CallInfo<'a>>,
 ) {
     let (Ok(token0), Ok(token1)) = (pool.token0.parse::<Address>(), pool.token1.parse::<Address>()) else {
+        println!(
+            "cargo::warning=Skipping pool {} for market '{}': invalid token address",
+            pool_idx, name
+        );
         return;
     };
 
@@ -445,9 +673,65 @@ async fn resolve_pool_addresses(
         .collect())
 }
 
+// Resolve base tokens for L2 markets by calling parentWrappedOutcome on each market contract
+async fn resolve_l2_quote_tokens(
+    markets: &BTreeMap<String, MarketInfo>,
+    rpc_url: &str,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let multicall = Multicall3::new(MULTICALL3_ADDRESS, provider);
+
+    let mut calls = Vec::new();
+    let mut market_names = Vec::new();
+
+    for (name, market_data) in markets {
+        let Some(market_id) = &market_data.market_id else {
+            println!("cargo::warning=Skipping base token resolution for '{}': no market_id", name);
+            continue;
+        };
+        let Ok(market_addr) = market_id.parse::<Address>() else {
+            println!("cargo::warning=Skipping base token resolution for '{}': invalid market_id '{}'", name, market_id);
+            continue;
+        };
+        let call_data = parentWrappedOutcomeCall {}.abi_encode();
+        calls.push(Multicall3::Call3 {
+            target: market_addr,
+            allowFailure: true,
+            callData: Bytes::from(call_data),
+        });
+        market_names.push(name.clone());
+    }
+
+    println!(
+        "cargo::warning=Batching {} parentWrappedOutcome calls via Multicall3...",
+        calls.len()
+    );
+
+    let mut quote_tokens: BTreeMap<String, String> = BTreeMap::new();
+
+    for (batch_idx, chunk) in calls.chunks(MULTICALL_BATCH_SIZE).enumerate() {
+        let start_idx = batch_idx * MULTICALL_BATCH_SIZE;
+        let results = multicall.aggregate3(chunk.to_vec()).call().await?;
+
+        for (i, result) in results.iter().enumerate() {
+            let market_name = &market_names[start_idx + i];
+            if result.success && result.returnData.len() >= 32 {
+                // The first 32 bytes contain the address (padded)
+                let addr = Address::from_slice(&result.returnData[12..32]);
+                if addr != Address::ZERO {
+                    quote_tokens.insert(market_name.clone(), format!("{addr:?}"));
+                }
+            }
+        }
+    }
+
+    Ok(quote_tokens)
+}
+
 async fn generate_markets_rs(
     l1_json_path: &Path,
     l2_json_path: &Path,
+    originality_json_path: &Path,
     output_path: &Path,
     rpc_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -457,20 +741,30 @@ async fn generate_markets_rs(
     let l2_content = fs::read_to_string(l2_json_path)?;
     let l2_json: MarketsFile = serde_json::from_str(&l2_content)?;
 
-    // Resolve pool addresses: first pool only for L1, all pools for L2
-    println!("cargo::warning=Resolving pool addresses for L1 markets (first pool only)...");
-    let l1_resolved_pools = resolve_pool_addresses(&l1_json.markets_data, rpc_url, true).await?;
+    let originality_content = fs::read_to_string(originality_json_path)?;
+    let originality_json: MarketsFile = serde_json::from_str(&originality_content)?;
 
-    println!("cargo::warning=Resolving pool addresses for L2 markets (all pools)...");
-    let l2_resolved_pools = resolve_pool_addresses(&l2_json.markets_data, rpc_url, false).await?;
+    // Resolve pool addresses and base tokens concurrently
+    println!("cargo::warning=Resolving pool addresses and base tokens for all markets...");
+    let (l1_res, l2_res, ori_res, quote_res) = tokio::join!(
+        resolve_pool_addresses(&l1_json.markets_data, rpc_url, true),
+        resolve_pool_addresses(&l2_json.markets_data, rpc_url, false),
+        resolve_pool_addresses(&originality_json.markets_data, rpc_url, false),
+        resolve_l2_quote_tokens(&l2_json.markets_data, rpc_url)
+    );
+
+    let l1_resolved_pools = l1_res?;
+    let l2_resolved_pools = l2_res?;
+    let originality_resolved_pools = ori_res?;
+    let l2_quote_tokens = quote_res?;
 
     let mut output = String::new();
-    writeln!(&mut output, "// Auto-generated from markets_data_l1.json and markets_data_l2.json - do not edit manually\n")?;
+    writeln!(&mut output, "// Auto-generated from markets_data_l1.json, markets_data_l2.json, and markets_data_originality.json - do not edit manually\n")?;
 
     writeln!(&mut output, "#[derive(Debug, Clone, Copy)]")?;
     writeln!(&mut output, "pub struct Tick {{")?;
-    writeln!(&mut output, "    pub tick_idx: &'static str,")?;
-    writeln!(&mut output, "    pub liquidity_net: &'static str,")?;
+    writeln!(&mut output, "    pub tick_idx: i32,")?;
+    writeln!(&mut output, "    pub liquidity_net: i128,")?;
     writeln!(&mut output, "}}\n")?;
 
     writeln!(&mut output, "#[derive(Debug, Clone, Copy)]")?;
@@ -489,6 +783,7 @@ async fn generate_markets_rs(
     writeln!(&mut output, "    pub market_id: &'static str,")?;
     writeln!(&mut output, "    pub outcome_token: &'static str,")?;
     writeln!(&mut output, "    pub pool: Option<Pool>,")?;
+    writeln!(&mut output, "    pub quote_token: &'static str,")?;
     writeln!(&mut output, "}}\n")?;
 
     // L2 MarketDataL2 (multiple pools)
@@ -498,19 +793,35 @@ async fn generate_markets_rs(
     writeln!(&mut output, "    pub market_id: &'static str,")?;
     writeln!(&mut output, "    pub outcome_token: &'static str,")?;
     writeln!(&mut output, "    pub pools: &'static [Pool],")?;
+    writeln!(&mut output, "    pub quote_token: &'static str,")?;
     writeln!(&mut output, "}}\n")?;
 
-    output.push_str(&generate_markets_l1_array(&l1_json.markets_data, &l1_resolved_pools)?);
+    // Originality MarketDataOriginality (upPool/downPool with explicit tokens)
+    writeln!(&mut output, "#[derive(Debug, Clone, Copy)]")?;
+    writeln!(&mut output, "pub struct MarketDataOriginality {{")?;
+    writeln!(&mut output, "    pub name: &'static str,")?;
+    writeln!(&mut output, "    pub market_id: &'static str,")?;
+    writeln!(&mut output, "    pub pools: &'static [Pool],")?;
+    writeln!(&mut output, "    pub up_token: &'static str,")?;
+    writeln!(&mut output, "    pub down_token: &'static str,")?;
+    writeln!(&mut output, "    pub quote_token: &'static str,")?;
+    writeln!(&mut output, "}}\n")?;
+
+    output.push_str(&generate_markets_l1_array(&l1_json.markets_data, &l1_resolved_pools, L1_QUOTE_TOKEN)?);
     writeln!(&mut output)?;
 
-    output.push_str(&generate_markets_l2_array(&l2_json.markets_data, &l2_resolved_pools)?);
+    output.push_str(&generate_markets_l2_array(&l2_json.markets_data, &l2_resolved_pools, &l2_quote_tokens)?);
+    writeln!(&mut output)?;
+
+    output.push_str(&generate_markets_originality_array(&originality_json.markets_data, &originality_resolved_pools, L1_QUOTE_TOKEN)?);
 
     fs::write(output_path, output)?;
     println!(
-        "cargo::warning=Generated {} with {} L1 markets and {} L2 markets",
+        "cargo::warning=Generated {} with {} L1 markets, {} L2 markets, {} originality markets",
         output_path.display(),
         l1_json.markets_data.len(),
-        l2_json.markets_data.len()
+        l2_json.markets_data.len(),
+        originality_json.markets_data.len()
     );
 
     Ok(())
@@ -529,20 +840,31 @@ fn main() {
         panic!("RPC environment variable not set. Please set it in .env file.");
     });
 
-    let weights_csv = manifest_path.join("weights.csv");
+    let l1_predictions_csv = manifest_path.join("l1-predictions.csv");
+    let l2_predictions_csv = manifest_path.join("l2-predictions.csv");
+    let originality_predictions_csv = manifest_path.join("originality-predictions.csv");
     let markets_l1_json = manifest_path.join("markets_data_l1.json");
     let markets_l2_json = manifest_path.join("markets_data_l2.json");
-    let weights_rs = manifest_path.join("src/weights.rs");
+    let markets_originality_json = manifest_path.join("markets_data_originality.json");
+    let predictions_rs = manifest_path.join("src/predictions.rs");
     let markets_rs = manifest_path.join("src/markets.rs");
 
-    println!("cargo::rerun-if-changed=weights.csv");
+    println!("cargo::rerun-if-changed=l1-predictions.csv");
+    println!("cargo::rerun-if-changed=l2-predictions.csv");
+    println!("cargo::rerun-if-changed=originality-predictions.csv");
     println!("cargo::rerun-if-changed=markets_data_l1.json");
     println!("cargo::rerun-if-changed=markets_data_l2.json");
+    println!("cargo::rerun-if-changed=markets_data_originality.json");
     println!("cargo::rerun-if-changed=.env");
 
-    if weights_csv.exists() {
-        if let Err(e) = generate_weights_rs(&weights_csv, &weights_rs) {
-            panic!("Failed to generate weights.rs: {}", e);
+    if l1_predictions_csv.exists() && l2_predictions_csv.exists() && originality_predictions_csv.exists() {
+        if let Err(e) = generate_predictions_rs(
+            &l1_predictions_csv,
+            &l2_predictions_csv,
+            &originality_predictions_csv,
+            &predictions_rs,
+        ) {
+            panic!("Failed to generate predictions.rs: {}", e);
         }
     }
     if !markets_l1_json.exists() {
@@ -551,10 +873,13 @@ fn main() {
     if !markets_l2_json.exists() {
         panic!("markets_data_l2.json not found. Run `cargo test test_prepare` to fetch market data.");
     }
+    if !markets_originality_json.exists() {
+        panic!("markets_data_originality.json not found. Run `cargo test test_prepare` to fetch market data.");
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
-    if let Err(e) = rt.block_on(generate_markets_rs(&markets_l1_json, &markets_l2_json, &markets_rs, &rpc_url)) {
+    if let Err(e) = rt.block_on(generate_markets_rs(&markets_l1_json, &markets_l2_json, &markets_originality_json, &markets_rs, &rpc_url)) {
         panic!("Failed to generate markets.rs: {}", e);
     }
 }

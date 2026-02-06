@@ -19,7 +19,6 @@ dependencies = [
  "alloy-core",
  "alloy-eips",
  "alloy-genesis",
- "alloy-json-rpc",
  "alloy-network",
  "alloy-provider",
  "alloy-pubsub",
@@ -1163,16 +1162,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bnum"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f781dba93de3a5ef6dc5b17c9958b208f6f3f021623b360fb605ea51ce443f10"
-dependencies = [
- "num-integer",
- "num-traits",
-]
-
-[[package]]
 name = "borsh"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1396,12 +1385,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
-name = "critical-section"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
-
-[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1526,7 +1509,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "uniswap-v3-sdk",
+ "uniswap_v3_math",
 ]
 
 [[package]]
@@ -1741,14 +1724,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastnum"
-version = "0.7.4"
+name = "eyre"
+version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4089ab2dfd45d8ddc92febb5ca80644389d5ebb954f40231274a3f18341762e2"
+checksum = "7cd915d99f24784cdc19fd37ef22b97e3ff0ae756c7e492e9fbfe897d61e2aec"
 dependencies = [
- "bnum",
- "num-integer",
- "num-traits",
+ "indenter",
+ "once_cell",
 ]
 
 [[package]]
@@ -2327,6 +2309,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "indenter"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "964de6e86d545b246d84badc0fef527924ace5134f30641c203ef52ba83f58d5"
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2487,12 +2475,6 @@ dependencies = [
  "digest 0.10.7",
  "sha3-asm",
 ]
-
-[[package]]
-name = "lazy_static"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
@@ -2667,10 +2649,6 @@ name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
-dependencies = [
- "critical-section",
- "portable-atomic",
-]
 
 [[package]]
 name = "openssl-probe"
@@ -2802,12 +2780,6 @@ dependencies = [
  "der",
  "spki",
 ]
-
-[[package]]
-name = "portable-atomic"
-version = "1.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f89776e4d69bb58bc6993e99ffa1d11f228b839984854c7daeb5d37f87cbe950"
 
 [[package]]
 name = "potential_utf"
@@ -4244,48 +4216,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
-name = "uniswap-lens"
-version = "0.15.0"
+name = "uniswap_v3_math"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d052f721e7beb41b8cbed47285172144ce6ba75cebe5745568e4bedf654609d9"
-dependencies = [
- "alloy",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "uniswap-sdk-core"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d7ad381e5fdc03b1df0b763af9bf440c1b7be9b1cdcee335bc0dfc021eb697b"
+checksum = "e393498a831893ce69ed6e1d06615e400bd1e8f97e9fcd113324f2d610fe6d45"
 dependencies = [
  "alloy-primitives",
- "derive_more",
- "fastnum",
- "lazy_static",
- "num-integer",
- "num-traits",
+ "eyre",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "uniswap-v3-sdk"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5029054e814a26705cc165e0e384966d2c03882228873ec81a5dbd6a84ba5dc0"
-dependencies = [
- "alloy",
- "alloy-primitives",
- "alloy-sol-types",
- "base64",
- "derive_more",
- "num-integer",
- "num-traits",
- "once_cell",
- "serde_json",
- "thiserror 2.0.18",
- "uniswap-lens",
- "uniswap-sdk-core",
 ]
 
 [[package]]
