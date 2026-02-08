@@ -187,7 +187,9 @@ pub struct ProfitabilityEntry {
 /// outcome prices for each matched market. Matches by market name (case-insensitive).
 ///
 /// `slot0_results` should come from `fetch_all_slot0`.
-pub fn profitability(slot0_results: &[(Slot0Result, &MarketData)]) -> Vec<ProfitabilityEntry> {
+pub fn profitability_simple(
+    slot0_results: &[(Slot0Result, &MarketData)],
+) -> Vec<ProfitabilityEntry> {
     let mut entries = Vec::new();
 
     for prediction in PREDICTIONS_L1.iter() {
@@ -381,7 +383,7 @@ pub fn simulate_buy(
 /// Calculates the implied long price for an outcome token by summing the prices
 /// of all other outcome tokens. This represents the cost of selling all tokens
 /// except the target, effectively going long on it.
-pub fn price_alt(outcome_token: &str, prices: &[(f64, &str)]) -> f64 {
+pub fn price_long_simple_alt(outcome_token: &str, prices: &[(f64, &str)]) -> f64 {
     let others_sum: f64 = prices
         .iter()
         .filter(|(_, token)| !token.eq_ignore_ascii_case(outcome_token))
@@ -616,23 +618,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_profitability() {
+    async fn test_profitability_simple() {
         dotenvy::dotenv().ok();
         let rpc_url = std::env::var("RPC").expect("RPC environment variable not set");
         let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
 
         let slot0_results = fetch_all_slot0(provider).await.unwrap();
-        let entries = profitability(&slot0_results);
+        let entries = profitability_simple(&slot0_results);
 
         println!("Profitability for {} matched markets:", entries.len());
         for entry in &entries {
             let d = &entry.depth;
             println!(
                 "  {}: prediction={:.4}, market_price={:.4}, diff={:+.4}, liq={}, tick_out={:.4}, tick_cost={:.4}, be_out={:.4}, be_cost={:.4}",
-                entry.market_name, entry.prediction, entry.market_price, entry.diff,
+                entry.market_name,
+                entry.prediction,
+                entry.market_price,
+                entry.diff,
                 entry.has_liquidity,
-                d.outcome_at_tick, d.cost_at_tick,
-                d.outcome_at_breakeven, d.cost_at_breakeven,
+                d.outcome_at_tick,
+                d.cost_at_tick,
+                d.outcome_at_breakeven,
+                d.cost_at_breakeven,
             );
         }
 
@@ -640,7 +647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_price_alt() {
+    async fn test_price_long_simple_alt() {
         dotenvy::dotenv().ok();
         let rpc_url = std::env::var("RPC").expect("RPC environment variable not set");
         let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
@@ -663,21 +670,21 @@ mod tests {
 
         println!("Prices for {} outcomes:", prices.len());
         for (price, token) in &prices {
-            let long_price = price_alt(token, &prices);
+            let long_price = price_long_simple_alt(token, &prices);
             println!(
-                "  token={}, price={:.6}, price_alt={:.6}",
+                "  token={}, price={:.6}, price_long_simple_alt={:.6}",
                 token, price, long_price
             );
         }
 
-        // price_alt should equal 1 - (total - own price)
+        // price_long_simple_alt should equal 1 - (total - own price)
         let total: f64 = prices.iter().map(|(p, _)| p).sum();
         for (price, token) in &prices {
-            let long_price = price_alt(token, &prices);
+            let long_price = price_long_simple_alt(token, &prices);
             let expected = 1.0 - (total - price);
             assert!(
                 (long_price - expected).abs() < 1e-12,
-                "price_alt mismatch for {}: got {}, expected {}",
+                "price_long_simple_alt mismatch for {}: got {}, expected {}",
                 token,
                 long_price,
                 expected
