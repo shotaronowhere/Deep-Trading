@@ -84,11 +84,9 @@ pub fn profitability(slot0_results: &[(Slot0Result, &MarketData)]) -> Vec<Profit
             None => continue,
         };
 
-        let is_token1_outcome =
-            pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+        let is_token1_outcome = pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
 
-        let price = match sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)
-        {
+        let price = match sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome) {
             Some(p) => p,
             None => continue,
         };
@@ -241,6 +239,18 @@ pub fn simulate_buy(
     simulate_swap(pool, sqrt_price_x96, amount, zero_for_one)
 }
 
+/// Calculates the implied long price for an outcome token by summing the prices
+/// of all other outcome tokens. This represents the cost of selling all tokens
+/// except the target, effectively going long on it.
+pub fn price_alt(outcome_token: &str, prices: &[(f64, &str)]) -> f64 {
+    let others_sum: f64 = prices
+        .iter()
+        .filter(|(_, token)| !token.eq_ignore_ascii_case(outcome_token))
+        .map(|(price, _)| price)
+        .sum();
+    1.0 - others_sum
+}
+
 /// Collects all markets with valid pools from MARKETS_L1, with pre-parsed pool_id
 fn collect_markets_with_pools() -> Vec<(Address, &'static MarketData)> {
     MARKETS_L1
@@ -387,7 +397,12 @@ mod tests {
 
                     // Exact output: negative amount
                     let amount = I256::try_from(mid).unwrap().checked_neg().unwrap();
-                    let result = match simulate_buy(pool, slot0.sqrt_price_x96, market.quote_token, amount) {
+                    let result = match simulate_buy(
+                        pool,
+                        slot0.sqrt_price_x96,
+                        market.quote_token,
+                        amount,
+                    ) {
                         Ok(r) => r,
                         Err(_) => {
                             valid = false;
@@ -421,7 +436,11 @@ mod tests {
                 "Optimal amount: {} (cost: {}, profit: {})",
                 best_amount,
                 best_cost,
-                if best_amount > best_cost { best_amount - best_cost } else { 0 }
+                if best_amount > best_cost {
+                    best_amount - best_cost
+                } else {
+                    0
+                }
             );
 
             // Print final state for each pool at optimal amount
@@ -429,11 +448,14 @@ mod tests {
                 let amount = I256::try_from(best_amount).unwrap().checked_neg().unwrap();
                 for (slot0, market) in results.iter() {
                     let pool = market.pool.as_ref().unwrap();
-                    let result = simulate_buy(pool, slot0.sqrt_price_x96, market.quote_token, amount).unwrap();
+                    let result =
+                        simulate_buy(pool, slot0.sqrt_price_x96, market.quote_token, amount)
+                            .unwrap();
                     let is_token1_outcome =
                         pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
                     let price_next =
-                        sqrt_price_x96_to_price_outcome(result.sqrt_price_next, is_token1_outcome).unwrap();
+                        sqrt_price_x96_to_price_outcome(result.sqrt_price_next, is_token1_outcome)
+                            .unwrap();
                     let price_f64: f64 = price_next.to_string().parse::<f64>().unwrap() / 1e18;
                     println!(
                         "  outcome={}: cost={}, price_next={:.6}, crossed={}",
@@ -472,5 +494,51 @@ mod tests {
         }
 
         assert!(!entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_price_alt() {
+        dotenvy::dotenv().ok();
+        let rpc_url = std::env::var("RPC").expect("RPC environment variable not set");
+        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+
+        let results = fetch_all_slot0(provider).await.unwrap();
+
+        // Build (price, outcome_token) pairs
+        let prices: Vec<(f64, &str)> = results
+            .iter()
+            .filter_map(|(slot0, market)| {
+                let pool = market.pool.as_ref()?;
+                let is_token1_outcome =
+                    pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+                let price =
+                    sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)?;
+                let price_f64: f64 = price.to_string().parse::<f64>().unwrap() / 1e18;
+                Some((price_f64, market.outcome_token))
+            })
+            .collect();
+
+        println!("Prices for {} outcomes:", prices.len());
+        for (price, token) in &prices {
+            let long_price = price_alt(token, &prices);
+            println!(
+                "  token={}, price={:.6}, price_alt={:.6}",
+                token, price, long_price
+            );
+        }
+
+        // price_alt should equal 1 - (total - own price)
+        let total: f64 = prices.iter().map(|(p, _)| p).sum();
+        for (price, token) in &prices {
+            let long_price = price_alt(token, &prices);
+            let expected = 1.0 - (total - price);
+            assert!(
+                (long_price - expected).abs() < 1e-12,
+                "price_alt mismatch for {}: got {}, expected {}",
+                token,
+                long_price,
+                expected
+            );
+        }
     }
 }
