@@ -52,6 +52,126 @@ pub fn sqrt_price_x96_to_price_outcome(
     }
 }
 
+/// Converts U256 (assumed 18-decimal fixed point) to f64.
+fn u256_to_f64(v: U256) -> f64 {
+    f64::from(v) / 1e18
+}
+
+/// Converts a prediction probability to the corresponding sqrtPriceX96.
+fn prediction_to_sqrt_price_x96(prediction: f64, is_token1_outcome: bool) -> Option<U256> {
+    let prediction_scaled = U256::from((prediction * 1e18) as u128);
+    if prediction_scaled.is_zero() {
+        return None;
+    }
+    let two_192 = TWO_96 * TWO_96;
+    if is_token1_outcome {
+        // outcome_price = 2^192 * 1e18 / sqrtPriceX96^2
+        // sqrtPriceX96 = sqrt(2^192 * 1e18 / prediction_scaled)
+        let numerator = mul_div(two_192, PRICE_SCALE, prediction_scaled).ok()?;
+        Some(numerator.root(2))
+    } else {
+        // outcome_price = sqrtPriceX96^2 * 1e18 / 2^192
+        // sqrtPriceX96 = sqrt(prediction_scaled * 2^192 / 1e18)
+        let numerator = mul_div(prediction_scaled, two_192, PRICE_SCALE).ok()?;
+        Some(numerator.root(2))
+    }
+}
+
+/// Liquidity depth at tick boundary and breakeven point.
+#[derive(Debug, Clone, Default)]
+pub struct DepthResult {
+    pub outcome_at_tick: f64,
+    pub cost_at_tick: f64,
+    pub outcome_at_breakeven: f64,
+    pub cost_at_breakeven: f64,
+}
+
+/// Computes liquidity depth: max outcome tokens and costs at tick boundary and breakeven.
+fn compute_depth(
+    pool: &Pool,
+    sqrt_price_x96: U256,
+    quote_token: &str,
+    is_token1_outcome: bool,
+    prediction: f64,
+) -> DepthResult {
+    let zero_for_one = pool.token0.to_lowercase() == quote_token.to_lowercase();
+    let liquidity: u128 = pool.liquidity.parse().unwrap();
+
+    let tick_0 = pool.ticks.get(0).unwrap();
+    let tick_1 = pool.ticks.get(1).unwrap();
+    let target_tick = if zero_for_one {
+        tick_0.tick_idx.min(tick_1.tick_idx)
+    } else {
+        tick_0.tick_idx.max(tick_1.tick_idx)
+    };
+    let sqrt_price_tick = match get_sqrt_ratio_at_tick(target_tick) {
+        Ok(v) => v,
+        Err(_) => return DepthResult::default(),
+    };
+
+    // I256::MAX as exact-input: compute_swap_step caps at the target price
+    let large_amount = I256::MAX;
+
+    // Max at tick boundary
+    let (tick_out, tick_cost) = match compute_swap_step(
+        sqrt_price_x96,
+        sqrt_price_tick,
+        liquidity,
+        large_amount,
+        FEE_PIPS,
+    ) {
+        Ok((_, amount_in, amount_out, fee_amount)) => {
+            (u256_to_f64(amount_out), u256_to_f64(amount_in + fee_amount))
+        }
+        Err(_) => (0.0, 0.0),
+    };
+
+    // Breakeven: buy until price reaches prediction
+    let (breakeven_out, breakeven_cost) =
+        match prediction_to_sqrt_price_x96(prediction, is_token1_outcome) {
+            Some(sqrt_price_breakeven) => {
+                // Clamp to tick boundary (don't go past available liquidity)
+                let target = if zero_for_one {
+                    sqrt_price_breakeven.max(sqrt_price_tick)
+                } else {
+                    sqrt_price_breakeven.min(sqrt_price_tick)
+                };
+
+                // Verify target is in the right direction from current price
+                let valid = if zero_for_one {
+                    target <= sqrt_price_x96
+                } else {
+                    target >= sqrt_price_x96
+                };
+
+                if !valid {
+                    (0.0, 0.0)
+                } else {
+                    match compute_swap_step(
+                        sqrt_price_x96,
+                        target,
+                        liquidity,
+                        large_amount,
+                        FEE_PIPS,
+                    ) {
+                        Ok((_, amount_in, amount_out, fee_amount)) => {
+                            (u256_to_f64(amount_out), u256_to_f64(amount_in + fee_amount))
+                        }
+                        Err(_) => (0.0, 0.0),
+                    }
+                }
+            }
+            None => (0.0, 0.0),
+        };
+
+    DepthResult {
+        outcome_at_tick: tick_out,
+        cost_at_tick: tick_cost,
+        outcome_at_breakeven: breakeven_out,
+        cost_at_breakeven: breakeven_cost,
+    }
+}
+
 /// Entry in the profitability result: how much the prediction exceeds the market price.
 #[derive(Debug, Clone)]
 pub struct ProfitabilityEntry {
@@ -59,6 +179,8 @@ pub struct ProfitabilityEntry {
     pub prediction: f64,
     pub market_price: f64,
     pub diff: f64,
+    pub has_liquidity: bool,
+    pub depth: DepthResult,
 }
 
 /// Returns the difference between predictions (PREDICTIONS_L1) and current
@@ -91,14 +213,31 @@ pub fn profitability(slot0_results: &[(Slot0Result, &MarketData)]) -> Vec<Profit
             None => continue,
         };
 
-        let price_f64: f64 = price.to_string().parse::<f64>().unwrap() / 1e18;
+        let price_f64 = u256_to_f64(price);
         let diff = (prediction.prediction - price_f64) / price_f64;
+
+        let liquidity: u128 = pool.liquidity.parse().unwrap_or(0);
+        let has_liquidity = liquidity > 0;
+
+        let depth = if has_liquidity && diff > 0.0 {
+            compute_depth(
+                pool,
+                slot0.sqrt_price_x96,
+                market.quote_token,
+                is_token1_outcome,
+                prediction.prediction,
+            )
+        } else {
+            DepthResult::default()
+        };
 
         entries.push(ProfitabilityEntry {
             market_name: market.name,
             prediction: prediction.prediction,
             market_price: price_f64,
             diff,
+            has_liquidity,
+            depth,
         });
     }
 
@@ -487,9 +626,13 @@ mod tests {
 
         println!("Profitability for {} matched markets:", entries.len());
         for entry in &entries {
+            let d = &entry.depth;
             println!(
-                "  {}: prediction={:.4}, market_price={:.4}, diff={:+.4}",
-                entry.market_name, entry.prediction, entry.market_price, entry.diff
+                "  {}: prediction={:.4}, market_price={:.4}, diff={:+.4}, liq={}, tick_out={:.4}, tick_cost={:.4}, be_out={:.4}, be_cost={:.4}",
+                entry.market_name, entry.prediction, entry.market_price, entry.diff,
+                entry.has_liquidity,
+                d.outcome_at_tick, d.cost_at_tick,
+                d.outcome_at_breakeven, d.cost_at_breakeven,
             );
         }
 
