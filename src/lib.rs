@@ -8,6 +8,7 @@ use std::io::BufWriter;
 pub mod markets;
 pub mod predictions;
 pub mod pools;
+pub mod portfolio;
 
 sol! {
     #[sol(rpc)]

@@ -11,8 +11,27 @@ use uniswap_v3_math::{
     full_math::mul_div, swap_math::compute_swap_step, tick, tick_math::get_sqrt_ratio_at_tick,
 };
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
 use crate::markets::{MARKETS_L1, MarketData, Pool};
 use crate::predictions::PREDICTIONS_L1;
+
+/// Normalize a market name for prediction lookup: trim trailing \t, lowercase.
+pub fn normalize_market_name(name: &str) -> String {
+    name.trim_end_matches("\\t").to_lowercase()
+}
+
+/// Returns a HashMap from normalized market name (lowercase) to prediction value.
+pub fn prediction_map() -> HashMap<String, f64> {
+    PREDICTIONS_L1
+        .iter()
+        .map(|p| (p.market.to_lowercase(), p.prediction))
+        .collect()
+}
 
 /// Price scale factor: 10^18 (18 decimals of precision)
 const PRICE_SCALE: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
@@ -53,12 +72,12 @@ pub fn sqrt_price_x96_to_price_outcome(
 }
 
 /// Converts U256 (assumed 18-decimal fixed point) to f64.
-fn u256_to_f64(v: U256) -> f64 {
+pub(crate) fn u256_to_f64(v: U256) -> f64 {
     f64::from(v) / 1e18
 }
 
 /// Converts a prediction probability to the corresponding sqrtPriceX96.
-fn prediction_to_sqrt_price_x96(prediction: f64, is_token1_outcome: bool) -> Option<U256> {
+pub(crate) fn prediction_to_sqrt_price_x96(prediction: f64, is_token1_outcome: bool) -> Option<U256> {
     let prediction_scaled = U256::from((prediction * 1e18) as u128);
     if prediction_scaled.is_zero() {
         return None;
@@ -192,14 +211,16 @@ pub fn profitability_simple(
 ) -> Vec<ProfitabilityEntry> {
     let mut entries = Vec::new();
 
+    // Build slot0 lookup by normalized market name
+    let slot0_by_name: HashMap<String, &(Slot0Result, &MarketData)> = slot0_results
+        .iter()
+        .map(|pair| (normalize_market_name(pair.1.name), pair))
+        .collect();
+
     for prediction in PREDICTIONS_L1.iter() {
         let pred_name = prediction.market.to_lowercase();
 
-        // Find the matching slot0 result by market name
-        let Some((slot0, market)) = slot0_results
-            .iter()
-            .find(|(_, m)| m.name.trim_end_matches("\\t").to_lowercase() == pred_name)
-        else {
+        let Some(&(slot0, market)) = slot0_by_name.get(&pred_name) else {
             continue;
         };
 
@@ -311,7 +332,7 @@ pub struct Slot0Result {
 }
 
 /// Fee tier in pips (100 = 0.01%)
-const FEE_PIPS: u32 = 100;
+pub(crate) const FEE_PIPS: u32 = 100;
 
 /// Swap result containing amounts and new price state
 #[derive(Debug, Clone)]
@@ -472,6 +493,152 @@ pub async fn fetch_all_slot0<P: Provider + Clone>(
     }
 
     Ok(slot0_results)
+}
+
+// ERC20 balanceOf for reading token balances
+sol! {
+    function balanceOf(address owner) external view returns (uint256);
+}
+
+/// Fetches sUSD and all outcome token balances for a wallet via batched multicall.
+/// Returns (susds_balance, outcome_balances_by_market_name).
+pub async fn fetch_balances<P: Provider + Clone>(
+    provider: P,
+    wallet: Address,
+) -> Result<(f64, HashMap<&'static str, f64>), Box<dyn std::error::Error>> {
+    let calldata = Bytes::from(balanceOfCall { owner: wallet }.abi_encode());
+
+    // First call: sUSD balance. Rest: one per market in MARKETS_L1.
+    let quote_token = Address::from_str(MARKETS_L1[0].quote_token)?;
+    let mut calls = vec![Multicall3::Call3 {
+        target: quote_token,
+        allowFailure: true,
+        callData: calldata.clone(),
+    }];
+
+    let markets: Vec<&'static MarketData> = MARKETS_L1.iter().collect();
+
+    for market in &markets {
+        let token = Address::from_str(market.outcome_token)?;
+        calls.push(Multicall3::Call3 {
+            target: token,
+            allowFailure: true,
+            callData: calldata.clone(),
+        });
+    }
+
+    let multicall = Multicall3::new(MULTICALL3_ADDRESS, provider);
+    let batch_futures: Vec<_> = calls
+        .chunks(MULTICALL_BATCH_SIZE)
+        .map(|chunk| {
+            let call = multicall.aggregate3(chunk.to_vec());
+            async move { call.call().await }
+        })
+        .collect();
+    let all_results = future::try_join_all(batch_futures).await?;
+    let flat: Vec<_> = all_results.into_iter().flatten().collect();
+
+    // Parse sUSD balance (first result)
+    let susds = flat
+        .first()
+        .and_then(|r| {
+            if r.success {
+                balanceOfCall::abi_decode_returns(&r.returnData).ok()
+            } else {
+                None
+            }
+        })
+        .map(u256_to_f64)
+        .unwrap_or(0.0);
+
+    // Parse outcome balances
+    let mut balances = HashMap::new();
+    for (i, market) in markets.iter().enumerate() {
+        let bal = flat
+            .get(i + 1)
+            .and_then(|r| {
+                if r.success {
+                    balanceOfCall::abi_decode_returns(&r.returnData).ok()
+                } else {
+                    None
+                }
+            })
+            .map(u256_to_f64)
+            .unwrap_or(0.0);
+        balances.insert(market.name, bal);
+    }
+
+    Ok((susds, balances))
+}
+
+/// Default cache staleness: 5 minutes.
+const CACHE_MAX_AGE_SECS: u64 = 300;
+
+/// Cached balance data, serialized to JSON.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BalanceCache {
+    pub timestamp: u64,
+    pub wallet: String,
+    pub susds: f64,
+    pub outcomes: HashMap<String, f64>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Save balance cache to a JSON file.
+pub fn save_balance_cache(
+    path: &Path,
+    wallet: &str,
+    susds: f64,
+    outcomes: &HashMap<&str, f64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cache = BalanceCache {
+        timestamp: now_secs(),
+        wallet: wallet.to_string(),
+        susds,
+        outcomes: outcomes
+            .iter()
+            .map(|(&k, &v)| (k.to_string(), v))
+            .collect(),
+    };
+    let file = std::fs::File::create(path)?;
+    serde_json::to_writer_pretty(std::io::BufWriter::new(file), &cache)?;
+    Ok(())
+}
+
+/// Load balance cache if it exists, matches wallet, and is fresh enough.
+/// Returns None if cache is missing, stale, or for a different wallet.
+pub fn load_balance_cache(
+    path: &Path,
+    wallet: &str,
+    max_age_secs: Option<u64>,
+) -> Option<BalanceCache> {
+    let file = std::fs::File::open(path).ok()?;
+    let cache: BalanceCache = serde_json::from_reader(std::io::BufReader::new(file)).ok()?;
+    if !cache.wallet.eq_ignore_ascii_case(wallet) {
+        return None;
+    }
+    let max_age = max_age_secs.unwrap_or(CACHE_MAX_AGE_SECS);
+    if now_secs().saturating_sub(cache.timestamp) > max_age {
+        return None;
+    }
+    Some(cache)
+}
+
+/// Convert cached outcome balances (String keys) to static str keys by matching market names.
+pub fn cache_to_balances(cache: &BalanceCache) -> HashMap<&'static str, f64> {
+    let mut result = HashMap::new();
+    for market in MARKETS_L1.iter() {
+        if let Some(&val) = cache.outcomes.get(market.name) {
+            result.insert(market.name, val);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -689,6 +856,104 @@ mod tests {
                 long_price,
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn test_cache_round_trip() {
+        let dir = std::env::temp_dir().join("deep_trading_test_cache");
+        let path = dir.join("balances.json");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut outcomes = HashMap::new();
+        outcomes.insert("outcome_a", 1.5);
+        outcomes.insert("outcome_b", 0.0);
+
+        save_balance_cache(&path, "0xABC", 42.0, &outcomes).unwrap();
+        let loaded = load_balance_cache(&path, "0xABC", None).unwrap();
+
+        assert_eq!(loaded.wallet, "0xABC");
+        assert_eq!(loaded.susds, 42.0);
+        assert_eq!(loaded.outcomes.get("outcome_a"), Some(&1.5));
+        assert_eq!(loaded.outcomes.get("outcome_b"), Some(&0.0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cache_expiration() {
+        let dir = std::env::temp_dir().join("deep_trading_test_cache");
+        let path = dir.join("balances_exp.json");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Write a cache with timestamp far in the past
+        let cache = BalanceCache {
+            timestamp: 1000,
+            wallet: "0xABC".to_string(),
+            susds: 1.0,
+            outcomes: HashMap::new(),
+        };
+        let file = std::fs::File::create(&path).unwrap();
+        serde_json::to_writer(std::io::BufWriter::new(file), &cache).unwrap();
+
+        let loaded = load_balance_cache(&path, "0xABC", Some(60));
+        assert!(loaded.is_none(), "cache should be expired");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cache_wallet_mismatch() {
+        let dir = std::env::temp_dir().join("deep_trading_test_cache");
+        let path = dir.join("balances_wm.json");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let outcomes = HashMap::new();
+        save_balance_cache(&path, "0xABC", 1.0, &outcomes).unwrap();
+
+        let loaded = load_balance_cache(&path, "0xDEF", Some(3600));
+        assert!(loaded.is_none(), "cache should reject different wallet");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cache_to_balances() {
+        let market_name = MARKETS_L1[0].name;
+        let mut outcomes = HashMap::new();
+        outcomes.insert(market_name.to_string(), 7.77);
+        outcomes.insert("nonexistent_market".to_string(), 99.0);
+
+        let cache = BalanceCache {
+            timestamp: now_secs(),
+            wallet: "0xABC".to_string(),
+            susds: 0.0,
+            outcomes,
+        };
+
+        let balances = cache_to_balances(&cache);
+        assert_eq!(balances.get(market_name), Some(&7.77));
+        assert!(!balances.contains_key("nonexistent_market"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_balances() {
+        dotenvy::dotenv().ok();
+        let rpc_url = match std::env::var("RPC") {
+            Ok(url) => url,
+            Err(_) => return,
+        };
+        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+
+        // Use zero address — should return 0 balances but not error
+        let wallet = Address::ZERO;
+        let (susds, balances) = fetch_balances(provider, wallet).await.unwrap();
+        println!("sUSD balance: {}", susds);
+        println!("Outcome balances: {} markets", balances.len());
+        for (name, bal) in &balances {
+            if *bal > 0.0 {
+                println!("  {}: {}", name, bal);
+            }
         }
     }
 }
