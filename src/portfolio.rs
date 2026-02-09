@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{I256, U256};
 use uniswap_v3_math::{swap_math::compute_swap_step, tick_math::get_sqrt_ratio_at_tick};
@@ -8,7 +8,7 @@ use crate::pools::{
     sqrt_price_x96_to_price_outcome, u256_to_f64, FEE_PIPS, Slot0Result,
 };
 
-const BINARY_SEARCH_ITERS: usize = 50;
+const BINARY_SEARCH_ITERS: usize = 20;
 
 /// A rebalancing action to execute.
 #[derive(Debug, Clone)]
@@ -33,6 +33,10 @@ pub enum Action {
         amount: f64,
         proceeds: f64,
     },
+    /// Borrow sUSD via flash loan to fund minting.
+    FlashLoan { amount: f64 },
+    /// Repay flash loan after selling minted tokens.
+    RepayFlashLoan { amount: f64 },
 }
 
 /// Mutable pool state for swap simulation during rebalancing.
@@ -234,7 +238,7 @@ fn alt_price(sims: &[PoolSim], idx: usize) -> f64 {
 
 /// Compute alt price after hypothetically selling `amount` of each non-target outcome.
 /// Returns the marginal alt cost at that mint quantity.
-fn alt_price_after_mint(sims: &[PoolSim], target_idx: usize, mint_amount: f64, skip: &[usize]) -> f64 {
+fn alt_price_after_mint(sims: &[PoolSim], target_idx: usize, mint_amount: f64, skip: &HashSet<usize>) -> f64 {
     let others_sum: f64 = sims
         .iter()
         .enumerate()
@@ -273,27 +277,6 @@ enum Route {
     Mint,
 }
 
-/// Determine best route and its price for an outcome.
-/// `mint_available`: true when all tradeable outcomes have liquid pools in sims.
-/// `missing_pred_sum`: sum of predictions for outcomes not in sims (basket bonus for partial mint).
-fn best_route(sims: &[PoolSim], idx: usize, mint_available: bool, missing_pred_sum: f64) -> (Route, f64) {
-    let direct = sims[idx].price();
-    let alt = alt_price(sims, idx);
-    if mint_available {
-        if alt > 0.0 && alt < direct {
-            return (Route::Mint, alt);
-        }
-    } else if missing_pred_sum > 0.0 {
-        // Partial mint: unsellable tokens have expected value = their predictions.
-        // Effective cost = alt_price - basket_bonus.
-        let adjusted = alt - missing_pred_sum;
-        if adjusted > 0.0 && adjusted < direct {
-            return (Route::Mint, adjusted);
-        }
-    }
-    (Route::Direct, direct)
-}
-
 /// For the direct route, compute cost to bring an outcome's profitability to `target_prof`.
 /// Returns (cost, outcome_amount, new_sqrt_price).
 fn direct_cost_to_prof(sim: &PoolSim, target_prof: f64) -> Option<(f64, f64, U256)> {
@@ -310,7 +293,7 @@ fn mint_cost_to_prof(
     target_idx: usize,
     target_prof: f64,
     missing_pred_sum: f64,
-    skip: &[usize],
+    skip: &HashSet<usize>,
 ) -> Option<(f64, f64)> {
     let tp = target_price_for_prof(sims[target_idx].prediction, target_prof);
     // Adjusted target: the alt price (before basket bonus) that corresponds to target_prof
@@ -352,35 +335,27 @@ fn mint_cost_to_prof(
     Some((net_cost, amount))
 }
 
-/// Compute cost to reach target_prof for a given outcome using the best route.
-/// Returns (cost, Route, amount, Option<new_sqrt_for_direct>).
-fn cost_to_prof(
+/// Compute cost to reach target_prof for a given outcome via a specific route.
+/// Returns (cost, amount, Option<new_sqrt_for_direct>).
+fn cost_for_route(
     sims: &[PoolSim],
     idx: usize,
+    route: Route,
     target_prof: f64,
-    mint_available: bool,
     missing_pred_sum: f64,
-    skip: &[usize],
-) -> Option<(f64, Route, f64, Option<U256>)> {
-    let direct = direct_cost_to_prof(&sims[idx], target_prof);
-    let mint = if mint_available || missing_pred_sum > 0.0 {
-        mint_cost_to_prof(sims, idx, target_prof, missing_pred_sum, skip)
-    } else {
-        None
-    };
-
-    match (direct, mint) {
-        (Some((dc, da, ds)), Some((mc, ma))) => {
-            if mc <= dc {
-                Some((mc.max(0.0), Route::Mint, ma, None))
-            } else {
-                Some((dc, Route::Direct, da, Some(ds)))
-            }
-        }
-        (Some((dc, da, ds)), None) => Some((dc, Route::Direct, da, Some(ds))),
-        (None, Some((mc, ma))) => Some((mc, Route::Mint, ma, None)),
-        (None, None) => None,
+    skip: &HashSet<usize>,
+) -> Option<(f64, f64, Option<U256>)> {
+    match route {
+        Route::Direct => direct_cost_to_prof(&sims[idx], target_prof)
+            .map(|(cost, amount, sqrt)| (cost, amount, Some(sqrt))),
+        Route::Mint => mint_cost_to_prof(sims, idx, target_prof, missing_pred_sum, skip)
+            .map(|(cost, amount)| (cost, amount, None)),
     }
+}
+
+/// Extract deduplicated outcome indices from active (outcome, route) pairs.
+fn active_skip_indices(active: &[(usize, Route)]) -> HashSet<usize> {
+    active.iter().map(|(idx, _)| *idx).collect()
 }
 
 fn lookup_balance(balances: &HashMap<&str, f64>, market_name: &str) -> f64 {
@@ -403,7 +378,7 @@ fn emit_mint_actions(
     target_idx: usize,
     amount: f64,
     actions: &mut Vec<Action>,
-    skip: &[usize],
+    skip: &HashSet<usize>,
 ) -> f64 {
     // Derive contract addresses from MARKETS_L1 (not sims, which may be partial).
     let mut contracts: Vec<&'static str> = crate::markets::MARKETS_L1
@@ -548,6 +523,7 @@ pub fn rebalance(
             Action::Sell { market_name, amount, .. } => {
                 *sim_balances.entry(market_name).or_insert(0.0) -= amount;
             }
+            Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
         }
     }
 
@@ -563,8 +539,7 @@ pub fn rebalance(
             if held <= 0.0 {
                 continue;
             }
-            let (_, best_p) = best_route(&sims, i, mint_available, missing_pred_sum);
-            let prof = profitability(sim.prediction, best_p);
+            let prof = profitability(sim.prediction, sim.price());
             if prof < last_bought_prof {
                 liquidation_candidates.push((i, prof));
             }
@@ -637,29 +612,42 @@ fn waterfall(
         return 0.0;
     }
 
-    // Build sorted index of profitable outcomes
-    let mut ranked: Vec<(usize, f64)> = sims
-        .iter()
-        .enumerate()
-        .filter_map(|(i, sim)| {
-            let (_, best_p) = best_route(sims, i, mint_available, missing_pred_sum);
-            let prof = profitability(sim.prediction, best_p);
-            if prof > 0.0 {
-                Some((i, prof))
-            } else {
-                None
+    // Build sorted index of (outcome, route) pairs with positive profitability.
+    // The same outcome can appear twice (once per route) at different profitability levels.
+    let mut ranked: Vec<(usize, Route, f64)> = Vec::new();
+    for (i, sim) in sims.iter().enumerate() {
+        let direct_prof = profitability(sim.prediction, sim.price());
+        if direct_prof > 0.0 {
+            ranked.push((i, Route::Direct, direct_prof));
+        }
+        if mint_available {
+            let mint_price = alt_price(sims, i);
+            if mint_price > 0.0 {
+                let mint_prof = profitability(sim.prediction, mint_price);
+                if mint_prof > 0.0 {
+                    ranked.push((i, Route::Mint, mint_prof));
+                }
             }
-        })
-        .collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        } else if missing_pred_sum > 0.0 {
+            let alt = alt_price(sims, i);
+            let adjusted = alt - missing_pred_sum;
+            if adjusted > 0.0 {
+                let mint_prof = profitability(sim.prediction, adjusted);
+                if mint_prof > 0.0 {
+                    ranked.push((i, Route::Mint, mint_prof));
+                }
+            }
+        }
+    }
+    ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
 
     if ranked.is_empty() {
         return 0.0;
     }
 
-    let mut active: Vec<usize> = vec![ranked[0].0];
+    let mut active: Vec<(usize, Route)> = vec![(ranked[0].0, ranked[0].1)];
     let mut next_rank = 1;
-    let mut current_prof = ranked[0].1;
+    let mut current_prof = ranked[0].2;
     let mut last_prof = 0.0;
 
     loop {
@@ -667,23 +655,23 @@ fn waterfall(
             break;
         }
 
-        // Target: next outcome's profitability, or 0 if none
+        // Target: next entry's profitability, or 0 if none
         let target_prof = if next_rank < ranked.len() {
-            ranked[next_rank].1.max(0.0)
+            ranked[next_rank].2.max(0.0)
         } else {
             0.0
         };
 
-        // Compute cost for each active outcome to reach target_prof
-        let mut step_costs: Vec<(f64, Route, f64, Option<U256>)> = Vec::new();
+        let skip = active_skip_indices(&active);
+
+        // Compute total cost for all active entries to reach target_prof
         let mut total_cost = 0.0;
         let mut any_failed = false;
 
-        for &idx in &active {
-            match cost_to_prof(sims, idx, target_prof, mint_available, missing_pred_sum, &active) {
-                Some((cost, route, amount, new_sqrt)) => {
+        for &(idx, route) in &active {
+            match cost_for_route(sims, idx, route, target_prof, missing_pred_sum, &skip) {
+                Some((cost, _, _)) => {
                     total_cost += cost;
-                    step_costs.push((cost, route, amount, new_sqrt));
                 }
                 None => {
                     any_failed = true;
@@ -693,34 +681,37 @@ fn waterfall(
         }
 
         if any_failed {
-            // Remove outcomes that can't be computed, try again
-            let snap = active.clone();
-            active.retain(|&idx| cost_to_prof(sims, idx, target_prof, mint_available, missing_pred_sum, &snap).is_some());
+            // Remove entries that can't be computed, try again
+            let snap_skip = active_skip_indices(&active);
+            active.retain(|&(idx, route)| cost_for_route(sims, idx, route, target_prof, missing_pred_sum, &snap_skip).is_some());
             if active.is_empty() {
                 break;
             }
             continue;
         }
 
-        if total_cost <= *budget && total_cost > 0.0 {
-            // Can afford to bring all active outcomes to target_prof: execute
+        if total_cost <= *budget {
+            // Can afford to bring all active entries to target_prof: execute.
+            // Negative total_cost means arbitrage (mint proceeds > cost) — still execute
+            // to capture profit and update pool states.
             // Recompute each cost right before executing, since mint actions mutate other pools.
             // Guard against budget overspend from recomputed costs exceeding the estimate.
             let mut any_skipped = false;
-            for &idx in &active {
-                if let Some((cost, route, amount, new_sqrt)) =
-                    cost_to_prof(sims, idx, target_prof, mint_available, missing_pred_sum, &active)
+            let skip = active_skip_indices(&active);
+            for &(idx, route) in &active {
+                if let Some((cost, amount, new_sqrt)) =
+                    cost_for_route(sims, idx, route, target_prof, missing_pred_sum, &skip)
                 {
-                    if cost < 0.0 || cost > *budget {
+                    if cost > *budget {
                         any_skipped = true;
                         continue;
                     }
-                    execute_buy(sims, idx, cost, amount, route, new_sqrt, budget, actions, &active);
+                    execute_buy(sims, idx, cost, amount, route, new_sqrt, budget, actions, &skip);
                 }
             }
 
             if any_skipped {
-                // Not all outcomes reached target_prof; don't advance profitability level
+                // Not all entries reached target_prof; don't advance profitability level
                 last_prof = current_prof;
                 break;
             }
@@ -728,39 +719,31 @@ fn waterfall(
             current_prof = target_prof;
             last_prof = target_prof;
 
-            // Add next outcome to active set
+            // Add next entry to active set
             if next_rank < ranked.len() {
-                active.push(ranked[next_rank].0);
+                active.push((ranked[next_rank].0, ranked[next_rank].1));
                 next_rank += 1;
             } else {
-                break; // No more outcomes, all reached prof 0
+                break; // No more entries, all reached prof 0
             }
-        } else if total_cost > 0.0 {
+        } else {
             // Can't afford full step. Binary search for achievable profitability.
-            let achievable = binary_search_prof(sims, &active, current_prof, target_prof, *budget, mint_available, missing_pred_sum);
+            let skip = active_skip_indices(&active);
+            let achievable = binary_search_prof(sims, &active, current_prof, target_prof, *budget, missing_pred_sum, &skip);
 
             // Compute costs at achievable level
-            for &idx in &active {
-                if let Some((cost, route, amount, new_sqrt)) =
-                    cost_to_prof(sims, idx, achievable, mint_available, missing_pred_sum, &active)
+            for &(idx, route) in &active {
+                if let Some((cost, amount, new_sqrt)) =
+                    cost_for_route(sims, idx, route, achievable, missing_pred_sum, &skip)
                 {
-                    if cost < 0.0 || cost > *budget {
+                    if cost > *budget {
                         continue;
                     }
-                    execute_buy(sims, idx, cost, amount, route, new_sqrt, budget, actions, &active);
+                    execute_buy(sims, idx, cost, amount, route, new_sqrt, budget, actions, &skip);
                 }
             }
             last_prof = achievable;
             break;
-        } else {
-            // Zero cost means we're already at target, add next
-            current_prof = target_prof;
-            if next_rank < ranked.len() {
-                active.push(ranked[next_rank].0);
-                next_rank += 1;
-            } else {
-                break;
-            }
         }
     }
 
@@ -777,8 +760,11 @@ fn execute_buy(
     new_sqrt: Option<U256>,
     budget: &mut f64,
     actions: &mut Vec<Action>,
-    skip: &[usize],
+    skip: &HashSet<usize>,
 ) {
+    if amount <= 0.0 {
+        return;
+    }
     match route {
         Route::Direct => {
             if let Some(ns) = new_sqrt {
@@ -792,9 +778,11 @@ fn execute_buy(
             });
         }
         Route::Mint => {
-            // Mint `amount` complete sets, sell all others
+            // Flash loan funds the mint upfront; net cost comes from budget
             let upfront = amount; // 1 sUSD per set
+            actions.push(Action::FlashLoan { amount: upfront });
             let proceeds = emit_mint_actions(sims, idx, amount, actions, skip);
+            actions.push(Action::RepayFlashLoan { amount: upfront });
             let net_cost = upfront - proceeds;
             *budget -= net_cost;
         }
@@ -804,12 +792,12 @@ fn execute_buy(
 /// Binary search for the lowest profitability level affordable with the budget.
 fn binary_search_prof(
     sims: &[PoolSim],
-    active: &[usize],
+    active: &[(usize, Route)],
     prof_hi: f64,
     prof_lo: f64,
     budget: f64,
-    mint_available: bool,
     missing_pred_sum: f64,
+    skip: &HashSet<usize>,
 ) -> f64 {
     let mut lo = prof_lo; // most buying (expensive)
     let mut hi = prof_hi; // least buying (cheap, ~0 cost)
@@ -818,7 +806,7 @@ fn binary_search_prof(
         let mid = (lo + hi) / 2.0;
         let total: f64 = active
             .iter()
-            .filter_map(|&idx| cost_to_prof(sims, idx, mid, mint_available, missing_pred_sum, active).map(|(c, _, _, _)| c))
+            .filter_map(|&(idx, route)| cost_for_route(sims, idx, route, mid, missing_pred_sum, skip).map(|(c, _, _)| c))
             .sum();
 
         if total <= budget {
@@ -1096,7 +1084,7 @@ mod tests {
         // Test emit_mint_actions directly
         let mint_amount = 10.0;
         let mut actions = Vec::new();
-        let proceeds = emit_mint_actions(&mut sims, 0, mint_amount, &mut actions, &[]);
+        let proceeds = emit_mint_actions(&mut sims, 0, mint_amount, &mut actions, &HashSet::new());
 
         // First action: Mint with target_market = M1
         assert!(
@@ -1129,7 +1117,7 @@ mod tests {
             .collect();
         let mut budget = 100.0;
         let mut actions2 = Vec::new();
-        execute_buy(&mut sims2, 0, 5.0, 10.0, Route::Mint, None, &mut budget, &mut actions2, &[]);
+        execute_buy(&mut sims2, 0, 5.0, 10.0, Route::Mint, None, &mut budget, &mut actions2, &HashSet::new());
         assert!(budget < 100.0, "budget should decrease after mint");
 
         // Test sim_balances tracking: Mint adds to all, Sell subtracts
@@ -1147,6 +1135,7 @@ mod tests {
                 Action::Sell { market_name, amount, .. } => {
                     *sim_balances.entry(market_name).or_insert(0.0) -= amount;
                 }
+                Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
             }
         }
         // Target M1 should hold the full mint amount
@@ -1201,6 +1190,8 @@ mod tests {
                     "  SELL {} {} (proceeds: {:.6})",
                     amount, market_name, proceeds
                 ),
+                Action::FlashLoan { amount } => println!("  FLASH_LOAN {:.6}", amount),
+                Action::RepayFlashLoan { amount } => println!("  REPAY_FLASH_LOAN {:.6}", amount),
             }
         }
     }
