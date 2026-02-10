@@ -40,7 +40,8 @@ API (deep.seer.pm)
 - **src/main.rs**: WebSocket connection to Optimism RPC
 - **src/markets.rs**: Generated static market data arrays
 - **src/predictions.rs**: Generated prediction weights from CSVs
-- **src/pools.rs**: On-chain pool queries and trading analytics
+- **src/pools.rs**: On-chain pool queries, trading analytics, balance fetching, and caching
+- **src/portfolio.rs**: Portfolio rebalancing (see [portfolio.md](portfolio.md), [model.md](model.md))
 
 ## Pool Analytics (`src/pools.rs`)
 
@@ -57,7 +58,7 @@ Converts Uniswap V3 `sqrtPriceX96` to outcome token prices (18-decimal fixed poi
 - **Breakeven depth**: Max outcome tokens buyable before the price moves to match the prediction (profitability = 0), and their cost. Uses `prediction_to_sqrt_price_x96` to convert the prediction probability to a target sqrtPriceX96, clamped to the tick boundary.
 
 ### Multicall Batching
-`fetch_all_slot0` batches `slot0()` calls across all pools using Multicall3, with configurable batch size (200).
+`fetch_all_slot0` batches `slot0()` calls across all pools using Multicall3, with configurable batch size (200). `fetch_balances` batches ERC20 `balanceOf` calls for sUSD + all 100 outcome tokens (including non-pooled outcomes). Balance caching via `save/load_balance_cache` persists to JSON with wallet validation and 5-minute staleness.
 
 ### Alternative Pricing
 `price_alt` computes the implied long price for an outcome by summing prices of all other outcomes: `1 - sum(others)`.

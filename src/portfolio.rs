@@ -291,7 +291,7 @@ fn target_price_for_prof(prediction: f64, target_prof: f64) -> f64 {
 }
 
 /// Which acquisition route is cheaper for an outcome.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Route {
     Direct,
     Mint,
@@ -642,6 +642,37 @@ pub fn rebalance(
     actions
 }
 
+/// Find the highest-profitability (outcome, route) pair not already in the active set.
+/// Scans current pool state each call, so mint perturbations are reflected immediately.
+fn best_non_active(
+    sims: &[PoolSim],
+    active: &[(usize, Route)],
+    mint_available: bool,
+) -> Option<(usize, Route, f64)> {
+    let active_set: HashSet<(usize, Route)> = active.iter().copied().collect();
+    let mut best: Option<(usize, Route, f64)> = None;
+    for (i, sim) in sims.iter().enumerate() {
+        if !active_set.contains(&(i, Route::Direct)) {
+            let prof = profitability(sim.prediction, sim.price());
+            if prof > 0.0 && best.map_or(true, |b| prof > b.2) {
+                best = Some((i, Route::Direct, prof));
+            }
+        }
+        if mint_available && !active_set.contains(&(i, Route::Mint)) {
+            let mp = alt_price(sims, i);
+            if mp > 0.0 {
+                let prof = profitability(sim.prediction, mp);
+                if prof > 0.0 && best.map_or(true, |b| prof > b.2) {
+                    best = Some((i, Route::Mint, prof));
+                }
+            }
+        }
+    }
+    best
+}
+
+const MAX_WATERFALL_ITERS: usize = 1000;
+
 /// Waterfall allocation: deploy capital to the highest profitability outcome.
 /// As capital is deployed, profitability drops until it matches the next outcome.
 /// Then deploy to both, then three, etc.
@@ -657,97 +688,82 @@ fn waterfall(
         return 0.0;
     }
 
-    // Build sorted index of (outcome, route) pairs with positive profitability.
-    // The same outcome can appear twice (once per route) at different profitability levels.
-    let mut ranked: Vec<(usize, Route, f64)> = Vec::new();
-    for (i, sim) in sims.iter().enumerate() {
-        let direct_prof = profitability(sim.prediction, sim.price());
-        if direct_prof > 0.0 {
-            ranked.push((i, Route::Direct, direct_prof));
-        }
-        if mint_available {
-            let mint_price = alt_price(sims, i);
-            if mint_price > 0.0 {
-                let mint_prof = profitability(sim.prediction, mint_price);
-                if mint_prof > 0.0 {
-                    ranked.push((i, Route::Mint, mint_prof));
-                }
-            }
-        }
-    }
-    ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
+    // Seed active set with the highest-profitability entry.
+    let first = match best_non_active(sims, &[], mint_available) {
+        Some(entry) if entry.2 > 0.0 => entry,
+        _ => return 0.0,
+    };
 
-    if ranked.is_empty() {
-        return 0.0;
-    }
-
-    let mut active: Vec<(usize, Route)> = vec![(ranked[0].0, ranked[0].1)];
-    let mut next_rank = 1;
-    let mut current_prof = ranked[0].2;
+    let mut active: Vec<(usize, Route)> = vec![(first.0, first.1)];
+    let mut current_prof = first.2;
     let mut last_prof = 0.0;
 
-    loop {
+    for _iter in 0..MAX_WATERFALL_ITERS {
         if *budget <= 1e-12 || current_prof <= 0.0 {
             break;
         }
 
-        // Target: next entry's profitability, or 0 if none
-        let target_prof = if next_rank < ranked.len() {
-            ranked[next_rank].2.max(0.0)
-        } else {
-            0.0
+        // Dynamically find the next best entry from current pool state.
+        // If a mint perturbed prices and pushed an entry above current_prof,
+        // absorb it into active immediately (no cost step needed).
+        loop {
+            match best_non_active(sims, &active, mint_available) {
+                Some((idx, route, prof)) if prof > current_prof => {
+                    active.push((idx, route));
+                }
+                _ => break,
+            }
+        }
+
+        let next = best_non_active(sims, &active, mint_available);
+        let target_prof = match next {
+            Some((_, _, p)) if p > 0.0 => p,
+            _ => 0.0,
         };
+
+        // Prune entries that can't reach target_prof (e.g. tick boundary hit).
+        // Re-derive skip after each removal so remaining entries see the correct set.
+        loop {
+            let skip = active_skip_indices(&active);
+            let before = active.len();
+            active.retain(|&(idx, route)| {
+                cost_for_route(sims, idx, route, target_prof, &skip).is_some()
+            });
+            if active.len() == before || active.is_empty() {
+                break;
+            }
+        }
+        if active.is_empty() {
+            break;
+        }
 
         let skip = active_skip_indices(&active);
 
         // Compute total cost for all active entries to reach target_prof
-        let mut total_cost = 0.0;
-        let mut any_failed = false;
-
-        for &(idx, route) in &active {
-            match cost_for_route(sims, idx, route, target_prof, &skip) {
-                Some((cost, _, _, _)) => {
-                    total_cost += cost;
-                }
-                None => {
-                    any_failed = true;
-                    break;
-                }
-            }
-        }
-
-        if any_failed {
-            // Remove entries that can't be computed, try again
-            let snap_skip = active_skip_indices(&active);
-            active.retain(|&(idx, route)| cost_for_route(sims, idx, route, target_prof, &snap_skip).is_some());
-            if active.is_empty() {
-                break;
-            }
-            continue;
-        }
+        let total_cost: f64 = active
+            .iter()
+            .filter_map(|&(idx, route)| {
+                cost_for_route(sims, idx, route, target_prof, &skip).map(|(c, _, _, _)| c)
+            })
+            .sum();
 
         if total_cost <= *budget {
-            // Can afford to bring all active entries to target_prof: execute.
-            // Negative total_cost means arbitrage (mint proceeds > cost) — still execute
-            // to capture profit and update pool states.
-            // Recompute each cost right before executing, since mint actions mutate other pools.
-            // Guard against budget overspend from recomputed costs exceeding the estimate.
+            // Can afford full step. Execute, recomputing costs right before
+            // since mint actions mutate other pools.
             let mut any_skipped = false;
             let skip = active_skip_indices(&active);
             for &(idx, route) in &active {
-                if let Some((cost, amount, new_sqrt, _)) =
-                    cost_for_route(sims, idx, route, target_prof, &skip)
-                {
-                    if cost > *budget {
-                        any_skipped = true;
-                        continue;
+                match cost_for_route(sims, idx, route, target_prof, &skip) {
+                    Some((cost, amount, new_sqrt, _)) if cost <= *budget => {
+                        execute_buy(sims, idx, cost, amount, route, new_sqrt, budget, actions, &skip);
                     }
-                    execute_buy(sims, idx, cost, amount, route, new_sqrt, budget, actions, &skip);
+                    _ => {
+                        any_skipped = true;
+                    }
                 }
             }
 
             if any_skipped {
-                // Not all entries reached target_prof; don't advance profitability level
                 last_prof = current_prof;
                 break;
             }
@@ -755,19 +771,19 @@ fn waterfall(
             current_prof = target_prof;
             last_prof = target_prof;
 
-            // Add next entry to active set
-            if next_rank < ranked.len() {
-                active.push((ranked[next_rank].0, ranked[next_rank].1));
-                next_rank += 1;
-            } else {
-                break; // No more entries, all reached prof 0
+            // Re-query best entry from post-execution state (not the stale pre-execution `next`),
+            // since mint actions during this step may have perturbed non-active pool prices.
+            match best_non_active(sims, &active, mint_available) {
+                Some((idx, route, prof)) if prof > 0.0 => {
+                    active.push((idx, route));
+                }
+                _ => break, // No more entries, all reached prof 0
             }
         } else {
-            // Can't afford full step. Binary search for achievable profitability.
+            // Can't afford full step. Solve for achievable profitability.
             let skip = active_skip_indices(&active);
             let achievable = solve_prof(sims, &active, current_prof, target_prof, *budget, &skip);
 
-            // Compute costs at achievable level
             for &(idx, route) in &active {
                 if let Some((cost, amount, new_sqrt, _)) =
                     cost_for_route(sims, idx, route, achievable, &skip)
