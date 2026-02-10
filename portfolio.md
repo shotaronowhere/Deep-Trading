@@ -92,10 +92,9 @@ When the total cost to bring all active entries to the next profitability level 
 
 **Mixed routes (Newton's method):** When mint routes are in the active set, uses Newton's method with analytical derivatives for both direct and mint entries. Mint derivatives use the implicit function theorem: `d(net_cost)/dπ = (1 - (1-f)×Σ Pⱼ(m)) × P_target / ((1+π) × g'(m))`, computed in the same pass as cost. Converges in ~3-4 iterations.
 
-**Known bugs in current mixed-route solver** (see [improvements.md](improvements.md)):
-1. `mint_cost_to_prof` solves `g(m) = 1 - tp` but `g(m)` only sums non-skip pools. The correct rhs is `(1 - tp) - Σ_{skip} P⁰_j`, causing systematic undershoot of m.
-2. Multiple mint entries are treated independently, but all sell into the same non-active pools. Proceeds concavity means summed individual proceeds overestimate actual proceeds, undershooting net cost.
-Both are fixed by the coupled solver in improvements.md, which reduces the problem to 2 unknowns (π, M) via the skip-semantics collapse.
+**Previously known bugs (now fixed):**
+1. ~~`mint_cost_to_prof` rhs~~ — Fixed: `rhs = (1 - tp) - Σ_{skip} P⁰_j` correctly accounts for skip pool prices.
+2. ~~Independent mint treatment in `solve_prof`~~ — Fixed: coupled (π, M) solver computes aggregate mint volume jointly. Returns `(profitability, aggregate_M)`. Waterfall executes mints first with M/|Q| per entry, then directs.
 
 #### Execution safeguards
 

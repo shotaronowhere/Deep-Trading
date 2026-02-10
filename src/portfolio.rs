@@ -319,9 +319,20 @@ fn mint_cost_to_prof(
         return Some((0.0, 0.0, 0.0));
     }
 
-    // Newton's method: solve g(m) = 1 - target where g(m) = Σⱼ pⱼ/(1+m×κⱼ)²
-    // g'(m) = Σⱼ -2×pⱼ×κⱼ/(1+m×κⱼ)³
-    let rhs = 1.0 - tp;
+    // Newton's method: solve g(m) = rhs where g(m) = Σⱼ pⱼ/(1+m×κⱼ)² (non-skip pools only).
+    // Correct rhs accounts for skip pool prices frozen at P⁰_j:
+    // rhs = (1 - tp) - Σ_{j∈skip, j≠target} P⁰_j
+    let skip_price_sum: f64 = sims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != target_idx && skip.contains(i))
+        .map(|(_, s)| s.price())
+        .sum();
+    let rhs = (1.0 - tp) - skip_price_sum;
+    if rhs <= 0.0 {
+        // Skip pools consume all probability mass — target alt price unreachable via minting.
+        return None;
+    }
 
     // Precompute per-pool parameters: (price, kappa, max_sell_tokens)
     let params: Vec<(f64, f64, f64)> = sims
@@ -782,16 +793,40 @@ fn waterfall(
         } else {
             // Can't afford full step. Solve for achievable profitability.
             let skip = active_skip_indices(&active);
-            let achievable = solve_prof(sims, &active, current_prof, target_prof, *budget, &skip);
+            let (achievable, mint_m) =
+                solve_prof(sims, &active, current_prof, target_prof, *budget, &skip);
 
-            for &(idx, route) in &active {
-                if let Some((cost, amount, new_sqrt, _)) =
-                    cost_for_route(sims, idx, route, achievable, &skip)
-                {
-                    if cost > *budget {
-                        continue;
+            // Execute mints first with aggregate M (updates non-active pool states).
+            // Split equally among mint entries (split is arbitrary; total cost depends only on M).
+            if mint_m > 0.0 {
+                let mint_entries: Vec<(usize, Route)> = active
+                    .iter()
+                    .filter(|&&(_, r)| r == Route::Mint)
+                    .copied()
+                    .collect();
+                if !mint_entries.is_empty() {
+                    let per_entry = mint_m / mint_entries.len() as f64;
+                    for &(idx, _) in &mint_entries {
+                        execute_buy(
+                            sims, idx, 0.0, per_entry, Route::Mint, None, budget, actions, &skip,
+                        );
                     }
-                    execute_buy(sims, idx, cost, amount, route, new_sqrt, budget, actions, &skip);
+                }
+            }
+
+            // Execute directs second (active pool prices unperturbed by mints)
+            for &(idx, route) in &active {
+                if route == Route::Direct {
+                    if let Some((cost, amount, new_sqrt, _)) =
+                        cost_for_route(sims, idx, route, achievable, &skip)
+                    {
+                        if cost > *budget {
+                            continue;
+                        }
+                        execute_buy(
+                            sims, idx, cost, amount, route, new_sqrt, budget, actions, &skip,
+                        );
+                    }
                 }
             }
             last_prof = achievable;
@@ -842,8 +877,8 @@ fn execute_buy(
 }
 
 /// Find the lowest profitability level affordable with the budget.
-/// Uses closed-form solution when all active entries are Direct route,
-/// otherwise Newton's method with analytical gradients for both routes.
+/// Returns (profitability, aggregate_mint_M).
+/// Uses closed-form for all-direct; coupled (π, M) Newton for mixed routes.
 fn solve_prof(
     sims: &[PoolSim],
     active: &[(usize, Route)],
@@ -851,7 +886,7 @@ fn solve_prof(
     prof_lo: f64,
     budget: f64,
     skip: &HashSet<usize>,
-) -> f64 {
+) -> (f64, f64) {
     let all_direct = active.iter().all(|&(_, route)| route == Route::Direct);
 
     if all_direct {
@@ -866,39 +901,227 @@ fn solve_prof(
         }
         let b = budget + b_sum;
         if b <= 0.0 {
-            return prof_hi;
+            return (prof_hi, 0.0);
         }
         let ratio = a_sum / b;
         let prof = ratio * ratio - 1.0;
-        return prof.clamp(prof_lo, prof_hi);
+        return (prof.clamp(prof_lo, prof_hi), 0.0);
     }
 
-    // Mixed routes: Newton's method on total_cost(π) = budget.
-    // Both direct and mint routes provide analytical derivatives via cost_for_route.
-    let mut pi = prof_hi;
-    for _ in 0..NEWTON_ITERS {
-        let mut total_cost = 0.0_f64;
-        let mut total_dcost = 0.0_f64;
+    // Coupled mixed-route solver: 2 unknowns (π, M).
+    // Skip semantics collapse: all non-active pools see the same aggregate sell volume M.
+    let direct_indices: HashSet<usize> = active
+        .iter()
+        .filter(|&&(_, r)| r == Route::Direct)
+        .map(|&(i, _)| i)
+        .collect();
+    let mint_indices: Vec<usize> = active
+        .iter()
+        .filter(|&&(_, r)| r == Route::Mint)
+        .map(|&(i, _)| i)
+        .collect();
 
-        for &(idx, route) in active {
-            if let Some((cost, _, _, dcost)) = cost_for_route(sims, idx, route, pi, skip) {
-                total_cost += cost;
-                total_dcost += dcost;
+    // Pick binding mint target i*: tightest alt-price constraint (fixed for all iterations)
+    let i_star = *mint_indices
+        .iter()
+        .max_by(|&&a, &&b| {
+            let gap_a = sims[a].prediction / (1.0 + prof_hi) - alt_price(sims, a);
+            let gap_b = sims[b].prediction / (1.0 + prof_hi) - alt_price(sims, b);
+            gap_a
+                .partial_cmp(&gap_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap();
+
+    // D* = D ∪ {i*}: outcomes with final price = pred/(1+π)
+    let d_star: HashSet<usize> = direct_indices
+        .iter()
+        .copied()
+        .chain(std::iter::once(i_star))
+        .collect();
+    let pi_star_sum: f64 = d_star.iter().map(|&j| sims[j].prediction).sum();
+    let s0: f64 = sims
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| !d_star.contains(j))
+        .map(|(_, s)| s.price())
+        .sum();
+
+    // Non-active pool parameters: (price, kappa, max_sell)
+    let na: Vec<(f64, f64, f64)> = sims
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| !skip.contains(j))
+        .map(|(_, s)| (s.price(), s.kappa(), s.max_sell_tokens()))
+        .collect();
+
+    // ΔG saturation ceiling
+    let dg_max: f64 = na
+        .iter()
+        .map(|&(p, k, cap)| {
+            let d = 1.0 + k * cap;
+            p * (1.0 - 1.0 / (d * d))
+        })
+        .sum();
+
+    let mut pi = prof_hi;
+    let mut big_m = 0.0_f64;
+
+    for _ in 0..15 {
+        // 1. Direct costs (independent of M; active pool prices unperturbed by mints)
+        let mut d_cost = 0.0_f64;
+        let mut d_dcost = 0.0_f64;
+        for &j in &direct_indices {
+            let tsqrt = (sims[j].prediction / (1.0 + pi)).sqrt();
+            let csqrt = sims[j].price().sqrt();
+            if tsqrt > csqrt {
+                d_cost += sims[j].l_eff() * (tsqrt - csqrt);
+                let t = 1.0 + pi;
+                d_dcost -= sims[j].l_eff() * sims[j].prediction.sqrt() / (2.0 * t * t.sqrt());
             }
         }
 
-        if total_dcost.abs() < 1e-30 {
+        // 2. δ(π) = Π*/(1+π) - (1 - S₀)
+        let delta = pi_star_sum / (1.0 + pi) - (1.0 - s0);
+        let d_delta = -pi_star_sum / ((1.0 + pi) * (1.0 + pi));
+
+        // 3. Solve M(π), compute mint cost and d(cost)/dπ
+        let mut c_mint = 0.0_f64;
+        let mut dc_dpi = 0.0_f64;
+
+        if delta <= 0.0 {
+            big_m = 0.0;
+        } else if delta >= dg_max && dg_max > 0.0 {
+            // Saturated: all non-active pools capped
+            let pi_bound = pi_star_sum / (1.0 - s0 + dg_max) - 1.0;
+            big_m = na.iter().map(|&(_, _, cap)| cap).fold(0.0_f64, f64::max);
+            c_mint = big_m
+                - na.iter()
+                    .map(|&(p, k, cap)| p * cap * FEE_FACTOR / (1.0 + k * cap))
+                    .sum::<f64>();
+            if direct_indices.is_empty() {
+                if c_mint <= budget {
+                    return (pi_bound.clamp(prof_lo, prof_hi), big_m);
+                }
+                // Can't afford saturation — nudge pi above boundary so next
+                // iteration lands in the unsaturated regime with non-zero gradients.
+                pi = pi_bound + 1e-10;
+                continue;
+            }
+            if pi < pi_bound {
+                pi = pi_bound;
+                // Recompute direct costs for updated pi
+                d_cost = 0.0;
+                d_dcost = 0.0;
+                for &j in &direct_indices {
+                    let tsqrt = (sims[j].prediction / (1.0 + pi)).sqrt();
+                    let csqrt = sims[j].price().sqrt();
+                    if tsqrt > csqrt {
+                        d_cost += sims[j].l_eff() * (tsqrt - csqrt);
+                        let t = 1.0 + pi;
+                        d_dcost -=
+                            sims[j].l_eff() * sims[j].prediction.sqrt() / (2.0 * t * t.sqrt());
+                    }
+                }
+            }
+            // dc_dpi = 0 (M doesn't vary with π when saturated)
+        } else {
+            // Inner Newton: solve ΔG(M) = δ
+            let dg0: f64 = na.iter().map(|&(p, k, _)| 2.0 * p * k).sum();
+            big_m = if dg0 > 1e-30 {
+                (delta / dg0).max(0.0)
+            } else {
+                0.0
+            };
+            for _ in 0..8 {
+                let mut dg = 0.0_f64;
+                let mut dgp = 0.0_f64;
+                for &(p, k, cap) in &na {
+                    let me = big_m.min(cap);
+                    let d = 1.0 + k * me;
+                    let d2 = d * d;
+                    dg += p * (1.0 - 1.0 / d2);
+                    if big_m < cap {
+                        dgp += 2.0 * p * k / (d2 * d);
+                    }
+                }
+                if dgp < 1e-30 {
+                    break;
+                }
+                let step = (dg - delta) / dgp;
+                big_m -= step;
+                big_m = big_m.max(0.0);
+                if step.abs() < 1e-10 * (1.0 + big_m) {
+                    break;
+                }
+            }
+
+            // Net cost and derivatives in one pass
+            let mut dgp_final = 0.0_f64;
+            let mut dc_dm = 1.0_f64;
+            c_mint = big_m;
+            for &(p, k, cap) in &na {
+                let me = big_m.min(cap);
+                let d = 1.0 + me * k;
+                c_mint -= p * me * FEE_FACTOR / d;
+                if big_m < cap {
+                    let d2 = d * d;
+                    dgp_final += 2.0 * p * k / (d2 * d);
+                    dc_dm -= FEE_FACTOR * p / d2;
+                }
+            }
+            let dm_dpi = if dgp_final > 1e-30 {
+                d_delta / dgp_final
+            } else {
+                0.0
+            };
+            dc_dpi = dc_dm * dm_dpi;
+        }
+
+        // 4. Newton step on π
+        let total = d_cost + c_mint;
+        let dtotal = d_dcost + dc_dpi;
+        if dtotal.abs() < 1e-30 {
             break;
         }
-        let step = (total_cost - budget) / total_dcost;
-        pi -= step;
-        pi = pi.clamp(prof_lo, prof_hi);
-        if step.abs() < 1e-12 {
+        let step = (total - budget) / dtotal;
+        let pi_new = (pi - step).clamp(prof_lo, prof_hi);
+        if (pi_new - pi).abs() < 1e-12 * (1.0 + pi.abs()) {
             break;
+        }
+        pi = pi_new;
+    }
+
+    // Final M recompute to ensure consistency with returned pi
+    let delta_final = pi_star_sum / (1.0 + pi) - (1.0 - s0);
+    if delta_final <= 0.0 {
+        big_m = 0.0;
+    } else if delta_final >= dg_max && dg_max > 0.0 {
+        big_m = na.iter().map(|&(_, _, cap)| cap).fold(0.0_f64, f64::max);
+    } else {
+        let dg0: f64 = na.iter().map(|&(p, k, _)| 2.0 * p * k).sum();
+        big_m = if dg0 > 1e-30 { (delta_final / dg0).max(0.0) } else { 0.0 };
+        for _ in 0..8 {
+            let mut dg = 0.0_f64;
+            let mut dgp = 0.0_f64;
+            for &(p, k, cap) in &na {
+                let me = big_m.min(cap);
+                let d = 1.0 + k * me;
+                let d2 = d * d;
+                dg += p * (1.0 - 1.0 / d2);
+                if big_m < cap {
+                    dgp += 2.0 * p * k / (d2 * d);
+                }
+            }
+            if dgp < 1e-30 { break; }
+            let step = (dg - delta_final) / dgp;
+            big_m -= step;
+            big_m = big_m.max(0.0);
+            if step.abs() < 1e-10 * (1.0 + big_m) { break; }
         }
     }
 
-    pi
+    (pi, big_m)
 }
 
 #[cfg(test)]

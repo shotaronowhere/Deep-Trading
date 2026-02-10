@@ -132,7 +132,7 @@ g'(m) = Σⱼ { -2×Pⱼ×κⱼ/(1+m×κⱼ)³  if m < Mⱼ,  0  if m ≥ Mⱼ }
 
 Each pool's price contribution freezes at P_limit once m exceeds that pool's sell cap Mⱼ (derivative = 0). Warm-started with the linearized first Newton step: m₀ = (P_target - alt(0)) / (2 × Σ Pⱼκⱼ). Converges reliably in 2-3 iterations.
 
-**Known bug**: When the active set has skip indices, the code's `g(m)` sums only non-skip pools but `rhs = 1 - P_target` assumes all pools. The correct rhs is `(1 - P_target) - Σ_{j∈skip} P⁰_j`. This causes systematic undershoot of m. See [improvements.md](improvements.md) for the exact coupled solver that fixes this.
+**Fixed**: `rhs = (1 - P_target) - Σ_{j∈skip, j≠target} P⁰_j` correctly accounts for skip pool prices frozen at their spot values.
 
 ### Mixed-Route Budget Solver
 
@@ -158,7 +158,9 @@ d(net_cost)/dπ = d(net_cost)/dm × dm/dπ
 
 Both derivatives are computed in the same pass as the cost (no finite differences).
 
-**Known limitation**: The current `solve_prof` treats each mint entry independently, but multiple mints sell into the same non-active pools. By concavity of proceeds, summing individual proceeds overestimates actual proceeds (subadditivity: Σ F_j(m_i) ≥ F_j(M)), causing the solver to undershoot net cost and return an overly aggressive π. See [improvements.md](improvements.md) for the exact coupled solver that computes the aggregate mint volume M jointly.
+**Fixed**: `solve_prof` now uses a coupled (π, M) Newton solver. All non-active pools see aggregate sell volume M (not individual m_i). Inner Newton solves ΔG(M) = δ(π) for M at each outer step. Returns (profitability, aggregate_M). Waterfall executes mints first (M/|Q| per entry), then directs.
+
+**Known approximation**: The binding mint target `i*` (the mint entry whose alt-price constraint is tightest) is selected once at `prof_hi` and held fixed throughout Newton iterations. If the active set contains 2+ mint entries with sufficiently different prediction/spot gaps, the true binding constraint could switch as π moves, causing slightly inaccurate profitability. In practice this is rare (waterfall adds one entry at a time) and the execute-then-check loop prevents budget overshoot.
 
 ## Profitability and Target Price
 
