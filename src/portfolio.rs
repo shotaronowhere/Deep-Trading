@@ -8,7 +8,8 @@ use crate::pools::{
     sqrt_price_x96_to_price_outcome, u256_to_f64, FEE_PIPS, Slot0Result,
 };
 
-const BINARY_SEARCH_ITERS: usize = 20;
+const NEWTON_ITERS: usize = 8;
+const FEE_FACTOR: f64 = 1.0 - (FEE_PIPS as f64 / 1_000_000.0);
 
 /// A rebalancing action to execute.
 #[derive(Debug, Clone)]
@@ -109,10 +110,44 @@ impl PoolSim {
     }
 
     /// Price at a hypothetical sqrt_price.
+    #[cfg(test)]
     fn price_at(&self, sqrt_price: U256) -> f64 {
         sqrt_price_x96_to_price_outcome(sqrt_price, self.is_token1_outcome)
             .map(|p| u256_to_f64(p))
             .unwrap_or(0.0)
+    }
+
+    /// Max tokens sellable before hitting the tick boundary.
+    /// Derived from: new_price = price / (1 + m × κ)², capped at sell_limit_price.
+    fn max_sell_tokens(&self) -> f64 {
+        let k = self.kappa();
+        if k <= 0.0 {
+            return 0.0;
+        }
+        let p = self.price();
+        let lp = sqrt_price_x96_to_price_outcome(self.sqrt_price_sell_limit, self.is_token1_outcome)
+            .map(|p| u256_to_f64(p))
+            .unwrap_or(0.0);
+        if lp <= 0.0 || lp >= p {
+            return 0.0;
+        }
+        ((p / lp).sqrt() - 1.0) / k
+    }
+
+    /// Price sensitivity parameter: κ = (1-fee) × √price × 1e18 / L.
+    /// Relates selling m tokens to new price: new_price = price / (1 + m × κ)².
+    fn kappa(&self) -> f64 {
+        let p = self.price();
+        if p <= 0.0 || self.liquidity == 0 {
+            return 0.0;
+        }
+        FEE_FACTOR * p.sqrt() * 1e18 / (self.liquidity as f64)
+    }
+
+    /// Effective liquidity for cost computation: L_eff = L / (1e18 × (1-fee)).
+    /// cost = L_eff × (√target_price - √current_price).
+    fn l_eff(&self) -> f64 {
+        (self.liquidity as f64) / (1e18 * FEE_FACTOR)
     }
 
     /// Cost to move pool price to target_price via direct buy.
@@ -213,14 +248,20 @@ impl PoolSim {
 }
 
 /// Build PoolSim entries from slot0 results, matching with predictions.
+/// Panics if any outcome has no matching prediction — partial prediction sets are not supported.
 fn build_sims(slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)]) -> Vec<PoolSim> {
     let preds = prediction_map();
     slot0_results
         .iter()
         .filter_map(|(slot0, market)| {
             let key = normalize_market_name(market.name);
-            let &pred = preds.get(&key)?;
-            PoolSim::from_slot0(slot0, market, pred)
+            let pred = preds.get(&key).unwrap_or_else(|| {
+                panic!(
+                    "No prediction for market '{}'. All tradeable outcomes must have predictions.",
+                    market.name
+                )
+            });
+            PoolSim::from_slot0(slot0, market, *pred)
         })
         .collect()
 }
@@ -232,27 +273,6 @@ fn alt_price(sims: &[PoolSim], idx: usize) -> f64 {
         .enumerate()
         .filter(|(i, _)| *i != idx)
         .map(|(_, s)| s.price())
-        .sum();
-    1.0 - others_sum
-}
-
-/// Compute alt price after hypothetically selling `amount` of each non-target outcome.
-/// Returns the marginal alt cost at that mint quantity.
-fn alt_price_after_mint(sims: &[PoolSim], target_idx: usize, mint_amount: f64, skip: &HashSet<usize>) -> f64 {
-    let others_sum: f64 = sims
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != target_idx)
-        .map(|(i, sim)| {
-            if mint_amount <= 0.0 || skip.contains(&i) {
-                return sim.price();
-            }
-            // Price after selling mint_amount tokens from this pool
-            match sim.sell_exact(mint_amount) {
-                Some((_, _, new_sqrt)) => sim.price_at(new_sqrt),
-                None => sim.price(),
-            }
-        })
         .sum();
     1.0 - others_sum
 }
@@ -285,71 +305,122 @@ fn direct_cost_to_prof(sim: &PoolSim, target_prof: f64) -> Option<(f64, f64, U25
 }
 
 /// For the mint route, compute cost to bring an outcome's profitability to `target_prof`.
-/// Binary searches for the mint amount where marginal alt cost = target price.
-/// `missing_pred_sum`: expected value of unsellable outcomes (basket bonus per unit minted).
-/// Returns (net_cost, mint_amount).
+/// Uses Newton's method to find mint amount where alt price = target price.
+/// Returns (net_cost, mint_amount, d_net_cost_d_pi).
 fn mint_cost_to_prof(
     sims: &[PoolSim],
     target_idx: usize,
     target_prof: f64,
-    missing_pred_sum: f64,
     skip: &HashSet<usize>,
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, f64)> {
     let tp = target_price_for_prof(sims[target_idx].prediction, target_prof);
-    // Adjusted target: the alt price (before basket bonus) that corresponds to target_prof
-    let tp_adjusted = tp + missing_pred_sum;
     let current_alt = alt_price(sims, target_idx);
-    if current_alt >= tp_adjusted {
-        return Some((0.0, 0.0));
+    if current_alt >= tp {
+        return Some((0.0, 0.0, 0.0));
     }
 
-    // Binary search: find mint_amount where marginal alt cost = adjusted target price
-    let mut lo = 0.0_f64;
-    let mut hi = 1e24_f64;
+    // Newton's method: solve g(m) = 1 - target where g(m) = Σⱼ pⱼ/(1+m×κⱼ)²
+    // g'(m) = Σⱼ -2×pⱼ×κⱼ/(1+m×κⱼ)³
+    let rhs = 1.0 - tp;
 
-    for _ in 0..BINARY_SEARCH_ITERS {
-        let mid = (lo + hi) / 2.0;
-        let mac = alt_price_after_mint(sims, target_idx, mid, skip);
-        if mac < tp_adjusted {
-            lo = mid; // alt price too low, need more minting
-        } else {
-            hi = mid; // alt price at/above target, need less minting
-        }
-    }
-
-    let amount = lo;
-    if amount < 1e-18 {
-        return Some((0.0, 0.0));
-    }
-
-    // Net cost = mint_cost - sell_proceeds (actual cash outflow).
-    // Basket bonus is already captured by tp_adjusted reducing the mint amount.
-    let total_proceeds: f64 = sims
+    // Precompute per-pool parameters: (price, kappa, max_sell_tokens)
+    let params: Vec<(f64, f64, f64)> = sims
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != target_idx && !skip.contains(i))
-        .filter_map(|(_, sim)| sim.sell_exact(amount).map(|(_, proceeds, _)| proceeds))
-        .sum();
-    let net_cost = amount - total_proceeds;
+        .map(|(_, sim)| (sim.price(), sim.kappa(), sim.max_sell_tokens()))
+        .collect();
 
-    Some((net_cost, amount))
+    // Warm start: first Newton step from m=0 gives m = (g(0) - rhs) / (-g'(0))
+    // = (tp - current_alt) / (2 × Σ Pⱼκⱼ), saving one iteration.
+    let sum_pk: f64 = params.iter().map(|&(p, k, _)| p * k).sum();
+    let mut m = if sum_pk > 1e-30 {
+        ((tp - current_alt) / (2.0 * sum_pk)).max(0.0)
+    } else {
+        0.0
+    };
+    for _ in 0..NEWTON_ITERS {
+        let mut g = 0.0_f64;
+        let mut gp = 0.0_f64;
+        for &(p, k, cap) in &params {
+            let me = m.min(cap);
+            let d = 1.0 + me * k;
+            let d2 = d * d;
+            g += p / d2;
+            if m < cap {
+                let d3 = d2 * d;
+                gp += -2.0 * p * k / d3;
+            }
+        }
+        if gp.abs() < 1e-30 {
+            break;
+        }
+        let step = (g - rhs) / gp;
+        m -= step;
+        if m < 0.0 {
+            m = 0.0;
+        }
+        if step.abs() < 1e-12 {
+            break;
+        }
+    }
+
+    if m < 1e-18 {
+        return None;
+    }
+
+    // Net cost and analytical derivative in one pass.
+    // d(net_cost)/dπ = d(net_cost)/dm × dm/dπ
+    // dm/dπ = P_target / ((1+π) × g'(m))  [implicit function theorem]
+    // d(net_cost)/dm = 1 - (1-f) × Σⱼ∈uncapped Pⱼ(m)
+    let mut sum_marginal = 0.0_f64;
+    let mut gp_final = 0.0_f64;
+    let total_proceeds: f64 = params
+        .iter()
+        .map(|&(p, k, cap)| {
+            let me = m.min(cap);
+            let d = 1.0 + me * k;
+            if m < cap {
+                let d2 = d * d;
+                let d3 = d2 * d;
+                sum_marginal += p / d2;
+                gp_final += -2.0 * p * k / d3;
+            }
+            p * me * FEE_FACTOR / d
+        })
+        .sum();
+    let net_cost = m - total_proceeds;
+
+    let d_cost_d_pi = if gp_final.abs() > 1e-30 {
+        let dm_d_pi = tp / ((1.0 + target_prof) * gp_final);
+        let d_cost_d_m = 1.0 - FEE_FACTOR * sum_marginal;
+        d_cost_d_m * dm_d_pi
+    } else {
+        0.0
+    };
+
+    Some((net_cost, m, d_cost_d_pi))
 }
 
 /// Compute cost to reach target_prof for a given outcome via a specific route.
-/// Returns (cost, amount, Option<new_sqrt_for_direct>).
+/// Returns (cost, amount, Option<new_sqrt_for_direct>, d_cost_d_pi).
 fn cost_for_route(
     sims: &[PoolSim],
     idx: usize,
     route: Route,
     target_prof: f64,
-    missing_pred_sum: f64,
     skip: &HashSet<usize>,
-) -> Option<(f64, f64, Option<U256>)> {
+) -> Option<(f64, f64, Option<U256>, f64)> {
     match route {
-        Route::Direct => direct_cost_to_prof(&sims[idx], target_prof)
-            .map(|(cost, amount, sqrt)| (cost, amount, Some(sqrt))),
-        Route::Mint => mint_cost_to_prof(sims, idx, target_prof, missing_pred_sum, skip)
-            .map(|(cost, amount)| (cost, amount, None)),
+        Route::Direct => direct_cost_to_prof(&sims[idx], target_prof).map(|(cost, amount, sqrt)| {
+            let l = sims[idx].l_eff();
+            let pred = sims[idx].prediction;
+            let t = 1.0 + target_prof;
+            let dcost = -l * pred.sqrt() / (2.0 * t * t.sqrt());
+            (cost, amount, Some(sqrt), dcost)
+        }),
+        Route::Mint => mint_cost_to_prof(sims, idx, target_prof, skip)
+            .map(|(cost, amount, dcost)| (cost, amount, None, dcost)),
     }
 }
 
@@ -359,16 +430,7 @@ fn active_skip_indices(active: &[(usize, Route)]) -> HashSet<usize> {
 }
 
 fn lookup_balance(balances: &HashMap<&str, f64>, market_name: &str) -> f64 {
-    if let Some(&v) = balances.get(market_name) {
-        return v;
-    }
-    let lower = market_name.to_lowercase();
-    for (&k, &v) in balances {
-        if k.to_lowercase() == lower {
-            return v;
-        }
-    }
-    0.0
+    balances.get(market_name).copied().unwrap_or(0.0)
 }
 
 /// Emit mint actions: mint on both contracts, sell all non-target outcomes.
@@ -436,24 +498,8 @@ pub fn rebalance(
     }
 
     // Mint route requires all tradeable outcomes to have liquid pools.
-    // sims only contains outcomes with non-zero liquidity and matching predictions.
+    // sims may be smaller than slot0_results if some pools have zero liquidity.
     let mint_available = sims.len() == slot0_results.len();
-
-    // Sum of predictions for outcomes not in sims (basket bonus for partial mint).
-    let missing_pred_sum: f64 = if mint_available {
-        0.0
-    } else {
-        let sim_names: std::collections::HashSet<String> = sims
-            .iter()
-            .map(|s| normalize_market_name(s.market_name))
-            .collect();
-        let preds = prediction_map();
-        preds
-            .iter()
-            .filter(|(name, _)| !sim_names.contains(name.as_str()))
-            .map(|(_, &pred)| pred)
-            .sum()
-    };
 
     // Track holdings changes during simulation
     let mut sim_balances: HashMap<&str, f64> = HashMap::new();
@@ -505,7 +551,7 @@ pub fn rebalance(
 
     // ── Phase 2: Waterfall allocation ──
     let actions_before = actions.len();
-    let last_bought_prof = waterfall(&mut sims, &mut budget, &mut actions, mint_available, missing_pred_sum);
+    let last_bought_prof = waterfall(&mut sims, &mut budget, &mut actions, mint_available);
 
     // Update sim_balances with positions acquired during waterfall.
     // Mint gives `amount` of every outcome; subsequent Sells reduce non-targets.
@@ -589,7 +635,7 @@ pub fn rebalance(
 
         // Reallocate recovered capital via waterfall
         if budget > 0.0 {
-            waterfall(&mut sims, &mut budget, &mut actions, mint_available, missing_pred_sum);
+            waterfall(&mut sims, &mut budget, &mut actions, mint_available);
         }
     }
 
@@ -606,7 +652,6 @@ fn waterfall(
     budget: &mut f64,
     actions: &mut Vec<Action>,
     mint_available: bool,
-    missing_pred_sum: f64,
 ) -> f64 {
     if *budget <= 0.0 {
         return 0.0;
@@ -624,15 +669,6 @@ fn waterfall(
             let mint_price = alt_price(sims, i);
             if mint_price > 0.0 {
                 let mint_prof = profitability(sim.prediction, mint_price);
-                if mint_prof > 0.0 {
-                    ranked.push((i, Route::Mint, mint_prof));
-                }
-            }
-        } else if missing_pred_sum > 0.0 {
-            let alt = alt_price(sims, i);
-            let adjusted = alt - missing_pred_sum;
-            if adjusted > 0.0 {
-                let mint_prof = profitability(sim.prediction, adjusted);
                 if mint_prof > 0.0 {
                     ranked.push((i, Route::Mint, mint_prof));
                 }
@@ -669,8 +705,8 @@ fn waterfall(
         let mut any_failed = false;
 
         for &(idx, route) in &active {
-            match cost_for_route(sims, idx, route, target_prof, missing_pred_sum, &skip) {
-                Some((cost, _, _)) => {
+            match cost_for_route(sims, idx, route, target_prof, &skip) {
+                Some((cost, _, _, _)) => {
                     total_cost += cost;
                 }
                 None => {
@@ -683,7 +719,7 @@ fn waterfall(
         if any_failed {
             // Remove entries that can't be computed, try again
             let snap_skip = active_skip_indices(&active);
-            active.retain(|&(idx, route)| cost_for_route(sims, idx, route, target_prof, missing_pred_sum, &snap_skip).is_some());
+            active.retain(|&(idx, route)| cost_for_route(sims, idx, route, target_prof, &snap_skip).is_some());
             if active.is_empty() {
                 break;
             }
@@ -699,8 +735,8 @@ fn waterfall(
             let mut any_skipped = false;
             let skip = active_skip_indices(&active);
             for &(idx, route) in &active {
-                if let Some((cost, amount, new_sqrt)) =
-                    cost_for_route(sims, idx, route, target_prof, missing_pred_sum, &skip)
+                if let Some((cost, amount, new_sqrt, _)) =
+                    cost_for_route(sims, idx, route, target_prof, &skip)
                 {
                     if cost > *budget {
                         any_skipped = true;
@@ -729,12 +765,12 @@ fn waterfall(
         } else {
             // Can't afford full step. Binary search for achievable profitability.
             let skip = active_skip_indices(&active);
-            let achievable = binary_search_prof(sims, &active, current_prof, target_prof, *budget, missing_pred_sum, &skip);
+            let achievable = solve_prof(sims, &active, current_prof, target_prof, *budget, &skip);
 
             // Compute costs at achievable level
             for &(idx, route) in &active {
-                if let Some((cost, amount, new_sqrt)) =
-                    cost_for_route(sims, idx, route, achievable, missing_pred_sum, &skip)
+                if let Some((cost, amount, new_sqrt, _)) =
+                    cost_for_route(sims, idx, route, achievable, &skip)
                 {
                     if cost > *budget {
                         continue;
@@ -789,34 +825,64 @@ fn execute_buy(
     }
 }
 
-/// Binary search for the lowest profitability level affordable with the budget.
-fn binary_search_prof(
+/// Find the lowest profitability level affordable with the budget.
+/// Uses closed-form solution when all active entries are Direct route,
+/// otherwise Newton's method with analytical gradients for both routes.
+fn solve_prof(
     sims: &[PoolSim],
     active: &[(usize, Route)],
     prof_hi: f64,
     prof_lo: f64,
     budget: f64,
-    missing_pred_sum: f64,
     skip: &HashSet<usize>,
 ) -> f64 {
-    let mut lo = prof_lo; // most buying (expensive)
-    let mut hi = prof_hi; // least buying (cheap, ~0 cost)
+    let all_direct = active.iter().all(|&(_, route)| route == Route::Direct);
 
-    for _ in 0..BINARY_SEARCH_ITERS {
-        let mid = (lo + hi) / 2.0;
-        let total: f64 = active
-            .iter()
-            .filter_map(|&(idx, route)| cost_for_route(sims, idx, route, mid, missing_pred_sum, skip).map(|(c, _, _)| c))
-            .sum();
+    if all_direct {
+        // Closed form: π = (A/B)² - 1
+        let mut a_sum = 0.0_f64;
+        let mut b_sum = 0.0_f64;
+        for &(idx, _) in active {
+            let l = sims[idx].l_eff();
+            let p = sims[idx].price();
+            a_sum += l * sims[idx].prediction.sqrt();
+            b_sum += l * p.sqrt();
+        }
+        let b = budget + b_sum;
+        if b <= 0.0 {
+            return prof_hi;
+        }
+        let ratio = a_sum / b;
+        let prof = ratio * ratio - 1.0;
+        return prof.clamp(prof_lo, prof_hi);
+    }
 
-        if total <= budget {
-            hi = mid; // can afford, try lower prof (more buying)
-        } else {
-            lo = mid; // too expensive
+    // Mixed routes: Newton's method on total_cost(π) = budget.
+    // Both direct and mint routes provide analytical derivatives via cost_for_route.
+    let mut pi = prof_hi;
+    for _ in 0..NEWTON_ITERS {
+        let mut total_cost = 0.0_f64;
+        let mut total_dcost = 0.0_f64;
+
+        for &(idx, route) in active {
+            if let Some((cost, _, _, dcost)) = cost_for_route(sims, idx, route, pi, skip) {
+                total_cost += cost;
+                total_dcost += dcost;
+            }
+        }
+
+        if total_dcost.abs() < 1e-30 {
+            break;
+        }
+        let step = (total_cost - budget) / total_dcost;
+        pi -= step;
+        pi = pi.clamp(prof_lo, prof_hi);
+        if step.abs() < 1e-12 {
+            break;
         }
     }
 
-    hi
+    pi
 }
 
 #[cfg(test)]
@@ -999,7 +1065,7 @@ mod tests {
         let mut budget = 1000.0;
         let mut actions = Vec::new();
 
-        waterfall(&mut sims, &mut budget, &mut actions, false, 0.0);
+        waterfall(&mut sims, &mut budget, &mut actions, false);
 
         // Should have buy actions
         let buys: Vec<_> = actions
@@ -1026,7 +1092,7 @@ mod tests {
         let mut budget = 100.0;
         let mut actions = Vec::new();
 
-        waterfall(&mut sims, &mut budget, &mut actions, false, 0.0);
+        waterfall(&mut sims, &mut budget, &mut actions, false);
 
         assert!(actions.is_empty(), "no actions when everything overpriced");
         assert!(
@@ -1047,7 +1113,7 @@ mod tests {
         let mut budget = 0.001; // tiny budget
         let mut actions = Vec::new();
 
-        waterfall(&mut sims, &mut budget, &mut actions, false, 0.0);
+        waterfall(&mut sims, &mut budget, &mut actions, false);
 
         // Should have a buy but budget should be nearly exhausted
         let buys: Vec<_> = actions
