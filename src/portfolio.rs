@@ -51,7 +51,6 @@ pub enum Action {
 /// All arithmetic is pure f64 — no U256 in the hot path.
 struct PoolSim {
     market_name: &'static str,
-    #[allow(dead_code)]
     market_id: &'static str,
     #[allow(dead_code)]
     outcome_token: &'static str,
@@ -438,7 +437,7 @@ fn lookup_balance(balances: &HashMap<&str, f64>, market_name: &str) -> f64 {
 }
 
 /// Emit mint actions: mint on both contracts, sell all non-target outcomes.
-/// Contract addresses are derived from the distinct market_ids in MARKETS_L1.
+/// Contract addresses are derived from the distinct market_ids in sims.
 fn emit_mint_actions(
     sims: &mut [PoolSim],
     target_idx: usize,
@@ -446,11 +445,7 @@ fn emit_mint_actions(
     actions: &mut Vec<Action>,
     skip: &HashSet<usize>,
 ) -> f64 {
-    // Derive contract addresses from MARKETS_L1 (not sims, which may be partial).
-    let mut contracts: Vec<&'static str> = crate::markets::MARKETS_L1
-        .iter()
-        .map(|m| m.market_id)
-        .collect();
+    let mut contracts: Vec<&'static str> = sims.iter().map(|s| s.market_id).collect();
     contracts.sort();
     contracts.dedup();
     actions.push(Action::Mint {
@@ -559,10 +554,7 @@ fn execute_merge_sell(
     }
 
     // Merge complete sets
-    let mut contracts: Vec<&'static str> = crate::markets::MARKETS_L1
-        .iter()
-        .map(|m| m.market_id)
-        .collect();
+    let mut contracts: Vec<&'static str> = sims.iter().map(|s| s.market_id).collect();
     contracts.sort();
     contracts.dedup();
     actions.push(Action::Merge {
@@ -605,9 +597,9 @@ pub fn rebalance(
         return actions;
     }
 
-    // Mint route requires all tradeable outcomes to have liquid pools.
-    // sims may be smaller than slot0_results if some pools have zero liquidity.
-    let mint_available = sims.len() == slot0_results.len();
+    // Mint/merge routes require all tradeable outcomes to have liquid pools.
+    // sims may be smaller if pools have zero liquidity or slot0_results is partial (RPC failures).
+    let mint_available = sims.len() == crate::predictions::PREDICTIONS_L1.len();
 
     // Track holdings changes during simulation
     let mut sim_balances: HashMap<&str, f64> = HashMap::new();

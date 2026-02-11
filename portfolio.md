@@ -19,6 +19,7 @@ pub fn rebalance(
 ```rust
 enum Action {
     Mint { contract_1, contract_2, amount, target_market },  // Mint across both L1 contracts
+    Merge { contract_1, contract_2, amount, source_market }, // Buy others + merge to sell
     Buy { market_name, amount, cost },                       // Buy outcome tokens from pool
     Sell { market_name, amount, proceeds },                  // Sell outcome tokens for sUSD
     FlashLoan { amount },                                    // Borrow sUSD to fund minting
@@ -26,14 +27,15 @@ enum Action {
 }
 ```
 
-Mint routes are wrapped in flash loans: `FlashLoan → Mint → Sell(others) → RepayFlashLoan`. This decouples the mint's upfront capital requirement from the portfolio's liquid budget — only the net cost (mint cost minus sell proceeds) is deducted from the budget.
+Mint routes are wrapped in flash loans: `FlashLoan → Mint → Sell(others) → RepayFlashLoan`. Merge routes are similarly wrapped: `FlashLoan → Buy(all others) → Merge → RepayFlashLoan`. Both decouple the upfront capital requirement from the portfolio's liquid budget.
 
 ## Algorithm
 
 ### Phase 1: Sell overpriced holdings
 For each outcome where market_price > prediction and we hold tokens:
-- Simulate selling via `compute_swap_step` until price reaches prediction, or sell all holdings if insufficient to reach it.
-- Exact proceeds computed from swap simulation (not mid-price).
+- Compare two sell routes: **direct sell** (sell into pool) vs **merge sell** (buy all other outcomes + merge complete sets for 1 sUSD each). Use whichever yields higher total proceeds.
+- Merge capacity is limited by the minimum `max_buy_tokens()` across all non-source pools. If merge handles fewer tokens than the sell amount, the remainder is direct-sold.
+- Merge route only available when `mint_available` (all pools present).
 - Pool state (`sqrt_price_x96`) updated after each sell for subsequent calculations.
 
 ### Phase 2: Waterfall allocation
@@ -46,8 +48,8 @@ Each outcome has up to two acquisition routes, each with its own price and profi
 - **Mint** (when all outcomes have liquid pools): price = `1 - sum(other_outcome_prices)`. Profitability = `(prediction - mint_price) / mint_price`.
 
 Route availability:
-- `mint_available = sims.len() == slot0_results.len()` — true when every tradeable outcome has a non-zero-liquidity pool
-- When `mint_available`: mint route competes with direct
+- `mint_available = sims.len() == PREDICTIONS_L1.len()` — true when every tradeable outcome (98) has a non-zero-liquidity pool
+- When `mint_available`: mint route competes with direct; merge sell route competes with direct sell
 - Partial prediction sets are not supported — `build_sims` panics if any outcome is missing a prediction
 
 #### Dual-route waterfall
@@ -104,13 +106,13 @@ Outer Newton on π (up to 15 iterations), inner Newton on M (2-3 iterations per 
 - Per-action budget guard skips actions where cost exceeds remaining budget. Negative costs (arbitrage) are executed — they increase the budget and update pool states. If any outcome is skipped during a step (recomputed cost diverged from estimate), the waterfall breaks early and `last_prof` is set to `current_prof` (the level actually achieved), not the target. This prevents Phase 3 from using a stale profitability threshold.
 - **Prune loop:** when entries fail cost computation (e.g. tick boundary hit), the active set is pruned in a loop that re-derives the skip set after each removal, so remaining entries always see a consistent skip set.
 - **Iteration cap:** the waterfall loop is bounded by `MAX_WATERFALL_ITERS` (1000) to prevent infinite cycling from negative-cost arbitrage that grows the budget.
-- `sim_balances` is updated after waterfall by processing all three action types: `Mint` adds `amount` to all outcomes (complete sets), `Sell` subtracts sold amount, `Buy` adds directly. This correctly tracks residual unsold tokens when partial sells hit tick boundaries.
+- `sim_balances` is updated after waterfall by processing all four action types: `Mint` adds `amount` to all outcomes (complete sets), `Merge` subtracts `amount` from all outcomes, `Sell` subtracts sold amount, `Buy` adds directly. This correctly tracks residual unsold tokens when partial sells hit tick boundaries.
 - `skip` in mint sell legs uses the set of all active outcome **indices** (not route-specific). If outcome A is active via both direct and mint, its index appears once in `skip` — preventing sell-then-rebuy regardless of which route triggered the mint.
 
 ### Phase 3: Post-allocation liquidation
 After the waterfall:
 1. Check all held outcomes' profitability against the last profitability level reached. Profitability is computed using the **direct pool price** (`sims[i].price()`), not `best_route` — because a held token's value is its exit price (what you'd receive selling into the pool), not its acquisition price. The mint route price is irrelevant for valuing existing holdings since you can't "un-mint" a single token.
-2. For holdings with profitability below that level (lowest first), sell only enough to raise profitability to match `last_bought_prof` (avoids round-trip churn from full liquidation)
+2. For holdings with profitability below that level (lowest first), sell only enough to raise profitability to match `last_bought_prof` (avoids round-trip churn from full liquidation). Compare direct vs merge sell routes (same logic as Phase 1) and use the higher-proceeds path.
 3. Reallocate recovered capital via another waterfall pass
 
 ## Two Market Contracts
@@ -119,7 +121,7 @@ L1 has 2 contracts (67 + 33 outcomes). Minting a complete set requires:
 1. Mint on contract 1 (costs 1 sUSD) → produces 67 tokens including "other repos"
 2. Use "other repos" token as collateral to mint on contract 2 → produces 33 tokens
 
-When using the mint route, `Action::Mint` encodes both contracts (derived from distinct `market_id` values in `MARKETS_L1`), and sell actions are emitted for non-target, non-active outcomes across both contracts. During waterfall allocation, outcomes currently being acquired (the "active" set) are skipped in mint sell legs to avoid wasteful sell-then-rebuy cycles.
+When using the mint route, `Action::Mint` encodes both contracts (derived from distinct `market_id` values in the `sims` array), and sell actions are emitted for non-target, non-active outcomes across both contracts. `Action::Merge` similarly derives contracts from `sims`. During waterfall allocation, outcomes currently being acquired (the "active" set) are skipped in mint sell legs to avoid wasteful sell-then-rebuy cycles.
 
 ## Pool Simulation (`PoolSim`)
 
@@ -127,6 +129,16 @@ Each outcome's pool state is tracked mutably during the rebalance:
 - `sqrt_price_x96`: updated after each simulated trade
 - Swap direction determined by token ordering (`zero_for_one_buy`)
 - Tick boundary clamping ensures trades stay within the pool's liquidity range
+
+### Sell-side methods
+- `kappa()`: κ = (1-f) × √price × 1e18 / L — price sensitivity for selling
+- `max_sell_tokens()`: max sellable before tick boundary — (√(price/limit_price) - 1) / κ
+- `sell_proceeds(m)`: proceeds = price × m × (1-f) / (1 + mκ)
+
+### Buy-side methods
+- `lambda()`: λ = √price × 1e18 / L — price sensitivity for buying (dual of κ)
+- `max_buy_tokens()`: max buyable before tick boundary — (1 - √(price/buy_limit_price)) / λ
+- `buy_exact(amount)`: returns (actual, cost, new_price). Cost = m × price / ((1-f)(1-mλ)). Price after buying: P/(1-mλ)²
 
 ## Balance Reading & Caching
 
@@ -171,6 +183,9 @@ for action in &actions {
     match action {
         Action::Mint { amount, target_market, .. } => {
             println!("MINT {} sets for {}", amount, target_market)
+        }
+        Action::Merge { amount, source_market, .. } => {
+            println!("MERGE {} sets from {}", amount, source_market)
         }
         Action::Buy { market_name, amount, cost } => {
             println!("BUY {} {} (cost: {})", amount, market_name, cost)
