@@ -33,6 +33,14 @@ pub enum Action {
         amount: f64,
         proceeds: f64,
     },
+    /// Merge (burn) complete sets across both L1 contracts to recover sUSD.
+    /// Reverse of Mint: buy all other outcomes, merge into complete set, get sUSD back.
+    Merge {
+        contract_1: &'static str,
+        contract_2: &'static str,
+        amount: f64,
+        source_market: &'static str,
+    },
     /// Borrow sUSD via flash loan to fund minting.
     FlashLoan { amount: f64 },
     /// Repay flash loan after selling minted tokens.
@@ -129,12 +137,56 @@ impl PoolSim {
         ((self.price / lp).sqrt() - 1.0) / k
     }
 
-    /// Price sensitivity: κ = (1-fee) × √price × 1e18 / L.
+    /// Price sensitivity for selling: κ = (1-fee) × √price × 1e18 / L.
     fn kappa(&self) -> f64 {
         if self.price <= 0.0 || self.liquidity == 0 {
             return 0.0;
         }
         FEE_FACTOR * self.price.sqrt() * 1e18 / (self.liquidity as f64)
+    }
+
+    /// Price sensitivity for buying: λ = √price × 1e18 / L.
+    fn lambda(&self) -> f64 {
+        if self.price <= 0.0 || self.liquidity == 0 {
+            return 0.0;
+        }
+        self.price.sqrt() * 1e18 / (self.liquidity as f64)
+    }
+
+    /// Max tokens buyable before hitting the tick boundary.
+    fn max_buy_tokens(&self) -> f64 {
+        let lam = self.lambda();
+        if lam <= 0.0 {
+            return 0.0;
+        }
+        let blp = self.buy_limit_price;
+        if blp <= self.price {
+            return 0.0;
+        }
+        (1.0 - (self.price / blp).sqrt()) / lam
+    }
+
+    /// Buy exact amount of outcome tokens.
+    /// Returns (tokens_actually_bought, quote_cost, new_price).
+    /// Price after buying m: P(m) = P₀ / (1 - mλ)²
+    /// Cost: m × P₀ / ((1-fee) × (1 - mλ))
+    fn buy_exact(&self, amount: f64) -> Option<(f64, f64, f64)> {
+        if amount <= 0.0 {
+            return Some((0.0, 0.0, self.price));
+        }
+        let lam = self.lambda();
+        let max_buy = self.max_buy_tokens();
+        let actual = amount.min(max_buy);
+        if actual <= 0.0 {
+            return Some((0.0, 0.0, self.price));
+        }
+        let d = 1.0 - actual * lam;
+        if d <= 0.0 {
+            return None;
+        }
+        let new_price = self.price / (d * d);
+        let cost = actual * self.price / (FEE_FACTOR * d);
+        Some((actual, cost, new_price))
     }
 
     /// Effective liquidity: L_eff = L / (1e18 × (1-fee)).
@@ -429,6 +481,110 @@ fn emit_mint_actions(
     total_proceeds
 }
 
+/// Compute merge sell proceeds without modifying state (dry run).
+/// Merge route: buy all other outcomes, merge complete sets, get sUSD back.
+/// Returns (net_proceeds, actual_merge_amount).
+fn merge_sell_proceeds(sims: &[PoolSim], source_idx: usize, amount: f64) -> (f64, f64) {
+    let merge_cap: f64 = sims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != source_idx)
+        .map(|(_, s)| s.max_buy_tokens())
+        .fold(f64::INFINITY, f64::min);
+
+    let actual = amount.min(merge_cap);
+    if actual <= 0.0 {
+        return (0.0, 0.0);
+    }
+
+    let total_buy_cost: f64 = sims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != source_idx)
+        .map(|(_, s)| s.buy_exact(actual).map(|(_, cost, _)| cost).unwrap_or(f64::MAX))
+        .sum();
+
+    (actual - total_buy_cost, actual)
+}
+
+/// Execute a merge sell: buy all other outcomes, merge complete sets, recover sUSD.
+/// Updates pool states, emits actions, updates budget.
+/// Returns the actual amount merged (tokens consumed from source holding).
+fn execute_merge_sell(
+    sims: &mut [PoolSim],
+    source_idx: usize,
+    amount: f64,
+    actions: &mut Vec<Action>,
+    budget: &mut f64,
+) -> f64 {
+    let merge_cap: f64 = sims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != source_idx)
+        .map(|(_, s)| s.max_buy_tokens())
+        .fold(f64::INFINITY, f64::min);
+
+    let actual = amount.min(merge_cap);
+    if actual <= 0.0 {
+        return 0.0;
+    }
+
+    // Pre-compute total buy cost for flash loan amount
+    let total_buy_cost: f64 = sims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != source_idx)
+        .map(|(_, s)| s.buy_exact(actual).map(|(_, cost, _)| cost).unwrap_or(0.0))
+        .sum();
+
+    actions.push(Action::FlashLoan {
+        amount: total_buy_cost,
+    });
+
+    // Buy all other outcomes, update pool states
+    for i in 0..sims.len() {
+        if i == source_idx {
+            continue;
+        }
+        if let Some((bought, cost, new_price)) = sims[i].buy_exact(actual) {
+            if bought > 0.0 {
+                sims[i].price = new_price;
+                actions.push(Action::Buy {
+                    market_name: sims[i].market_name,
+                    amount: bought,
+                    cost,
+                });
+            }
+        }
+    }
+
+    // Merge complete sets
+    let mut contracts: Vec<&'static str> = crate::markets::MARKETS_L1
+        .iter()
+        .map(|m| m.market_id)
+        .collect();
+    contracts.sort();
+    contracts.dedup();
+    actions.push(Action::Merge {
+        contract_1: contracts[0],
+        contract_2: if contracts.len() > 1 {
+            contracts[1]
+        } else {
+            contracts[0]
+        },
+        amount: actual,
+        source_market: sims[source_idx].market_name,
+    });
+
+    actions.push(Action::RepayFlashLoan {
+        amount: total_buy_cost,
+    });
+
+    // Net proceeds: merge returns `actual` sUSD, minus buy costs
+    *budget += actual - total_buy_cost;
+    actual
+}
+
 /// Computes optimal rebalancing trades for L1 markets.
 ///
 /// 1. Sell overpriced holdings (price > prediction) via swap simulation
@@ -475,29 +631,67 @@ pub fn rebalance(
             .sell_to_price(sims[i].prediction)
             .unwrap_or((0.0, 0.0, sims[i].price));
 
-        if tokens_needed > 0.0 && tokens_needed <= held {
-            sims[i].price = price_at_pred;
-            budget += proceeds_to_pred;
-            *sim_balances.get_mut(sims[i].market_name).unwrap() -= tokens_needed;
+        // Determine sell amount and direct proceeds
+        let (sell_amount, direct_proceeds, direct_new_price) =
+            if tokens_needed > 0.0 && tokens_needed <= held {
+                (tokens_needed, proceeds_to_pred, price_at_pred)
+            } else {
+                let (sold, proceeds, np) = sims[i]
+                    .sell_exact(held)
+                    .unwrap_or((0.0, 0.0, sims[i].price));
+                (sold, proceeds, np)
+            };
+
+        if sell_amount <= 0.0 {
+            continue;
+        }
+
+        // Compare total proceeds: merge path (merge + direct remainder) vs all-direct
+        let use_merge = if mint_available {
+            let (merge_net, merge_actual) = merge_sell_proceeds(&sims, i, sell_amount);
+            if merge_actual > 0.0 {
+                let remainder = sell_amount - merge_actual;
+                let remainder_proceeds = if remainder > 1e-18 {
+                    sims[i].sell_exact(remainder).map(|(_, p, _)| p).unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                (merge_net + remainder_proceeds) > direct_proceeds
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if use_merge {
+            let merged = execute_merge_sell(&mut sims, i, sell_amount, &mut actions, &mut budget);
+            *sim_balances.get_mut(sims[i].market_name).unwrap() -= merged;
+            // Direct-sell any remainder that couldn't be merged (capacity-limited)
+            let remainder = sell_amount - merged;
+            if remainder > 1e-18 {
+                if let Some((sold, proceeds, new_price)) = sims[i].sell_exact(remainder) {
+                    if sold > 0.0 {
+                        sims[i].price = new_price;
+                        budget += proceeds;
+                        *sim_balances.get_mut(sims[i].market_name).unwrap() -= sold;
+                        actions.push(Action::Sell {
+                            market_name: sims[i].market_name,
+                            amount: sold,
+                            proceeds,
+                        });
+                    }
+                }
+            }
+        } else {
+            sims[i].price = direct_new_price;
+            budget += direct_proceeds;
+            *sim_balances.get_mut(sims[i].market_name).unwrap() -= sell_amount;
             actions.push(Action::Sell {
                 market_name: sims[i].market_name,
-                amount: tokens_needed,
-                proceeds: proceeds_to_pred,
+                amount: sell_amount,
+                proceeds: direct_proceeds,
             });
-        } else if held > 0.0 {
-            let (sold, proceeds, new_price) = sims[i]
-                .sell_exact(held)
-                .unwrap_or((0.0, 0.0, sims[i].price));
-            if sold > 0.0 {
-                sims[i].price = new_price;
-                budget += proceeds;
-                *sim_balances.get_mut(sims[i].market_name).unwrap() -= sold;
-                actions.push(Action::Sell {
-                    market_name: sims[i].market_name,
-                    amount: sold,
-                    proceeds,
-                });
-            }
         }
     }
 
@@ -520,6 +714,11 @@ pub fn rebalance(
             }
             Action::Sell { market_name, amount, .. } => {
                 *sim_balances.entry(market_name).or_insert(0.0) -= amount;
+            }
+            Action::Merge { amount, .. } => {
+                for sim in sims.iter() {
+                    *sim_balances.entry(sim.market_name).or_insert(0.0) -= amount;
+                }
             }
             Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
         }
@@ -558,30 +757,76 @@ pub fn rebalance(
                 .sell_to_price(target_price)
                 .unwrap_or((0.0, 0.0, sims[idx].price));
             let sell_amount = tokens_needed.min(held);
-            if sell_amount > 0.0 {
-                let (sold, proceeds, new_price) = if (sell_amount - held).abs() < 1e-18 {
-                    // Selling all holdings
+            if sell_amount <= 0.0 {
+                continue;
+            }
+
+            // Compute direct sell proceeds
+            let (sold, direct_proceeds, direct_new_price) =
+                if (sell_amount - held).abs() < 1e-18 {
                     sims[idx]
                         .sell_exact(held)
                         .unwrap_or((0.0, 0.0, sims[idx].price))
                 } else if (sell_amount - tokens_needed).abs() < 1e-18 {
-                    // Selling exactly the amount needed to reach target price
                     (tokens_needed, proceeds_to_target, price_at_target)
                 } else {
                     sims[idx]
                         .sell_exact(sell_amount)
                         .unwrap_or((0.0, 0.0, sims[idx].price))
                 };
-                if sold > 0.0 {
-                    sims[idx].price = new_price;
-                    budget += proceeds;
-                    *sim_balances.get_mut(sims[idx].market_name).unwrap() -= sold;
-                    actions.push(Action::Sell {
-                        market_name: sims[idx].market_name,
-                        amount: sold,
-                        proceeds,
-                    });
+
+            if sold <= 0.0 {
+                continue;
+            }
+
+            // Compare total proceeds: merge path (merge + direct remainder) vs all-direct
+            let use_merge = if mint_available {
+                let (merge_net, merge_actual) = merge_sell_proceeds(&sims, idx, sold);
+                if merge_actual > 0.0 {
+                    let remainder = sold - merge_actual;
+                    let remainder_proceeds = if remainder > 1e-18 {
+                        sims[idx].sell_exact(remainder).map(|(_, p, _)| p).unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    (merge_net + remainder_proceeds) > direct_proceeds
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+
+            if use_merge {
+                let merged =
+                    execute_merge_sell(&mut sims, idx, sold, &mut actions, &mut budget);
+                *sim_balances.get_mut(sims[idx].market_name).unwrap() -= merged;
+                // Direct-sell any remainder that couldn't be merged
+                let remainder = sold - merged;
+                if remainder > 1e-18 {
+                    if let Some((rsold, rproceeds, rnew_price)) = sims[idx].sell_exact(remainder)
+                    {
+                        if rsold > 0.0 {
+                            sims[idx].price = rnew_price;
+                            budget += rproceeds;
+                            *sim_balances.get_mut(sims[idx].market_name).unwrap() -= rsold;
+                            actions.push(Action::Sell {
+                                market_name: sims[idx].market_name,
+                                amount: rsold,
+                                proceeds: rproceeds,
+                            });
+                        }
+                    }
+                }
+            } else {
+                sims[idx].price = direct_new_price;
+                budget += direct_proceeds;
+                *sim_balances.get_mut(sims[idx].market_name).unwrap() -= sold;
+                actions.push(Action::Sell {
+                    market_name: sims[idx].market_name,
+                    amount: sold,
+                    proceeds: direct_proceeds,
+                });
             }
         }
 
@@ -1390,6 +1635,11 @@ mod tests {
                 Action::Sell { market_name, amount, .. } => {
                     *sim_balances.entry(market_name).or_insert(0.0) -= amount;
                 }
+                Action::Merge { amount, .. } => {
+                    for sim in sims2.iter() {
+                        *sim_balances.entry(sim.market_name).or_insert(0.0) -= amount;
+                    }
+                }
                 Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
             }
         }
@@ -1404,6 +1654,107 @@ mod tests {
             let bal = *sim_balances.get(name).unwrap_or(&0.0);
             assert!(bal >= -1e-12, "{} balance should be >= 0 (residual), got {}", name, bal);
         }
+    }
+
+    #[test]
+    fn test_merge_route_sells() {
+        // 3 outcomes: M1 at price 0.8 (overpriced, pred=0.3), M2 and M3 at price 0.05 each.
+        // Merge sell of M1: buy M2+M3 (cheap), merge → 1 sUSD. Cost ≈ 0.05/0.9999 × 2 ≈ 0.10.
+        // Net merge proceeds per token ≈ 1 - 0.10 = 0.90.
+        // Direct sell proceeds per token ≈ 0.8 × 0.9999 ≈ 0.80.
+        // Merge should be chosen (0.90 > 0.80).
+        let tokens = [
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+        ];
+        let names = ["M1", "M2", "M3"];
+        let prices = [0.8, 0.05, 0.05];
+        let preds = [0.3, 0.3, 0.3];
+
+        let slot0_results: Vec<_> = tokens
+            .iter()
+            .zip(names.iter())
+            .zip(prices.iter())
+            .map(|((tok, name), price)| mock_slot0_market(name, tok, *price))
+            .collect();
+
+        let mut sims: Vec<_> = slot0_results
+            .iter()
+            .zip(preds.iter())
+            .map(|((s, m), pred)| PoolSim::from_slot0(s, m, *pred).unwrap())
+            .collect();
+
+        // Verify merge is better than direct for M1
+        let sell_amount = 5.0;
+        let (merge_net, merge_actual) = merge_sell_proceeds(&sims, 0, sell_amount);
+        let (_, direct_proceeds, _) = sims[0].sell_exact(sell_amount).unwrap();
+
+        println!("Merge net: {:.6}, Direct proceeds: {:.6}", merge_net, direct_proceeds);
+        assert!(merge_net > direct_proceeds,
+            "merge ({:.6}) should beat direct ({:.6}) for high-price outcome", merge_net, direct_proceeds);
+        assert!(merge_actual > 0.0, "merge should be feasible");
+
+        // Execute merge sell and verify actions
+        let mut budget = 0.0;
+        let mut actions = Vec::new();
+        let merged = execute_merge_sell(&mut sims, 0, sell_amount, &mut actions, &mut budget);
+
+        assert!(merged > 0.0, "should have merged tokens");
+        assert!(budget > 0.0, "budget should increase from merge proceeds");
+
+        // Should have: FlashLoan, Buy×2, Merge, RepayFlashLoan
+        let has_merge = actions.iter().any(|a| matches!(a, Action::Merge { .. }));
+        let has_flash = actions.iter().any(|a| matches!(a, Action::FlashLoan { .. }));
+        let buy_count = actions.iter().filter(|a| matches!(a, Action::Buy { .. })).count();
+        assert!(has_merge, "should have Merge action");
+        assert!(has_flash, "should have FlashLoan action");
+        assert_eq!(buy_count, 2, "should buy 2 non-source outcomes");
+
+        // Other pool prices should have increased (we bought into them)
+        assert!(sims[1].price > 0.05, "M2 price should increase after buying");
+        assert!(sims[2].price > 0.05, "M3 price should increase after buying");
+    }
+
+    #[test]
+    fn test_merge_not_chosen_for_low_price() {
+        // M1 at price 0.1 (overpriced, pred=0.05), M2 and M3 at price 0.4 each.
+        // Direct sell price ≈ 0.1×0.9999 ≈ 0.10/token.
+        // Merge cost: buy M2+M3 ≈ 0.4/0.9999 × 2 ≈ 0.80. Net ≈ 1 - 0.80 = 0.20/token.
+        // Actually merge is still better here. Let me pick prices where it's not.
+        // M1 at price 0.1, M2+M3 at 0.45 each → merge cost ≈ 0.90, net ≈ 0.10.
+        // Direct ≈ 0.10. Very close. Let M2+M3 be 0.48 → merge cost ≈ 0.96, net ≈ 0.04.
+        // Direct ≈ 0.10. Direct wins.
+        let tokens = [
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "0x3333333333333333333333333333333333333333",
+        ];
+        let names = ["M1", "M2", "M3"];
+        let prices = [0.1, 0.48, 0.48];
+        let preds = [0.05, 0.3, 0.3];
+
+        let slot0_results: Vec<_> = tokens
+            .iter()
+            .zip(names.iter())
+            .zip(prices.iter())
+            .map(|((tok, name), price)| mock_slot0_market(name, tok, *price))
+            .collect();
+
+        let sims: Vec<_> = slot0_results
+            .iter()
+            .zip(preds.iter())
+            .map(|((s, m), pred)| PoolSim::from_slot0(s, m, *pred).unwrap())
+            .collect();
+
+        let sell_amount = 5.0;
+        let (merge_net, _) = merge_sell_proceeds(&sims, 0, sell_amount);
+        let (_, direct_proceeds, _) = sims[0].sell_exact(sell_amount).unwrap();
+
+        println!("Merge net: {:.6}, Direct proceeds: {:.6}", merge_net, direct_proceeds);
+        assert!(direct_proceeds > merge_net,
+            "direct ({:.6}) should beat merge ({:.6}) for low-price outcome with expensive others",
+            direct_proceeds, merge_net);
     }
 
     #[test]
@@ -1463,11 +1814,12 @@ mod tests {
         let buys = actions.iter().filter(|a| matches!(a, Action::Buy { .. })).count();
         let sells = actions.iter().filter(|a| matches!(a, Action::Sell { .. })).count();
         let mints = actions.iter().filter(|a| matches!(a, Action::Mint { .. })).count();
+        let merges = actions.iter().filter(|a| matches!(a, Action::Merge { .. })).count();
 
         println!("=== Rebalance Performance (full L1, {} outcomes) ===", slot0_results.len());
         println!("  Total: {:?} for {} iterations", elapsed, iters);
         println!("  Per call: {:?}", elapsed / iters as u32);
-        println!("  Actions: {} total ({} buys, {} sells, {} mints)", actions.len(), buys, sells, mints);
+        println!("  Actions: {} total ({} buys, {} sells, {} mints, {} merges)", actions.len(), buys, sells, mints, merges);
 
         // Sanity: should produce actions when everything is underpriced
         assert!(!actions.is_empty(), "should produce actions for underpriced markets");
@@ -1496,6 +1848,14 @@ mod tests {
                         let _ = slot0;
                         *holdings.entry(market.name).or_insert(0.0) += amount;
                     }
+                }
+                Action::Merge { amount, .. } => {
+                    // Merge burns all outcomes, returns sUSD
+                    for (slot0, market) in &slot0_results {
+                        let _ = slot0;
+                        *holdings.entry(market.name).or_insert(0.0) -= amount;
+                    }
+                    total_sell_proceeds += amount; // sUSD recovered
                 }
                 _ => {}
             }
@@ -1578,6 +1938,14 @@ mod tests {
                     "  SELL {} {} (proceeds: {:.6})",
                     amount, market_name, proceeds
                 ),
+                Action::Merge {
+                    contract_1,
+                    contract_2,
+                    amount,
+                    source_market,
+                } => {
+                    println!("  MERGE {} sets from {} (c1={}, c2={})", amount, source_market, contract_1, contract_2)
+                }
                 Action::FlashLoan { amount } => println!("  FLASH_LOAN {:.6}", amount),
                 Action::RepayFlashLoan { amount } => println!("  REPAY_FLASH_LOAN {:.6}", amount),
             }

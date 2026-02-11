@@ -349,8 +349,8 @@
       ]
     },
     "Invalid result": {
-      "outcomeToken": "0xd1ebfedd9a6480e0407552eb521270c6ddc837b0",
-      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "outcomeToken": "0x9ee7d0afd06f2c3d64d478d68dc5282746ec7d80",
+      "marketId": "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
       "pools": []
     },
     "LFDT-web3j/web3j": {
@@ -584,6 +584,11 @@
           ]
         }
       ]
+    },
+    "Other Invalid result": {
+      "outcomeToken": "0xd1ebfedd9a6480e0407552eb521270c6ddc837b0",
+      "marketId": "0xfea47428981f70110c64dd678889826c3627245b",
+      "pools": []
     },
     "Other repositories not present on the market created on November 26, 2025": {
       "outcomeToken": "0x63a4f76ef5846f68d069054c271465b7118e8ed9",

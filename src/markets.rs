@@ -436,7 +436,7 @@ static TICKS_L1_WIGHAWAG_HARDHAT_DEPLOY: [Tick; 2] = [
     Tick { tick_idx: -92109, liquidity_net: 863224772119945130379 },
 ];
 
-pub static MARKETS_L1: [MarketData; 100] = [
+pub static MARKETS_L1: [MarketData; 101] = [
     MarketData {
         name: "0xmiden/miden-vm",
         market_id: "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
@@ -595,8 +595,8 @@ pub static MARKETS_L1: [MarketData; 100] = [
     },
     MarketData {
         name: "invalid result",
-        market_id: "0xfea47428981f70110c64dd678889826c3627245b",
-        outcome_token: "0xd1ebfedd9a6480e0407552eb521270c6ddc837b0",
+        market_id: "0x3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6",
+        outcome_token: "0x9ee7d0afd06f2c3d64d478d68dc5282746ec7d80",
         pool: None,
         quote_token: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
     },
@@ -702,6 +702,13 @@ pub static MARKETS_L1: [MarketData; 100] = [
             liquidity: "513503292205085177556",
             ticks: &TICKS_L1_OPENZEPPELIN_OPENZEPPELIN_CONTRACTS,
         }),
+        quote_token: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
+    },
+    MarketData {
+        name: "other invalid result",
+        market_id: "0xfea47428981f70110c64dd678889826c3627245b",
+        outcome_token: "0xd1ebfedd9a6480e0407552eb521270c6ddc837b0",
+        pool: None,
         quote_token: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
     },
     MarketData {
