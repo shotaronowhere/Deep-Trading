@@ -136,31 +136,22 @@ Each pool's price contribution freezes at P_limit once m exceeds that pool's sel
 
 ### Mixed-Route Budget Solver
 
-When the active set contains both direct and mint routes, Newton's method solves for π:
+When the active set contains both direct and mint routes, budget exhaustion is solved by
+simulation-backed bisection on profitability π.
 
 ```
-total_cost(π) = Σᵢ∈direct L_eff_i × (√(πᵢ/(1+π)) - √Pᵢ) + Σⱼ∈mint mint_cost_j(π) = B
+find lowest π ∈ [π_lo, π_hi] such that feasible_cost(π) ≤ B
 ```
 
-Both routes have analytical derivatives:
+`feasible_cost(π)` is computed by planning the exact execution path used on-chain:
+- Evaluate each active route at π on current simulated pool state
+- Execute routes in mint-first order (mints can free budget, directs consume budget)
+- Apply each route's simulated price updates before evaluating the next route
+- Track running budget and require no intermediate budget violation
 
-```
-d(cost_direct)/dπ = -L_eff × √pred / (2 × (1+π)^(3/2))
-```
-
-For mint routes, the derivative uses the implicit function theorem on the constraint g(m) = 1 - P_target:
-
-```
-dm/dπ = P_target / ((1+π) × g'(m))
-d(net_cost)/dm = 1 - (1-f) × Σⱼ∈uncapped Pⱼ(m)
-d(net_cost)/dπ = d(net_cost)/dm × dm/dπ
-```
-
-Both derivatives are computed in the same pass as the cost (no finite differences).
-
-**Fixed**: `solve_prof` now uses a coupled (π, M) Newton solver. All non-active pools see aggregate sell volume M (not individual m_i). Inner Newton solves ΔG(M) = δ(π) for M at each outer step. Returns (profitability, aggregate_M). Waterfall executes mints first (M/|Q| per entry), then directs.
-
-**Known approximation**: The binding mint target `i*` (the mint entry whose alt-price constraint is tightest) is selected once at `prof_hi` and held fixed throughout Newton iterations. If the active set contains 2+ mint entries with sufficiently different prediction/spot gaps, the true binding constraint could switch as π moves, causing slightly inaccurate profitability. In practice this is rare (waterfall adds one entry at a time) and the execute-then-check loop prevents budget overshoot.
+This removes the fixed-binding-target approximation: if the tight mint constraint changes as π moves,
+the simulation naturally captures that switch. Bisection converges in ≤64 iterations and each probe
+uses the same route logic as execution, so solver/executor drift is minimized.
 
 ## Profitability and Target Price
 
@@ -187,7 +178,7 @@ The waterfall equalizes prof across all active outcomes. At the optimum, every p
 | M (sell cap) | `PoolSim::max_sell_tokens()` | (√(P/P_limit) - 1) / κ |
 | π = (A/B')² - 1 | `solve_prof` (direct branch) | Closed form |
 | g(m) = rhs | `mint_cost_to_prof` | Newton, ≤8 iter, tick-capped, warm-started |
-| total_cost(π) = B | `solve_prof` (mixed branch) | Newton, ≤8 iter, analytical gradients |
+| total_cost(π) = B | `solve_prof` (mixed branch) | Simulation-backed bisection, ≤64 iter |
 | cost(P₀→P₁) | `PoolSim::cost_to_price` | `compute_swap_step` (U256) |
 | proceeds(m) | analytical in `mint_cost_to_prof` | P×min(m,M)×(1-f)/(1+min(m,M)×κ) |
 

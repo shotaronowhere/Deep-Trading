@@ -2,12 +2,11 @@
 
 ## Open
 
-(none)
+- [ ] Integrate gas/MEV-aware net-PnL objective (EV minus execution costs) once live gas-cost estimator wiring is available.
 
 ## Deferred
 
 - [ ] L2 and Originality market support
-- [ ] ~~Multi-mint exact solve~~ — the coupled (π, M) solver uses a single binding i\*; when |Q|>1 the remaining mint entries have residual alt-price mismatch. Full K-constraint solve deferred — error ~1-3% of budget, dwarfed by execution noise. See `improvements.md`
 
 ## Done
 
@@ -18,3 +17,4 @@
 - [x] **Fix `mint_cost_to_prof` bug**: corrected Newton RHS to `(1 - tp) - Σ_{skip, j≠target} P⁰_j`, added `rhs ≤ 0` guard. (8879ce0)
 - [x] **Mint-before-direct execution ordering**: budget-exhaustion branch now executes mints first (aggregate M split equally), then directs using post-mint pool state. (8879ce0)
 - [x] **Coupled (π, M) Newton solver**: `solve_prof` returns `(profitability, aggregate_mint_M)` using D*/S₀ partition, inner Newton on M, outer Newton on π. (8879ce0)
+- [x] **Mixed-route exactness upgrade**: replaced fixed-binding `i*` approximation with simulation-backed bisection over profitability and budget-feasible route planning/execution (mint-first, no partial-step skips).

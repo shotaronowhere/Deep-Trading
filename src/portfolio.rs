@@ -49,6 +49,7 @@ pub enum Action {
 
 /// Mutable pool state for swap simulation during rebalancing.
 /// All arithmetic is pure f64 — no U256 in the hot path.
+#[derive(Clone)]
 struct PoolSim {
     market_name: &'static str,
     market_id: &'static str,
@@ -269,10 +270,8 @@ fn alt_price(sims: &[PoolSim], idx: usize, price_sum: f64) -> f64 {
 
 /// Profitability = (prediction - best_price) / best_price
 fn profitability(prediction: f64, best_price: f64) -> f64 {
-    if best_price <= 0.0 {
-        return f64::NEG_INFINITY;
-    }
-    (prediction - best_price) / best_price
+    let effective_price = best_price.max(1e-12);
+    (prediction - effective_price) / effective_price
 }
 
 /// Target price for a given target profitability: prediction / (1 + target_prof)
@@ -376,7 +375,7 @@ fn mint_cost_to_prof(
     }
 
     if m < 1e-18 {
-        return None;
+        return Some((0.0, 0.0, 0.0, 0.0));
     }
 
     // Net cost and analytical derivative in one pass.
@@ -447,6 +446,303 @@ fn active_skip_indices(active: &[(usize, Route)]) -> HashSet<usize> {
     active.iter().map(|(idx, _)| *idx).collect()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PlannedRoute {
+    idx: usize,
+    route: Route,
+    cost: f64,
+    amount: f64,
+    new_price: Option<f64>,
+}
+
+fn execution_order(active: &[(usize, Route)]) -> Vec<(usize, Route)> {
+    let mut ordered: Vec<(usize, Route)> = Vec::with_capacity(active.len());
+    ordered.extend(
+        active
+            .iter()
+            .copied()
+            .filter(|(_, route)| *route == Route::Mint),
+    );
+    ordered.extend(
+        active
+            .iter()
+            .copied()
+            .filter(|(_, route)| *route == Route::Direct),
+    );
+    ordered
+}
+
+fn plan_active_routes(
+    sims: &[PoolSim],
+    active: &[(usize, Route)],
+    target_prof: f64,
+    skip: &HashSet<usize>,
+) -> Option<Vec<PlannedRoute>> {
+    let mut sim_state = sims.to_vec();
+    let mut price_sum: f64 = sim_state.iter().map(|s| s.price).sum();
+    let mut plan: Vec<PlannedRoute> = Vec::with_capacity(active.len());
+
+    for (idx, route) in execution_order(active) {
+        let (direct_cost, _, amount, new_price, _) =
+            cost_for_route(&sim_state, idx, route, target_prof, skip, price_sum)?;
+
+        let (actual_cost, applied_new_price) = match route {
+            Route::Direct => {
+                let np = new_price?;
+                sim_state[idx].price = np;
+                (direct_cost, Some(np))
+            }
+            Route::Mint => {
+                let mut proceeds = 0.0_f64;
+                if amount > 0.0 {
+                    for i in 0..sim_state.len() {
+                        if i == idx || skip.contains(&i) {
+                            continue;
+                        }
+                        if let Some((sold, leg_proceeds, new_leg_price)) =
+                            sim_state[i].sell_exact(amount)
+                        {
+                            if sold > 0.0 {
+                                proceeds += leg_proceeds;
+                                sim_state[i].price = new_leg_price;
+                            }
+                        }
+                    }
+                }
+                (amount - proceeds, None)
+            }
+        };
+
+        if !actual_cost.is_finite() {
+            return None;
+        }
+        plan.push(PlannedRoute {
+            idx,
+            route,
+            cost: actual_cost,
+            amount,
+            new_price: applied_new_price,
+        });
+
+        price_sum = sim_state.iter().map(|s| s.price).sum();
+    }
+
+    Some(plan)
+}
+
+fn plan_is_budget_feasible(plan: &[PlannedRoute], budget: f64) -> bool {
+    let mut running_budget = budget;
+    for step in plan {
+        if step.cost > running_budget + 1e-12 {
+            return false;
+        }
+        running_budget -= step.cost;
+        if !running_budget.is_finite() {
+            return false;
+        }
+    }
+    true
+}
+
+fn execute_planned_routes(
+    sims: &mut [PoolSim],
+    plan: &[PlannedRoute],
+    budget: &mut f64,
+    actions: &mut Vec<Action>,
+    skip: &HashSet<usize>,
+) -> bool {
+    for step in plan {
+        if step.cost > *budget + 1e-12 {
+            return false;
+        }
+        execute_buy(
+            sims,
+            step.idx,
+            step.cost,
+            step.amount,
+            step.route,
+            step.new_price,
+            budget,
+            actions,
+            skip,
+        );
+    }
+    true
+}
+
+fn action_contract_pair(sims: &[PoolSim]) -> (&'static str, &'static str) {
+    if sims.is_empty() {
+        return ("", "");
+    }
+    let mut contracts: Vec<&'static str> = sims.iter().map(|s| s.market_id).collect();
+    contracts.sort();
+    contracts.dedup();
+    let c1 = contracts[0];
+    let c2 = if contracts.len() > 1 {
+        contracts[1]
+    } else {
+        contracts[0]
+    };
+    (c1, c2)
+}
+
+fn apply_actions_to_sim_balances(
+    actions: &[Action],
+    sims: &[PoolSim],
+    sim_balances: &mut HashMap<&str, f64>,
+) {
+    for action in actions {
+        match action {
+            Action::Buy {
+                market_name,
+                amount,
+                ..
+            } => {
+                *sim_balances.entry(market_name).or_insert(0.0) += amount;
+            }
+            Action::Mint { amount, .. } => {
+                for sim in sims.iter() {
+                    *sim_balances.entry(sim.market_name).or_insert(0.0) += amount;
+                }
+            }
+            Action::Sell {
+                market_name,
+                amount,
+                ..
+            } => {
+                *sim_balances.entry(market_name).or_insert(0.0) -= amount;
+            }
+            Action::Merge { amount, .. } => {
+                for sim in sims.iter() {
+                    *sim_balances.entry(sim.market_name).or_insert(0.0) -= amount;
+                }
+            }
+            Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
+        }
+    }
+}
+
+fn complete_set_arb_cap(sims: &[PoolSim]) -> f64 {
+    if sims.is_empty() {
+        return 0.0;
+    }
+    sims.iter()
+        .map(|s| s.max_buy_tokens())
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn complete_set_marginal_buy_cost(sims: &[PoolSim], amount: f64) -> f64 {
+    let mut total = 0.0_f64;
+    for s in sims {
+        let lam = s.lambda();
+        if lam <= 0.0 || s.price <= 0.0 {
+            return f64::INFINITY;
+        }
+        let d = 1.0 - amount * lam;
+        if d <= 0.0 {
+            return f64::INFINITY;
+        }
+        total += s.price / (FEE_FACTOR * d * d);
+    }
+    total
+}
+
+fn solve_complete_set_arb_amount(sims: &[PoolSim]) -> f64 {
+    let cap = complete_set_arb_cap(sims);
+    if cap <= 1e-18 {
+        return 0.0;
+    }
+
+    let d0 = complete_set_marginal_buy_cost(sims, 0.0);
+    if !d0.is_finite() || d0 >= 1.0 {
+        return 0.0;
+    }
+
+    let cap_left = (cap - 1e-12 * (1.0 + cap)).max(0.0);
+    let d_cap = complete_set_marginal_buy_cost(sims, cap_left);
+    if d_cap <= 1.0 {
+        return cap;
+    }
+
+    let mut lo = 0.0_f64;
+    let mut hi = cap_left;
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        let d_mid = complete_set_marginal_buy_cost(sims, mid);
+        if d_mid > 1.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+        if (hi - lo).abs() <= 1e-12 * (1.0 + hi.abs()) {
+            break;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+fn execute_complete_set_arb(
+    sims: &mut [PoolSim],
+    actions: &mut Vec<Action>,
+    budget: &mut f64,
+) -> f64 {
+    let amount = solve_complete_set_arb_amount(sims);
+    if amount <= 1e-18 {
+        return 0.0;
+    }
+
+    let mut legs: Vec<(usize, f64, f64)> = Vec::with_capacity(sims.len());
+    let mut total_buy_cost = 0.0_f64;
+    for (i, s) in sims.iter().enumerate() {
+        match s.buy_exact(amount) {
+            Some((bought, cost, new_price))
+                if bought + 1e-12 >= amount && bought > 0.0 && cost.is_finite() =>
+            {
+                legs.push((i, cost, new_price));
+                total_buy_cost += cost;
+            }
+            _ => return 0.0,
+        }
+    }
+
+    let profit = amount - total_buy_cost;
+    if !profit.is_finite() || profit <= 1e-12 {
+        return 0.0;
+    }
+
+    if total_buy_cost > 1e-18 {
+        actions.push(Action::FlashLoan {
+            amount: total_buy_cost,
+        });
+    }
+
+    for (i, cost, new_price) in legs {
+        sims[i].price = new_price;
+        actions.push(Action::Buy {
+            market_name: sims[i].market_name,
+            amount,
+            cost,
+        });
+    }
+
+    let (contract_1, contract_2) = action_contract_pair(sims);
+    actions.push(Action::Merge {
+        contract_1,
+        contract_2,
+        amount,
+        source_market: "complete_set_arb",
+    });
+
+    if total_buy_cost > 1e-18 {
+        actions.push(Action::RepayFlashLoan {
+            amount: total_buy_cost,
+        });
+    }
+
+    *budget += profit;
+    profit
+}
+
 fn lookup_balance(balances: &HashMap<&str, f64>, market_name: &str) -> f64 {
     balances.get(market_name).copied().unwrap_or(0.0)
 }
@@ -460,16 +756,10 @@ fn emit_mint_actions(
     actions: &mut Vec<Action>,
     skip: &HashSet<usize>,
 ) -> f64 {
-    let mut contracts: Vec<&'static str> = sims.iter().map(|s| s.market_id).collect();
-    contracts.sort();
-    contracts.dedup();
+    let (contract_1, contract_2) = action_contract_pair(sims);
     actions.push(Action::Mint {
-        contract_1: contracts[0],
-        contract_2: if contracts.len() > 1 {
-            contracts[1]
-        } else {
-            contracts[0]
-        },
+        contract_1,
+        contract_2,
         amount,
         target_market: sims[target_idx].market_name,
     });
@@ -610,7 +900,9 @@ fn merge_sell_cap_with_inventory(
     sims.iter()
         .enumerate()
         .filter(|(i, _)| *i != source_idx)
-        .map(|(_, s)| merge_usable_inventory(sim_balances, s, inventory_keep_prof) + s.max_buy_tokens())
+        .map(|(_, s)| {
+            merge_usable_inventory(sim_balances, s, inventory_keep_prof) + s.max_buy_tokens()
+        })
         .fold(f64::INFINITY, f64::min)
 }
 
@@ -641,14 +933,13 @@ fn split_sell_total_proceeds_with_inventory(
     sim_balances: Option<&HashMap<&str, f64>>,
     inventory_keep_prof: f64,
 ) -> (f64, f64) {
-    let (merge_net, merged_actual) =
-        merge_sell_proceeds_with_inventory(
-            sims,
-            source_idx,
-            merge_amount,
-            sim_balances,
-            inventory_keep_prof,
-        );
+    let (merge_net, merged_actual) = merge_sell_proceeds_with_inventory(
+        sims,
+        source_idx,
+        merge_amount,
+        sim_balances,
+        inventory_keep_prof,
+    );
     let remainder = (sell_amount - merged_actual).max(0.0);
     let direct_proceeds = sims[source_idx]
         .sell_exact(remainder)
@@ -682,15 +973,14 @@ fn optimal_sell_split_with_inventory(
     let merge_upper =
         merge_sell_cap_with_inventory(sims, source_idx, sim_balances, inventory_keep_prof)
             .min(sell_amount);
-    let (direct_total, _) =
-        split_sell_total_proceeds_with_inventory(
-            sims,
-            source_idx,
-            sell_amount,
-            0.0,
-            sim_balances,
-            inventory_keep_prof,
-        );
+    let (direct_total, _) = split_sell_total_proceeds_with_inventory(
+        sims,
+        source_idx,
+        sell_amount,
+        0.0,
+        sim_balances,
+        inventory_keep_prof,
+    );
     if merge_upper <= OPT_EPS {
         return (0.0, direct_total);
     }
@@ -713,19 +1003,16 @@ fn optimal_sell_split_with_inventory(
         0.0,
         sim_balances,
         inventory_keep_prof,
-    )
-        - direct_sell_marginal_proceeds(source, sell_amount);
+    ) - direct_sell_marginal_proceeds(source, sell_amount);
 
     let upper_left = (merge_upper - OPT_EPS * (1.0 + merge_upper)).max(0.0);
-    let d_upper =
-        merge_sell_marginal_proceeds_with_inventory(
-            sims,
-            source_idx,
-            upper_left,
-            sim_balances,
-            inventory_keep_prof,
-        )
-            - direct_sell_marginal_proceeds(source, (sell_amount - upper_left).max(0.0));
+    let d_upper = merge_sell_marginal_proceeds_with_inventory(
+        sims,
+        source_idx,
+        upper_left,
+        sim_balances,
+        inventory_keep_prof,
+    ) - direct_sell_marginal_proceeds(source, (sell_amount - upper_left).max(0.0));
 
     // Concave objective: if derivative is non-positive at 0, best is at 0.
     if d0 <= 0.0 {
@@ -754,8 +1041,7 @@ fn optimal_sell_split_with_inventory(
             mid,
             sim_balances,
             inventory_keep_prof,
-        )
-            - direct_sell_marginal_proceeds(source, (sell_amount - mid).max(0.0));
+        ) - direct_sell_marginal_proceeds(source, (sell_amount - mid).max(0.0));
         if dm > 0.0 {
             lo = mid;
         } else {
@@ -940,16 +1226,10 @@ fn execute_merge_sell_with_inventory(
         }
     }
 
-    let mut contracts: Vec<&'static str> = sims.iter().map(|s| s.market_id).collect();
-    contracts.sort();
-    contracts.dedup();
+    let (contract_1, contract_2) = action_contract_pair(sims);
     actions.push(Action::Merge {
-        contract_1: contracts[0],
-        contract_2: if contracts.len() > 1 {
-            contracts[1]
-        } else {
-            contracts[0]
-        },
+        contract_1,
+        contract_2,
         amount: actual,
         source_market: sims[source_idx].market_name,
     });
@@ -1020,16 +1300,10 @@ fn execute_merge_sell(
     }
 
     // Merge complete sets
-    let mut contracts: Vec<&'static str> = sims.iter().map(|s| s.market_id).collect();
-    contracts.sort();
-    contracts.dedup();
+    let (contract_1, contract_2) = action_contract_pair(sims);
     actions.push(Action::Merge {
-        contract_1: contracts[0],
-        contract_2: if contracts.len() > 1 {
-            contracts[1]
-        } else {
-            contracts[0]
-        },
+        contract_1,
+        contract_2,
         amount: actual,
         source_market: sims[source_idx].market_name,
     });
@@ -1067,10 +1341,20 @@ pub fn rebalance(
     // sims may be smaller if pools have zero liquidity or slot0_results is partial (RPC failures).
     let mint_available = sims.len() == crate::predictions::PREDICTIONS_L1.len();
 
-    // Track holdings changes during simulation
+    // Track holdings changes during simulation.
+    // `legacy_remaining` tracks inventory that existed before this rebalance call.
     let mut sim_balances: HashMap<&str, f64> = HashMap::new();
+    let mut legacy_remaining: HashMap<&str, f64> = HashMap::new();
     for sim in &sims {
-        sim_balances.insert(sim.market_name, lookup_balance(balances, sim.market_name));
+        let held = lookup_balance(balances, sim.market_name).max(0.0);
+        sim_balances.insert(sim.market_name, held);
+        legacy_remaining.insert(sim.market_name, held);
+    }
+
+    // ── Phase 0: Complete-set arbitrage (buy all outcomes, merge) ──
+    // Execute before any discretionary rebalancing so free budget is harvested first.
+    if mint_available {
+        let _arb_profit = execute_complete_set_arb(&mut sims, &mut actions, &mut budget);
     }
 
     // ── Phase 1: Sell overpriced holdings ──
@@ -1113,96 +1397,125 @@ pub fn rebalance(
         );
     }
 
+    // Legacy inventory available for phase-3 recycling cannot exceed current holdings after phase 1.
+    for sim in &sims {
+        let current = *sim_balances.get(sim.market_name).unwrap_or(&0.0);
+        let legacy = legacy_remaining.entry(sim.market_name).or_insert(0.0);
+        *legacy = (*legacy).min(current.max(0.0));
+        if *legacy < 1e-12 {
+            *legacy = 0.0;
+        }
+    }
+    let has_legacy_holdings = legacy_remaining.values().any(|&v| v > 1e-12);
+
     // ── Phase 2: Waterfall allocation ──
     let actions_before = actions.len();
     let last_bought_prof = waterfall(&mut sims, &mut budget, &mut actions, mint_available);
 
-    // Update sim_balances with positions acquired during waterfall.
-    // Mint gives `amount` of every outcome; subsequent Sells reduce non-targets.
-    // Partial sells leave residual holdings (amount - sold) that must be tracked.
-    for action in &actions[actions_before..] {
-        match action {
-            Action::Buy {
-                market_name,
-                amount,
-                ..
-            } => {
-                *sim_balances.entry(market_name).or_insert(0.0) += amount;
-            }
-            Action::Mint { amount, .. } => {
-                for sim in sims.iter() {
-                    *sim_balances.entry(sim.market_name).or_insert(0.0) += amount;
-                }
-            }
-            Action::Sell {
-                market_name,
-                amount,
-                ..
-            } => {
-                *sim_balances.entry(market_name).or_insert(0.0) -= amount;
-            }
-            Action::Merge { amount, .. } => {
-                for sim in sims.iter() {
-                    *sim_balances.entry(sim.market_name).or_insert(0.0) -= amount;
-                }
-            }
-            Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
-        }
-    }
+    // Update simulated holdings from the initial waterfall pass.
+    apply_actions_to_sim_balances(&actions[actions_before..], &sims, &mut sim_balances);
 
     // ── Phase 3: Post-allocation liquidation ──
-    // If we bought something, check if any held outcomes are less profitable
-    // than the last asset we bought. Sell lowest-profitability holdings first
-    // and reallocate upward via waterfall.
-    if last_bought_prof > 0.0 {
-        // Collect held outcomes with profitability below last_bought_prof
-        let mut liquidation_candidates: Vec<(usize, f64)> = Vec::new();
-        for (i, sim) in sims.iter().enumerate() {
-            let held = *sim_balances.get(sim.market_name).unwrap_or(&0.0);
-            if held <= 0.0 {
-                continue;
+    // Iterate liquidation/reallocation until convergence, but recycle legacy inventory only.
+    if has_legacy_holdings {
+        const MAX_PHASE3_ITERS: usize = 8;
+        const PHASE3_PROF_REL_TOL: f64 = 1e-9;
+        let mut phase3_prof = last_bought_prof;
+        for _ in 0..MAX_PHASE3_ITERS {
+            if phase3_prof <= 0.0 {
+                break;
             }
-            let prof = profitability(sim.prediction, sim.price());
-            if prof < last_bought_prof {
-                liquidation_candidates.push((i, prof));
-            }
-        }
-
-        // Sort by profitability ascending (sell least profitable first)
-        liquidation_candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-        for (idx, _) in liquidation_candidates {
-            let held = *sim_balances.get(sims[idx].market_name).unwrap_or(&0.0);
-            if held <= 0.0 {
-                continue;
-            }
-            // Sell only enough to raise profitability to last_bought_prof.
-            // Target price = prediction / (1 + last_bought_prof).
-            let target_price = target_price_for_prof(sims[idx].prediction, last_bought_prof);
-            let (tokens_needed, _, _) =
-                sims[idx]
-                    .sell_to_price(target_price)
-                    .unwrap_or((0.0, 0.0, sims[idx].price));
-            let sell_target = tokens_needed.min(held);
-            if sell_target <= 0.0 {
-                continue;
+            if !legacy_remaining.values().any(|&v| v > 1e-12) {
+                break;
             }
 
-            let _sold_total = execute_optimal_sell(
-                &mut sims,
-                idx,
-                sell_target,
+            // Collect legacy-held outcomes with profitability below the current threshold.
+            let mut liquidation_candidates: Vec<(usize, f64)> = Vec::new();
+            for (i, sim) in sims.iter().enumerate() {
+                let held_total = *sim_balances.get(sim.market_name).unwrap_or(&0.0);
+                let held_legacy = legacy_remaining
+                    .get(sim.market_name)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .min(held_total)
+                    .max(0.0);
+                if held_legacy <= 0.0 {
+                    continue;
+                }
+                let prof = profitability(sim.prediction, sim.price());
+                if prof < phase3_prof {
+                    liquidation_candidates.push((i, prof));
+                }
+            }
+            if liquidation_candidates.is_empty() {
+                break;
+            }
+
+            liquidation_candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+            let actions_before_liq = actions.len();
+            let budget_before_liq = budget;
+            for (idx, _) in liquidation_candidates {
+                let held_total = *sim_balances.get(sims[idx].market_name).unwrap_or(&0.0);
+                let held_legacy = legacy_remaining
+                    .get(sims[idx].market_name)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .min(held_total)
+                    .max(0.0);
+                if held_legacy <= 0.0 {
+                    continue;
+                }
+                let target_price = target_price_for_prof(sims[idx].prediction, phase3_prof);
+                let (tokens_needed, _, _) =
+                    sims[idx]
+                        .sell_to_price(target_price)
+                        .unwrap_or((0.0, 0.0, sims[idx].price));
+                let sell_target = tokens_needed.min(held_legacy);
+                if sell_target <= 0.0 {
+                    continue;
+                }
+
+                let sold_total = execute_optimal_sell(
+                    &mut sims,
+                    idx,
+                    sell_target,
+                    &mut sim_balances,
+                    phase3_prof,
+                    mint_available,
+                    &mut actions,
+                    &mut budget,
+                );
+                if sold_total > 0.0 {
+                    let legacy = legacy_remaining.entry(sims[idx].market_name).or_insert(0.0);
+                    *legacy = (*legacy - sold_total).max(0.0);
+                }
+            }
+
+            let recovered_budget = budget - budget_before_liq;
+            if actions.len() == actions_before_liq || recovered_budget <= 1e-12 {
+                break;
+            }
+            if budget <= 1e-12 {
+                break;
+            }
+
+            // Reallocate recovered capital and fold the acquired positions into simulated balances.
+            let actions_before_realloc = actions.len();
+            let new_prof = waterfall(&mut sims, &mut budget, &mut actions, mint_available);
+            apply_actions_to_sim_balances(
+                &actions[actions_before_realloc..],
+                &sims,
                 &mut sim_balances,
-                last_bought_prof,
-                mint_available,
-                &mut actions,
-                &mut budget,
             );
-        }
-
-        // Reallocate recovered capital via waterfall
-        if budget > 0.0 {
-            waterfall(&mut sims, &mut budget, &mut actions, mint_available);
+            if actions.len() == actions_before_realloc || new_prof <= 0.0 {
+                break;
+            }
+            let prof_delta = (new_prof - phase3_prof).abs();
+            if prof_delta <= PHASE3_PROF_REL_TOL * (1.0 + phase3_prof.abs()) {
+                break;
+            }
+            phase3_prof = new_prof;
         }
     }
 
@@ -1227,11 +1540,9 @@ fn best_non_active(
         }
         if mint_available && !active_set.contains(&(i, Route::Mint)) {
             let mp = alt_price(sims, i, price_sum);
-            if mp > 0.0 {
-                let prof = profitability(sim.prediction, mp);
-                if prof > 0.0 && best.map_or(true, |b| prof > b.2) {
-                    best = Some((i, Route::Mint, prof));
-                }
+            let prof = profitability(sim.prediction, mp);
+            if prof > 0.0 && best.map_or(true, |b| prof > b.2) {
+                best = Some((i, Route::Mint, prof));
             }
         }
     }
@@ -1312,42 +1623,22 @@ fn waterfall(
         }
 
         let skip = active_skip_indices(&active);
-
-        // Compute total cost for all active entries to reach target_prof
-        let total_cost: f64 = active
-            .iter()
-            .filter_map(|&(idx, route)| {
-                cost_for_route(sims, idx, route, target_prof, &skip, price_sum)
-                    .map(|(c, _, _, _, _)| c)
-            })
-            .sum();
-
-        if total_cost <= *budget {
-            // Can afford full step. Execute, recomputing costs right before
-            // since mint actions mutate other pools.
-            let mut any_skipped = false;
-            let skip = active_skip_indices(&active);
-            for &(idx, route) in &active {
-                let ps_before: f64 = sims.iter().map(|s| s.price).sum();
-                match cost_for_route(sims, idx, route, target_prof, &skip, ps_before) {
-                    Some((cost, _, amount, new_price, _)) if cost <= *budget => {
-                        execute_buy(
-                            sims, idx, cost, amount, route, new_price, budget, actions, &skip,
-                        );
-                    }
-                    _ => {
-                        any_skipped = true;
-                    }
-                }
+        let full_plan = match plan_active_routes(sims, &active, target_prof, &skip) {
+            Some(plan) => plan,
+            None => {
+                last_prof = current_prof;
+                break;
             }
-            // Refresh price_sum after executions
-            price_sum = sims.iter().map(|s| s.price).sum();
+        };
 
-            if any_skipped {
+        if plan_is_budget_feasible(&full_plan, *budget) {
+            if !execute_planned_routes(sims, &full_plan, budget, actions, &skip) {
                 last_prof = current_prof;
                 break;
             }
 
+            // Refresh price_sum after executions
+            price_sum = sims.iter().map(|s| s.price).sum();
             current_prof = target_prof;
             last_prof = target_prof;
 
@@ -1360,58 +1651,53 @@ fn waterfall(
                 _ => break,
             }
         } else {
-            // Can't afford full step. Solve for achievable profitability.
-            let skip = active_skip_indices(&active);
-            let (achievable, mint_m) = solve_prof(
-                sims,
-                &active,
-                current_prof,
-                target_prof,
-                *budget,
-                &skip,
-                price_sum,
-            );
+            // Can't afford full step. Solve for lowest feasible profitability in [target_prof, current_prof].
+            let mut achievable =
+                solve_prof(sims, &active, current_prof, target_prof, *budget, &skip);
+            let mut execution_plan = plan_active_routes(sims, &active, achievable, &skip);
 
-            // Execute mints first with aggregate M (updates non-active pool states).
-            if mint_m > 0.0 {
-                let mint_entries: Vec<(usize, Route)> = active
-                    .iter()
-                    .filter(|&&(_, r)| r == Route::Mint)
-                    .copied()
-                    .collect();
-                if !mint_entries.is_empty() {
-                    let per_entry = mint_m / mint_entries.len() as f64;
-                    for &(idx, _) in &mint_entries {
-                        execute_buy(
-                            sims,
-                            idx,
-                            0.0,
-                            per_entry,
-                            Route::Mint,
-                            None,
-                            budget,
-                            actions,
-                            &skip,
-                        );
+            // Numerical guard: tighten toward current_prof until feasible.
+            if execution_plan
+                .as_ref()
+                .map(|p| !plan_is_budget_feasible(p, *budget))
+                .unwrap_or(true)
+            {
+                let mut lo = achievable;
+                let mut hi = current_prof;
+                let mut best: Option<(f64, Vec<PlannedRoute>)> = None;
+                for _ in 0..32 {
+                    let mid = 0.5 * (lo + hi);
+                    if let Some(plan) = plan_active_routes(sims, &active, mid, &skip) {
+                        if plan_is_budget_feasible(&plan, *budget) {
+                            best = Some((mid, plan));
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                        }
+                    } else {
+                        lo = mid;
                     }
+                    if (hi - lo).abs() <= 1e-12 * (1.0 + hi.abs()) {
+                        break;
+                    }
+                }
+                if let Some((best_prof, plan)) = best {
+                    achievable = best_prof;
+                    execution_plan = Some(plan);
                 }
             }
 
-            // Execute directs second (active pool prices unperturbed by mints)
-            price_sum = sims.iter().map(|s| s.price).sum();
-            for &(idx, route) in &active {
-                if route == Route::Direct {
-                    if let Some((cost, _, amount, new_price, _)) =
-                        cost_for_route(sims, idx, route, achievable, &skip, price_sum)
-                    {
-                        if cost > *budget {
-                            continue;
-                        }
-                        execute_buy(
-                            sims, idx, cost, amount, route, new_price, budget, actions, &skip,
-                        );
-                    }
-                }
+            let Some(execution_plan) = execution_plan else {
+                last_prof = current_prof;
+                break;
+            };
+            if !plan_is_budget_feasible(&execution_plan, *budget) {
+                last_prof = current_prof;
+                break;
+            }
+            if !execute_planned_routes(sims, &execution_plan, budget, actions, &skip) {
+                last_prof = current_prof;
+                break;
             }
             last_prof = achievable;
             break;
@@ -1460,9 +1746,8 @@ fn execute_buy(
     }
 }
 
-/// Find the lowest profitability level affordable with the budget.
-/// Returns (profitability, aggregate_mint_M).
-/// Uses closed-form for all-direct; coupled (π, M) Newton for mixed routes.
+/// Find the lowest profitability level affordable with the available budget.
+/// Uses closed-form for all-direct, and simulation-backed bisection for mixed routes.
 fn solve_prof(
     sims: &[PoolSim],
     active: &[(usize, Route)],
@@ -1470,8 +1755,7 @@ fn solve_prof(
     prof_lo: f64,
     budget: f64,
     skip: &HashSet<usize>,
-    price_sum: f64,
-) -> (f64, f64) {
+) -> f64 {
     let all_direct = active.iter().all(|&(_, route)| route == Route::Direct);
 
     if all_direct {
@@ -1486,235 +1770,41 @@ fn solve_prof(
         }
         let b = budget + b_sum;
         if b <= 0.0 {
-            return (prof_hi, 0.0);
+            return prof_hi;
         }
         let ratio = a_sum / b;
         let prof = ratio * ratio - 1.0;
-        return (prof.clamp(prof_lo, prof_hi), 0.0);
+        return prof.clamp(prof_lo, prof_hi);
     }
 
-    // Coupled mixed-route solver: 2 unknowns (π, M).
-    // Skip semantics collapse: all non-active pools see the same aggregate sell volume M.
-    let direct_indices: HashSet<usize> = active
-        .iter()
-        .filter(|&&(_, r)| r == Route::Direct)
-        .map(|&(i, _)| i)
-        .collect();
-    let mint_indices: Vec<usize> = active
-        .iter()
-        .filter(|&&(_, r)| r == Route::Mint)
-        .map(|&(i, _)| i)
-        .collect();
+    let affordable = |prof: f64| -> bool {
+        plan_active_routes(sims, active, prof, skip)
+            .map(|plan| plan_is_budget_feasible(&plan, budget))
+            .unwrap_or(false)
+    };
 
-    // Pick binding mint target i*: tightest alt-price constraint (fixed for all iterations)
-    let i_star = *mint_indices
-        .iter()
-        .max_by(|&&a, &&b| {
-            let gap_a = sims[a].prediction / (1.0 + prof_hi) - alt_price(sims, a, price_sum);
-            let gap_b = sims[b].prediction / (1.0 + prof_hi) - alt_price(sims, b, price_sum);
-            gap_a
-                .partial_cmp(&gap_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .unwrap();
+    if affordable(prof_lo) {
+        return prof_lo;
+    }
+    if !affordable(prof_hi) {
+        return prof_hi;
+    }
 
-    // D* = D ∪ {i*}: outcomes with final price = pred/(1+π)
-    let d_star: HashSet<usize> = direct_indices
-        .iter()
-        .copied()
-        .chain(std::iter::once(i_star))
-        .collect();
-    let pi_star_sum: f64 = d_star.iter().map(|&j| sims[j].prediction).sum();
-    let s0: f64 = sims
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| !d_star.contains(j))
-        .map(|(_, s)| s.price())
-        .sum();
-
-    // Non-active pool parameters: (price, kappa, max_sell)
-    let na: Vec<(f64, f64, f64)> = sims
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| !skip.contains(j))
-        .map(|(_, s)| (s.price(), s.kappa(), s.max_sell_tokens()))
-        .collect();
-
-    // ΔG saturation ceiling
-    let dg_max: f64 = na
-        .iter()
-        .map(|&(p, k, cap)| {
-            let d = 1.0 + k * cap;
-            p * (1.0 - 1.0 / (d * d))
-        })
-        .sum();
-
-    let mut pi = prof_hi;
-    let mut big_m = 0.0_f64;
-
-    for _ in 0..15 {
-        // 1. Direct costs (independent of M; active pool prices unperturbed by mints)
-        let mut d_cost = 0.0_f64;
-        let mut d_dcost = 0.0_f64;
-        for &j in &direct_indices {
-            let tsqrt = (sims[j].prediction / (1.0 + pi)).sqrt();
-            let csqrt = sims[j].price().sqrt();
-            if tsqrt > csqrt {
-                d_cost += sims[j].l_eff() * (tsqrt - csqrt);
-                let t = 1.0 + pi;
-                d_dcost -= sims[j].l_eff() * sims[j].prediction.sqrt() / (2.0 * t * t.sqrt());
-            }
-        }
-
-        // 2. δ(π) = Π*/(1+π) - (1 - S₀)
-        let delta = pi_star_sum / (1.0 + pi) - (1.0 - s0);
-        let d_delta = -pi_star_sum / ((1.0 + pi) * (1.0 + pi));
-
-        // 3. Solve M(π), compute mint cost and d(cost)/dπ
-        let mut c_mint = 0.0_f64;
-        let mut dc_dpi = 0.0_f64;
-
-        if delta <= 0.0 {
-            big_m = 0.0;
-        } else if delta >= dg_max && dg_max > 0.0 {
-            // Saturated: all non-active pools capped
-            let pi_bound = pi_star_sum / (1.0 - s0 + dg_max) - 1.0;
-            big_m = na.iter().map(|&(_, _, cap)| cap).fold(0.0_f64, f64::max);
-            c_mint = big_m
-                - na.iter()
-                    .map(|&(p, k, cap)| p * cap * FEE_FACTOR / (1.0 + k * cap))
-                    .sum::<f64>();
-            if direct_indices.is_empty() {
-                if c_mint <= budget {
-                    return (pi_bound.clamp(prof_lo, prof_hi), big_m);
-                }
-                // Can't afford saturation — nudge pi above boundary so next
-                // iteration lands in the unsaturated regime with non-zero gradients.
-                pi = pi_bound + 1e-10;
-                continue;
-            }
-            if pi < pi_bound {
-                pi = pi_bound;
-                // Recompute direct costs for updated pi
-                d_cost = 0.0;
-                d_dcost = 0.0;
-                for &j in &direct_indices {
-                    let tsqrt = (sims[j].prediction / (1.0 + pi)).sqrt();
-                    let csqrt = sims[j].price().sqrt();
-                    if tsqrt > csqrt {
-                        d_cost += sims[j].l_eff() * (tsqrt - csqrt);
-                        let t = 1.0 + pi;
-                        d_dcost -=
-                            sims[j].l_eff() * sims[j].prediction.sqrt() / (2.0 * t * t.sqrt());
-                    }
-                }
-            }
-            // dc_dpi = 0 (M doesn't vary with π when saturated)
+    let mut lo = prof_lo;
+    let mut hi = prof_hi;
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        if affordable(mid) {
+            hi = mid;
         } else {
-            // Inner Newton: solve ΔG(M) = δ
-            let dg0: f64 = na.iter().map(|&(p, k, _)| 2.0 * p * k).sum();
-            big_m = if dg0 > 1e-30 {
-                (delta / dg0).max(0.0)
-            } else {
-                0.0
-            };
-            for _ in 0..8 {
-                let mut dg = 0.0_f64;
-                let mut dgp = 0.0_f64;
-                for &(p, k, cap) in &na {
-                    let me = big_m.min(cap);
-                    let d = 1.0 + k * me;
-                    let d2 = d * d;
-                    dg += p * (1.0 - 1.0 / d2);
-                    if big_m < cap {
-                        dgp += 2.0 * p * k / (d2 * d);
-                    }
-                }
-                if dgp < 1e-30 {
-                    break;
-                }
-                let step = (dg - delta) / dgp;
-                big_m -= step;
-                big_m = big_m.max(0.0);
-                if step.abs() < 1e-10 * (1.0 + big_m) {
-                    break;
-                }
-            }
-
-            // Net cost and derivatives in one pass
-            let mut dgp_final = 0.0_f64;
-            let mut dc_dm = 1.0_f64;
-            c_mint = big_m;
-            for &(p, k, cap) in &na {
-                let me = big_m.min(cap);
-                let d = 1.0 + me * k;
-                c_mint -= p * me * FEE_FACTOR / d;
-                if big_m < cap {
-                    let d2 = d * d;
-                    dgp_final += 2.0 * p * k / (d2 * d);
-                    dc_dm -= FEE_FACTOR * p / d2;
-                }
-            }
-            let dm_dpi = if dgp_final > 1e-30 {
-                d_delta / dgp_final
-            } else {
-                0.0
-            };
-            dc_dpi = dc_dm * dm_dpi;
+            lo = mid;
         }
-
-        // 4. Newton step on π
-        let total = d_cost + c_mint;
-        let dtotal = d_dcost + dc_dpi;
-        if dtotal.abs() < 1e-30 {
+        if (hi - lo).abs() <= 1e-12 * (1.0 + hi.abs()) {
             break;
         }
-        let step = (total - budget) / dtotal;
-        let pi_new = (pi - step).clamp(prof_lo, prof_hi);
-        if (pi_new - pi).abs() < 1e-12 * (1.0 + pi.abs()) {
-            break;
-        }
-        pi = pi_new;
     }
 
-    // Final M recompute to ensure consistency with returned pi
-    let delta_final = pi_star_sum / (1.0 + pi) - (1.0 - s0);
-    if delta_final <= 0.0 {
-        big_m = 0.0;
-    } else if delta_final >= dg_max && dg_max > 0.0 {
-        big_m = na.iter().map(|&(_, _, cap)| cap).fold(0.0_f64, f64::max);
-    } else {
-        let dg0: f64 = na.iter().map(|&(p, k, _)| 2.0 * p * k).sum();
-        big_m = if dg0 > 1e-30 {
-            (delta_final / dg0).max(0.0)
-        } else {
-            0.0
-        };
-        for _ in 0..8 {
-            let mut dg = 0.0_f64;
-            let mut dgp = 0.0_f64;
-            for &(p, k, cap) in &na {
-                let me = big_m.min(cap);
-                let d = 1.0 + k * me;
-                let d2 = d * d;
-                dg += p * (1.0 - 1.0 / d2);
-                if big_m < cap {
-                    dgp += 2.0 * p * k / (d2 * d);
-                }
-            }
-            if dgp < 1e-30 {
-                break;
-            }
-            let step = (dg - delta_final) / dgp;
-            big_m -= step;
-            big_m = big_m.max(0.0);
-            if step.abs() < 1e-10 * (1.0 + big_m) {
-                break;
-            }
-        }
-    }
-
-    (pi, big_m)
+    hi.clamp(prof_lo, prof_hi)
 }
 
 #[cfg(test)]
@@ -2066,6 +2156,101 @@ mod tests {
                 bal
             );
         }
+    }
+
+    #[test]
+    fn test_profitability_handles_nonpositive_prices() {
+        let p_neg = profitability(0.3, -0.2);
+        let p_zero = profitability(0.3, 0.0);
+        let p_small = profitability(0.3, 1e-12);
+        assert!(p_neg.is_finite() && p_neg > 0.0);
+        assert!(p_zero.is_finite() && p_zero > 0.0);
+        assert!(
+            (p_zero - p_small).abs() < 1e-9,
+            "zero and epsilon clamp should match"
+        );
+    }
+
+    #[test]
+    fn test_waterfall_can_activate_mint_with_negative_alt_price() {
+        // Sum(prices) > 1 => alt price for each target is negative.
+        // Mint route should still be considered and executed.
+        let mut sims = build_three_sims_with_preds([0.8, 0.8, 0.8], [0.3, 0.3, 0.3]);
+        let mut budget = 1.0;
+        let mut actions = Vec::new();
+
+        let last_prof = waterfall(&mut sims, &mut budget, &mut actions, true);
+
+        assert!(last_prof.is_finite() && last_prof >= 0.0);
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+            "negative alt-price setup should trigger mint route"
+        );
+    }
+
+    #[test]
+    fn test_complete_set_arb_executes_when_profitable() {
+        // Sum prices = 0.6 < 1.0 (before fees/slippage), so complete-set buy+merge should be profitable.
+        let mut sims = build_three_sims_with_preds([0.2, 0.2, 0.2], [0.3, 0.3, 0.3]);
+        let mut actions = Vec::new();
+        let mut budget = 0.0;
+
+        let profit = execute_complete_set_arb(&mut sims, &mut actions, &mut budget);
+        assert!(profit > 0.0, "arb should produce positive profit");
+        assert!(
+            (budget - profit).abs() < 1e-9,
+            "budget increase should match realized arb profit"
+        );
+
+        let buy_count = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Buy { .. }))
+            .count();
+        assert_eq!(
+            buy_count, 3,
+            "complete-set arb should buy every pooled outcome"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Merge {
+                    source_market: "complete_set_arb",
+                    ..
+                }
+            )),
+            "arb should emit merge action tagged as complete_set_arb"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::FlashLoan { .. })),
+            "arb legs should be funded with a flash loan"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::RepayFlashLoan { .. })),
+            "arb legs should repay the flash loan"
+        );
+    }
+
+    #[test]
+    fn test_complete_set_arb_skips_when_unprofitable() {
+        // Sum prices = 1.5 > 1.0, so buy-all-and-merge should be non-profitable.
+        let mut sims = build_three_sims_with_preds([0.5, 0.5, 0.5], [0.3, 0.3, 0.3]);
+        let mut actions = Vec::new();
+        let mut budget = 7.0;
+
+        let profit = execute_complete_set_arb(&mut sims, &mut actions, &mut budget);
+        assert!(profit <= 1e-12, "unprofitable setup should not execute arb");
+        assert!(
+            actions.is_empty(),
+            "no actions should be emitted when arb is skipped"
+        );
+        assert!(
+            (budget - 7.0).abs() < 1e-12,
+            "budget should remain unchanged when no arb trade is executed"
+        );
     }
 
     fn build_three_sims(prices: [f64; 3]) -> Vec<PoolSim> {
@@ -2697,17 +2882,155 @@ mod tests {
             ev_after
         );
 
-        // Budget accounting: remaining should be >= 0 and < initial
+        // Budget accounting: remaining should be non-negative.
+        // It may exceed initial budget if complete-set arbitrage is executed.
         assert!(
             remaining_budget >= -1e-9,
             "remaining budget should be non-negative: {:.6}",
             remaining_budget
         );
-        assert!(
-            remaining_budget < initial_budget,
-            "should have spent some budget: remaining={:.6}",
-            remaining_budget
+    }
+
+    #[test]
+    #[ignore = "profiling helper; run explicitly"]
+    fn profile_rebalance_scenarios() {
+        use crate::markets::MARKETS_L1;
+        use std::time::Instant;
+
+        fn build_slot0_with<F>(
+            limit: Option<usize>,
+            mut price_for_pred: F,
+        ) -> Vec<(Slot0Result, &'static crate::markets::MarketData)>
+        where
+            F: FnMut(f64, usize) -> f64,
+        {
+            let preds = crate::pools::prediction_map();
+            let mut rows = Vec::new();
+            for market in MARKETS_L1.iter().filter(|m| m.pool.is_some()) {
+                let key = normalize_market_name(market.name);
+                let Some(&pred) = preds.get(&key) else {
+                    continue;
+                };
+                let pool = market.pool.as_ref().unwrap();
+                let is_token1_outcome =
+                    pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+                let idx = rows.len();
+                let price = price_for_pred(pred, idx).max(1e-6);
+                let sqrt_price = prediction_to_sqrt_price_x96(price, is_token1_outcome)
+                    .unwrap_or(U256::from(1u128 << 96));
+                rows.push((
+                    Slot0Result {
+                        pool_id: Address::ZERO,
+                        sqrt_price_x96: sqrt_price,
+                        tick: 0,
+                        observation_index: 0,
+                        observation_cardinality: 0,
+                        observation_cardinality_next: 0,
+                        fee_protocol: 0,
+                        unlocked: true,
+                    },
+                    market,
+                ));
+                if let Some(max_rows) = limit {
+                    if rows.len() >= max_rows {
+                        break;
+                    }
+                }
+            }
+            rows
+        }
+
+        let scenarios: Vec<(
+            &str,
+            Vec<(Slot0Result, &'static crate::markets::MarketData)>,
+            HashMap<&str, f64>,
+            f64,
+        )> = vec![
+            (
+                "full_underpriced_with_arb",
+                build_slot0_with(None, |pred, _| pred * 0.5),
+                HashMap::new(),
+                100.0,
+            ),
+            (
+                "full_near_fair",
+                build_slot0_with(None, |pred, _| pred * 0.98),
+                HashMap::new(),
+                100.0,
+            ),
+            (
+                "partial_underpriced_no_mint_route",
+                build_slot0_with(Some(64), |pred, _| pred * 0.5),
+                HashMap::new(),
+                100.0,
+            ),
+        ];
+
+        for (name, slot0_results, balances, susd) in scenarios {
+            // Warm up
+            let _ = rebalance(&balances, susd, &slot0_results);
+
+            let iters = 3;
+            let start = Instant::now();
+            let mut actions = Vec::new();
+            for _ in 0..iters {
+                actions = rebalance(&balances, susd, &slot0_results);
+            }
+            let elapsed = start.elapsed();
+            let buys = actions
+                .iter()
+                .filter(|a| matches!(a, Action::Buy { .. }))
+                .count();
+            let sells = actions
+                .iter()
+                .filter(|a| matches!(a, Action::Sell { .. }))
+                .count();
+            let mints = actions
+                .iter()
+                .filter(|a| matches!(a, Action::Mint { .. }))
+                .count();
+            let merges = actions
+                .iter()
+                .filter(|a| matches!(a, Action::Merge { .. }))
+                .count();
+            let flash = actions
+                .iter()
+                .filter(|a| matches!(a, Action::FlashLoan { .. }))
+                .count();
+            println!(
+                "[profile] {}: outcomes={}, per_call={:?}, actions={} (buys={}, sells={}, mints={}, merges={}, flash={})",
+                name,
+                slot0_results.len(),
+                elapsed / iters as u32,
+                actions.len(),
+                buys,
+                sells,
+                mints,
+                merges,
+                flash
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling helper; run explicitly"]
+    fn profile_complete_set_arb_solver() {
+        let sims = build_three_sims_with_preds([0.2, 0.2, 0.2], [0.3, 0.3, 0.3]);
+        let iters = 2000;
+        let start = std::time::Instant::now();
+        let mut last = 0.0;
+        for _ in 0..iters {
+            last = solve_complete_set_arb_amount(&sims);
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "[profile] complete_set_arb_solver: iters={}, total={:?}, per_iter={:?}, amount={:.12}",
+            iters,
+            elapsed,
+            elapsed / iters as u32,
+            last
         );
+        assert!(last >= 0.0);
     }
 
     #[tokio::test]

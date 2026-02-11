@@ -159,19 +159,15 @@ The derivative d(cash_cost)/dm = 1 − (1−f) × Σⱼ∈uncapped Pⱼ(m). Both
 
 ## Mixed-Route Budget Solver
 
-When the active set contains both direct and mint entries, the budget equation couples them:
+When the active set contains both direct and mint entries, the budget equation is solved with a simulation-backed profitability search:
 
 ```
-Σᵢ∈direct cost_direct_i(π*) + Σⱼ∈mint cost_mint_j(π*) = B
+find lowest π* such that feasible_cost(π*) ≤ B
 ```
 
-Direct costs have closed-form derivatives: d(cost)/dπ = −L_eff √pred / (2(1 + π*)^(3/2)).
+At each candidate π*, we simulate the exact execution order used by the bot (mint first, then direct), applying every route's price impact before evaluating the next one. This captures route coupling directly, including active-set switches and path-dependent budget effects.
 
-Mint costs have implicit derivatives, computed via the chain rule through the inner Newton solve for m.
-
-The outer solver runs Newton on π* using these analytical gradients. An inner Newton solves for the mint amount M at each outer step. This nested structure — outer Newton on π*, inner Newton on M — converges in about 15 × 8 = 120 function evaluations, which is fast enough (the whole rebalance runs in 3.6ms for 98 outcomes).
-
-**Coupling simplification.** All non-active pools see the same aggregate sell volume M from minting, regardless of which target outcome the mint is for. This collapses the problem to two scalar unknowns (π*, M) rather than one per mint entry.
+A bisection loop over π* then finds the lowest feasible value in the interval `[π_lo, π_hi]`. This avoids the fixed-binding-target approximation and keeps the solver aligned with actual execution semantics.
 
 ## Two Sell Routes
 
@@ -182,7 +178,7 @@ When reducing exposure to an outcome (Phases 1 and 3), there are two routes:
 **Merge route:** Buy one token of every *other* outcome, then merge (burn) complete sets to recover 1 sUSD per set. The effective sell price is:
 
 ```
-merge_price(i) = 1 − Σⱼ≠ᵢ buy_cost(j, 1) / 1
+merge_price(i) = 1 − Σⱼ≠ᵢ buy_cost(j, 1)
 ```
 
 At marginal (m→0): merge_price ≈ 1 − Σⱼ≠ᵢ Pⱼ/(1−f), which is worse than direct by the fee spread. But for high-price outcomes (P > ~0.5), buying the cheap complementary set and merging dominates direct selling.
@@ -197,26 +193,28 @@ Price after buying m: P(m) = P₀ / (1 − mλ)². Cost: m × P₀ / ((1−f)(1�
 
 The merge route is only available when all pools are present (no partial-pool handling). When selling, we optimize a direct/merge split for each token amount and execute the proceeds-maximizing mixture.
 
-## The Full Rebalance: Three Phases
+## The Full Rebalance: Four Phases
+
+**Phase 0: Complete-set arbitrage.** Before discretionary rebalancing, check if buying one unit of every outcome and merging is profitable (slippage- and fee-aware, sized optimally). Execute this first to harvest risk-free budget expansion.
 
 **Phase 1: Sell overpriced holdings.** For any outcome where the market price exceeds your prediction and you hold tokens, sell until price = prediction or you exhaust holdings. For each sell amount, optimize a **mixture** of direct sells and merge sells (buy all others + merge), because marginal route attractiveness shifts as each route is partially consumed; execute the proceeds-maximizing split. This is unambiguously correct — holding overpriced assets is negative expected value — and the proceeds fund Phase 2.
 
-**Phase 2: Waterfall allocation.** Deploy the budget (initial sUSD + Phase 1 proceeds) via the waterfall. Returns the final profitability level π_last.
+**Phase 2: Waterfall allocation.** Deploy the budget (initial sUSD + Phase 0 + Phase 1 proceeds) via the waterfall. Returns the final profitability level π_last.
 
-**Phase 3: Liquidation and reallocation.** After the waterfall, scan existing holdings. Any holding with profitability below π_last is capital trapped in a suboptimal position. Sell the worst holdings first (only enough to raise their profitability to π_last — full liquidation would cause round-trip losses), optimizing a direct/merge split for each sell. Recover the capital and run a second waterfall pass.
+**Phase 3: Liquidation and reallocation to convergence.** After the waterfall, scan holdings. Any holding with profitability below π_last is capital trapped in a suboptimal position. Sell the worst holdings first (only enough to raise their profitability to π_last), optimize direct/merge split per sell, recover capital, run waterfall again, and repeat until no meaningful improvement remains.
 
-The three phases ensure: (1) no capital sits in overpriced positions, (2) available capital goes to the best opportunities, (3) legacy holdings that lag the portfolio's marginal standard are recycled.
+The four phases ensure: (1) free arbitrage budget is harvested first, (2) no capital sits in overpriced positions, (3) available capital goes to the best opportunities, (4) legacy holdings that lag the portfolio's marginal standard are iteratively recycled.
 
 ## Why This Works
 
 The waterfall is not a greedy heuristic that happens to do well. It is the exact solution to the constrained optimization, derived from the KKT conditions. The equal-marginal-profitability condition is both necessary and sufficient for optimality (the cost function is convex, the objective is linear, strong duality holds).
 
-The closed-form solver for all-direct and the nested Newton for mixed routes are not approximations — they find the exact π* (up to floating-point precision and the single-tick-range assumption). The only genuine approximation is that we model each pool as having a single tick range of liquidity. For pools with liquidity concentrated in one range (which these are), this is exact.
+The closed-form solver for all-direct and simulation-backed bisection for mixed routes find the best feasible π* under the implemented execution model (up to floating-point precision and the single-tick-range assumption). The remaining model approximation is single-range liquidity per pool.
 
 The algorithm handles edge cases structurally:
 - **Zero-liquidity pools**: excluded at construction (no PoolSim created), mint route disabled
 - **Tick boundary saturation**: per-pool sell caps enforced in Newton, derivative zeroed for saturated pools
 - **Negative mint costs** (arbitrage): executed normally, budget increases
-- **Active-set changes during execution**: costs recomputed right before each trade, waterfall breaks early if recomputed costs diverge from estimates
+- **Active-set changes during execution**: handled naturally by simulation-backed planning at each candidate profitability
 
-Performance: 3.6ms per call for 98 outcomes on release build. The dominant cost is the waterfall loop (at most 1000 iterations, each doing O(n) work across outcomes). In practice, convergence happens in 10–20 iterations.
+Performance is dominated by the waterfall loop and mixed-route solve probes. In practice, convergence still occurs in a small number of waterfall iterations, while the bisection solver (≤64 probes) trades some speed for higher robustness and solver/executor consistency.
