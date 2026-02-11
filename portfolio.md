@@ -90,11 +90,13 @@ When the total cost to bring all active entries to the next profitability level 
 - A = Σᵢ L_eff_i × √pred_i, B = budget + Σᵢ L_eff_i × √price_i
 - **π = (A/B)² - 1** — zero iterations, exact solution.
 
-**Mixed routes (Newton's method):** When mint routes are in the active set, uses Newton's method with analytical derivatives for both direct and mint entries. Mint derivatives use the implicit function theorem: `d(net_cost)/dπ = (1 - (1-f)×Σ Pⱼ(m)) × P_target / ((1+π) × g'(m))`, computed in the same pass as cost. Converges in ~3-4 iterations.
+**Mixed routes (coupled (π, M) Newton):** When mint routes are in the active set, skip semantics collapse inter-mint coupling to a scalar: all non-active pools see the same aggregate sell volume M = Σ mᵢ, and active pool prices are unperturbed by mints. This reduces the problem to 2 unknowns (π, M).
 
-**Previously known bugs (now fixed):**
-1. ~~`mint_cost_to_prof` rhs~~ — Fixed: `rhs = (1 - tp) - Σ_{skip} P⁰_j` correctly accounts for skip pool prices.
-2. ~~Independent mint treatment in `solve_prof`~~ — Fixed: coupled (π, M) solver computes aggregate mint volume jointly. Returns `(profitability, aggregate_M)`. Waterfall executes mints first with M/|Q| per entry, then directs.
+The solver partitions outcomes into D\* (direct-active ∪ binding mint target i\*), Q' (mint-active-only, pool price frozen), and N (non-active, sold into by mints). Key equations:
+- **Alt-price constraint** (defines M for given π): `ΔG(M) = δ(π)`, where `δ(π) = Π*/(1+π) - (1-S₀)`, `Π* = Σ_{D*} predⱼ`, `S₀ = Σ_{j∉D*} P⁰ⱼ`
+- **Budget constraint**: `Σ_{D} d_j(π) + C_mint(M(π)) = B`
+
+Outer Newton on π (up to 15 iterations), inner Newton on M (2-3 iterations per outer step). Returns `(profitability, aggregate_M)`. Waterfall executes mints first (M split equally among entries), then directs using post-mint pool state. See `improvements.md` for full derivation and review history.
 
 #### Execution safeguards
 
@@ -144,6 +146,16 @@ if let Some(cache) = load_balance_cache(Path::new("balance_cache.json"), &wallet
     let balances = cache_to_balances(&cache);
 }
 ```
+
+## Performance
+
+`test_rebalance_perf_full_l1` benchmarks the full rebalance across all 98 tradeable L1 outcomes using real market/tick/liquidity data from `MARKETS_L1` with synthetic slot0 prices (50% of prediction, creating buy opportunities for every outcome).
+
+| Mode | Per call (98 outcomes) |
+|------|-----------------------|
+| Release | ~3.6ms |
+
+Run with: `cargo test --release test_rebalance_perf_full_l1 -- --nocapture`
 
 ## Usage
 
