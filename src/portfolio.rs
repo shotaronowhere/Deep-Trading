@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use alloy_primitives::{I256, U256};
-use uniswap_v3_math::{swap_math::compute_swap_step, tick_math::get_sqrt_ratio_at_tick};
+use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
 
 use crate::pools::{
-    normalize_market_name, prediction_map, prediction_to_sqrt_price_x96,
-    sqrt_price_x96_to_price_outcome, u256_to_f64, FEE_PIPS, Slot0Result,
+    normalize_market_name, prediction_map, sqrt_price_x96_to_price_outcome, u256_to_f64, FEE_PIPS,
+    Slot0Result,
 };
 
 const NEWTON_ITERS: usize = 8;
@@ -41,6 +40,7 @@ pub enum Action {
 }
 
 /// Mutable pool state for swap simulation during rebalancing.
+/// All arithmetic is pure f64 — no U256 in the hot path.
 struct PoolSim {
     market_name: &'static str,
     #[allow(dead_code)]
@@ -49,12 +49,11 @@ struct PoolSim {
     outcome_token: &'static str,
     #[allow(dead_code)]
     pool: &'static crate::markets::Pool,
-    sqrt_price_x96: U256,
-    is_token1_outcome: bool,
-    zero_for_one_buy: bool,
+    price: f64,            // current outcome price (mutable)
+    buy_limit_price: f64,  // max outcome price reachable via buying (tick boundary)
+    sell_limit_price: f64, // min outcome price reachable via selling (tick boundary)
     liquidity: u128,
-    sqrt_price_buy_limit: U256,
-    sqrt_price_sell_limit: U256,
+    l_eff: f64, // precomputed L / (1e18 × (1-fee))
     prediction: f64,
 }
 
@@ -78,172 +77,117 @@ impl PoolSim {
         let sqrt_lo = get_sqrt_ratio_at_tick(t0.min(t1)).ok()?;
         let sqrt_hi = get_sqrt_ratio_at_tick(t0.max(t1)).ok()?;
 
-        // Buy direction: zero_for_one → price decreases → target = lower
-        //                !zero_for_one → price increases → target = upper
-        // Sell is opposite direction
-        let (sqrt_price_buy_limit, sqrt_price_sell_limit) = if zero_for_one_buy {
+        let (sqrt_buy_limit, sqrt_sell_limit) = if zero_for_one_buy {
             (sqrt_lo, sqrt_hi)
         } else {
             (sqrt_hi, sqrt_lo)
         };
+
+        // Convert all U256 prices to f64 once at construction
+        let price = u256_to_f64(sqrt_price_x96_to_price_outcome(
+            slot0.sqrt_price_x96,
+            is_token1_outcome,
+        )?);
+        let buy_limit_price = u256_to_f64(sqrt_price_x96_to_price_outcome(
+            sqrt_buy_limit,
+            is_token1_outcome,
+        )?);
+        let sell_limit_price = u256_to_f64(sqrt_price_x96_to_price_outcome(
+            sqrt_sell_limit,
+            is_token1_outcome,
+        )?);
 
         Some(PoolSim {
             market_name: market.name,
             market_id: market.market_id,
             outcome_token: market.outcome_token,
             pool,
-            sqrt_price_x96: slot0.sqrt_price_x96,
-            is_token1_outcome,
-            zero_for_one_buy,
+            price,
+            buy_limit_price,
+            sell_limit_price,
             liquidity,
-            sqrt_price_buy_limit,
-            sqrt_price_sell_limit,
+            l_eff: (liquidity as f64) / (1e18 * FEE_FACTOR),
             prediction,
         })
     }
 
-    /// Current outcome price as f64.
+    /// Current outcome price.
     fn price(&self) -> f64 {
-        sqrt_price_x96_to_price_outcome(self.sqrt_price_x96, self.is_token1_outcome)
-            .map(|p| u256_to_f64(p))
-            .unwrap_or(0.0)
-    }
-
-    /// Price at a hypothetical sqrt_price.
-    #[cfg(test)]
-    fn price_at(&self, sqrt_price: U256) -> f64 {
-        sqrt_price_x96_to_price_outcome(sqrt_price, self.is_token1_outcome)
-            .map(|p| u256_to_f64(p))
-            .unwrap_or(0.0)
+        self.price
     }
 
     /// Max tokens sellable before hitting the tick boundary.
-    /// Derived from: new_price = price / (1 + m × κ)², capped at sell_limit_price.
     fn max_sell_tokens(&self) -> f64 {
         let k = self.kappa();
         if k <= 0.0 {
             return 0.0;
         }
-        let p = self.price();
-        let lp = sqrt_price_x96_to_price_outcome(self.sqrt_price_sell_limit, self.is_token1_outcome)
-            .map(|p| u256_to_f64(p))
-            .unwrap_or(0.0);
-        if lp <= 0.0 || lp >= p {
+        let lp = self.sell_limit_price;
+        if lp <= 0.0 || lp >= self.price {
             return 0.0;
         }
-        ((p / lp).sqrt() - 1.0) / k
+        ((self.price / lp).sqrt() - 1.0) / k
     }
 
-    /// Price sensitivity parameter: κ = (1-fee) × √price × 1e18 / L.
-    /// Relates selling m tokens to new price: new_price = price / (1 + m × κ)².
+    /// Price sensitivity: κ = (1-fee) × √price × 1e18 / L.
     fn kappa(&self) -> f64 {
-        let p = self.price();
-        if p <= 0.0 || self.liquidity == 0 {
+        if self.price <= 0.0 || self.liquidity == 0 {
             return 0.0;
         }
-        FEE_FACTOR * p.sqrt() * 1e18 / (self.liquidity as f64)
+        FEE_FACTOR * self.price.sqrt() * 1e18 / (self.liquidity as f64)
     }
 
-    /// Effective liquidity for cost computation: L_eff = L / (1e18 × (1-fee)).
-    /// cost = L_eff × (√target_price - √current_price).
+    /// Effective liquidity: L_eff = L / (1e18 × (1-fee)).
     fn l_eff(&self) -> f64 {
-        (self.liquidity as f64) / (1e18 * FEE_FACTOR)
+        self.l_eff
     }
 
     /// Cost to move pool price to target_price via direct buy.
-    /// Returns (quote_cost, outcome_received, new_sqrt_price).
-    fn cost_to_price(&self, target_price: f64) -> Option<(f64, f64, U256)> {
-        let target_sqrt =
-            prediction_to_sqrt_price_x96(target_price, self.is_token1_outcome)?;
-        // Clamp to tick boundary in buy direction
-        let clamped = if self.zero_for_one_buy {
-            target_sqrt.max(self.sqrt_price_buy_limit)
-        } else {
-            target_sqrt.min(self.sqrt_price_buy_limit)
-        };
-        // Verify target is in the buy direction from current price
-        let valid = if self.zero_for_one_buy {
-            clamped <= self.sqrt_price_x96
-        } else {
-            clamped >= self.sqrt_price_x96
-        };
-        if !valid {
-            return Some((0.0, 0.0, self.sqrt_price_x96));
+    /// Returns (quote_cost, outcome_received, new_price).
+    fn cost_to_price(&self, target_price: f64) -> Option<(f64, f64, f64)> {
+        let clamped = target_price.min(self.buy_limit_price);
+        if clamped <= self.price {
+            return Some((0.0, 0.0, self.price));
         }
-
-        let (sqrt_next, amount_in, amount_out, fee) = compute_swap_step(
-            self.sqrt_price_x96,
-            clamped,
-            self.liquidity,
-            I256::MAX,
-            FEE_PIPS,
-        )
-        .ok()?;
-        Some((
-            u256_to_f64(amount_in + fee),
-            u256_to_f64(amount_out),
-            sqrt_next,
-        ))
+        let cost = self.l_eff * (clamped.sqrt() - self.price.sqrt());
+        let l_raw = self.liquidity as f64 / 1e18;
+        let amount = l_raw * (1.0 / self.price.sqrt() - 1.0 / clamped.sqrt());
+        Some((cost, amount, clamped))
     }
 
     /// Sell outcome tokens until price drops to target.
-    /// Returns (tokens_sold, quote_received, new_sqrt_price).
-    fn sell_to_price(&self, target_price: f64) -> Option<(f64, f64, U256)> {
-        let target_sqrt =
-            prediction_to_sqrt_price_x96(target_price, self.is_token1_outcome)?;
-        // Clamp to tick boundary in sell direction
-        let zero_for_one_sell = !self.zero_for_one_buy;
-        let clamped = if zero_for_one_sell {
-            target_sqrt.max(self.sqrt_price_sell_limit)
-        } else {
-            target_sqrt.min(self.sqrt_price_sell_limit)
-        };
-        // Verify target is in the sell direction from current price
-        let valid = if zero_for_one_sell {
-            clamped <= self.sqrt_price_x96
-        } else {
-            clamped >= self.sqrt_price_x96
-        };
-        if !valid {
-            return Some((0.0, 0.0, self.sqrt_price_x96));
+    /// Returns (tokens_sold, quote_received, new_price).
+    fn sell_to_price(&self, target_price: f64) -> Option<(f64, f64, f64)> {
+        let clamped = target_price.max(self.sell_limit_price);
+        if clamped >= self.price {
+            return Some((0.0, 0.0, self.price));
         }
-
-        let (sqrt_next, amount_in, amount_out, fee) = compute_swap_step(
-            self.sqrt_price_x96,
-            clamped,
-            self.liquidity,
-            I256::MAX,
-            FEE_PIPS,
-        )
-        .ok()?;
-        // amount_in = outcome tokens consumed, amount_out = quote received
-        Some((
-            u256_to_f64(amount_in + fee),
-            u256_to_f64(amount_out),
-            sqrt_next,
-        ))
+        let k = self.kappa();
+        if k <= 0.0 {
+            return None;
+        }
+        let tokens = ((self.price / clamped).sqrt() - 1.0) / k;
+        let d = 1.0 + tokens * k;
+        let proceeds = self.price * tokens * FEE_FACTOR / d;
+        Some((tokens, proceeds, clamped))
     }
 
     /// Sell exact amount of outcome tokens.
-    /// Returns (tokens_actually_sold, quote_received, new_sqrt_price).
-    fn sell_exact(&self, amount: f64) -> Option<(f64, f64, U256)> {
+    /// Returns (tokens_actually_sold, quote_received, new_price).
+    fn sell_exact(&self, amount: f64) -> Option<(f64, f64, f64)> {
         if amount <= 0.0 {
-            return Some((0.0, 0.0, self.sqrt_price_x96));
+            return Some((0.0, 0.0, self.price));
         }
-        let sell_amount = I256::try_from(U256::from((amount * 1e18) as u128)).ok()?;
-        let (sqrt_next, amount_in, amount_out, fee) = compute_swap_step(
-            self.sqrt_price_x96,
-            self.sqrt_price_sell_limit,
-            self.liquidity,
-            sell_amount,
-            FEE_PIPS,
-        )
-        .ok()?;
-        Some((
-            u256_to_f64(amount_in + fee),
-            u256_to_f64(amount_out),
-            sqrt_next,
-        ))
+        let k = self.kappa();
+        let max_sell = self.max_sell_tokens();
+        let actual = amount.min(max_sell);
+        if actual <= 0.0 {
+            return Some((0.0, 0.0, self.price));
+        }
+        let d = 1.0 + actual * k;
+        let new_price = self.price / (d * d);
+        let proceeds = self.price * actual * FEE_FACTOR / d;
+        Some((actual, proceeds, new_price))
     }
 }
 
@@ -267,14 +211,9 @@ fn build_sims(slot0_results: &[(Slot0Result, &'static crate::markets::MarketData
 }
 
 /// Compute alt price for outcome at `idx`: 1 - sum(other outcome prices).
-fn alt_price(sims: &[PoolSim], idx: usize) -> f64 {
-    let others_sum: f64 = sims
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != idx)
-        .map(|(_, s)| s.price())
-        .sum();
-    1.0 - others_sum
+/// O(1) when price_sum is precomputed.
+fn alt_price(sims: &[PoolSim], idx: usize, price_sum: f64) -> f64 {
+    1.0 - (price_sum - sims[idx].price)
 }
 
 /// Profitability = (prediction - best_price) / best_price
@@ -298,8 +237,8 @@ enum Route {
 }
 
 /// For the direct route, compute cost to bring an outcome's profitability to `target_prof`.
-/// Returns (cost, outcome_amount, new_sqrt_price).
-fn direct_cost_to_prof(sim: &PoolSim, target_prof: f64) -> Option<(f64, f64, U256)> {
+/// Returns (cost, outcome_amount, new_price).
+fn direct_cost_to_prof(sim: &PoolSim, target_prof: f64) -> Option<(f64, f64, f64)> {
     let tp = target_price_for_prof(sim.prediction, target_prof);
     sim.cost_to_price(tp)
 }
@@ -312,9 +251,10 @@ fn mint_cost_to_prof(
     target_idx: usize,
     target_prof: f64,
     skip: &HashSet<usize>,
+    price_sum: f64,
 ) -> Option<(f64, f64, f64)> {
     let tp = target_price_for_prof(sims[target_idx].prediction, target_prof);
-    let current_alt = alt_price(sims, target_idx);
+    let current_alt = alt_price(sims, target_idx, price_sum);
     if current_alt >= tp {
         return Some((0.0, 0.0, 0.0));
     }
@@ -414,23 +354,24 @@ fn mint_cost_to_prof(
 }
 
 /// Compute cost to reach target_prof for a given outcome via a specific route.
-/// Returns (cost, amount, Option<new_sqrt_for_direct>, d_cost_d_pi).
+/// Returns (cost, amount, Option<new_price_for_direct>, d_cost_d_pi).
 fn cost_for_route(
     sims: &[PoolSim],
     idx: usize,
     route: Route,
     target_prof: f64,
     skip: &HashSet<usize>,
-) -> Option<(f64, f64, Option<U256>, f64)> {
+    price_sum: f64,
+) -> Option<(f64, f64, Option<f64>, f64)> {
     match route {
-        Route::Direct => direct_cost_to_prof(&sims[idx], target_prof).map(|(cost, amount, sqrt)| {
+        Route::Direct => direct_cost_to_prof(&sims[idx], target_prof).map(|(cost, amount, new_price)| {
             let l = sims[idx].l_eff();
             let pred = sims[idx].prediction;
             let t = 1.0 + target_prof;
             let dcost = -l * pred.sqrt() / (2.0 * t * t.sqrt());
-            (cost, amount, Some(sqrt), dcost)
+            (cost, amount, Some(new_price), dcost)
         }),
-        Route::Mint => mint_cost_to_prof(sims, idx, target_prof, skip)
+        Route::Mint => mint_cost_to_prof(sims, idx, target_prof, skip, price_sum)
             .map(|(cost, amount, dcost)| (cost, amount, None, dcost)),
     }
 }
@@ -473,10 +414,10 @@ fn emit_mint_actions(
         if i == target_idx || skip.contains(&i) {
             continue;
         }
-        if let Some((sold, proceeds, new_sqrt)) = sims[i].sell_exact(amount) {
+        if let Some((sold, proceeds, new_price)) = sims[i].sell_exact(amount) {
             if sold > 0.0 {
                 total_proceeds += proceeds;
-                sims[i].sqrt_price_x96 = new_sqrt;
+                sims[i].price = new_price;
                 actions.push(Action::Sell {
                     market_name: sims[i].market_name,
                     amount: sold,
@@ -530,12 +471,12 @@ pub fn rebalance(
         }
 
         // Sell until price = prediction, or sell all if holdings insufficient
-        let (tokens_needed, proceeds_to_pred, sqrt_at_pred) = sims[i]
+        let (tokens_needed, proceeds_to_pred, price_at_pred) = sims[i]
             .sell_to_price(sims[i].prediction)
-            .unwrap_or((0.0, 0.0, sims[i].sqrt_price_x96));
+            .unwrap_or((0.0, 0.0, sims[i].price));
 
         if tokens_needed > 0.0 && tokens_needed <= held {
-            sims[i].sqrt_price_x96 = sqrt_at_pred;
+            sims[i].price = price_at_pred;
             budget += proceeds_to_pred;
             *sim_balances.get_mut(sims[i].market_name).unwrap() -= tokens_needed;
             actions.push(Action::Sell {
@@ -544,11 +485,11 @@ pub fn rebalance(
                 proceeds: proceeds_to_pred,
             });
         } else if held > 0.0 {
-            let (sold, proceeds, new_sqrt) = sims[i]
+            let (sold, proceeds, new_price) = sims[i]
                 .sell_exact(held)
-                .unwrap_or((0.0, 0.0, sims[i].sqrt_price_x96));
+                .unwrap_or((0.0, 0.0, sims[i].price));
             if sold > 0.0 {
-                sims[i].sqrt_price_x96 = new_sqrt;
+                sims[i].price = new_price;
                 budget += proceeds;
                 *sim_balances.get_mut(sims[i].market_name).unwrap() -= sold;
                 actions.push(Action::Sell {
@@ -613,26 +554,26 @@ pub fn rebalance(
             // Sell only enough to raise profitability to last_bought_prof.
             // Target price = prediction / (1 + last_bought_prof).
             let target_price = target_price_for_prof(sims[idx].prediction, last_bought_prof);
-            let (tokens_needed, proceeds_to_target, sqrt_at_target) = sims[idx]
+            let (tokens_needed, proceeds_to_target, price_at_target) = sims[idx]
                 .sell_to_price(target_price)
-                .unwrap_or((0.0, 0.0, sims[idx].sqrt_price_x96));
+                .unwrap_or((0.0, 0.0, sims[idx].price));
             let sell_amount = tokens_needed.min(held);
             if sell_amount > 0.0 {
-                let (sold, proceeds, new_sqrt) = if (sell_amount - held).abs() < 1e-18 {
+                let (sold, proceeds, new_price) = if (sell_amount - held).abs() < 1e-18 {
                     // Selling all holdings
                     sims[idx]
                         .sell_exact(held)
-                        .unwrap_or((0.0, 0.0, sims[idx].sqrt_price_x96))
+                        .unwrap_or((0.0, 0.0, sims[idx].price))
                 } else if (sell_amount - tokens_needed).abs() < 1e-18 {
                     // Selling exactly the amount needed to reach target price
-                    (tokens_needed, proceeds_to_target, sqrt_at_target)
+                    (tokens_needed, proceeds_to_target, price_at_target)
                 } else {
                     sims[idx]
                         .sell_exact(sell_amount)
-                        .unwrap_or((0.0, 0.0, sims[idx].sqrt_price_x96))
+                        .unwrap_or((0.0, 0.0, sims[idx].price))
                 };
                 if sold > 0.0 {
-                    sims[idx].sqrt_price_x96 = new_sqrt;
+                    sims[idx].price = new_price;
                     budget += proceeds;
                     *sim_balances.get_mut(sims[idx].market_name).unwrap() -= sold;
                     actions.push(Action::Sell {
@@ -657,20 +598,20 @@ pub fn rebalance(
 /// Scans current pool state each call, so mint perturbations are reflected immediately.
 fn best_non_active(
     sims: &[PoolSim],
-    active: &[(usize, Route)],
+    active_set: &HashSet<(usize, Route)>,
     mint_available: bool,
+    price_sum: f64,
 ) -> Option<(usize, Route, f64)> {
-    let active_set: HashSet<(usize, Route)> = active.iter().copied().collect();
     let mut best: Option<(usize, Route, f64)> = None;
     for (i, sim) in sims.iter().enumerate() {
         if !active_set.contains(&(i, Route::Direct)) {
-            let prof = profitability(sim.prediction, sim.price());
+            let prof = profitability(sim.prediction, sim.price);
             if prof > 0.0 && best.map_or(true, |b| prof > b.2) {
                 best = Some((i, Route::Direct, prof));
             }
         }
         if mint_available && !active_set.contains(&(i, Route::Mint)) {
-            let mp = alt_price(sims, i);
+            let mp = alt_price(sims, i, price_sum);
             if mp > 0.0 {
                 let prof = profitability(sim.prediction, mp);
                 if prof > 0.0 && best.map_or(true, |b| prof > b.2) {
@@ -699,13 +640,18 @@ fn waterfall(
         return 0.0;
     }
 
+    // Precompute price_sum; maintained incrementally after executions.
+    let mut price_sum: f64 = sims.iter().map(|s| s.price).sum();
+    let mut active_set: HashSet<(usize, Route)> = HashSet::new();
+
     // Seed active set with the highest-profitability entry.
-    let first = match best_non_active(sims, &[], mint_available) {
+    let first = match best_non_active(sims, &active_set, mint_available, price_sum) {
         Some(entry) if entry.2 > 0.0 => entry,
         _ => return 0.0,
     };
 
     let mut active: Vec<(usize, Route)> = vec![(first.0, first.1)];
+    active_set.insert((first.0, first.1));
     let mut current_prof = first.2;
     let mut last_prof = 0.0;
 
@@ -718,15 +664,16 @@ fn waterfall(
         // If a mint perturbed prices and pushed an entry above current_prof,
         // absorb it into active immediately (no cost step needed).
         loop {
-            match best_non_active(sims, &active, mint_available) {
+            match best_non_active(sims, &active_set, mint_available, price_sum) {
                 Some((idx, route, prof)) if prof > current_prof => {
                     active.push((idx, route));
+                    active_set.insert((idx, route));
                 }
                 _ => break,
             }
         }
 
-        let next = best_non_active(sims, &active, mint_available);
+        let next = best_non_active(sims, &active_set, mint_available, price_sum);
         let target_prof = match next {
             Some((_, _, p)) if p > 0.0 => p,
             _ => 0.0,
@@ -738,11 +685,12 @@ fn waterfall(
             let skip = active_skip_indices(&active);
             let before = active.len();
             active.retain(|&(idx, route)| {
-                cost_for_route(sims, idx, route, target_prof, &skip).is_some()
+                cost_for_route(sims, idx, route, target_prof, &skip, price_sum).is_some()
             });
             if active.len() == before || active.is_empty() {
                 break;
             }
+            active_set = active.iter().copied().collect();
         }
         if active.is_empty() {
             break;
@@ -754,7 +702,7 @@ fn waterfall(
         let total_cost: f64 = active
             .iter()
             .filter_map(|&(idx, route)| {
-                cost_for_route(sims, idx, route, target_prof, &skip).map(|(c, _, _, _)| c)
+                cost_for_route(sims, idx, route, target_prof, &skip, price_sum).map(|(c, _, _, _)| c)
             })
             .sum();
 
@@ -764,15 +712,18 @@ fn waterfall(
             let mut any_skipped = false;
             let skip = active_skip_indices(&active);
             for &(idx, route) in &active {
-                match cost_for_route(sims, idx, route, target_prof, &skip) {
-                    Some((cost, amount, new_sqrt, _)) if cost <= *budget => {
-                        execute_buy(sims, idx, cost, amount, route, new_sqrt, budget, actions, &skip);
+                let ps_before: f64 = sims.iter().map(|s| s.price).sum();
+                match cost_for_route(sims, idx, route, target_prof, &skip, ps_before) {
+                    Some((cost, amount, new_price, _)) if cost <= *budget => {
+                        execute_buy(sims, idx, cost, amount, route, new_price, budget, actions, &skip);
                     }
                     _ => {
                         any_skipped = true;
                     }
                 }
             }
+            // Refresh price_sum after executions
+            price_sum = sims.iter().map(|s| s.price).sum();
 
             if any_skipped {
                 last_prof = current_prof;
@@ -782,22 +733,21 @@ fn waterfall(
             current_prof = target_prof;
             last_prof = target_prof;
 
-            // Re-query best entry from post-execution state (not the stale pre-execution `next`),
-            // since mint actions during this step may have perturbed non-active pool prices.
-            match best_non_active(sims, &active, mint_available) {
+            // Re-query best entry from post-execution state
+            match best_non_active(sims, &active_set, mint_available, price_sum) {
                 Some((idx, route, prof)) if prof > 0.0 => {
                     active.push((idx, route));
+                    active_set.insert((idx, route));
                 }
-                _ => break, // No more entries, all reached prof 0
+                _ => break,
             }
         } else {
             // Can't afford full step. Solve for achievable profitability.
             let skip = active_skip_indices(&active);
             let (achievable, mint_m) =
-                solve_prof(sims, &active, current_prof, target_prof, *budget, &skip);
+                solve_prof(sims, &active, current_prof, target_prof, *budget, &skip, price_sum);
 
             // Execute mints first with aggregate M (updates non-active pool states).
-            // Split equally among mint entries (split is arbitrary; total cost depends only on M).
             if mint_m > 0.0 {
                 let mint_entries: Vec<(usize, Route)> = active
                     .iter()
@@ -815,16 +765,17 @@ fn waterfall(
             }
 
             // Execute directs second (active pool prices unperturbed by mints)
+            price_sum = sims.iter().map(|s| s.price).sum();
             for &(idx, route) in &active {
                 if route == Route::Direct {
-                    if let Some((cost, amount, new_sqrt, _)) =
-                        cost_for_route(sims, idx, route, achievable, &skip)
+                    if let Some((cost, amount, new_price, _)) =
+                        cost_for_route(sims, idx, route, achievable, &skip, price_sum)
                     {
                         if cost > *budget {
                             continue;
                         }
                         execute_buy(
-                            sims, idx, cost, amount, route, new_sqrt, budget, actions, &skip,
+                            sims, idx, cost, amount, route, new_price, budget, actions, &skip,
                         );
                     }
                 }
@@ -844,7 +795,7 @@ fn execute_buy(
     cost: f64,
     amount: f64,
     route: Route,
-    new_sqrt: Option<U256>,
+    new_price: Option<f64>,
     budget: &mut f64,
     actions: &mut Vec<Action>,
     skip: &HashSet<usize>,
@@ -854,8 +805,8 @@ fn execute_buy(
     }
     match route {
         Route::Direct => {
-            if let Some(ns) = new_sqrt {
-                sims[idx].sqrt_price_x96 = ns;
+            if let Some(np) = new_price {
+                sims[idx].price = np;
             }
             *budget -= cost;
             actions.push(Action::Buy {
@@ -886,6 +837,7 @@ fn solve_prof(
     prof_lo: f64,
     budget: f64,
     skip: &HashSet<usize>,
+    price_sum: f64,
 ) -> (f64, f64) {
     let all_direct = active.iter().all(|&(_, route)| route == Route::Direct);
 
@@ -925,8 +877,8 @@ fn solve_prof(
     let i_star = *mint_indices
         .iter()
         .max_by(|&&a, &&b| {
-            let gap_a = sims[a].prediction / (1.0 + prof_hi) - alt_price(sims, a);
-            let gap_b = sims[b].prediction / (1.0 + prof_hi) - alt_price(sims, b);
+            let gap_a = sims[a].prediction / (1.0 + prof_hi) - alt_price(sims, a, price_sum);
+            let gap_b = sims[b].prediction / (1.0 + prof_hi) - alt_price(sims, b, price_sum);
             gap_a
                 .partial_cmp(&gap_b)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -1128,8 +1080,8 @@ fn solve_prof(
 mod tests {
     use super::*;
     use crate::markets::{MarketData, Pool, Tick};
-    use crate::pools::Slot0Result;
-    use alloy::primitives::Address;
+    use crate::pools::{prediction_to_sqrt_price_x96, Slot0Result};
+    use alloy::primitives::{Address, U256};
 
     /// Mock pool: token0=quote(sUSD), token1=outcome → is_token1_outcome=true.
     /// Uses positive tick range matching real L1 pools with this ordering.
@@ -1242,16 +1194,15 @@ mod tests {
         let price = sim.price();
         assert!(price > 0.3, "price {} should be > 0.3", price);
 
-        let (tokens_needed, proceeds, new_sqrt) = sim.sell_to_price(0.3).unwrap();
+        let (tokens_needed, proceeds, new_price) = sim.sell_to_price(0.3).unwrap();
         assert!(tokens_needed > 0.0, "should need to sell some tokens");
         assert!(proceeds > 0.0, "should receive proceeds");
 
         // Check price after sell
-        let price_after = sim.price_at(new_sqrt);
         assert!(
-            (price_after - 0.3).abs() < 0.01,
+            (new_price - 0.3).abs() < 0.01,
             "price after sell {} should be ~0.3",
-            price_after
+            new_price
         );
     }
 
@@ -1265,16 +1216,15 @@ mod tests {
         );
         let sim = PoolSim::from_slot0(&slot0, market, 0.5).unwrap();
 
-        let (cost, amount, new_sqrt) = sim.cost_to_price(0.1).unwrap();
+        let (cost, amount, new_price) = sim.cost_to_price(0.1).unwrap();
         assert!(cost > 0.0, "should cost something to move price");
         assert!(amount > 0.0, "should receive outcome tokens");
 
         // Price should increase toward target, clamped to tick boundary
-        let price_after = sim.price_at(new_sqrt);
         assert!(
-            price_after > 0.01,
+            new_price > 0.01,
             "price after buy {} should be > initial 0.01",
-            price_after
+            new_price
         );
     }
 
@@ -1454,6 +1404,139 @@ mod tests {
             let bal = *sim_balances.get(name).unwrap_or(&0.0);
             assert!(bal >= -1e-12, "{} balance should be >= 0 (residual), got {}", name, bal);
         }
+    }
+
+    #[test]
+    fn test_rebalance_perf_full_l1() {
+        use crate::markets::MARKETS_L1;
+        use std::time::Instant;
+
+        let preds = crate::pools::prediction_map();
+
+        // Build slot0 results for all 98 tradeable markets (those with pools + predictions).
+        // Set each price to 50% of prediction to create buy opportunities for the waterfall.
+        let slot0_results: Vec<(Slot0Result, &'static crate::markets::MarketData)> = MARKETS_L1
+            .iter()
+            .filter(|m| m.pool.is_some())
+            .filter(|m| {
+                let key = normalize_market_name(m.name);
+                preds.contains_key(&key)
+            })
+            .map(|market| {
+                let pool = market.pool.as_ref().unwrap();
+                let is_token1_outcome =
+                    pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+                let key = normalize_market_name(market.name);
+                let pred = preds[&key];
+                // Price = 50% of prediction → profitable to buy
+                let price = pred * 0.5;
+                let sqrt_price = prediction_to_sqrt_price_x96(price, is_token1_outcome)
+                    .unwrap_or(U256::from(1u128 << 96));
+                let slot0 = Slot0Result {
+                    pool_id: Address::ZERO,
+                    sqrt_price_x96: sqrt_price,
+                    tick: 0,
+                    observation_index: 0,
+                    observation_cardinality: 0,
+                    observation_cardinality_next: 0,
+                    fee_protocol: 0,
+                    unlocked: true,
+                };
+                (slot0, market)
+            })
+            .collect();
+
+        println!("Markets: {}", slot0_results.len());
+
+        // Warm up
+        let _ = rebalance(&HashMap::new(), 100.0, &slot0_results);
+
+        // Benchmark: 10 iterations
+        let iters = 10;
+        let start = Instant::now();
+        let mut actions = Vec::new();
+        for _ in 0..iters {
+            actions = rebalance(&HashMap::new(), 100.0, &slot0_results);
+        }
+        let elapsed = start.elapsed();
+
+        let buys = actions.iter().filter(|a| matches!(a, Action::Buy { .. })).count();
+        let sells = actions.iter().filter(|a| matches!(a, Action::Sell { .. })).count();
+        let mints = actions.iter().filter(|a| matches!(a, Action::Mint { .. })).count();
+
+        println!("=== Rebalance Performance (full L1, {} outcomes) ===", slot0_results.len());
+        println!("  Total: {:?} for {} iterations", elapsed, iters);
+        println!("  Per call: {:?}", elapsed / iters as u32);
+        println!("  Actions: {} total ({} buys, {} sells, {} mints)", actions.len(), buys, sells, mints);
+
+        // Sanity: should produce actions when everything is underpriced
+        assert!(!actions.is_empty(), "should produce actions for underpriced markets");
+
+        // === Expected value verification ===
+        // Before: EV = 100.0 sUSD (no holdings)
+        let initial_budget = 100.0;
+
+        // Compute portfolio after rebalancing
+        let mut holdings: HashMap<&str, f64> = HashMap::new();
+        let mut total_cost = 0.0_f64;
+        let mut total_sell_proceeds = 0.0_f64;
+        for action in &actions {
+            match action {
+                Action::Buy { market_name, amount, cost } => {
+                    *holdings.entry(market_name).or_insert(0.0) += amount;
+                    total_cost += cost;
+                }
+                Action::Sell { market_name, amount, proceeds } => {
+                    *holdings.entry(market_name).or_insert(0.0) -= amount;
+                    total_sell_proceeds += proceeds;
+                }
+                Action::Mint { amount, .. } => {
+                    // Mint gives all outcomes
+                    for (slot0, market) in &slot0_results {
+                        let _ = slot0;
+                        *holdings.entry(market.name).or_insert(0.0) += amount;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let remaining_budget = initial_budget - total_cost + total_sell_proceeds;
+
+        // EV_after = remaining_sUSD + Σ prediction_i × holdings_i
+        let ev_holdings: f64 = holdings.iter().map(|(name, &units)| {
+            let key = normalize_market_name(name);
+            let pred = preds.get(&key).copied().unwrap_or(0.0);
+            pred * units
+        }).sum();
+        let ev_after = remaining_budget + ev_holdings;
+
+        // Verify no holdings are negative
+        for (name, &units) in &holdings {
+            assert!(units >= -1e-9, "negative holdings for {}: {}", name, units);
+        }
+
+        // Count unique outcomes bought
+        let outcomes_bought: Vec<_> = holdings.iter().filter(|&(_, &u)| u > 1e-12).collect();
+
+        println!("=== Expected Value Check ===");
+        println!("  EV before:        {:.6} sUSD", initial_budget);
+        println!("  EV after:         {:.6} sUSD", ev_after);
+        println!("  EV gain:          {:.6} sUSD ({:.2}%)", ev_after - initial_budget, (ev_after / initial_budget - 1.0) * 100.0);
+        println!("  Remaining budget: {:.6} sUSD", remaining_budget);
+        println!("  Holdings EV:      {:.6} sUSD", ev_holdings);
+        println!("  Outcomes held:    {}/{}", outcomes_bought.len(), slot0_results.len());
+        println!("  Total buy cost:   {:.6}", total_cost);
+        println!("  Total sell proc:  {:.6}", total_sell_proceeds);
+
+        // EV should increase (we're buying underpriced assets at 50% of prediction)
+        assert!(ev_after > initial_budget,
+            "EV should increase: before={:.6}, after={:.6}", initial_budget, ev_after);
+
+        // Budget accounting: remaining should be >= 0 and < initial
+        assert!(remaining_budget >= -1e-9,
+            "remaining budget should be non-negative: {:.6}", remaining_budget);
+        assert!(remaining_budget < initial_budget,
+            "should have spent some budget: remaining={:.6}", remaining_budget);
     }
 
     #[tokio::test]
