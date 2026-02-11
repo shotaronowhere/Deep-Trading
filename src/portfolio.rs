@@ -296,18 +296,19 @@ fn direct_cost_to_prof(sim: &PoolSim, target_prof: f64) -> Option<(f64, f64, f64
 
 /// For the mint route, compute cost to bring an outcome's profitability to `target_prof`.
 /// Uses Newton's method to find mint amount where alt price = target price.
-/// Returns (net_cost, mint_amount, d_net_cost_d_pi).
+/// Returns (cash_cost, value_cost, mint_amount, d_cash_cost_d_pi).
+/// cash_cost = actual sUSD spent; value_cost = cash_cost minus expected value of unsold tokens.
 fn mint_cost_to_prof(
     sims: &[PoolSim],
     target_idx: usize,
     target_prof: f64,
     skip: &HashSet<usize>,
     price_sum: f64,
-) -> Option<(f64, f64, f64)> {
+) -> Option<(f64, f64, f64, f64)> {
     let tp = target_price_for_prof(sims[target_idx].prediction, target_prof);
     let current_alt = alt_price(sims, target_idx, price_sum);
     if current_alt >= tp {
-        return Some((0.0, 0.0, 0.0));
+        return Some((0.0, 0.0, 0.0, 0.0));
     }
 
     // Newton's method: solve g(m) = rhs where g(m) = Σⱼ pⱼ/(1+m×κⱼ)² (non-skip pools only).
@@ -325,17 +326,17 @@ fn mint_cost_to_prof(
         return None;
     }
 
-    // Precompute per-pool parameters: (price, kappa, max_sell_tokens)
-    let params: Vec<(f64, f64, f64)> = sims
+    // Precompute per-pool parameters: (price, kappa, max_sell_tokens, prediction)
+    let params: Vec<(f64, f64, f64, f64)> = sims
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != target_idx && !skip.contains(i))
-        .map(|(_, sim)| (sim.price(), sim.kappa(), sim.max_sell_tokens()))
+        .map(|(_, sim)| (sim.price(), sim.kappa(), sim.max_sell_tokens(), sim.prediction))
         .collect();
 
     // Warm start: first Newton step from m=0 gives m = (g(0) - rhs) / (-g'(0))
     // = (tp - current_alt) / (2 × Σ Pⱼκⱼ), saving one iteration.
-    let sum_pk: f64 = params.iter().map(|&(p, k, _)| p * k).sum();
+    let sum_pk: f64 = params.iter().map(|&(p, k, _, _)| p * k).sum();
     let mut m = if sum_pk > 1e-30 {
         ((tp - current_alt) / (2.0 * sum_pk)).max(0.0)
     } else {
@@ -344,7 +345,7 @@ fn mint_cost_to_prof(
     for _ in 0..NEWTON_ITERS {
         let mut g = 0.0_f64;
         let mut gp = 0.0_f64;
-        for &(p, k, cap) in &params {
+        for &(p, k, cap, _) in &params {
             let me = m.min(cap);
             let d = 1.0 + me * k;
             let d2 = d * d;
@@ -372,14 +373,15 @@ fn mint_cost_to_prof(
     }
 
     // Net cost and analytical derivative in one pass.
-    // d(net_cost)/dπ = d(net_cost)/dm × dm/dπ
+    // d(cash_cost)/dπ = d(cash_cost)/dm × dm/dπ
     // dm/dπ = P_target / ((1+π) × g'(m))  [implicit function theorem]
-    // d(net_cost)/dm = 1 - (1-f) × Σⱼ∈uncapped Pⱼ(m)
+    // d(cash_cost)/dm = 1 - (1-f) × Σⱼ∈uncapped Pⱼ(m)
     let mut sum_marginal = 0.0_f64;
     let mut gp_final = 0.0_f64;
+    let mut unsold_value = 0.0_f64;
     let total_proceeds: f64 = params
         .iter()
-        .map(|&(p, k, cap)| {
+        .map(|&(p, k, cap, pred)| {
             let me = m.min(cap);
             let d = 1.0 + me * k;
             if m < cap {
@@ -387,11 +389,14 @@ fn mint_cost_to_prof(
                 let d3 = d2 * d;
                 sum_marginal += p / d2;
                 gp_final += -2.0 * p * k / d3;
+            } else {
+                unsold_value += pred * (m - me);
             }
             p * me * FEE_FACTOR / d
         })
         .sum();
-    let net_cost = m - total_proceeds;
+    let cash_cost = m - total_proceeds;
+    let value_cost = cash_cost - unsold_value;
 
     let d_cost_d_pi = if gp_final.abs() > 1e-30 {
         let dm_d_pi = tp / ((1.0 + target_prof) * gp_final);
@@ -401,11 +406,12 @@ fn mint_cost_to_prof(
         0.0
     };
 
-    Some((net_cost, m, d_cost_d_pi))
+    Some((cash_cost, value_cost, m, d_cost_d_pi))
 }
 
 /// Compute cost to reach target_prof for a given outcome via a specific route.
-/// Returns (cost, amount, Option<new_price_for_direct>, d_cost_d_pi).
+/// Returns (cash_cost, value_cost, amount, Option<new_price_for_direct>, d_cash_cost_d_pi).
+/// cash_cost = actual sUSD spent; value_cost = cash_cost minus expected value of unsold tokens.
 fn cost_for_route(
     sims: &[PoolSim],
     idx: usize,
@@ -413,17 +419,17 @@ fn cost_for_route(
     target_prof: f64,
     skip: &HashSet<usize>,
     price_sum: f64,
-) -> Option<(f64, f64, Option<f64>, f64)> {
+) -> Option<(f64, f64, f64, Option<f64>, f64)> {
     match route {
         Route::Direct => direct_cost_to_prof(&sims[idx], target_prof).map(|(cost, amount, new_price)| {
             let l = sims[idx].l_eff();
             let pred = sims[idx].prediction;
             let t = 1.0 + target_prof;
             let dcost = -l * pred.sqrt() / (2.0 * t * t.sqrt());
-            (cost, amount, Some(new_price), dcost)
+            (cost, cost, amount, Some(new_price), dcost)
         }),
         Route::Mint => mint_cost_to_prof(sims, idx, target_prof, skip, price_sum)
-            .map(|(cost, amount, dcost)| (cost, amount, None, dcost)),
+            .map(|(cash, value, amount, dcost)| (cash, value, amount, None, dcost)),
     }
 }
 
@@ -939,7 +945,7 @@ fn waterfall(
         let total_cost: f64 = active
             .iter()
             .filter_map(|&(idx, route)| {
-                cost_for_route(sims, idx, route, target_prof, &skip, price_sum).map(|(c, _, _, _)| c)
+                cost_for_route(sims, idx, route, target_prof, &skip, price_sum).map(|(c, _, _, _, _)| c)
             })
             .sum();
 
@@ -951,7 +957,7 @@ fn waterfall(
             for &(idx, route) in &active {
                 let ps_before: f64 = sims.iter().map(|s| s.price).sum();
                 match cost_for_route(sims, idx, route, target_prof, &skip, ps_before) {
-                    Some((cost, amount, new_price, _)) if cost <= *budget => {
+                    Some((cost, _, amount, new_price, _)) if cost <= *budget => {
                         execute_buy(sims, idx, cost, amount, route, new_price, budget, actions, &skip);
                     }
                     _ => {
@@ -1005,7 +1011,7 @@ fn waterfall(
             price_sum = sims.iter().map(|s| s.price).sum();
             for &(idx, route) in &active {
                 if route == Route::Direct {
-                    if let Some((cost, amount, new_price, _)) =
+                    if let Some((cost, _, amount, new_price, _)) =
                         cost_for_route(sims, idx, route, achievable, &skip, price_sum)
                     {
                         if cost > *budget {
