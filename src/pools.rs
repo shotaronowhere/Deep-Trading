@@ -77,7 +77,10 @@ pub(crate) fn u256_to_f64(v: U256) -> f64 {
 }
 
 /// Converts a prediction probability to the corresponding sqrtPriceX96.
-pub(crate) fn prediction_to_sqrt_price_x96(prediction: f64, is_token1_outcome: bool) -> Option<U256> {
+pub(crate) fn prediction_to_sqrt_price_x96(
+    prediction: f64,
+    is_token1_outcome: bool,
+) -> Option<U256> {
     let prediction_scaled = U256::from((prediction * 1e18) as u128);
     if prediction_scaled.is_zero() {
         return None;
@@ -601,10 +604,7 @@ pub fn save_balance_cache(
         timestamp: now_secs(),
         wallet: wallet.to_string(),
         susds,
-        outcomes: outcomes
-            .iter()
-            .map(|(&k, &v)| (k.to_string(), v))
-            .collect(),
+        outcomes: outcomes.iter().map(|(&k, &v)| (k.to_string(), v)).collect(),
     };
     let file = std::fs::File::create(path)?;
     serde_json::to_writer_pretty(std::io::BufWriter::new(file), &cache)?;
@@ -646,11 +646,23 @@ mod tests {
     use super::*;
     use alloy::providers::ProviderBuilder;
 
+    fn network_tests_enabled() -> bool {
+        std::env::var("RUN_NETWORK_TESTS").ok().as_deref() == Some("1")
+    }
+
     #[tokio::test]
     async fn test_fetch_all_slot0() {
+        if !network_tests_enabled() {
+            return;
+        }
         dotenvy::dotenv().ok();
         let rpc_url = std::env::var("RPC").expect("RPC environment variable not set");
-        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+        let provider = ProviderBuilder::new().with_reqwest(rpc_url.parse().unwrap(), |builder| {
+            builder
+                .no_proxy()
+                .build()
+                .expect("failed to build reqwest client for tests")
+        });
 
         let results = fetch_all_slot0(provider).await.unwrap();
 
@@ -786,9 +798,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_profitability_simple() {
+        if !network_tests_enabled() {
+            return;
+        }
         dotenvy::dotenv().ok();
         let rpc_url = std::env::var("RPC").expect("RPC environment variable not set");
-        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+        let provider = ProviderBuilder::new().with_reqwest(rpc_url.parse().unwrap(), |builder| {
+            builder
+                .no_proxy()
+                .build()
+                .expect("failed to build reqwest client for tests")
+        });
 
         let slot0_results = fetch_all_slot0(provider).await.unwrap();
         let entries = profitability_simple(&slot0_results);
@@ -815,9 +835,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_price_long_simple_alt() {
+        if !network_tests_enabled() {
+            return;
+        }
         dotenvy::dotenv().ok();
         let rpc_url = std::env::var("RPC").expect("RPC environment variable not set");
-        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+        let provider = ProviderBuilder::new().with_reqwest(rpc_url.parse().unwrap(), |builder| {
+            builder
+                .no_proxy()
+                .build()
+                .expect("failed to build reqwest client for tests")
+        });
 
         let results = fetch_all_slot0(provider).await.unwrap();
 
@@ -938,12 +966,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_balances() {
+        if !network_tests_enabled() {
+            return;
+        }
         dotenvy::dotenv().ok();
         let rpc_url = match std::env::var("RPC") {
             Ok(url) => url,
             Err(_) => return,
         };
-        let provider = ProviderBuilder::new().connect_http(rpc_url.parse().unwrap());
+        let provider = ProviderBuilder::new().with_reqwest(rpc_url.parse().unwrap(), |builder| {
+            builder
+                .no_proxy()
+                .build()
+                .expect("failed to build reqwest client for tests")
+        });
 
         // Use zero address — should return 0 balances but not error
         let wallet = Address::ZERO;

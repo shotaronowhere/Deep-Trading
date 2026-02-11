@@ -1,4 +1,4 @@
-use alloy::primitives::{address, Address, Bytes, Uint};
+use alloy::primitives::{Address, Bytes, Uint, address};
 use alloy::providers::ProviderBuilder;
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -141,7 +141,6 @@ fn parse_pool_address(result: &Multicall3::Result) -> Option<String> {
     (addr != Address::ZERO).then(|| format!("{addr:?}"))
 }
 
-
 /// Format f64 to always include a decimal point (for valid Rust float literals)
 fn format_f64(f: f64) -> String {
     let s = f.to_string();
@@ -171,7 +170,10 @@ fn generate_predictions_rs(
             panic!("l1-predictions.csv row {}: weight cannot be negative", row);
         }
         if !seen_l1_markets.insert(market.to_string()) {
-            panic!("l1-predictions.csv row {}: duplicate market '{}'", row, market);
+            panic!(
+                "l1-predictions.csv row {}: duplicate market '{}'",
+                row, market
+            );
         }
         l1_predictions.push((market.to_string(), record.weight));
     }
@@ -212,13 +214,19 @@ fn generate_predictions_rs(
             );
         }
         if !seen_originality_markets.insert(market.to_string()) {
-            panic!("originality-predictions.csv row {}: duplicate market '{}'", row, market);
+            panic!(
+                "originality-predictions.csv row {}: duplicate market '{}'",
+                row, market
+            );
         }
         originality_predictions.push((market.to_string(), record.originality));
     }
 
     let mut output = String::new();
-    writeln!(&mut output, "// Auto-generated from prediction CSVs - do not edit manually\n")?;
+    writeln!(
+        &mut output,
+        "// Auto-generated from prediction CSVs - do not edit manually\n"
+    )?;
 
     // L1 Prediction struct and array
     writeln!(&mut output, "#[derive(Debug, Clone, Copy)]")?;
@@ -236,7 +244,8 @@ fn generate_predictions_rs(
         writeln!(
             &mut output,
             "    Prediction {{ market: \"{}\", prediction: {} }},",
-            market, format_f64(*weight)
+            market,
+            format_f64(*weight)
         )?;
     }
     writeln!(&mut output, "];\n")?;
@@ -258,7 +267,9 @@ fn generate_predictions_rs(
         writeln!(
             &mut output,
             "    PredictionL2 {{ dependency: \"{}\", repo: \"{}\", prediction: {} }},",
-            dependency, repo, format_f64(*weight)
+            dependency,
+            repo,
+            format_f64(*weight)
         )?;
     }
     writeln!(&mut output, "];\n")?;
@@ -279,7 +290,8 @@ fn generate_predictions_rs(
         writeln!(
             &mut output,
             "    Originality {{ market: \"{}\", originality: {} }},",
-            market, format_f64(*originality)
+            market,
+            format_f64(*originality)
         )?;
     }
     writeln!(&mut output, "];")?;
@@ -350,10 +362,26 @@ fn generate_markets_l1_array(
                 };
 
                 writeln!(&mut market_entries, "        pool: Some(Pool {{")?;
-                writeln!(&mut market_entries, "            token0: \"{}\",", pool.token0)?;
-                writeln!(&mut market_entries, "            token1: \"{}\",", pool.token1)?;
-                writeln!(&mut market_entries, "            pool_id: \"{}\",", pool_id_str)?;
-                writeln!(&mut market_entries, "            liquidity: \"{}\",", liquidity_str)?;
+                writeln!(
+                    &mut market_entries,
+                    "            token0: \"{}\",",
+                    pool.token0
+                )?;
+                writeln!(
+                    &mut market_entries,
+                    "            token1: \"{}\",",
+                    pool.token1
+                )?;
+                writeln!(
+                    &mut market_entries,
+                    "            pool_id: \"{}\",",
+                    pool_id_str
+                )?;
+                writeln!(
+                    &mut market_entries,
+                    "            liquidity: \"{}\",",
+                    liquidity_str
+                )?;
                 writeln!(&mut market_entries, "            ticks: {},", ticks_ref)?;
                 writeln!(&mut market_entries, "        }}),")?;
             }
@@ -362,7 +390,11 @@ fn generate_markets_l1_array(
             }
         }
 
-        writeln!(&mut market_entries, "        quote_token: \"{}\",", quote_token)?;
+        writeln!(
+            &mut market_entries,
+            "        quote_token: \"{}\",",
+            quote_token
+        )?;
         writeln!(&mut market_entries, "    }},")?;
     }
 
@@ -403,10 +435,17 @@ fn generate_markets_originality_array(
             // Generate tick arrays for each pool first
             for (pool_idx, pool) in pools.iter().enumerate() {
                 if !pool.ticks.is_empty() {
-                    let tick_static_name = format!("TICKS_ORI_{}_{}", safe_name.to_uppercase(), pool_idx);
-                    writeln!(&mut pool_definitions, "static {}: [Tick; {}] = [", tick_static_name, pool.ticks.len())?;
+                    let tick_static_name =
+                        format!("TICKS_ORI_{}_{}", safe_name.to_uppercase(), pool_idx);
+                    writeln!(
+                        &mut pool_definitions,
+                        "static {}: [Tick; {}] = [",
+                        tick_static_name,
+                        pool.ticks.len()
+                    )?;
                     for tick in &pool.ticks {
-                        writeln!(&mut pool_definitions,
+                        writeln!(
+                            &mut pool_definitions,
                             "    Tick {{ tick_idx: {}, liquidity_net: {} }},",
                             tick.tick_idx, tick.liquidity_net
                         )?;
@@ -416,7 +455,12 @@ fn generate_markets_originality_array(
             }
 
             // Generate pool array
-            writeln!(&mut pool_definitions, "static {}: [Pool; {}] = [", static_name, pools.len())?;
+            writeln!(
+                &mut pool_definitions,
+                "static {}: [Pool; {}] = [",
+                static_name,
+                pools.len()
+            )?;
             for (pool_idx, pool) in pools.iter().enumerate() {
                 let pool_id_str = pool.pool_id.as_deref().unwrap_or("");
                 let liquidity_str = pool.liquidity.as_deref().unwrap_or("");
@@ -425,7 +469,8 @@ fn generate_markets_originality_array(
                 } else {
                     format!("&TICKS_ORI_{}_{}", safe_name.to_uppercase(), pool_idx)
                 };
-                writeln!(&mut pool_definitions,
+                writeln!(
+                    &mut pool_definitions,
                     "    Pool {{ token0: \"{}\", token1: \"{}\", pool_id: \"{}\", liquidity: \"{}\", ticks: {} }},",
                     pool.token0, pool.token1, pool_id_str, liquidity_str, ticks_ref
                 )?;
@@ -444,8 +489,16 @@ fn generate_markets_originality_array(
         writeln!(&mut market_entries, "        market_id: \"{}\",", market_id)?;
         writeln!(&mut market_entries, "        pools: {},", pool_ref)?;
         writeln!(&mut market_entries, "        up_token: \"{}\",", up_token)?;
-        writeln!(&mut market_entries, "        down_token: \"{}\",", down_token)?;
-        writeln!(&mut market_entries, "        quote_token: \"{}\",", quote_token)?;
+        writeln!(
+            &mut market_entries,
+            "        down_token: \"{}\",",
+            down_token
+        )?;
+        writeln!(
+            &mut market_entries,
+            "        quote_token: \"{}\",",
+            quote_token
+        )?;
         writeln!(&mut market_entries, "    }},")?;
     }
 
@@ -453,7 +506,11 @@ fn generate_markets_originality_array(
     if !pool_definitions.is_empty() {
         writeln!(&mut output)?;
     }
-    writeln!(&mut output, "pub static MARKETS_ORIGINALITY: [MarketDataOriginality; {}] = [", markets.len())?;
+    writeln!(
+        &mut output,
+        "pub static MARKETS_ORIGINALITY: [MarketDataOriginality; {}] = [",
+        markets.len()
+    )?;
     output.push_str(&market_entries);
     writeln!(&mut output, "];")?;
 
@@ -483,10 +540,17 @@ fn generate_markets_l2_array(
             // Generate tick arrays for each pool first
             for (pool_idx, pool) in pools.iter().enumerate() {
                 if !pool.ticks.is_empty() {
-                    let tick_static_name = format!("TICKS_{}_{}", safe_name.to_uppercase(), pool_idx);
-                    writeln!(&mut pool_definitions, "static {}: [Tick; {}] = [", tick_static_name, pool.ticks.len())?;
+                    let tick_static_name =
+                        format!("TICKS_{}_{}", safe_name.to_uppercase(), pool_idx);
+                    writeln!(
+                        &mut pool_definitions,
+                        "static {}: [Tick; {}] = [",
+                        tick_static_name,
+                        pool.ticks.len()
+                    )?;
                     for tick in &pool.ticks {
-                        writeln!(&mut pool_definitions,
+                        writeln!(
+                            &mut pool_definitions,
                             "    Tick {{ tick_idx: {}, liquidity_net: {} }},",
                             tick.tick_idx, tick.liquidity_net
                         )?;
@@ -496,7 +560,12 @@ fn generate_markets_l2_array(
             }
 
             // Generate pool array
-            writeln!(&mut pool_definitions, "static {}: [Pool; {}] = [", static_name, pools.len())?;
+            writeln!(
+                &mut pool_definitions,
+                "static {}: [Pool; {}] = [",
+                static_name,
+                pools.len()
+            )?;
             for (pool_idx, pool) in pools.iter().enumerate() {
                 let pool_id_str = pool.pool_id.as_deref().unwrap_or("");
                 let liquidity_str = pool.liquidity.as_deref().unwrap_or("");
@@ -505,7 +574,8 @@ fn generate_markets_l2_array(
                 } else {
                     format!("&TICKS_{}_{}", safe_name.to_uppercase(), pool_idx)
                 };
-                writeln!(&mut pool_definitions,
+                writeln!(
+                    &mut pool_definitions,
                     "    Pool {{ token0: \"{}\", token1: \"{}\", pool_id: \"{}\", liquidity: \"{}\", ticks: {} }},",
                     pool.token0, pool.token1, pool_id_str, liquidity_str, ticks_ref
                 )?;
@@ -519,9 +589,17 @@ fn generate_markets_l2_array(
         writeln!(&mut market_entries, "    MarketDataL2 {{")?;
         writeln!(&mut market_entries, "        name: \"{}\",", lower_name)?;
         writeln!(&mut market_entries, "        market_id: \"{}\",", market_id)?;
-        writeln!(&mut market_entries, "        outcome_token: \"{}\",", market_data.outcome_token)?;
+        writeln!(
+            &mut market_entries,
+            "        outcome_token: \"{}\",",
+            market_data.outcome_token
+        )?;
         writeln!(&mut market_entries, "        pools: {},", pool_ref)?;
-        writeln!(&mut market_entries, "        quote_token: \"{}\",", quote_token)?;
+        writeln!(
+            &mut market_entries,
+            "        quote_token: \"{}\",",
+            quote_token
+        )?;
         writeln!(&mut market_entries, "    }},")?;
     }
 
@@ -529,7 +607,11 @@ fn generate_markets_l2_array(
     if !pool_definitions.is_empty() {
         writeln!(&mut output)?;
     }
-    writeln!(&mut output, "pub static MARKETS_L2: [MarketDataL2; {}] = [", markets.len())?;
+    writeln!(
+        &mut output,
+        "pub static MARKETS_L2: [MarketDataL2; {}] = [",
+        markets.len()
+    )?;
     output.push_str(&market_entries);
     writeln!(&mut output, "];")?;
 
@@ -549,7 +631,10 @@ fn filter_ticks(pool: &PoolInfo) -> Vec<ResolvedTick> {
                         return None;
                     }
                     let tick_idx: i32 = t.tick_idx.parse().ok()?;
-                    Some(ResolvedTick { tick_idx, liquidity_net })
+                    Some(ResolvedTick {
+                        tick_idx,
+                        liquidity_net,
+                    })
                 })
                 .collect()
         })
@@ -564,7 +649,10 @@ fn build_single_call<'a>(
     calls: &mut Vec<Multicall3::Call3>,
     call_infos: &mut Vec<CallInfo<'a>>,
 ) {
-    let (Ok(token0), Ok(token1)) = (pool.token0.parse::<Address>(), pool.token1.parse::<Address>()) else {
+    let (Ok(token0), Ok(token1)) = (
+        pool.token0.parse::<Address>(),
+        pool.token1.parse::<Address>(),
+    ) else {
         println!(
             "cargo::warning=Skipping pool {} for market '{}': invalid token address",
             pool_idx, name
@@ -627,7 +715,12 @@ async fn resolve_pool_addresses(
     rpc_url: &str,
     first_only: bool,
 ) -> Result<BTreeMap<String, Vec<ResolvedPool>>, Box<dyn std::error::Error>> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().with_reqwest(rpc_url.parse()?, |builder| {
+        builder
+            .no_proxy()
+            .build()
+            .expect("failed to build reqwest client for build script")
+    });
     let multicall = Multicall3::new(MULTICALL3_ADDRESS, provider);
 
     let (calls, call_infos) = build_pool_calls(markets, first_only);
@@ -678,7 +771,12 @@ async fn resolve_l2_quote_tokens(
     markets: &BTreeMap<String, MarketInfo>,
     rpc_url: &str,
 ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().with_reqwest(rpc_url.parse()?, |builder| {
+        builder
+            .no_proxy()
+            .build()
+            .expect("failed to build reqwest client for build script")
+    });
     let multicall = Multicall3::new(MULTICALL3_ADDRESS, provider);
 
     let mut calls = Vec::new();
@@ -686,11 +784,17 @@ async fn resolve_l2_quote_tokens(
 
     for (name, market_data) in markets {
         let Some(market_id) = &market_data.market_id else {
-            println!("cargo::warning=Skipping base token resolution for '{}': no market_id", name);
+            println!(
+                "cargo::warning=Skipping base token resolution for '{}': no market_id",
+                name
+            );
             continue;
         };
         let Ok(market_addr) = market_id.parse::<Address>() else {
-            println!("cargo::warning=Skipping base token resolution for '{}': invalid market_id '{}'", name, market_id);
+            println!(
+                "cargo::warning=Skipping base token resolution for '{}': invalid market_id '{}'",
+                name, market_id
+            );
             continue;
         };
         let call_data = parentWrappedOutcomeCall {}.abi_encode();
@@ -759,7 +863,10 @@ async fn generate_markets_rs(
     let l2_quote_tokens = quote_res?;
 
     let mut output = String::new();
-    writeln!(&mut output, "// Auto-generated from markets_data_l1.json, markets_data_l2.json, and markets_data_originality.json - do not edit manually\n")?;
+    writeln!(
+        &mut output,
+        "// Auto-generated from markets_data_l1.json, markets_data_l2.json, and markets_data_originality.json - do not edit manually\n"
+    )?;
 
     writeln!(&mut output, "#[derive(Debug, Clone, Copy)]")?;
     writeln!(&mut output, "pub struct Tick {{")?;
@@ -807,13 +914,25 @@ async fn generate_markets_rs(
     writeln!(&mut output, "    pub quote_token: &'static str,")?;
     writeln!(&mut output, "}}\n")?;
 
-    output.push_str(&generate_markets_l1_array(&l1_json.markets_data, &l1_resolved_pools, L1_QUOTE_TOKEN)?);
+    output.push_str(&generate_markets_l1_array(
+        &l1_json.markets_data,
+        &l1_resolved_pools,
+        L1_QUOTE_TOKEN,
+    )?);
     writeln!(&mut output)?;
 
-    output.push_str(&generate_markets_l2_array(&l2_json.markets_data, &l2_resolved_pools, &l2_quote_tokens)?);
+    output.push_str(&generate_markets_l2_array(
+        &l2_json.markets_data,
+        &l2_resolved_pools,
+        &l2_quote_tokens,
+    )?);
     writeln!(&mut output)?;
 
-    output.push_str(&generate_markets_originality_array(&originality_json.markets_data, &originality_resolved_pools, L1_QUOTE_TOKEN)?);
+    output.push_str(&generate_markets_originality_array(
+        &originality_json.markets_data,
+        &originality_resolved_pools,
+        L1_QUOTE_TOKEN,
+    )?);
 
     fs::write(output_path, output)?;
     println!(
@@ -857,7 +976,10 @@ fn main() {
     println!("cargo::rerun-if-changed=markets_data_originality.json");
     println!("cargo::rerun-if-changed=.env");
 
-    if l1_predictions_csv.exists() && l2_predictions_csv.exists() && originality_predictions_csv.exists() {
+    if l1_predictions_csv.exists()
+        && l2_predictions_csv.exists()
+        && originality_predictions_csv.exists()
+    {
         if let Err(e) = generate_predictions_rs(
             &l1_predictions_csv,
             &l2_predictions_csv,
@@ -868,18 +990,38 @@ fn main() {
         }
     }
     if !markets_l1_json.exists() {
-        panic!("markets_data_l1.json not found. Run `cargo test test_prepare` to fetch market data.");
+        panic!(
+            "markets_data_l1.json not found. Run `cargo test test_prepare` to fetch market data."
+        );
     }
     if !markets_l2_json.exists() {
-        panic!("markets_data_l2.json not found. Run `cargo test test_prepare` to fetch market data.");
+        panic!(
+            "markets_data_l2.json not found. Run `cargo test test_prepare` to fetch market data."
+        );
     }
     if !markets_originality_json.exists() {
-        panic!("markets_data_originality.json not found. Run `cargo test test_prepare` to fetch market data.");
+        panic!(
+            "markets_data_originality.json not found. Run `cargo test test_prepare` to fetch market data."
+        );
     }
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
 
-    if let Err(e) = rt.block_on(generate_markets_rs(&markets_l1_json, &markets_l2_json, &markets_originality_json, &markets_rs, &rpc_url)) {
-        panic!("Failed to generate markets.rs: {}", e);
+    if let Err(e) = rt.block_on(generate_markets_rs(
+        &markets_l1_json,
+        &markets_l2_json,
+        &markets_originality_json,
+        &markets_rs,
+        &rpc_url,
+    )) {
+        if markets_rs.exists() {
+            println!(
+                "cargo::warning=Failed to refresh markets.rs ({}). Using existing {}",
+                e,
+                markets_rs.display()
+            );
+        } else {
+            panic!("Failed to generate markets.rs: {}", e);
+        }
     }
 }

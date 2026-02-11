@@ -33,8 +33,10 @@ Mint routes are wrapped in flash loans: `FlashLoan → Mint → Sell(others) →
 
 ### Phase 1: Sell overpriced holdings
 For each outcome where market_price > prediction and we hold tokens:
-- Compare two sell routes: **direct sell** (sell into pool) vs **merge sell** (buy all other outcomes + merge complete sets for 1 sUSD each). Use whichever yields higher total proceeds.
-- Merge capacity is limited by the minimum `max_buy_tokens()` across all non-source pools. If merge handles fewer tokens than the sell amount, the remainder is direct-sold.
+- Optimize a split between **direct sell** (sell into pool) and **merge sell** (buy all other outcomes + merge complete sets for 1 sUSD each) to maximize total proceeds for the fixed sell amount.
+- The split is solved as a 1D concave optimization (`f'(m)=0`) over merge amount `m`, with boundary checks (`m=0`, `m=cap`) and bisection on the interior root when needed.
+- Merge consumes existing complementary holdings first, and buys only any shortfall from pools.
+- Merge capacity is limited by complementary inventory plus buy caps (`held_j + max_buy_tokens_j`) across non-source outcomes; direct handles the remainder.
 - Merge route only available when `mint_available` (all pools present).
 - Pool state (`sqrt_price_x96`) updated after each sell for subsequent calculations.
 
@@ -111,8 +113,8 @@ Outer Newton on π (up to 15 iterations), inner Newton on M (2-3 iterations per 
 
 ### Phase 3: Post-allocation liquidation
 After the waterfall:
-1. Check all held outcomes' profitability against the last profitability level reached. Profitability is computed using the **direct pool price** (`sims[i].price()`), not `best_route` — because a held token's value is its exit price (what you'd receive selling into the pool), not its acquisition price. The mint route price is irrelevant for valuing existing holdings since you can't "un-mint" a single token.
-2. For holdings with profitability below that level (lowest first), sell only enough to raise profitability to match `last_bought_prof` (avoids round-trip churn from full liquidation). Compare direct vs merge sell routes (same logic as Phase 1) and use the higher-proceeds path.
+1. Check all held outcomes' profitability against the last profitability level reached. Profitability is computed using the **direct pool price** (`sims[i].price()`), not `best_route`, because this step is a valuation threshold based on immediate pool-exit value.
+2. For holdings with profitability below that level (lowest first), sell only enough to raise profitability to match `last_bought_prof` (avoids round-trip churn from full liquidation). For each such sale, use the same direct/merge split optimizer as Phase 1.
 3. Reallocate recovered capital via another waterfall pass
 
 ## Two Market Contracts

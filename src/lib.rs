@@ -6,9 +6,9 @@ use std::fs::File;
 use std::io::BufWriter;
 
 pub mod markets;
-pub mod predictions;
 pub mod pools;
 pub mod portfolio;
+pub mod predictions;
 
 sol! {
     #[sol(rpc)]
@@ -30,10 +30,10 @@ struct ApiResponse {
 #[serde(rename_all = "camelCase")]
 struct ApiMarket {
     id: String,
-    market_id: Option<String>,  // L1 has this, L2 doesn't
-    pool: Option<Pool>,         // L1 uses single pool
-    pools: Option<Vec<Pool>>,   // L2 uses pools array
-    up_pool: Option<Pool>,      // Originality uses upPool/downPool
+    market_id: Option<String>, // L1 has this, L2 doesn't
+    pool: Option<Pool>,        // L1 uses single pool
+    pools: Option<Vec<Pool>>,  // L2 uses pools array
+    up_pool: Option<Pool>,     // Originality uses upPool/downPool
     down_pool: Option<Pool>,
 }
 
@@ -123,7 +123,8 @@ impl From<ApiMarket> for OutputMarket {
 /// Fetches market data from the API and saves it to markets_data.json.
 /// Run this to update the local data file, then rebuild to regenerate markets.rs.
 pub async fn prepare(url: &str, file_name: &str) -> Result<(), Box<dyn Error>> {
-    let response = reqwest::get(url).await?.error_for_status()?;
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let response = client.get(url).send().await?.error_for_status()?;
     let api_data: ApiResponse = response.json().await?;
 
     let output_data: OutputFile = api_data.into();
@@ -141,8 +142,15 @@ pub async fn prepare(url: &str, file_name: &str) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    fn network_tests_enabled() -> bool {
+        std::env::var("RUN_NETWORK_TESTS").ok().as_deref() == Some("1")
+    }
+
     #[tokio::test]
     async fn test_prepare_l1() {
+        if !network_tests_enabled() {
+            return;
+        }
         let url: &str = "https://deep.seer.pm/.netlify/functions/get-l1-markets-data";
         let name = "markets_data_l1.json";
         let result = prepare(url, name).await;
@@ -151,6 +159,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_l2() {
+        if !network_tests_enabled() {
+            return;
+        }
         let url: &str = "https://deep.seer.pm/.netlify/functions/get-l2-markets-data";
         let name = "markets_data_l2.json";
         let result = prepare(url, name).await;
@@ -159,6 +170,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_prepare_originality() {
+        if !network_tests_enabled() {
+            return;
+        }
         let url: &str = "https://deep.seer.pm/.netlify/functions/get-originality-markets-data";
         let name = "markets_data_originality.json";
         let result = prepare(url, name).await;
