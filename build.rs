@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use alloy::primitives::{Address, Bytes, Uint, address};
 use alloy::providers::ProviderBuilder;
 use alloy::sol;
@@ -8,6 +10,7 @@ use std::env;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 // Uniswap V3 Factory getPool call
 sol! {
@@ -148,6 +151,41 @@ fn format_f64(f: f64) -> String {
         s
     } else {
         format!("{}.0", s)
+    }
+}
+
+fn rustfmt_generated_file(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+
+    match Command::new("rustfmt")
+        .arg("--emit")
+        .arg("files")
+        .arg(path)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let reason = if stderr.trim().is_empty() {
+                format!("exit status {}", output.status)
+            } else {
+                stderr.replace('\n', " ").trim().to_string()
+            };
+            println!(
+                "cargo::warning=rustfmt failed for {}: {}",
+                path.display(),
+                reason
+            );
+        }
+        Err(err) => {
+            println!(
+                "cargo::warning=rustfmt unavailable; skipped formatting {}: {}",
+                path.display(),
+                err
+            );
+        }
     }
 }
 
@@ -297,6 +335,7 @@ fn generate_predictions_rs(
     writeln!(&mut output, "];")?;
 
     fs::write(output_path, output)?;
+    rustfmt_generated_file(output_path);
     println!(
         "cargo::warning=Generated {} with {} L1, {} L2, {} originality predictions",
         output_path.display(),
@@ -935,6 +974,7 @@ async fn generate_markets_rs(
     )?);
 
     fs::write(output_path, output)?;
+    rustfmt_generated_file(output_path);
     println!(
         "cargo::warning=Generated {} with {} L1 markets, {} L2 markets, {} originality markets",
         output_path.display(),
@@ -949,22 +989,10 @@ async fn generate_markets_rs(
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_path = Path::new(&manifest_dir);
-    let env_path = manifest_path.join(".env");
-
-    if env_path.exists() {
-        dotenvy::from_path(&env_path).ok();
-    }
-
-    let rpc_url = env::var("RPC").unwrap_or_else(|_| {
-        panic!("RPC environment variable not set. Please set it in .env file.");
-    });
 
     let l1_predictions_csv = manifest_path.join("l1-predictions.csv");
     let l2_predictions_csv = manifest_path.join("l2-predictions.csv");
     let originality_predictions_csv = manifest_path.join("originality-predictions.csv");
-    let markets_l1_json = manifest_path.join("markets_data_l1.json");
-    let markets_l2_json = manifest_path.join("markets_data_l2.json");
-    let markets_originality_json = manifest_path.join("markets_data_originality.json");
     let predictions_rs = manifest_path.join("src/predictions.rs");
     let markets_rs = manifest_path.join("src/markets.rs");
 
@@ -974,54 +1002,36 @@ fn main() {
     println!("cargo::rerun-if-changed=markets_data_l1.json");
     println!("cargo::rerun-if-changed=markets_data_l2.json");
     println!("cargo::rerun-if-changed=markets_data_originality.json");
-    println!("cargo::rerun-if-changed=.env");
 
-    if l1_predictions_csv.exists()
-        && l2_predictions_csv.exists()
-        && originality_predictions_csv.exists()
-    {
-        if let Err(e) = generate_predictions_rs(
-            &l1_predictions_csv,
-            &l2_predictions_csv,
-            &originality_predictions_csv,
-            &predictions_rs,
-        ) {
-            panic!("Failed to generate predictions.rs: {}", e);
-        }
+    if !l1_predictions_csv.exists() {
+        panic!("l1-predictions.csv not found");
     }
-    if !markets_l1_json.exists() {
-        panic!(
-            "markets_data_l1.json not found. Run `cargo test test_prepare` to fetch market data."
-        );
+    if !l2_predictions_csv.exists() {
+        panic!("l2-predictions.csv not found");
     }
-    if !markets_l2_json.exists() {
-        panic!(
-            "markets_data_l2.json not found. Run `cargo test test_prepare` to fetch market data."
-        );
-    }
-    if !markets_originality_json.exists() {
-        panic!(
-            "markets_data_originality.json not found. Run `cargo test test_prepare` to fetch market data."
-        );
+    if !originality_predictions_csv.exists() {
+        panic!("originality-predictions.csv not found");
     }
 
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    if let Err(e) = generate_predictions_rs(
+        &l1_predictions_csv,
+        &l2_predictions_csv,
+        &originality_predictions_csv,
+        &predictions_rs,
+    ) {
+        panic!("Failed to generate predictions.rs: {}", e);
+    }
 
-    if let Err(e) = rt.block_on(generate_markets_rs(
-        &markets_l1_json,
-        &markets_l2_json,
-        &markets_originality_json,
-        &markets_rs,
-        &rpc_url,
-    )) {
-        if markets_rs.exists() {
-            println!(
-                "cargo::warning=Failed to refresh markets.rs ({}). Using existing {}",
-                e,
-                markets_rs.display()
-            );
-        } else {
-            panic!("Failed to generate markets.rs: {}", e);
-        }
+    if markets_rs.exists() {
+        rustfmt_generated_file(&markets_rs);
+        println!(
+            "cargo::warning=Using existing {}. Network fetch for markets is disabled.",
+            markets_rs.display()
+        );
+    } else {
+        panic!(
+            "{} not found. Network fetch for markets is disabled in build.rs. Restore or generate markets.rs outside the build step.",
+            markets_rs.display()
+        );
     }
 }

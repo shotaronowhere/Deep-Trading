@@ -171,6 +171,38 @@ if let Some(cache) = load_balance_cache(Path::new("balance_cache.json"), &wallet
 
 Run with: `cargo test --release test_rebalance_perf_full_l1 -- --nocapture`
 
+## Oracle and Fuzz Validation
+
+`src/portfolio.rs` includes direct-only oracle checks, mixed-route budget-order tests, and fuzz property tests over partial/full fixtures.
+
+- `test_oracle_two_pool_direct_only_with_legacy_holdings_matches_grid_optimum`: hardcoded 2-market fixture with legacy inventory in an overpriced market and an underpriced alternative; verifies rebalance emits sell/reallocate flow and lands near oracle EV.
+- `test_oracle_fuzz_two_pool_direct_only_with_legacy_holdings_not_worse_than_grid`: randomized 2-market fuzz over prices, budget, and initial holdings; checks rebalance EV is not materially below the oracle optimum while preserving action-stream invariants.
+- `test_oracle_two_pool_closed_form_direct_waterfall_matches_kkt_target`: hardcoded 2-market direct-only fixture with analytic closed-form KKT target; asserts waterfall profitability and final prices match the derived optimum while exhausting budget.
+- `test_oracle_two_pool_direct_only_legacy_self_funding_budget_zero_matches_grid`: hardcoded 2-market zero-cash legacy fixture; validates that Phase-1 liquidation can self-fund reallocation and remain near the direct-only oracle EV.
+- `test_mint_first_order_can_make_zero_cash_plan_feasible`: sampled mixed-route adversarial search proving order-sensitive feasibility; verifies mint-first execution can make a zero-cash plan feasible while direct-first ordering is infeasible.
+- `test_fuzz_rebalance_partial_direct_only_ev_non_decreasing`: partial-L1 direct-only fuzz property asserting `rebalance` does not reduce expected value across randomized prices, holdings, and budgets.
+- `test_fuzz_rebalance_partial_no_legacy_holdings_emits_no_sells`: partial-L1 fuzz property asserting no `Sell`/`Merge` actions are emitted when initial legacy inventory is empty (guards against Phase-3 churn on newly bought positions).
+- `test_rebalance_negative_budget_legacy_sells_self_fund_rebalance`: hardcoded debt-entry fixture (`susds_balance < 0`) showing Phase-1 liquidation can recover cash and avoid EV regression.
+- `test_rebalance_handles_nan_and_infinite_budget_without_non_finite_actions`: defensive-input test that `NaN`/`Infinity` budgets fail closed (no actions emitted).
+- `test_rebalance_non_finite_balances_fail_closed_to_zero_inventory`: defensive-input fixture ensuring `NaN`/`Infinity` holdings are sanitized to zero inventory, preventing invalid liquidation flow.
+- `test_rebalance_zero_liquidity_outcome_disables_mint_merge_routes`: explicit full-L1 fixture with one forced zero-liquidity outcome; verifies mint/merge/flash routes are disabled while direct buys continue for remaining underpriced pools.
+- `test_phase3_near_tie_low_liquidity_avoids_ev_regression`: tiny-liquidity near-equal-profitability fixture guarding against Phase-3 churn causing net EV loss.
+- `test_phase3_recycling_full_l1_with_mint_routes_reduces_low_prof_legacy`: full-L1 mint-enabled fixture with near-fair legacy bucket; verifies low-marginal legacy holdings are actually reduced while preserving EV and flash-loan accounting.
+- `test_fuzz_flash_loan_action_stream_ordering_invariants`: full-L1 fuzz property for flash-loan bracket structure (no nesting, matched repay amount, no dangling loan).
+- `test_waterfall_misnormalized_prediction_sums_remain_finite`: robustness test for miscalibrated belief vectors (`sum(pred) > 1` and `< 1`) to ensure waterfall state and actions remain finite.
+- `test_phase1_merge_split_can_leave_source_pool_overpriced`: adversarial Phase-1 fixture showing that when the optimal sell split uses merge legs, the source pool can remain overpriced even when sell sizing is derived from `sell_to_price(prediction)` in direct-price space.
+- `test_fuzz_phase1_sell_order_budget_stability`: sampled order-stability check for Phase-1 liquidation across adversarial 3-outcome fixtures (same holdings/prices, swapped sell order), guarding against unexpected order-sensitive budget recovery drift.
+- `test_fuzz_plan_execute_cost_consistency_near_mint_caps`: seeded near-cap mixed-route search ensuring planned route costs remain consistent with executed budget deltas when mint legs operate close to sell-cap boundaries.
+- `test_direct_closed_form_target_can_overshoot_tick_boundary`: stress test documenting that all-direct closed-form profitability targets can imply prices above tick boundaries, while execution planning clamps to feasible `buy_limit_price`.
+- `test_oracle_phase3_recycling_two_pool_direct_only_matches_grid_optimum`: direct-only 2-market oracle fixture validating Phase-3-style legacy-capital recycling (sell low-profitability legacy inventory, reallocate into a higher-marginal-profitability market) against a grid-search baseline.
+- `test_fuzz_pool_sim_kappa_lambda_finite_difference_accuracy`: finite-difference fuzz validation that `kappa`/`lambda` sensitivity parameters match observed small-step price derivatives and closed-form price update equations from `buy_exact`/`sell_exact`.
+- `test_rebalance_regression_full_l1_snapshot_invariants`: deterministic full-L1 regression snapshot using real generated L1 market metadata (liquidity/ticks/tokens) with fixed synthetic prices + initial holdings, asserting fixed action-count baseline and fixed EV baseline (tight tolerance) to detect behavioral drift.
+- `test_rebalance_regression_full_l1_snapshot_variant_b_invariants`: second deterministic full-L1 snapshot in a distinct near-fair/mixed-price regime with different holdings and budget, asserting a separate fixed action/EV baseline to reduce overfitting to one market profile.
+- `test_rebalance_phase1_clears_or_fairs_legacy_overpriced_source_full_l1`: full-L1 adversarial check that legacy overpriced source inventory is not left both held and overpriced after rebalance (legacy inventory must be exhausted or the source price must be brought to prediction/fair level).
+
+Phase-1 liquidation now runs iteratively per outcome (bounded) instead of a single sell attempt. This prevents one-shot merge-heavy splits from leaving residual legacy inventory in an overpriced source market.
+Phase-3 liquidation/reallocation now has an EV guardrail: each iteration is dry-run on cloned state and committed only if expected value does not regress (within numerical tolerance).
+
 ## Usage
 
 ```rust
