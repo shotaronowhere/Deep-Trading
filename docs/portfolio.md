@@ -2,7 +2,7 @@
 
 ## Overview
 
-`src/portfolio.rs` computes optimal rebalancing trades for L1 prediction markets using exact swap simulation via Uniswap V3 math. Implements the waterfall allocation algorithm: deploy capital to the most profitable outcome, equalize profitability progressively with the next-best outcomes, then liquidate underperforming holdings and reallocate.
+`src/portfolio/core/mod.rs` (with `sim.rs`, `planning.rs`, `solver.rs`, `trading.rs`, `waterfall.rs`, `rebalancer.rs`) computes optimal rebalancing trades for L1 prediction markets using exact swap simulation via Uniswap V3 math. Implements the waterfall allocation algorithm: deploy capital to the most profitable outcome, equalize profitability progressively with the next-best outcomes, then liquidate underperforming holdings and reallocate.
 
 ## Function: `rebalance`
 
@@ -173,7 +173,7 @@ Run with: `cargo test --release test_rebalance_perf_full_l1 -- --nocapture`
 
 ## Oracle and Fuzz Validation
 
-`src/portfolio.rs` includes direct-only oracle checks, mixed-route budget-order tests, and fuzz property tests over partial/full fixtures.
+Portfolio tests are split across `src/portfolio/tests.rs` (shared fixtures + early deterministic checks), `src/portfolio/tests/fuzz_rebalance.rs`, `src/portfolio/tests/oracle.rs`, and `src/portfolio/tests/execution.rs`.
 
 - `test_oracle_two_pool_direct_only_with_legacy_holdings_matches_grid_optimum`: hardcoded 2-market fixture with legacy inventory in an overpriced market and an underpriced alternative; verifies rebalance emits sell/reallocate flow and lands near oracle EV.
 - `test_oracle_fuzz_two_pool_direct_only_with_legacy_holdings_not_worse_than_grid`: randomized 2-market fuzz over prices, budget, and initial holdings; checks rebalance EV is not materially below the oracle optimum while preserving action-stream invariants.

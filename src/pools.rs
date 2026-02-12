@@ -8,7 +8,7 @@ use alloy_primitives::{I256, U256};
 use futures_util::future;
 use std::str::FromStr;
 use uniswap_v3_math::{
-    full_math::mul_div, swap_math::compute_swap_step, tick, tick_math::get_sqrt_ratio_at_tick,
+    full_math::mul_div, swap_math::compute_swap_step, tick_math::get_sqrt_ratio_at_tick,
 };
 
 use std::collections::HashMap;
@@ -119,7 +119,7 @@ fn compute_depth(
     let zero_for_one = pool.token0.to_lowercase() == quote_token.to_lowercase();
     let liquidity: u128 = pool.liquidity.parse().unwrap();
 
-    let tick_0 = pool.ticks.get(0).unwrap();
+    let tick_0 = pool.ticks.first().unwrap();
     let tick_1 = pool.ticks.get(1).unwrap();
     let target_tick = if zero_for_one {
         tick_0.tick_idx.min(tick_1.tick_idx)
@@ -358,7 +358,7 @@ pub fn simulate_swap(
     zero_for_one: bool,
 ) -> Result<SwapResult, uniswap_v3_math::error::UniswapV3MathError> {
     // we don't know which tick is low or high
-    let tick_0 = pool.ticks.get(0).unwrap();
+    let tick_0 = pool.ticks.first().unwrap();
     let tick_1 = pool.ticks.get(1).unwrap();
     let liquidity: u128 = pool.liquidity.parse().unwrap();
 

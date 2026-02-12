@@ -249,7 +249,7 @@ After converging to π*:
 
 **Ordering is critical**: mints first (update non-active pool states), directs second (use actual states). The code must enforce this explicitly, not iterate `allocs` in arbitrary order.
 
-### Code Changes in `src/portfolio.rs`
+### Code Changes in `src/portfolio/core/mod.rs`
 
 **Modify `solve_prof`** (~line 847): Add a branch for mixed routes that uses the coupled algorithm above, replacing the independent `cost_for_route` summation.
 

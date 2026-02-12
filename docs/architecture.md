@@ -41,7 +41,18 @@ API (deep.seer.pm)
 - **src/markets.rs**: Generated static market data arrays
 - **src/predictions.rs**: Generated prediction weights from CSVs
 - **src/pools.rs**: On-chain pool queries, trading analytics, balance fetching, and caching
-- **src/portfolio.rs**: Portfolio rebalancing (see [portfolio.md](portfolio.md), [model.md](model.md))
+- **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
+- **src/portfolio/core/mod.rs**: Portfolio core aggregation module
+- **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers
+- **src/portfolio/core/planning.rs**: Pure route planning and cost modeling helpers
+- **src/portfolio/core/solver.rs**: Numerical solvers (mint Newton solve and budget-exhaustion profitability solve)
+- **src/portfolio/core/trading.rs**: Trade/plan execution, merge/mint helpers, and inventory accounting (`ExecutionState` centralizes mutable execution state and execution methods)
+- **src/portfolio/core/waterfall.rs**: Waterfall allocation strategy and active-set profitability equalization loop
+- **src/portfolio/core/rebalancer.rs**: Rebalance phase orchestration and phase-specific inventory/budget flows (`RebalanceContext` handles setup/validation)
+- **src/portfolio/tests.rs**: Portfolio test root (shared fixtures + early deterministic tests)
+- **src/portfolio/tests/fuzz_rebalance.rs**: Fuzz and full/partial rebalance regression tests
+- **src/portfolio/tests/oracle.rs**: Oracle parity, phase behavior, and invariants tests
+- **src/portfolio/tests/execution.rs**: Merge/sell execution, perf, and integration test helpers
 
 ## Pool Analytics (`src/pools.rs`)
 

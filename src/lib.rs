@@ -136,8 +136,6 @@ pub async fn prepare(url: &str, file_name: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-///
-
 #[cfg(test)]
 mod tests {
     use super::*;
