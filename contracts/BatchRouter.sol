@@ -47,6 +47,8 @@ interface IV3SwapRouter {
 /// @notice Batches Uniswap V3 swaps with aggregate slippage protection.
 contract BatchRouter {
     error SlippageExceeded();
+    error ApprovalFailed();
+    error TransferFailed();
 
     IV3SwapRouter public immutable router;
 
@@ -68,7 +70,8 @@ contract BatchRouter {
     ) external returns (uint256 amount) {
         for (uint i = 0; i < swaps.length; i++) {
             IERC20 tokenIn = IERC20(swaps[i].tokenIn);
-            tokenIn.approve(address(router), swaps[i].amountIn);
+            bool success = tokenIn.approve(address(router), swaps[i].amountIn);
+            require(success, ApprovalFailed());
             // TRUSTED: external call to Uniswap V3 swap router
             amount += router.exactInputSingle(swaps[i]);
         }
@@ -80,7 +83,7 @@ contract BatchRouter {
     /// @param max Maximum total amount of input tokens to spend.
     /// @return amount Total amount of input tokens spent.
     /// @dev Caller must transfer tokenInMax to this contract before calling.
-    /// @dev To enforce only group slippage protection, all swap params must be zero.
+    /// @dev To enforce only group slippage protection, set each swap's amountOutMinimum to zero.
     /// @dev tokenIn is assumed to be the same for all swaps in swaps.
     /// @dev tokenOut is sent to recipient specified in each swaps[i].
     function buy(
@@ -89,7 +92,8 @@ contract BatchRouter {
     ) external returns (uint256 amount) {
         // tokenIn is same for all swaps, so approve once
         IERC20 tokenIn = IERC20(swaps[0].tokenIn);
-        tokenIn.approve(address(router), max);
+        bool success = tokenIn.approve(address(router), max);
+        require(success, ApprovalFailed());
         for (uint i = 0; i < swaps.length; i++) {
             // TRUSTED: external call to Uniswap V3 swap router
             amount += router.exactOutputSingle(swaps[i]);
@@ -97,6 +101,9 @@ contract BatchRouter {
         require(amount <= max, SlippageExceeded());
         // Refund unused tokenIn to caller
         uint256 remaining = tokenIn.balanceOf(address(this));
-        if (remaining > 0) tokenIn.transfer(msg.sender, remaining);
+        if (remaining > 0) {
+            success = tokenIn.transfer(msg.sender, remaining);
+            require(success, TransferFailed());
+        }
     }
 }
