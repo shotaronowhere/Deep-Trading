@@ -7,11 +7,68 @@ use super::super::rebalancer::rebalance;
 use super::super::sim::PoolSim;
 use super::super::trading::{ExecutionState, solve_complete_set_arb_amount};
 use super::{
-    Action, brute_force_best_split, build_three_sims, build_three_sims_with_preds,
-    mock_slot0_market,
+    Action, brute_force_best_split, build_slot0_results_for_markets, build_three_sims,
+    build_three_sims_with_preds, eligible_l1_markets_with_predictions, mock_slot0_market,
 };
+use crate::execution::GroupKind;
+use crate::execution::bounds::{
+    BufferConfig, build_group_plans_with_default_edges, derive_batch_quote_bounds,
+    stamp_plans_with_block,
+};
+use crate::execution::gas::GasAssumptions;
+use crate::execution::grouping::group_actions;
 use crate::pools::{Slot0Result, normalize_market_name, prediction_to_sqrt_price_x96};
 use alloy::primitives::{Address, U256};
+
+fn sample_rebalance_actions() -> Vec<Action> {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(8).collect();
+    let multipliers = [1.35, 0.55, 1.40, 0.60, 1.25, 0.70, 1.15, 0.75];
+    let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
+    rebalance(&HashMap::new(), 100.0, &slot0_results)
+}
+
+fn test_gas_assumptions() -> GasAssumptions {
+    GasAssumptions {
+        l1_fee_per_byte_wei: 1.0e11,
+        ..GasAssumptions::default()
+    }
+}
+
+fn assert_flash_brackets_are_well_formed(actions: &[Action]) {
+    let mut in_flash_bracket = false;
+
+    for (i, action) in actions.iter().enumerate() {
+        match action {
+            Action::FlashLoan { .. } => {
+                assert!(
+                    !in_flash_bracket,
+                    "nested flash bracket at action index {i}"
+                );
+                in_flash_bracket = true;
+            }
+            Action::RepayFlashLoan { .. } => {
+                assert!(
+                    in_flash_bracket,
+                    "repay outside flash bracket at action index {i}"
+                );
+                in_flash_bracket = false;
+            }
+            Action::Mint { .. } => {
+                assert!(
+                    in_flash_bracket,
+                    "mint outside flash bracket at action index {i}"
+                );
+            }
+            Action::Buy { .. } | Action::Sell { .. } | Action::Merge { .. } => {}
+        }
+    }
+
+    assert!(
+        !in_flash_bracket,
+        "unterminated flash bracket at end of action stream"
+    );
+}
 
 #[test]
 fn test_optimal_sell_split_matches_bruteforce() {
@@ -733,6 +790,90 @@ fn profile_complete_set_arb_solver() {
         last
     );
     assert!(last >= 0.0);
+}
+
+#[test]
+fn test_rebalance_output_is_groupable() {
+    let actions = sample_rebalance_actions();
+    let groups = group_actions(&actions).expect("rebalance output should be groupable");
+
+    let covered_actions = groups.iter().map(|g| g.action_indices.len()).sum::<usize>();
+    assert_eq!(
+        covered_actions,
+        actions.len(),
+        "grouping should cover every action exactly once"
+    );
+    assert!(
+        groups.iter().all(|g| !g.action_indices.is_empty()),
+        "groups should never be empty"
+    );
+}
+
+#[test]
+fn test_rebalance_output_is_plannable_with_default_edge_model() {
+    let actions = sample_rebalance_actions();
+    let groups = group_actions(&actions).expect("rebalance output should be groupable");
+
+    let plans = build_group_plans_with_default_edges(
+        &actions,
+        &test_gas_assumptions(),
+        1e-10,
+        3000.0,
+        BufferConfig::default(),
+    )
+    .expect("planning should succeed with built-in direct-buy edge mapping");
+
+    let direct_buy_groups = groups
+        .iter()
+        .filter(|g| g.kind == GroupKind::DirectBuy)
+        .count();
+    let direct_buy_plans = plans
+        .iter()
+        .filter(|p| p.kind == GroupKind::DirectBuy)
+        .count();
+    assert_eq!(
+        direct_buy_plans, direct_buy_groups,
+        "all direct-buy groups should be plannable with explicit edge input"
+    );
+}
+
+#[test]
+fn test_rebalance_non_direct_merge_plans_have_batch_bounds() {
+    let actions = sample_rebalance_actions();
+    let mut plans = build_group_plans_with_default_edges(
+        &actions,
+        &test_gas_assumptions(),
+        1e-10,
+        3000.0,
+        BufferConfig::default(),
+    )
+    .expect("planning should succeed");
+    stamp_plans_with_block(&mut plans, 100);
+
+    assert!(!plans.is_empty(), "expected at least one executable plan");
+    for plan in plans {
+        let bounds = derive_batch_quote_bounds(&plan, 100, 2)
+            .expect("planned groups should never have mixed buy/sell leg directions");
+        match plan.kind {
+            GroupKind::DirectMerge => assert!(
+                bounds.is_none(),
+                "direct merge should not map to batch buy/sell bounds"
+            ),
+            GroupKind::DirectBuy
+            | GroupKind::DirectSell
+            | GroupKind::MintSell
+            | GroupKind::BuyMerge => assert!(
+                bounds.is_some(),
+                "dex-leg groups must map to aggregate batch bounds"
+            ),
+        }
+    }
+}
+
+#[test]
+fn test_rebalance_never_emits_naked_mint_or_repay() {
+    let actions = sample_rebalance_actions();
+    assert_flash_brackets_are_well_formed(&actions);
 }
 
 #[tokio::test]

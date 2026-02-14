@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufWriter;
 
+pub mod execution;
 pub mod markets;
 pub mod pools;
 pub mod portfolio;

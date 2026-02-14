@@ -3,6 +3,8 @@
 ## Open
 
 - [ ] Integrate gas/MEV-aware net-PnL objective (EV minus execution costs) once live gas-cost estimator wiring is available.
+- [ ] Replace heuristic L1 data-fee model (estimated calldata bytes + cached two-point `getL1Fee(bytes)` marginal fee/byte estimate) with exact transaction-serialization-based `getL1Fee(txData)` once action->transaction calldata wiring is implemented.
+- [ ] Enforce strict staleness/deadline gating at submission time (`planned_at_block` + `max_stale_blocks`, `deadline_secs`) once action->transaction execution loop is wired.
 
 ## Deferred
 

@@ -20,9 +20,12 @@ use serde::{Deserialize, Serialize};
 use crate::markets::{MARKETS_L1, MarketData, Pool};
 use crate::predictions::PREDICTIONS_L1;
 
-/// Normalize a market name for prediction lookup: trim trailing \t, lowercase.
+/// Normalize a market name for prediction lookup:
+/// trim trailing literal "\\t" or tab, then lowercase.
 pub fn normalize_market_name(name: &str) -> String {
-    name.trim_end_matches("\\t").to_lowercase()
+    name.trim_end_matches("\\t")
+        .trim_end_matches('\t')
+        .to_lowercase()
 }
 
 /// Returns a HashMap from normalized market name (lowercase) to prediction value.
