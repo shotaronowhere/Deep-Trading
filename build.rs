@@ -48,6 +48,7 @@ const FACTORY_ADDRESS: Address = address!("1F98431c8aD98523631AE4a59f267346ea31F
 const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
 const FEE_TIER: u32 = 100;
 const MULTICALL_BATCH_SIZE: usize = 16000;
+const DEFAULT_OPTIMISM_RPC_URL: &str = "https://optimism.drpc.org";
 
 // L1 base token (hardcoded)
 const L1_QUOTE_TOKEN: &str = "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0";
@@ -987,12 +988,16 @@ async fn generate_markets_rs(
 }
 
 fn main() {
+    dotenvy::dotenv().ok();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_path = Path::new(&manifest_dir);
 
     let l1_predictions_csv = manifest_path.join("l1-predictions.csv");
     let l2_predictions_csv = manifest_path.join("l2-predictions.csv");
     let originality_predictions_csv = manifest_path.join("originality-predictions.csv");
+    let markets_data_l1_json = manifest_path.join("markets_data_l1.json");
+    let markets_data_l2_json = manifest_path.join("markets_data_l2.json");
+    let markets_data_originality_json = manifest_path.join("markets_data_originality.json");
     let predictions_rs = manifest_path.join("src/predictions.rs");
     let markets_rs = manifest_path.join("src/markets.rs");
 
@@ -1025,13 +1030,35 @@ fn main() {
     if markets_rs.exists() {
         rustfmt_generated_file(&markets_rs);
         println!(
-            "cargo::warning=Using existing {}. Network fetch for markets is disabled.",
+            "cargo::warning=Using existing {}. Skipping market generation.",
             markets_rs.display()
         );
     } else {
-        panic!(
-            "{} not found. Network fetch for markets is disabled in build.rs. Restore or generate markets.rs outside the build step.",
-            markets_rs.display()
+        let rpc_url = env::var("RPC")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_OPTIMISM_RPC_URL.to_string());
+
+        println!(
+            "cargo::warning={} not found. Generating from markets_data_*.json using RPC {}",
+            markets_rs.display(),
+            rpc_url
         );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime for markets generation");
+
+        if let Err(e) = runtime.block_on(generate_markets_rs(
+            &markets_data_l1_json,
+            &markets_data_l2_json,
+            &markets_data_originality_json,
+            &markets_rs,
+            &rpc_url,
+        )) {
+            panic!("Failed to generate markets.rs: {}", e);
+        }
     }
 }

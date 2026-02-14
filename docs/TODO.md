@@ -9,6 +9,7 @@
 ## Deferred
 
 - [ ] L2 and Originality market support
+- [ ] Decouple portfolio core from L1-global assumptions (`PREDICTIONS_L1`, full-L1 market universe) to reduce integration risk for L2/Originality.
 
 ## Done
 

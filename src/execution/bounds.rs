@@ -463,7 +463,7 @@ pub fn build_group_plans_with_default_edges(
     let predictions = crate::pools::prediction_map();
     build_group_plans_with_prediction_edges(
         actions,
-        &predictions,
+        predictions,
         gas_assumptions,
         gas_price_eth,
         eth_usd_assumed,
@@ -539,7 +539,9 @@ fn summarize_group(
             }
             Action::Sell {
                 market_name,
-                amount, proceeds, ..
+                amount,
+                proceeds,
+                ..
             } => {
                 debug_assert!(
                     amount.is_finite() && amount >= 0.0,

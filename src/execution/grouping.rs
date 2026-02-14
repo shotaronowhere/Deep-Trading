@@ -186,22 +186,20 @@ fn classify_flash_loan_bracket(
 
     let inner = &actions[(start_index + 1)..end_index];
 
-    if let Some((first, rest)) = inner.split_first() {
-        if matches!(first, Action::Mint { .. })
-            && !rest.is_empty()
-            && rest.iter().all(|a| matches!(a, Action::Sell { .. }))
-        {
-            return Ok(GroupKind::MintSell);
-        }
+    if let Some((first, rest)) = inner.split_first()
+        && matches!(first, Action::Mint { .. })
+        && !rest.is_empty()
+        && rest.iter().all(|a| matches!(a, Action::Sell { .. }))
+    {
+        return Ok(GroupKind::MintSell);
     }
 
-    if let Some((last, rest)) = inner.split_last() {
-        if matches!(last, Action::Merge { .. })
-            && !rest.is_empty()
-            && rest.iter().all(|a| matches!(a, Action::Buy { .. }))
-        {
-            return Ok(GroupKind::BuyMerge);
-        }
+    if let Some((last, rest)) = inner.split_last()
+        && matches!(last, Action::Merge { .. })
+        && !rest.is_empty()
+        && rest.iter().all(|a| matches!(a, Action::Buy { .. }))
+    {
+        return Ok(GroupKind::BuyMerge);
     }
 
     Err(GroupingError::InvalidFlashLoanBracket {

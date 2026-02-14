@@ -35,12 +35,17 @@ API (deep.seer.pm)
 
 ## Key Files
 
-- **build.rs**: Fetches pool addresses via Multicall3, generates `markets.rs` and `predictions.rs`
+- **build.rs**: Always regenerates `predictions.rs`. Generates `markets.rs` via Multicall3 only when `src/markets.rs` is missing; otherwise keeps the checked-in file.
 - **src/lib.rs**: API client, fetches market data from Seer PM endpoints
 - **src/main.rs**: WebSocket connection to Optimism RPC
 - **src/markets.rs**: Generated static market data arrays
 - **src/predictions.rs**: Generated prediction weights from CSVs
-- **src/pools.rs**: On-chain pool queries, trading analytics, balance fetching, and caching
+- **src/pools.rs**: Facade/re-exports for pool utilities
+- **src/pools/pricing.rs**: Price conversions, prediction lookup map, and shared numeric helpers
+- **src/pools/swap.rs**: Uniswap V3 swap-step simulation helpers
+- **src/pools/analytics.rs**: Profitability/depth analytics
+- **src/pools/rpc.rs**: On-chain pool + balance multicall queries
+- **src/pools/cache.rs**: Local balance cache serialization and staleness checks
 - **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
 - **src/portfolio/core/mod.rs**: Portfolio core aggregation module
 - **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers
@@ -72,7 +77,7 @@ Converts Uniswap V3 `sqrtPriceX96` to outcome token prices (18-decimal fixed poi
 `fetch_all_slot0` batches `slot0()` calls across all pools using Multicall3, with configurable batch size (200). `fetch_balances` batches ERC20 `balanceOf` calls for sUSD + all 100 outcome tokens (including non-pooled outcomes). Balance caching via `save/load_balance_cache` persists to JSON with wallet validation and 5-minute staleness.
 
 ### Alternative Pricing
-`price_alt` computes the implied long price for an outcome by summing prices of all other outcomes: `1 - sum(others)`.
+`price_long_simple_alt` computes the implied long price for an outcome by summing prices of all other outcomes: `1 - sum(others)`.
 
 ## External Dependencies
 
@@ -84,11 +89,13 @@ Converts Uniswap V3 `sqrtPriceX96` to outcome token prices (18-decimal fixed poi
 
 ## Build Process
 
-1. Read JSON market data files
-2. Batch `getPool()` calls via Multicall3 to resolve Uniswap V3 pool addresses
-3. For L2: batch `parentWrappedOutcome()` to resolve quote tokens
-4. Generate static Rust arrays with all market/pool data
-5. Parse prediction CSVs and generate prediction arrays
+1. Parse prediction CSVs and regenerate `src/predictions.rs`
+2. If `src/markets.rs` exists, keep it and skip market generation
+3. If `src/markets.rs` is missing:
+4. Read JSON market data files
+5. Batch `getPool()` calls via Multicall3 to resolve Uniswap V3 pool addresses
+6. For L2: batch `parentWrappedOutcome()` to resolve quote tokens
+7. Generate static Rust arrays in `src/markets.rs`
 
 ## Constants
 
