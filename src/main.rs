@@ -14,6 +14,10 @@ sol! {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     // Connect to an Ethereum node via WebSocket
     let ws = WsConnect::new("wss://optimism.drpc.org");
     let provider = ProviderBuilder::new().connect_ws(ws).await?;

@@ -186,4 +186,4 @@ The f64 analytical math drives the optimization (choosing what to trade). The U2
 
 ## Invariants
 
-- **Full prediction coverage**: every tradeable outcome must have a prediction. `build_sims` panics on mismatch. This ensures the mint route's cost model (1 - Σ proceeds) accounts for all minted tokens — no unsold residuals or untracked holdings.
+- **Full prediction coverage**: every tradeable outcome must have a prediction. `build_sims` returns a typed error on mismatch, and `rebalance` fail-closes with no actions. This ensures the mint route's cost model (1 - Σ proceeds) accounts for all minted tokens — no unsold residuals or untracked holdings.

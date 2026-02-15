@@ -57,15 +57,15 @@ const MULTICALL3_ADDRESS: Address =
 const MULTICALL_BATCH_SIZE: usize = 200;
 
 /// Returns (base_token, quote_token) addresses for price calculation
-pub fn base_quote_tokens(market: &MarketData) -> (Address, Address) {
-    let pool = market.pool.as_ref().unwrap();
-    let token0 = Address::from_str(pool.token0).unwrap();
-    let token1 = Address::from_str(pool.token1).unwrap();
-    let quote_token = Address::from_str(market.quote_token).unwrap();
+pub fn base_quote_tokens(market: &MarketData) -> Option<(Address, Address)> {
+    let pool = market.pool.as_ref()?;
+    let token0 = Address::from_str(pool.token0).ok()?;
+    let token1 = Address::from_str(pool.token1).ok()?;
+    let quote_token = Address::from_str(market.quote_token).ok()?;
     if token0 == quote_token {
-        (token1, token0)
+        Some((token1, token0))
     } else {
-        (token0, token1)
+        Some((token0, token1))
     }
 }
 
@@ -156,7 +156,7 @@ pub async fn fetch_all_slot0<P: Provider + Clone>(
         for (result, (pool_id, market)) in results_batch.iter().zip(markets_batch.iter()) {
             match parse_slot0_result(*pool_id, result) {
                 Some(slot0_data) => slot0_results.push((slot0_data, *market)),
-                None => eprintln!("Failed to fetch slot0 for pool {}", pool_id),
+                None => tracing::warn!(%pool_id, "failed to fetch slot0"),
             }
         }
     }
@@ -233,4 +233,51 @@ pub async fn fetch_balances<P: Provider + Clone>(
     }
 
     Ok((susds, balances))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base_quote_tokens;
+    use crate::markets::{MarketData, Pool, Tick};
+
+    static TICKS: [Tick; 2] = [
+        Tick {
+            tick_idx: -1,
+            liquidity_net: 100,
+        },
+        Tick {
+            tick_idx: 1,
+            liquidity_net: -100,
+        },
+    ];
+
+    #[test]
+    fn base_quote_tokens_returns_none_when_pool_is_missing() {
+        let market = MarketData {
+            name: "m",
+            market_id: "id",
+            outcome_token: "0x1",
+            pool: None,
+            quote_token: "0x2",
+        };
+        assert!(base_quote_tokens(&market).is_none());
+    }
+
+    #[test]
+    fn base_quote_tokens_returns_none_on_invalid_token_address() {
+        let market = MarketData {
+            name: "m",
+            market_id: "id",
+            outcome_token: "0x1",
+            pool: Some(Pool {
+                token0: "not-an-address",
+                token1: "0x0000000000000000000000000000000000000001",
+                pool_id: "0x0000000000000000000000000000000000000002",
+                liquidity: "1000",
+                ticks: &TICKS,
+            }),
+            quote_token: "0x0000000000000000000000000000000000000003",
+        };
+        assert!(base_quote_tokens(&market).is_none());
+    }
 }

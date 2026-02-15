@@ -1,6 +1,8 @@
 use alloy::primitives::U256;
 
+mod batch_bounds;
 pub mod bounds;
+mod edge;
 pub mod gas;
 pub mod grouping;
 

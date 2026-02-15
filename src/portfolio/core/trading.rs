@@ -12,24 +12,11 @@ pub(super) struct ExecutionState<'a> {
     pub(super) sims: &'a mut [PoolSim],
     pub(super) budget: &'a mut f64,
     pub(super) actions: &'a mut Vec<Action>,
-    pub(super) sim_balances: Option<&'a mut BalanceMap>,
+    pub(super) sim_balances: &'a mut BalanceMap,
 }
 
 impl<'a> ExecutionState<'a> {
     pub(super) fn new(
-        sims: &'a mut [PoolSim],
-        budget: &'a mut f64,
-        actions: &'a mut Vec<Action>,
-    ) -> Self {
-        Self {
-            sims,
-            budget,
-            actions,
-            sim_balances: None,
-        }
-    }
-
-    pub(super) fn with_balances(
         sims: &'a mut [PoolSim],
         budget: &'a mut f64,
         actions: &'a mut Vec<Action>,
@@ -39,7 +26,7 @@ impl<'a> ExecutionState<'a> {
             sims,
             budget,
             actions,
-            sim_balances: Some(sim_balances),
+            sim_balances,
         }
     }
 }
@@ -57,14 +44,14 @@ pub(super) fn complete_set_marginal_buy_cost(sims: &[PoolSim], amount: f64) -> f
     let mut total = 0.0_f64;
     for s in sims {
         let lam = s.lambda();
-        if lam <= 0.0 || s.price <= 0.0 {
+        if lam <= 0.0 || s.price() <= 0.0 {
             return f64::INFINITY;
         }
         let d = 1.0 - amount * lam;
         if d <= 0.0 {
             return f64::INFINITY;
         }
-        total += s.price / (FEE_FACTOR * d * d);
+        total += s.price() / (FEE_FACTOR * d * d);
     }
     total
 }
@@ -136,7 +123,7 @@ impl<'a> ExecutionState<'a> {
         }
 
         for (i, cost, new_price) in legs {
-            self.sims[i].price = new_price;
+            self.sims[i].set_price(new_price);
             self.actions.push(Action::Buy {
                 market_name: self.sims[i].market_name,
                 amount,
@@ -194,9 +181,7 @@ impl<'a> ExecutionState<'a> {
         if sell_amount <= 0.0 {
             return 0.0;
         }
-        let Some(sim_balances) = self.sim_balances.as_deref_mut() else {
-            return 0.0;
-        };
+        let sim_balances = &mut *self.sim_balances;
 
         let merge_target = if mint_available {
             let (m_opt, _) = optimal_sell_split_with_inventory(
@@ -217,7 +202,7 @@ impl<'a> ExecutionState<'a> {
                 self.sims,
                 source_idx,
                 merge_target,
-                sim_balances as &mut HashMap<&str, f64>,
+                sim_balances,
                 inventory_keep_prof,
                 self.actions,
                 self.budget,
@@ -230,7 +215,7 @@ impl<'a> ExecutionState<'a> {
             && let Some((sold, proceeds, new_price)) = self.sims[source_idx].sell_exact(remainder)
             && sold > 0.0
         {
-            self.sims[source_idx].price = new_price;
+            self.sims[source_idx].set_price(new_price);
             *self.budget += proceeds;
             sold_total += sold;
             subtract_balance(sim_balances, self.sims[source_idx].market_name, sold);
@@ -297,7 +282,7 @@ pub(super) fn emit_mint_actions(
             && sold > 0.0
         {
             total_proceeds += proceeds;
-            sim.price = new_price;
+            sim.set_price(new_price);
             actions.push(Action::Sell {
                 market_name: sim.market_name,
                 amount: sold,
@@ -324,7 +309,7 @@ pub(super) fn execute_buy(
     match route {
         Route::Direct => {
             if let Some(np) = new_price {
-                exec.sims[idx].price = np;
+                exec.sims[idx].set_price(np);
             }
             *exec.budget -= cost;
             exec.actions.push(Action::Buy {

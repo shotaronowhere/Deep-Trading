@@ -2,12 +2,46 @@ use std::fmt;
 
 use crate::portfolio::Action;
 
-use super::GroupKind;
+use super::{GroupKind, LegKind};
 
 #[derive(Debug, Clone)]
 pub struct ActionGroup {
     pub kind: GroupKind,
     pub action_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GroupLeg {
+    pub action_index: usize,
+    pub market_name: Option<&'static str>,
+    pub kind: LegKind,
+    pub planned_quote_susd: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DirectBuyInput {
+    pub action_index: usize,
+    pub market_name: &'static str,
+    pub amount: f64,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionGroup {
+    pub kind: GroupKind,
+    pub action_indices: Vec<usize>,
+    pub legs: Vec<GroupLeg>,
+    pub planned_cost_susd: f64,
+    pub planned_proceeds_susd: f64,
+    pub buy_legs: usize,
+    pub sell_legs: usize,
+    pub direct_buy: Option<DirectBuyInput>,
+}
+
+impl ExecutionGroup {
+    pub fn first_action_index(&self) -> Option<usize> {
+        self.action_indices.first().copied()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +103,122 @@ impl fmt::Display for GroupingError {
 
 impl std::error::Error for GroupingError {}
 
-/// Groups optimizer actions into execution units supported by the strict executor.
+fn collect_flash_loan_end(
+    actions: &[Action],
+    flash_loan_index: usize,
+) -> Result<usize, GroupingError> {
+    let mut i = flash_loan_index + 1;
+    while i < actions.len() {
+        match &actions[i] {
+            Action::FlashLoan { .. } => {
+                return Err(GroupingError::NestedFlashLoan { index: i });
+            }
+            Action::RepayFlashLoan { .. } => {
+                return Ok(i);
+            }
+            _ => i += 1,
+        }
+    }
+    Err(GroupingError::MissingRepayFlashLoan { flash_loan_index })
+}
+
+fn typed_group_from_actions(
+    actions: &[Action],
+    kind: GroupKind,
+    action_indices: Vec<usize>,
+) -> ExecutionGroup {
+    let mut legs = Vec::new();
+    let mut planned_cost_susd = 0.0_f64;
+    let mut planned_proceeds_susd = 0.0_f64;
+    let mut buy_legs = 0usize;
+    let mut sell_legs = 0usize;
+    let mut direct_buy = None;
+
+    for action_index in &action_indices {
+        match actions[*action_index] {
+            Action::Buy {
+                market_name,
+                amount,
+                cost,
+            } => {
+                debug_assert!(
+                    amount.is_finite() && amount >= 0.0,
+                    "invalid buy amount: {amount}"
+                );
+                debug_assert!(cost.is_finite() && cost >= 0.0, "invalid buy cost: {cost}");
+                let quote = cost.max(0.0);
+                planned_cost_susd += quote;
+                buy_legs += 1;
+                legs.push(GroupLeg {
+                    action_index: *action_index,
+                    market_name: Some(market_name),
+                    kind: LegKind::Buy,
+                    planned_quote_susd: quote,
+                });
+                if kind == GroupKind::DirectBuy {
+                    direct_buy = Some(DirectBuyInput {
+                        action_index: *action_index,
+                        market_name,
+                        amount,
+                        cost,
+                    });
+                }
+            }
+            Action::Sell {
+                market_name,
+                amount,
+                proceeds,
+            } => {
+                debug_assert!(
+                    amount.is_finite() && amount >= 0.0,
+                    "invalid sell amount: {amount}"
+                );
+                debug_assert!(
+                    proceeds.is_finite() && proceeds >= 0.0,
+                    "invalid sell proceeds: {proceeds}"
+                );
+                let quote = proceeds.max(0.0);
+                planned_proceeds_susd += quote;
+                sell_legs += 1;
+                legs.push(GroupLeg {
+                    action_index: *action_index,
+                    market_name: Some(market_name),
+                    kind: LegKind::Sell,
+                    planned_quote_susd: quote,
+                });
+            }
+            Action::Mint { amount, .. } => {
+                debug_assert!(
+                    amount.is_finite() && amount >= 0.0,
+                    "invalid mint amount: {amount}"
+                );
+                planned_cost_susd += amount.max(0.0);
+            }
+            Action::Merge { amount, .. } => {
+                debug_assert!(
+                    amount.is_finite() && amount >= 0.0,
+                    "invalid merge amount: {amount}"
+                );
+                planned_proceeds_susd += amount.max(0.0);
+            }
+            Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
+        }
+    }
+
+    ExecutionGroup {
+        kind,
+        action_indices,
+        legs,
+        planned_cost_susd,
+        planned_proceeds_susd,
+        buy_legs,
+        sell_legs,
+        direct_buy,
+    }
+}
+
+/// Groups optimizer actions into execution units and converts each unit into a typed IR
+/// consumed by execution planning.
 ///
 /// Supported shapes:
 /// - `DirectBuy`, `DirectSell`, `DirectMerge`
@@ -77,64 +226,42 @@ impl std::error::Error for GroupingError {}
 /// - `BuyMerge` flash bracket: `FlashLoan -> Buy+ -> Merge -> RepayFlashLoan`
 ///
 /// Any unsupported shape returns an error (fail closed) so callers can skip submission.
-pub fn group_actions(actions: &[Action]) -> Result<Vec<ActionGroup>, GroupingError> {
+pub fn group_execution_actions(actions: &[Action]) -> Result<Vec<ExecutionGroup>, GroupingError> {
     let mut groups = Vec::new();
     let mut i = 0usize;
 
     while i < actions.len() {
         match &actions[i] {
             Action::Buy { .. } => {
-                groups.push(ActionGroup {
-                    kind: GroupKind::DirectBuy,
-                    action_indices: vec![i],
-                });
+                groups.push(typed_group_from_actions(
+                    actions,
+                    GroupKind::DirectBuy,
+                    vec![i],
+                ));
                 i += 1;
             }
             Action::Sell { .. } => {
-                groups.push(ActionGroup {
-                    kind: GroupKind::DirectSell,
-                    action_indices: vec![i],
-                });
+                groups.push(typed_group_from_actions(
+                    actions,
+                    GroupKind::DirectSell,
+                    vec![i],
+                ));
                 i += 1;
             }
             Action::Merge { .. } => {
-                groups.push(ActionGroup {
-                    kind: GroupKind::DirectMerge,
-                    action_indices: vec![i],
-                });
+                groups.push(typed_group_from_actions(
+                    actions,
+                    GroupKind::DirectMerge,
+                    vec![i],
+                ));
                 i += 1;
             }
             Action::FlashLoan { .. } => {
                 let start = i;
-                i += 1;
-                let mut end: Option<usize> = None;
-                while i < actions.len() {
-                    match &actions[i] {
-                        Action::FlashLoan { .. } => {
-                            return Err(GroupingError::NestedFlashLoan { index: i });
-                        }
-                        Action::RepayFlashLoan { .. } => {
-                            end = Some(i);
-                            break;
-                        }
-                        _ => {
-                            i += 1;
-                        }
-                    }
-                }
-
-                let Some(end_index) = end else {
-                    return Err(GroupingError::MissingRepayFlashLoan {
-                        flash_loan_index: start,
-                    });
-                };
-
+                let end_index = collect_flash_loan_end(actions, start)?;
                 let kind = classify_flash_loan_bracket(actions, start, end_index)?;
                 let action_indices = (start..=end_index).collect();
-                groups.push(ActionGroup {
-                    kind,
-                    action_indices,
-                });
+                groups.push(typed_group_from_actions(actions, kind, action_indices));
                 i = end_index + 1;
             }
             Action::Mint { .. } | Action::RepayFlashLoan { .. } => {
@@ -144,6 +271,18 @@ pub fn group_actions(actions: &[Action]) -> Result<Vec<ActionGroup>, GroupingErr
     }
 
     Ok(groups)
+}
+
+/// Compatibility wrapper that preserves the previous grouping output (`kind + action indices`).
+pub fn group_actions(actions: &[Action]) -> Result<Vec<ActionGroup>, GroupingError> {
+    let groups = group_execution_actions(actions)?;
+    Ok(groups
+        .into_iter()
+        .map(|group| ActionGroup {
+            kind: group.kind,
+            action_indices: group.action_indices,
+        })
+        .collect())
 }
 
 fn classify_flash_loan_bracket(
@@ -259,6 +398,45 @@ mod tests {
         assert_eq!(groups[1].kind, GroupKind::MintSell);
         assert_eq!(groups[2].kind, GroupKind::BuyMerge);
         assert_eq!(groups[3].kind, GroupKind::DirectSell);
+    }
+
+    #[test]
+    fn typed_groups_capture_cashflow_and_dex_legs() {
+        let actions = vec![
+            Action::FlashLoan { amount: 10.0 },
+            Action::Mint {
+                contract_1: "c1",
+                contract_2: "c2",
+                amount: 10.0,
+                target_market: "t",
+            },
+            sell("a", 10.0, 7.0),
+            sell("b", 10.0, 6.0),
+            Action::RepayFlashLoan { amount: 10.0 },
+        ];
+
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, GroupKind::MintSell);
+        assert_eq!(groups[0].planned_cost_susd, 10.0);
+        assert_eq!(groups[0].planned_proceeds_susd, 13.0);
+        assert_eq!(groups[0].buy_legs, 0);
+        assert_eq!(groups[0].sell_legs, 2);
+        assert_eq!(groups[0].legs.len(), 2);
+    }
+
+    #[test]
+    fn typed_direct_buy_group_captures_prediction_inputs() {
+        let actions = vec![buy("mkt", 2.0, 0.9)];
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, GroupKind::DirectBuy);
+        let direct_buy = groups[0]
+            .direct_buy
+            .expect("direct-buy metadata should be present");
+        assert_eq!(direct_buy.market_name, "mkt");
+        assert_eq!(direct_buy.amount, 2.0);
+        assert_eq!(direct_buy.cost, 0.9);
     }
 
     #[test]

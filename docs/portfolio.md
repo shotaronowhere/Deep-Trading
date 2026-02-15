@@ -52,7 +52,9 @@ Each outcome has up to two acquisition routes, each with its own price and profi
 Route availability:
 - `mint_available = sims.len() == PREDICTIONS_L1.len()` — true when every tradeable outcome (98) has a non-zero-liquidity pool
 - When `mint_available`: mint route competes with direct; merge sell route competes with direct sell
-- Partial prediction sets are not supported — `build_sims` panics if any outcome is missing a prediction
+- Partial prediction sets are not supported — `build_sims` returns a typed error if any outcome is missing a prediction, and `rebalance` fail-closes with no actions.
+- Initialization fail-close reasons are emitted with structured logs (`non_finite_budget`, `sim_build_failed`, `no_eligible_sims`) for runtime diagnostics.
+- Invalid pool state entries (zero liquidity, malformed liquidity, missing ticks, or out-of-range tick math) are dropped from sim construction with an info log.
 
 #### Dual-route waterfall
 
@@ -105,6 +107,7 @@ Outer Newton on π (up to 15 iterations), inner Newton on M (2-3 iterations per 
 #### Execution safeguards
 
 - Each outcome's cost is recomputed right before execution (not from stale precomputed values), since mint actions mutate other pools' state.
+- Waterfall route planning reuses a scratch simulation buffer across iterations to avoid repeated `Vec<PoolSim>` allocation/cloning in the hot loop.
 - Per-action budget guard skips actions where cost exceeds remaining budget. Negative costs (arbitrage) are executed — they increase the budget and update pool states. If any outcome is skipped during a step (recomputed cost diverged from estimate), the waterfall breaks early and `last_prof` is set to `current_prof` (the level actually achieved), not the target. This prevents Phase 3 from using a stale profitability threshold.
 - **Prune loop:** when entries fail cost computation (e.g. tick boundary hit), the active set is pruned in a loop that re-derives the skip set after each removal, so remaining entries always see a consistent skip set.
 - **Iteration cap:** the waterfall loop is bounded by `MAX_WATERFALL_ITERS` (1000) to prevent infinite cycling from negative-cost arbitrage that grows the budget.

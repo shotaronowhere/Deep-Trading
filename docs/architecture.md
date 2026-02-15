@@ -16,10 +16,13 @@ API (deep.seer.pm)
   JSON files (markets_data_*.json)
        |
        v
-  build.rs (compile time)
+  cargo run --bin regenerate
        |
        v
   Generated Rust (src/markets.rs, src/predictions.rs)
+       |
+       v
+  build.rs staleness guard (compile time)
        |
        v
   Runtime binary (main.rs)
@@ -35,7 +38,11 @@ API (deep.seer.pm)
 
 ## Key Files
 
-- **build.rs**: Always regenerates `predictions.rs`. Generates `markets.rs` via Multicall3 only when `src/markets.rs` is missing; otherwise keeps the checked-in file.
+- **build.rs**: Validates generated files exist and are not stale versus CSV/JSON inputs; fails fast with a regenerate instruction when stale/missing.
+- **src/bin/regenerate.rs**: Orchestration entrypoint for manual codegen (`cargo run --bin regenerate`)
+- **src/bin/regenerate/predictions.rs**: CSV parsing/validation and `predictions.rs` generation
+- **src/bin/regenerate/markets.rs**: JSON parsing, multicall address resolution, and `markets.rs` generation
+- **src/bin/regenerate/common.rs**: Shared codegen helper(s) (e.g., formatting generated outputs)
 - **src/lib.rs**: API client, fetches market data from Seer PM endpoints
 - **src/main.rs**: WebSocket connection to Optimism RPC
 - **src/markets.rs**: Generated static market data arrays
@@ -46,6 +53,11 @@ API (deep.seer.pm)
 - **src/pools/analytics.rs**: Profitability/depth analytics
 - **src/pools/rpc.rs**: On-chain pool + balance multicall queries
 - **src/pools/cache.rs**: Local balance cache serialization and staleness checks
+- **src/execution/bounds.rs**: Group planning, strict gating, and execution-plan orchestration
+- **src/execution/edge.rs**: Group cashflow/EV edge derivation helpers
+- **src/execution/batch_bounds.rs**: Aggregate `sell(min)` / `buy(max)` bound derivation + plan stamping
+- **src/execution/gas.rs**: L2/L1 gas estimate model + cached Optimism L1 fee-per-byte hydration
+- **src/execution/grouping.rs**: Action grouping and flash-bracket shape validation
 - **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
 - **src/portfolio/core/mod.rs**: Portfolio core aggregation module
 - **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers
@@ -89,13 +101,13 @@ Converts Uniswap V3 `sqrtPriceX96` to outcome token prices (18-decimal fixed poi
 
 ## Build Process
 
-1. Parse prediction CSVs and regenerate `src/predictions.rs`
-2. If `src/markets.rs` exists, keep it and skip market generation
-3. If `src/markets.rs` is missing:
-4. Read JSON market data files
-5. Batch `getPool()` calls via Multicall3 to resolve Uniswap V3 pool addresses
-6. For L2: batch `parentWrappedOutcome()` to resolve quote tokens
-7. Generate static Rust arrays in `src/markets.rs`
+1. Run `cargo run --bin regenerate`
+2. Parse prediction CSVs and regenerate `src/predictions.rs`
+3. Read JSON market data files
+4. Batch `getPool()` calls via Multicall3 to resolve Uniswap V3 pool addresses
+5. For L2: batch `parentWrappedOutcome()` to resolve quote tokens
+6. Generate static Rust arrays in `src/markets.rs`
+7. During compile, `build.rs` verifies generated outputs are present and newer than generator inputs; if not, the build fails closed.
 
 ## Constants
 

@@ -21,8 +21,8 @@ pub struct BalanceCache {
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .map(|dur| dur.as_secs())
+        .unwrap_or(0)
 }
 
 /// Save balance cache to a JSON file.

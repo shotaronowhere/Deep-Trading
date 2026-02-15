@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::Action;
 use super::planning::{
-    PlannedRoute, active_skip_indices, cost_for_route, plan_active_routes, plan_is_budget_feasible,
-    solve_prof,
+    PlannedRoute, active_skip_indices, cost_for_route, plan_active_routes_with_scratch,
+    plan_is_budget_feasible, solve_prof,
 };
 use super::sim::{EPS, PoolSim, Route, alt_price, profitability};
 use super::trading::ExecutionState;
@@ -19,7 +19,7 @@ pub(super) fn best_non_active(
     let mut best: Option<(usize, Route, f64)> = None;
     for (i, sim) in sims.iter().enumerate() {
         if !active_set.contains(&(i, Route::Direct)) {
-            let prof = profitability(sim.prediction, sim.price);
+            let prof = profitability(sim.prediction, sim.price());
             if prof > 0.0 && best.is_none_or(|b| prof > b.2) {
                 best = Some((i, Route::Direct, prof));
             }
@@ -53,7 +53,7 @@ pub(super) fn waterfall(
     }
 
     // Precompute price_sum; maintained incrementally after executions.
-    let mut price_sum: f64 = sims.iter().map(|s| s.price).sum();
+    let mut price_sum: f64 = sims.iter().map(|s| s.price()).sum();
     let mut active_set: HashSet<(usize, Route)> = HashSet::new();
 
     // Seed active set with the highest-profitability entry.
@@ -66,6 +66,8 @@ pub(super) fn waterfall(
     active_set.insert((first.0, first.1));
     let mut current_prof = first.2;
     let mut last_prof = 0.0;
+    let mut waterfall_balances: HashMap<&str, f64> = HashMap::new();
+    let mut planning_sim_state: Vec<PoolSim> = Vec::with_capacity(sims.len());
 
     for _iter in 0..MAX_WATERFALL_ITERS {
         if *budget <= EPS || current_prof <= 0.0 {
@@ -109,7 +111,13 @@ pub(super) fn waterfall(
         }
 
         let skip = active_skip_indices(&active);
-        let full_plan = match plan_active_routes(sims, &active, target_prof, &skip) {
+        let full_plan = match plan_active_routes_with_scratch(
+            sims,
+            &active,
+            target_prof,
+            &skip,
+            &mut planning_sim_state,
+        ) {
             Some(plan) => plan,
             None => {
                 last_prof = current_prof;
@@ -119,7 +127,8 @@ pub(super) fn waterfall(
 
         if plan_is_budget_feasible(&full_plan, *budget) {
             let executed = {
-                let mut exec = ExecutionState::new(sims, budget, actions);
+                waterfall_balances.clear();
+                let mut exec = ExecutionState::new(sims, budget, actions, &mut waterfall_balances);
                 exec.execute_planned_routes(&full_plan, &skip)
             };
             if !executed {
@@ -128,7 +137,7 @@ pub(super) fn waterfall(
             }
 
             // Refresh price_sum after executions
-            price_sum = sims.iter().map(|s| s.price).sum();
+            price_sum = sims.iter().map(|s| s.price()).sum();
             current_prof = target_prof;
             last_prof = target_prof;
 
@@ -144,7 +153,13 @@ pub(super) fn waterfall(
             // Can't afford full step. Solve for lowest feasible profitability in [target_prof, current_prof].
             let mut achievable =
                 solve_prof(sims, &active, current_prof, target_prof, *budget, &skip);
-            let mut execution_plan = plan_active_routes(sims, &active, achievable, &skip);
+            let mut execution_plan = plan_active_routes_with_scratch(
+                sims,
+                &active,
+                achievable,
+                &skip,
+                &mut planning_sim_state,
+            );
 
             // Numerical guard: tighten toward current_prof until feasible.
             if execution_plan
@@ -157,7 +172,13 @@ pub(super) fn waterfall(
                 let mut best: Option<(f64, Vec<PlannedRoute>)> = None;
                 for _ in 0..32 {
                     let mid = 0.5 * (lo + hi);
-                    if let Some(plan) = plan_active_routes(sims, &active, mid, &skip) {
+                    if let Some(plan) = plan_active_routes_with_scratch(
+                        sims,
+                        &active,
+                        mid,
+                        &skip,
+                        &mut planning_sim_state,
+                    ) {
                         if plan_is_budget_feasible(&plan, *budget) {
                             best = Some((mid, plan));
                             hi = mid;
@@ -186,7 +207,8 @@ pub(super) fn waterfall(
                 break;
             }
             let executed = {
-                let mut exec = ExecutionState::new(sims, budget, actions);
+                waterfall_balances.clear();
+                let mut exec = ExecutionState::new(sims, budget, actions, &mut waterfall_balances);
                 exec.execute_planned_routes(&execution_plan, &skip)
             };
             if !executed {

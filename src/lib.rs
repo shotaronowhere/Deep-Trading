@@ -6,9 +6,11 @@ use std::fs::File;
 use std::io::BufWriter;
 
 pub mod execution;
+#[allow(clippy::all, clippy::pedantic)]
 pub mod markets;
 pub mod pools;
 pub mod portfolio;
+#[allow(clippy::all, clippy::pedantic)]
 pub mod predictions;
 
 sol! {

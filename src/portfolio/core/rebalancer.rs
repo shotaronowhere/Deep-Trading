@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::pools::Slot0Result;
 
 use super::Action;
-use super::sim::{EPS, PoolSim, build_sims, profitability, target_price_for_prof};
+use super::sim::{EPS, PoolSim, SimBuildError, build_sims, profitability, target_price_for_prof};
 use super::trading::{ExecutionState, portfolio_expected_value};
 use super::types::BalanceMap;
 use super::types::{apply_actions_to_sim_balances, lookup_balance};
@@ -13,6 +13,53 @@ const MAX_PHASE1_ITERS: usize = 128;
 const MAX_PHASE3_ITERS: usize = 8;
 const PHASE3_PROF_REL_TOL: f64 = 1e-9;
 const PHASE3_EV_GUARD_REL_TOL: f64 = 1e-10;
+
+#[derive(Debug, Clone, Copy)]
+enum RebalanceInitError {
+    NonFiniteBudget {
+        susds_balance: f64,
+    },
+    SimBuildFailed {
+        err: SimBuildError,
+    },
+    NoEligibleSims {
+        slot0_result_count: usize,
+        prediction_count: usize,
+        expected_outcome_count: usize,
+    },
+}
+
+fn log_rebalance_init_error(err: RebalanceInitError) {
+    match err {
+        RebalanceInitError::NonFiniteBudget { susds_balance } => {
+            tracing::warn!(
+                init_failure = "non_finite_budget",
+                susds_balance,
+                "rebalance initialization failed"
+            );
+        }
+        RebalanceInitError::SimBuildFailed { err } => {
+            tracing::warn!(
+                init_failure = "sim_build_failed",
+                %err,
+                "rebalance initialization failed"
+            );
+        }
+        RebalanceInitError::NoEligibleSims {
+            slot0_result_count,
+            prediction_count,
+            expected_outcome_count,
+        } => {
+            tracing::warn!(
+                init_failure = "no_eligible_sims",
+                slot0_result_count,
+                prediction_count,
+                expected_outcome_count,
+                "rebalance initialization failed"
+            );
+        }
+    }
+}
 
 fn held_total(sim_balances: &BalanceMap, market_name: &'static str) -> f64 {
     *sim_balances.get(market_name).unwrap_or(&0.0)
@@ -66,7 +113,7 @@ impl Phase3Trial {
         inventory_keep_prof: f64,
         mint_available: bool,
     ) -> f64 {
-        let mut exec = ExecutionState::with_balances(
+        let mut exec = ExecutionState::new(
             &mut self.sims,
             &mut self.budget,
             &mut self.actions,
@@ -81,19 +128,26 @@ impl RebalanceContext {
         balances: &HashMap<&str, f64>,
         susds_balance: f64,
         slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
-    ) -> Option<Self> {
+        predictions: &std::collections::HashMap<String, f64>,
+        expected_outcome_count: usize,
+    ) -> Result<Self, RebalanceInitError> {
         if !susds_balance.is_finite() {
-            return None;
+            return Err(RebalanceInitError::NonFiniteBudget { susds_balance });
         }
 
-        let sims = build_sims(slot0_results);
+        let sims = build_sims(slot0_results, predictions)
+            .map_err(|err| RebalanceInitError::SimBuildFailed { err })?;
         if sims.is_empty() {
-            return None;
+            return Err(RebalanceInitError::NoEligibleSims {
+                slot0_result_count: slot0_results.len(),
+                prediction_count: predictions.len(),
+                expected_outcome_count,
+            });
         }
 
         // Mint/merge routes require all tradeable outcomes to have liquid pools.
         // sims may be smaller if pools have zero liquidity or slot0_results is partial (RPC failures).
-        let mint_available = sims.len() == crate::predictions::PREDICTIONS_L1.len();
+        let mint_available = sims.len() == expected_outcome_count;
 
         let mut sim_balances: BalanceMap = HashMap::new();
         let mut legacy_remaining: BalanceMap = HashMap::new();
@@ -103,7 +157,7 @@ impl RebalanceContext {
             legacy_remaining.insert(sim.market_name, held);
         }
 
-        Some(Self {
+        Ok(Self {
             actions: Vec::new(),
             budget: susds_balance,
             sims,
@@ -158,7 +212,7 @@ impl RebalanceContext {
         sell_amount: f64,
         inventory_keep_prof: f64,
     ) -> f64 {
-        let mut exec = ExecutionState::with_balances(
+        let mut exec = ExecutionState::new(
             &mut self.sims,
             &mut self.budget,
             &mut self.actions,
@@ -190,7 +244,7 @@ impl RebalanceContext {
                 let (tokens_needed, _, _) =
                     self.sims[i]
                         .sell_to_price(pred)
-                        .unwrap_or((0.0, 0.0, self.sims[i].price));
+                        .unwrap_or((0.0, 0.0, self.sims[i].price()));
                 let sell_amount = if tokens_needed > EPS {
                     tokens_needed.min(held)
                 } else {
@@ -257,7 +311,7 @@ impl RebalanceContext {
                 let target_price = target_price_for_prof(trial.sims[idx].prediction, phase3_prof);
                 let (tokens_needed, _, _) = trial.sims[idx]
                     .sell_to_price(target_price)
-                    .unwrap_or((0.0, 0.0, trial.sims[idx].price));
+                    .unwrap_or((0.0, 0.0, trial.sims[idx].price()));
                 let sell_target = tokens_needed.min(legacy_amount);
                 if sell_target <= EPS {
                     continue;
@@ -327,16 +381,32 @@ pub fn rebalance(
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
 ) -> Vec<Action> {
-    let Some(mut ctx) = RebalanceContext::from_inputs(balances, susds_balance, slot0_results)
-    else {
-        return Vec::new();
+    let preds = crate::pools::prediction_map();
+    let expected_count = crate::predictions::PREDICTIONS_L1.len();
+    let mut ctx = match RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        &preds,
+        expected_count,
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log_rebalance_init_error(err);
+            return Vec::new();
+        }
     };
 
     // ── Phase 0: Complete-set arbitrage (buy all outcomes, merge) ──
     // Execute before any discretionary rebalancing so free budget is harvested first.
     if ctx.mint_available {
         let _arb_profit = {
-            let mut exec = ExecutionState::new(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions);
+            let mut exec = ExecutionState::new(
+                &mut ctx.sims,
+                &mut ctx.budget,
+                &mut ctx.actions,
+                &mut ctx.sim_balances,
+            );
             exec.execute_complete_set_arb()
         };
     }

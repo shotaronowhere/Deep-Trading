@@ -80,14 +80,14 @@ pub(super) fn direct_sell_marginal_proceeds(sim: &PoolSim, amount_sold: f64) -> 
         return 0.0;
     }
     let k = sim.kappa();
-    if k <= 0.0 || sim.price <= 0.0 {
+    if k <= 0.0 || sim.price() <= 0.0 {
         return 0.0;
     }
     let d = 1.0 + amount_sold * k;
     if d <= 0.0 {
         return 0.0;
     }
-    sim.price * FEE_FACTOR / (d * d)
+    sim.price() * FEE_FACTOR / (d * d)
 }
 
 pub(super) fn merge_sell_marginal_proceeds_with_inventory(
@@ -108,14 +108,14 @@ pub(super) fn merge_sell_marginal_proceeds_with_inventory(
         }
         let buy_amount = merge_amount - held;
         let lam = sim.lambda();
-        if lam <= 0.0 || sim.price <= 0.0 {
+        if lam <= 0.0 || sim.price() <= 0.0 {
             return f64::NEG_INFINITY;
         }
         let d = 1.0 - buy_amount * lam;
         if d <= 0.0 {
             return f64::NEG_INFINITY;
         }
-        marginal_buy_cost_sum += sim.price / (FEE_FACTOR * d * d);
+        marginal_buy_cost_sum += sim.price() / (FEE_FACTOR * d * d);
     }
     1.0 - marginal_buy_cost_sum
 }
@@ -364,7 +364,7 @@ pub(super) fn execute_merge_sell_with_inventory(
         let consumed_from_inventory = actual.min(held);
         let buy_amount = (actual - consumed_from_inventory).max(0.0);
         if buy_amount <= DUST {
-            legs.push((i, 0.0, 0.0, s.price, consumed_from_inventory));
+            legs.push((i, 0.0, 0.0, s.price(), consumed_from_inventory));
             continue;
         }
         match s.buy_exact(buy_amount) {
@@ -386,7 +386,7 @@ pub(super) fn execute_merge_sell_with_inventory(
 
     for (i, bought, cost, new_price, _) in &legs {
         if *bought > DUST {
-            sims[*i].price = *new_price;
+            sims[*i].set_price(*new_price);
             actions.push(Action::Buy {
                 market_name: sims[*i].market_name,
                 amount: *bought,

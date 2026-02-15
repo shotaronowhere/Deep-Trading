@@ -77,7 +77,7 @@ fn test_fuzz_mint_newton_solver_hits_target_or_saturation() {
             }
             if let Some((sold, _, p_new)) = saturated[i].sell_exact(cap) {
                 if sold > 0.0 {
-                    saturated[i].price = p_new;
+                    saturated[i].set_price(p_new);
                 }
             }
         }
@@ -128,7 +128,7 @@ fn test_fuzz_mint_newton_solver_hits_target_or_saturation() {
             }
             if let Some((sold, leg_proceeds, p_new)) = simulated[i].sell_exact(mint_amount) {
                 if sold > 0.0 {
-                    simulated[i].price = p_new;
+                    simulated[i].set_price(p_new);
                     proceeds += leg_proceeds;
                 }
             }

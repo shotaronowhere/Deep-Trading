@@ -5,8 +5,7 @@ use alloy::primitives::{Address, U256};
 use super::PoolSim;
 
 /// Mock pool: token0=quote(sUSD), token1=outcome → is_token1_outcome=true.
-/// Uses positive tick range matching real L1 pools with this ordering.
-/// Price range: ~[0.0001, 0.2] for outcome token.
+/// Tick range [1, 92108] gives outcome price range ~[0.0001, 0.9999].
 pub(super) fn mock_pool() -> Pool {
     Pool {
         token0: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0", // quote (sUSD)
@@ -15,7 +14,7 @@ pub(super) fn mock_pool() -> Pool {
         liquidity: "1000000000000000000000", // 1000 tokens
         ticks: &[
             Tick {
-                tick_idx: 16095,
+                tick_idx: 1,
                 liquidity_net: 1000000000000000000000,
             },
             Tick {

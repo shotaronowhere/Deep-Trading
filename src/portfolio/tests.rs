@@ -227,7 +227,8 @@ fn test_mint_route_actions() {
         .collect();
     let mut budget = 100.0;
     let mut actions2 = Vec::new();
-    let mut exec = ExecutionState::new(&mut sims2, &mut budget, &mut actions2);
+    let mut unused_bal: HashMap<&str, f64> = HashMap::new();
+    let mut exec = ExecutionState::new(&mut sims2, &mut budget, &mut actions2, &mut unused_bal);
     execute_buy(&mut exec, 0, 5.0, 10.0, Route::Mint, None, &HashSet::new());
     assert!(budget < 100.0, "budget should decrease after mint");
 
@@ -319,7 +320,8 @@ fn test_complete_set_arb_executes_when_profitable() {
     let mut budget = 0.0;
 
     let profit = {
-        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions);
+        let mut unused_bal: HashMap<&str, f64> = HashMap::new();
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut unused_bal);
         exec.execute_complete_set_arb()
     };
     assert!(profit > 0.0, "arb should produce positive profit");
@@ -368,7 +370,8 @@ fn test_complete_set_arb_skips_when_unprofitable() {
     let mut budget = 7.0;
 
     let profit = {
-        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions);
+        let mut unused_bal: HashMap<&str, f64> = HashMap::new();
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut unused_bal);
         exec.execute_complete_set_arb()
     };
     assert!(profit <= 1e-12, "unprofitable setup should not execute arb");
@@ -789,7 +792,9 @@ fn replay_actions_to_market_state(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static MarketData)],
 ) -> Vec<(Slot0Result, &'static MarketData)> {
-    let mut sims = build_sims(slot0_results);
+    let preds = crate::pools::prediction_map();
+    let mut sims =
+        build_sims(slot0_results, &preds).expect("test fixtures should have prediction coverage");
     let mut idx_by_market: HashMap<&str, usize> = HashMap::new();
     for (i, sim) in sims.iter().enumerate() {
         idx_by_market.insert(sim.market_name, i);
@@ -805,7 +810,7 @@ fn replay_actions_to_market_state(
                 if let Some(&idx) = idx_by_market.get(market_name) {
                     if let Some((bought, _, new_price)) = sims[idx].buy_exact(*amount) {
                         if bought > 0.0 {
-                            sims[idx].price = new_price;
+                            sims[idx].set_price(new_price);
                         }
                     }
                 }
@@ -818,7 +823,7 @@ fn replay_actions_to_market_state(
                 if let Some(&idx) = idx_by_market.get(market_name) {
                     if let Some((sold, _, new_price)) = sims[idx].sell_exact(*amount) {
                         if sold > 0.0 {
-                            sims[idx].price = new_price;
+                            sims[idx].set_price(new_price);
                         }
                     }
                 }
@@ -838,7 +843,7 @@ fn replay_actions_to_market_state(
                 if let Some(pool) = market.pool.as_ref() {
                     let is_token1_outcome =
                         pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
-                    let p = sims[idx].price.max(1e-12);
+                    let p = sims[idx].price().max(1e-12);
                     next.sqrt_price_x96 = prediction_to_sqrt_price_x96(p, is_token1_outcome)
                         .unwrap_or(slot0.sqrt_price_x96);
                 }
@@ -901,7 +906,7 @@ fn brute_force_best_gain_mint_direct(
                     if sold > 0.0 {
                         holdings[i] -= sold;
                         proceeds += leg_proceeds;
-                        state[i].price = new_p;
+                        state[i].set_price(new_p);
                     }
                 }
             }
@@ -922,7 +927,7 @@ fn brute_force_best_gain_mint_direct(
                     if bought > 0.0 {
                         holdings_d[direct_idx] += bought;
                         spent_d += cost;
-                        state_d[direct_idx].price = new_p;
+                        state_d[direct_idx].set_price(new_p);
                     }
                 }
             }

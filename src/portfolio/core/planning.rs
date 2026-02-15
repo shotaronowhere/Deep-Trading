@@ -76,6 +76,7 @@ fn execution_order(active: &[(usize, Route)]) -> impl Iterator<Item = (usize, Ro
         )
 }
 
+#[cfg(test)]
 pub(super) fn plan_active_routes(
     sims: &[PoolSim],
     active: &[(usize, Route)],
@@ -100,7 +101,7 @@ pub(super) fn plan_active_routes_with_scratch(
         sim_state.clone_from_slice(sims);
     }
 
-    let mut price_sum: f64 = sim_state.iter().map(|s| s.price).sum();
+    let mut price_sum: f64 = sim_state.iter().map(|s| s.price()).sum();
     let mut plan: Vec<PlannedRoute> = Vec::with_capacity(active.len());
 
     for (idx, route) in execution_order(active) {
@@ -112,7 +113,7 @@ pub(super) fn plan_active_routes_with_scratch(
         let (actual_cost, applied_new_price) = match route {
             Route::Direct => {
                 let np = new_price?;
-                sim_state[idx].price = np;
+                sim_state[idx].set_price(np);
                 (direct_cost, Some(np))
             }
             Route::Mint => {
@@ -126,7 +127,7 @@ pub(super) fn plan_active_routes_with_scratch(
                             && sold > DUST
                         {
                             proceeds += leg_proceeds;
-                            sim.price = new_leg_price;
+                            sim.set_price(new_leg_price);
                         }
                     }
                 }
@@ -145,7 +146,7 @@ pub(super) fn plan_active_routes_with_scratch(
             new_price: applied_new_price,
         });
 
-        price_sum = sim_state.iter().map(|s| s.price).sum();
+        price_sum = sim_state.iter().map(|s| s.price()).sum();
     }
 
     Some(plan)

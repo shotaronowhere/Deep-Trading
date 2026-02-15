@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::pools::normalize_market_name;
 use crate::portfolio::Action;
 
+pub use super::batch_bounds::{
+    BatchBoundsError, derive_batch_quote_bounds, derive_batch_quote_bounds_unchecked,
+    stamp_plan_with_block, stamp_plans_with_block,
+};
+pub use super::edge::{planned_cashflow_edge_susd, planned_edge_from_prediction_map_susd};
 use super::gas::{
     GasAssumptions, estimate_group_l2_gas_units, estimate_l2_gas_susd, estimate_total_gas_susd,
     hydrate_cached_optimism_l1_fee_per_byte, resolve_l1_fee_per_byte_wei,
 };
-use super::grouping::{ActionGroup, GroupingError, group_actions};
-use super::{
-    BatchQuoteBounds, ExecutionGroupPlan, ExecutionLegPlan, GroupKind, LegKind, is_plan_stale,
-};
+use super::grouping::{ExecutionGroup, GroupingError, group_execution_actions};
+use super::{ExecutionGroupPlan, ExecutionLegPlan, GroupKind, LegKind};
 
 #[derive(Debug, Clone, Copy)]
 pub struct BufferConfig {
@@ -36,13 +38,20 @@ pub enum GroupPlanningError {
         group_kind: GroupKind,
         first_action_index: usize,
     },
+    L1FeeHydration {
+        rpc_url: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchBoundsError {
-    InvalidSlippageBudget,
-    MixedLegDirections,
-    StalePlan,
+pub enum GroupSkipReason {
+    NonPositiveEdge,
+    MissingDexLegs,
+    InvalidL2GasEstimate,
+    InvalidTotalGasEstimate,
+    NonPositivePostBufferMargin,
+    InvalidLegNotional,
 }
 
 impl fmt::Display for GroupPlanningError {
@@ -57,25 +66,31 @@ impl fmt::Display for GroupPlanningError {
                 f,
                 "missing edge for group #{group_index} ({group_kind:?}) starting at action index {first_action_index}"
             ),
+            Self::L1FeeHydration { rpc_url, reason } => write!(
+                f,
+                "failed to hydrate Optimism L1 fee-per-byte from RPC '{}': {}",
+                rpc_url, reason
+            ),
         }
     }
 }
 
 impl std::error::Error for GroupPlanningError {}
 
-impl fmt::Display for BatchBoundsError {
+impl fmt::Display for GroupSkipReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidSlippageBudget => write!(f, "invalid slippage budget on group plan"),
-            Self::MixedLegDirections => {
-                write!(f, "mixed buy/sell legs cannot map to one batch bound")
+            Self::NonPositiveEdge => write!(f, "group edge is non-positive or non-finite"),
+            Self::MissingDexLegs => write!(f, "group has no DEX legs and is not a direct merge"),
+            Self::InvalidL2GasEstimate => write!(f, "l2 gas estimate is non-finite"),
+            Self::InvalidTotalGasEstimate => write!(f, "total gas estimate is non-finite"),
+            Self::NonPositivePostBufferMargin => {
+                write!(f, "edge does not clear gas + profit buffer gate")
             }
-            Self::StalePlan => write!(f, "plan is stale or missing reference block"),
+            Self::InvalidLegNotional => write!(f, "leg notionals are non-positive or non-finite"),
         }
     }
 }
-
-impl std::error::Error for BatchBoundsError {}
 
 impl From<GroupingError> for GroupPlanningError {
     fn from(value: GroupingError) -> Self {
@@ -83,119 +98,58 @@ impl From<GroupingError> for GroupPlanningError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct GroupLegSummary {
-    action_index: usize,
-    market_name: Option<&'static str>,
-    kind: LegKind,
-    planned_quote_susd: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct GroupCashflowSummary {
-    planned_cost_susd: f64,
-    planned_proceeds_susd: f64,
-    buy_legs: usize,
-    sell_legs: usize,
-}
-
-pub fn planned_cashflow_edge_susd(actions: &[Action], group: &ActionGroup) -> f64 {
-    let (summary, _) = summarize_group(actions, group, false);
-    summary.planned_proceeds_susd - summary.planned_cost_susd
-}
-
-pub fn planned_edge_from_prediction_map_susd(
-    actions: &[Action],
-    group: &ActionGroup,
-    prediction_by_market: &HashMap<String, f64>,
-) -> Option<f64> {
-    match group.kind {
-        GroupKind::DirectBuy => {
-            let action_index = *group.action_indices.first()?;
-            match actions.get(action_index)? {
-                Action::Buy {
-                    market_name,
-                    amount,
-                    cost,
-                } => {
-                    let key = normalize_market_name(market_name);
-                    let prediction = match prediction_by_market.get(&key).copied() {
-                        Some(prediction) => prediction,
-                        None => {
-                            eprintln!(
-                                "info: missing prediction for direct-buy market '{}' (normalized '{}'); using prediction=0.0 and relying on edge gate",
-                                market_name, key
-                            );
-                            0.0
-                        }
-                    };
-                    debug_assert!(
-                        amount.is_finite() && *amount >= 0.0,
-                        "invalid buy amount at action index {}: {}",
-                        action_index,
-                        amount
-                    );
-                    debug_assert!(
-                        cost.is_finite() && *cost >= 0.0,
-                        "invalid buy cost at action index {}: {}",
-                        action_index,
-                        cost
-                    );
-                    debug_assert!(
-                        prediction.is_finite(),
-                        "invalid prediction for direct-buy market '{}' (normalized '{}'): {}",
-                        market_name,
-                        key,
-                        prediction
-                    );
-                    Some(amount.max(0.0) * prediction - cost.max(0.0))
-                }
-                _ => None,
-            }
-        }
-        _ => Some(planned_cashflow_edge_susd(actions, group)),
-    }
-}
-
 pub fn build_group_plan(
-    actions: &[Action],
-    group: &ActionGroup,
+    group: &ExecutionGroup,
     edge_plan_susd: f64,
     gas_assumptions: &GasAssumptions,
     gas_price_eth: f64,
     eth_usd_assumed: f64,
     buffer: BufferConfig,
 ) -> Option<ExecutionGroupPlan> {
-    if !edge_plan_susd.is_finite() || edge_plan_susd <= 0.0 {
-        return None;
-    }
-
-    let (cashflow, legs) = summarize_group(actions, group, true);
-    if legs.is_empty() && group.kind != GroupKind::DirectMerge {
-        return None;
-    }
-
-    let l2_gas_units = estimate_group_l2_gas_units(
+    build_group_plan_with_reason(
+        group,
+        edge_plan_susd,
         gas_assumptions,
-        group.kind,
-        cashflow.buy_legs,
-        cashflow.sell_legs,
-    );
+        gas_price_eth,
+        eth_usd_assumed,
+        buffer,
+    )
+    .ok()
+}
+
+pub fn build_group_plan_with_reason(
+    group: &ExecutionGroup,
+    edge_plan_susd: f64,
+    gas_assumptions: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd_assumed: f64,
+    buffer: BufferConfig,
+) -> Result<ExecutionGroupPlan, GroupSkipReason> {
+    if !edge_plan_susd.is_finite() || edge_plan_susd <= 0.0 {
+        return Err(GroupSkipReason::NonPositiveEdge);
+    }
+
+    if group.legs.is_empty() && group.kind != GroupKind::DirectMerge {
+        return Err(GroupSkipReason::MissingDexLegs);
+    }
+
+    let l2_gas_units =
+        estimate_group_l2_gas_units(gas_assumptions, group.kind, group.buy_legs, group.sell_legs);
     let gas_l2_susd = estimate_l2_gas_susd(l2_gas_units, gas_price_eth, eth_usd_assumed);
     if !gas_l2_susd.is_finite() {
-        return None;
+        return Err(GroupSkipReason::InvalidL2GasEstimate);
     }
     let gas_total_susd = estimate_total_gas_susd(
         gas_assumptions,
         group.kind,
-        cashflow.buy_legs,
-        cashflow.sell_legs,
+        group.buy_legs,
+        group.sell_legs,
         l2_gas_units,
         gas_price_eth,
         eth_usd_assumed,
     );
     if !gas_total_susd.is_finite() {
-        return None;
+        return Err(GroupSkipReason::InvalidTotalGasEstimate);
     }
 
     let profit_buffer_susd = buffer
@@ -203,7 +157,7 @@ pub fn build_group_plan(
         .max(buffer.buffer_frac.max(0.0) * edge_plan_susd);
     let post_buffer_margin_susd = edge_plan_susd - gas_total_susd - profit_buffer_susd;
     if !post_buffer_margin_susd.is_finite() || post_buffer_margin_susd <= 0.0 {
-        return None;
+        return Err(GroupSkipReason::NonPositivePostBufferMargin);
     }
     let slippage_budget_susd = if group.kind == GroupKind::DirectMerge {
         0.0
@@ -211,16 +165,16 @@ pub fn build_group_plan(
         post_buffer_margin_susd
     };
 
-    let leg_plans = if legs.is_empty() {
+    let leg_plans = if group.legs.is_empty() {
         Vec::new()
     } else {
-        let total_notional: f64 = legs.iter().map(|l| l.planned_quote_susd).sum();
+        let total_notional: f64 = group.legs.iter().map(|l| l.planned_quote_susd).sum();
         if total_notional <= 0.0 || !total_notional.is_finite() {
-            return None;
+            return Err(GroupSkipReason::InvalidLegNotional);
         }
 
-        let mut leg_plans = Vec::with_capacity(legs.len());
-        for leg in legs {
+        let mut leg_plans = Vec::with_capacity(group.legs.len());
+        for leg in &group.legs {
             let allocated_slippage_susd =
                 slippage_budget_susd * (leg.planned_quote_susd / total_notional);
             let (max_cost_susd, min_proceeds_susd) = match leg.kind {
@@ -253,7 +207,7 @@ pub fn build_group_plan(
         profit_buffer_susd
     };
 
-    Some(ExecutionGroupPlan {
+    Ok(ExecutionGroupPlan {
         kind: group.kind,
         action_indices: group.action_indices.clone(),
         legs: leg_plans,
@@ -268,74 +222,6 @@ pub fn build_group_plan(
     })
 }
 
-/// Derive aggregate quote-token bounds for BatchRouter execution.
-///
-/// Returns:
-/// - `Sell { min_total_out_susd }` for sell-only leg groups
-/// - `Buy { max_total_in_susd }` for buy-only leg groups
-/// - `None` for groups with no DEX legs (e.g. DirectMerge)
-pub fn derive_batch_quote_bounds(
-    plan: &ExecutionGroupPlan,
-    current_block: u64,
-    max_stale_blocks: u64,
-) -> Result<Option<BatchQuoteBounds>, BatchBoundsError> {
-    if is_plan_stale(plan, current_block, max_stale_blocks) {
-        return Err(BatchBoundsError::StalePlan);
-    }
-    derive_batch_quote_bounds_unchecked(plan)
-}
-
-/// Derive aggregate quote-token bounds without applying staleness checks.
-/// Prefer `derive_batch_quote_bounds` on the execution path.
-pub fn derive_batch_quote_bounds_unchecked(
-    plan: &ExecutionGroupPlan,
-) -> Result<Option<BatchQuoteBounds>, BatchBoundsError> {
-    if !plan.slippage_budget_susd.is_finite() || plan.slippage_budget_susd < 0.0 {
-        return Err(BatchBoundsError::InvalidSlippageBudget);
-    }
-
-    let mut planned_total_in_susd = 0.0_f64;
-    let mut planned_total_out_susd = 0.0_f64;
-    for leg in &plan.legs {
-        match leg.kind {
-            LegKind::Buy => planned_total_in_susd += leg.planned_quote_susd.max(0.0),
-            LegKind::Sell => planned_total_out_susd += leg.planned_quote_susd.max(0.0),
-        }
-    }
-
-    if planned_total_in_susd > 0.0 && planned_total_out_susd > 0.0 {
-        return Err(BatchBoundsError::MixedLegDirections);
-    }
-
-    if planned_total_out_susd > 0.0 {
-        let min_total_out_susd = (planned_total_out_susd - plan.slippage_budget_susd).max(0.0);
-        return Ok(Some(BatchQuoteBounds::Sell {
-            planned_total_out_susd,
-            min_total_out_susd,
-        }));
-    }
-
-    if planned_total_in_susd > 0.0 {
-        let max_total_in_susd = planned_total_in_susd + plan.slippage_budget_susd;
-        return Ok(Some(BatchQuoteBounds::Buy {
-            planned_total_in_susd,
-            max_total_in_susd,
-        }));
-    }
-
-    Ok(None)
-}
-
-pub fn stamp_plan_with_block(plan: &mut ExecutionGroupPlan, planned_at_block: u64) {
-    plan.planned_at_block = Some(planned_at_block);
-}
-
-pub fn stamp_plans_with_block(plans: &mut [ExecutionGroupPlan], planned_at_block: u64) {
-    for plan in plans {
-        stamp_plan_with_block(plan, planned_at_block);
-    }
-}
-
 pub fn build_group_plans_with_edge_provider<F>(
     actions: &[Action],
     gas_assumptions: &GasAssumptions,
@@ -345,11 +231,11 @@ pub fn build_group_plans_with_edge_provider<F>(
     mut edge_provider: F,
 ) -> Result<Vec<ExecutionGroupPlan>, GroupPlanningError>
 where
-    F: FnMut(usize, &ActionGroup, &[Action]) -> Option<f64>,
+    F: FnMut(usize, &ExecutionGroup) -> Option<f64>,
 {
     // DirectBuy groups have no route-local cashflow edge and must receive
     // externally supplied expected-value edge from the caller.
-    let groups = group_actions(actions)?;
+    let groups = group_execution_actions(actions)?;
     let mut effective_gas_assumptions = *gas_assumptions;
     if let Some(l1_fee_per_byte_wei) = resolve_l1_fee_per_byte_wei(gas_assumptions) {
         effective_gas_assumptions.l1_fee_per_byte_wei = l1_fee_per_byte_wei;
@@ -357,9 +243,9 @@ where
     if !effective_gas_assumptions.l1_fee_per_byte_wei.is_finite()
         || effective_gas_assumptions.l1_fee_per_byte_wei <= 0.0
     {
-        eprintln!(
-            "warning: no usable Optimism L1 fee-per-byte estimate is available (value: {}); strict planning will fail closed and skip all groups. Configure a conservative positive GasAssumptions.l1_fee_per_byte_wei fallback to preserve liveness during oracle outages",
-            effective_gas_assumptions.l1_fee_per_byte_wei
+        tracing::warn!(
+            l1_fee_per_byte_wei = effective_gas_assumptions.l1_fee_per_byte_wei,
+            "no usable Optimism L1 fee-per-byte estimate; strict planning will skip all groups"
         );
     }
     let mut plans = Vec::new();
@@ -367,24 +253,20 @@ where
     for (group_index, group) in groups.iter().enumerate() {
         let first_action_index =
             group
-                .action_indices
-                .first()
-                .copied()
+                .first_action_index()
                 .ok_or(GroupPlanningError::MissingEdge {
                     group_index,
                     group_kind: group.kind,
                     first_action_index: 0,
                 })?;
 
-        let edge =
-            edge_provider(group_index, group, actions).ok_or(GroupPlanningError::MissingEdge {
-                group_index,
-                group_kind: group.kind,
-                first_action_index,
-            })?;
+        let edge = edge_provider(group_index, group).ok_or(GroupPlanningError::MissingEdge {
+            group_index,
+            group_kind: group.kind,
+            first_action_index,
+        })?;
 
-        if let Some(plan) = build_group_plan(
-            actions,
+        match build_group_plan_with_reason(
             group,
             edge,
             &effective_gas_assumptions,
@@ -392,7 +274,16 @@ where
             eth_usd_assumed,
             buffer,
         ) {
-            plans.push(plan);
+            Ok(plan) => plans.push(plan),
+            Err(skip_reason) => {
+                tracing::info!(
+                    group_index,
+                    group_kind = ?group.kind,
+                    first_action_index,
+                    %skip_reason,
+                    "skipped group"
+                );
+            }
         }
     }
 
@@ -423,9 +314,9 @@ pub fn build_group_plans_from_cashflow(
         gas_price_eth,
         eth_usd_assumed,
         buffer,
-        |_, group, actions| match group.kind {
+        |_, group| match group.kind {
             GroupKind::DirectBuy => None,
-            _ => Some(planned_cashflow_edge_susd(actions, group)),
+            _ => Some(planned_cashflow_edge_susd(group)),
         },
     )
 }
@@ -446,9 +337,7 @@ pub fn build_group_plans_with_prediction_edges(
         gas_price_eth,
         eth_usd_assumed,
         buffer,
-        |_, group, actions| {
-            planned_edge_from_prediction_map_susd(actions, group, prediction_by_market)
-        },
+        |_, group| planned_edge_from_prediction_map_susd(group, prediction_by_market),
     )
 }
 
@@ -473,9 +362,6 @@ pub fn build_group_plans_with_default_edges(
 
 /// Hydration-first planning helper: refresh Optimism L1 fee-per-byte (cache-aware)
 /// before building plans with default edges.
-///
-/// Panics if hydration fails because execution cannot proceed safely without
-/// reliable RPC-derived fee data.
 pub async fn build_group_plans_with_default_edges_and_l1_hydration(
     actions: &[Action],
     gas_assumptions: &GasAssumptions,
@@ -487,116 +373,12 @@ pub async fn build_group_plans_with_default_edges_and_l1_hydration(
     let mut hydrated = *gas_assumptions;
     hydrate_cached_optimism_l1_fee_per_byte(&mut hydrated, rpc_url)
         .await
-        .unwrap_or_else(|err| {
-            panic!(
-                "failed to hydrate Optimism L1 fee-per-byte from RPC; cannot continue safe execution planning: {err}"
-            )
-        });
+        .map_err(|err| GroupPlanningError::L1FeeHydration {
+            rpc_url: rpc_url.to_string(),
+            reason: err.to_string(),
+        })?;
 
     build_group_plans_with_default_edges(actions, &hydrated, gas_price_eth, eth_usd_assumed, buffer)
-}
-
-fn summarize_group(
-    actions: &[Action],
-    group: &ActionGroup,
-    include_legs: bool,
-) -> (GroupCashflowSummary, Vec<GroupLegSummary>) {
-    let mut planned_cost_susd = 0.0_f64;
-    let mut planned_proceeds_susd = 0.0_f64;
-    let mut buy_legs = 0usize;
-    let mut sell_legs = 0usize;
-    let mut legs = Vec::new();
-
-    for idx in &group.action_indices {
-        match actions[*idx] {
-            Action::Buy {
-                market_name,
-                amount,
-                cost,
-            } => {
-                debug_assert!(
-                    amount.is_finite() && amount >= 0.0,
-                    "invalid buy amount at action index {}: {}",
-                    idx,
-                    amount
-                );
-                debug_assert!(
-                    cost.is_finite() && cost >= 0.0,
-                    "invalid buy cost at action index {}: {}",
-                    idx,
-                    cost
-                );
-                planned_cost_susd += cost.max(0.0);
-                buy_legs += 1;
-                if include_legs {
-                    legs.push(GroupLegSummary {
-                        action_index: *idx,
-                        market_name: Some(market_name),
-                        kind: LegKind::Buy,
-                        planned_quote_susd: cost.max(0.0),
-                    });
-                }
-            }
-            Action::Sell {
-                market_name,
-                amount,
-                proceeds,
-                ..
-            } => {
-                debug_assert!(
-                    amount.is_finite() && amount >= 0.0,
-                    "invalid sell amount at action index {}: {}",
-                    idx,
-                    amount
-                );
-                debug_assert!(
-                    proceeds.is_finite() && proceeds >= 0.0,
-                    "invalid sell proceeds at action index {}: {}",
-                    idx,
-                    proceeds
-                );
-                planned_proceeds_susd += proceeds.max(0.0);
-                sell_legs += 1;
-                if include_legs {
-                    legs.push(GroupLegSummary {
-                        action_index: *idx,
-                        market_name: Some(market_name),
-                        kind: LegKind::Sell,
-                        planned_quote_susd: proceeds.max(0.0),
-                    });
-                }
-            }
-            Action::Mint { amount, .. } => {
-                debug_assert!(
-                    amount.is_finite() && amount >= 0.0,
-                    "invalid mint amount at action index {}: {}",
-                    idx,
-                    amount
-                );
-                planned_cost_susd += amount.max(0.0);
-            }
-            Action::Merge { amount, .. } => {
-                debug_assert!(
-                    amount.is_finite() && amount >= 0.0,
-                    "invalid merge amount at action index {}: {}",
-                    idx,
-                    amount
-                );
-                planned_proceeds_susd += amount.max(0.0);
-            }
-            Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
-        }
-    }
-
-    (
-        GroupCashflowSummary {
-            planned_cost_susd,
-            planned_proceeds_susd,
-            buy_legs,
-            sell_legs,
-        },
-        legs,
-    )
 }
 
 #[cfg(test)]
@@ -604,8 +386,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::execution::BatchQuoteBounds;
     use crate::execution::GroupKind;
-    use crate::execution::grouping::{GroupingError, group_actions};
+    use crate::execution::grouping::{GroupingError, group_execution_actions};
 
     fn buy(name: &'static str, amount: f64, cost: f64) -> Action {
         Action::Buy {
@@ -642,9 +425,8 @@ mod tests {
     #[test]
     fn skips_group_when_edge_below_gas_plus_buffer() {
         let actions = vec![sell("x", 1.0, 1.0)];
-        let groups = group_actions(&actions).expect("grouping should succeed");
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
         let plan = build_group_plan(
-            &actions,
             &groups[0],
             0.5,
             &test_gas_assumptions(),
@@ -653,6 +435,47 @@ mod tests {
             BufferConfig::default(),
         );
         assert!(plan.is_none(), "group should be skipped by strict gate");
+    }
+
+    #[test]
+    fn build_group_plan_with_reason_reports_non_positive_edge() {
+        let actions = vec![sell("x", 1.0, 1.0)];
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
+        let err = build_group_plan_with_reason(
+            &groups[0],
+            0.0,
+            &test_gas_assumptions(),
+            1e-10,
+            3000.0,
+            BufferConfig::default(),
+        )
+        .expect_err("non-positive edge should report explicit skip reason");
+        assert_eq!(err, GroupSkipReason::NonPositiveEdge);
+    }
+
+    #[test]
+    fn build_group_plan_with_reason_reports_invalid_leg_notional() {
+        let actions = vec![sell("x", 1.0, 0.0)];
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
+        let gas = GasAssumptions {
+            direct_sell_l2_units: 0,
+            l1_data_fee_floor_susd: 0.0,
+            l1_fee_per_byte_wei: 1.0,
+            ..GasAssumptions::default()
+        };
+        let err = build_group_plan_with_reason(
+            &groups[0],
+            10.0,
+            &gas,
+            0.0,
+            0.0,
+            BufferConfig {
+                buffer_frac: 0.0,
+                buffer_min_susd: 0.0,
+            },
+        )
+        .expect_err("zero notional legs should report explicit skip reason");
+        assert_eq!(err, GroupSkipReason::InvalidLegNotional);
     }
 
     #[test]
@@ -670,11 +493,10 @@ mod tests {
             Action::RepayFlashLoan { amount: 10.0 },
         ];
 
-        let groups = group_actions(&actions).expect("grouping should succeed");
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
         assert_eq!(groups[0].kind, GroupKind::MintSell);
 
         let plan = build_group_plan(
-            &actions,
             &groups[0],
             8.0,
             &test_gas_assumptions(),
@@ -705,7 +527,7 @@ mod tests {
             1e-10,
             3000.0,
             BufferConfig::default(),
-            |_, group, actions| Some(planned_cashflow_edge_susd(actions, group).max(0.1)),
+            |_, group| Some(planned_cashflow_edge_susd(group).max(0.1)),
         )
         .expect("planning should succeed");
 
@@ -747,9 +569,9 @@ mod tests {
             1e-10,
             3000.0,
             BufferConfig::default(),
-            |_, group, actions| match group.kind {
+            |_, group| match group.kind {
                 GroupKind::DirectBuy => None,
-                _ => Some(planned_cashflow_edge_susd(actions, group)),
+                _ => Some(planned_cashflow_edge_susd(group)),
             },
         )
         .expect_err("direct buy should require an externally supplied edge");
@@ -903,12 +725,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(
-        expected = "failed to hydrate Optimism L1 fee-per-byte from RPC; cannot continue safe execution planning"
-    )]
-    async fn hydration_entrypoint_panics_when_hydration_fails() {
+    async fn hydration_entrypoint_returns_error_when_hydration_fails() {
         let actions = vec![sell("x", 1.0, 2.0)];
-        let _ = build_group_plans_with_default_edges_and_l1_hydration(
+        let err = build_group_plans_with_default_edges_and_l1_hydration(
             &actions,
             &GasAssumptions::default(),
             "",
@@ -916,7 +735,12 @@ mod tests {
             3000.0,
             BufferConfig::default(),
         )
-        .await;
+        .await
+        .expect_err("empty RPC URL should fail hydration");
+        assert!(
+            matches!(err, GroupPlanningError::L1FeeHydration { .. }),
+            "expected typed hydration error, got: {err}"
+        );
     }
 
     #[test]
@@ -950,12 +774,11 @@ mod tests {
     #[test]
     fn direct_merge_is_plannable_without_dex_legs() {
         let actions = vec![merge(10.0)];
-        let groups = group_actions(&actions).expect("grouping should succeed");
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
         assert_eq!(groups[0].kind, GroupKind::DirectMerge);
 
-        let edge = planned_cashflow_edge_susd(&actions, &groups[0]);
+        let edge = planned_cashflow_edge_susd(&groups[0]);
         let plan = build_group_plan(
-            &actions,
             &groups[0],
             edge,
             &test_gas_assumptions(),
@@ -999,12 +822,11 @@ mod tests {
     #[test]
     fn direct_merge_is_skipped_when_edge_is_below_gas_plus_buffer() {
         let actions = vec![merge(0.01)];
-        let groups = group_actions(&actions).expect("grouping should succeed");
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
         assert_eq!(groups[0].kind, GroupKind::DirectMerge);
 
-        let edge = planned_cashflow_edge_susd(&actions, &groups[0]);
+        let edge = planned_cashflow_edge_susd(&groups[0]);
         let plan = build_group_plan(
-            &actions,
             &groups[0],
             edge,
             &test_gas_assumptions(),
@@ -1032,9 +854,8 @@ mod tests {
             sell("b", 10.0, 7.0),
             Action::RepayFlashLoan { amount: 10.0 },
         ];
-        let groups = group_actions(&actions).expect("grouping should succeed");
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
         let plan = build_group_plan(
-            &actions,
             &groups[0],
             8.0,
             &test_gas_assumptions(),
@@ -1069,9 +890,8 @@ mod tests {
     #[test]
     fn derives_batch_buy_bounds_from_buy_legs() {
         let actions = vec![buy("c", 1.0, 1.0)];
-        let groups = group_actions(&actions).expect("grouping should succeed");
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
         let plan = build_group_plan(
-            &actions,
             &groups[0],
             2.0,
             &test_gas_assumptions(),
@@ -1111,11 +931,10 @@ mod tests {
             merge(1.0),
             Action::RepayFlashLoan { amount: 10.0 },
         ];
-        let groups = group_actions(&actions).expect("grouping should succeed");
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
         assert_eq!(groups[0].kind, GroupKind::BuyMerge);
 
         let plan = build_group_plan(
-            &actions,
             &groups[0],
             3.0,
             &test_gas_assumptions(),
@@ -1149,10 +968,9 @@ mod tests {
     #[test]
     fn direct_merge_has_no_batch_router_bounds() {
         let actions = vec![merge(10.0)];
-        let groups = group_actions(&actions).expect("grouping should succeed");
-        let edge = planned_cashflow_edge_susd(&actions, &groups[0]);
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
+        let edge = planned_cashflow_edge_susd(&groups[0]);
         let plan = build_group_plan(
-            &actions,
             &groups[0],
             edge,
             &test_gas_assumptions(),

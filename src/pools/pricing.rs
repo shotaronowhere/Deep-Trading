@@ -18,10 +18,20 @@ pub fn normalize_market_name(name: &str) -> String {
 pub fn prediction_map() -> &'static HashMap<String, f64> {
     static PREDICTIONS_BY_MARKET: OnceLock<HashMap<String, f64>> = OnceLock::new();
     PREDICTIONS_BY_MARKET.get_or_init(|| {
-        PREDICTIONS_L1
-            .iter()
-            .map(|p| (p.market.to_lowercase(), p.prediction))
-            .collect()
+        let mut by_market = HashMap::with_capacity(PREDICTIONS_L1.len());
+        for p in PREDICTIONS_L1 {
+            let key = normalize_market_name(p.market);
+            let prev = by_market.insert(key.clone(), p.prediction);
+            assert!(
+                prev.is_none(),
+                "duplicate normalized prediction key '{}' for market '{}' (previous value: {:?}, new value: {})",
+                key,
+                p.market,
+                prev,
+                p.prediction
+            );
+        }
+        by_market
     })
 }
 

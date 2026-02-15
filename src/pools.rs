@@ -13,10 +13,11 @@ pub use pricing::{
 pub use rpc::{Slot0Result, base_quote_tokens, fetch_all_slot0, fetch_balances};
 pub use swap::{SwapResult, simulate_buy, simulate_swap};
 
-#[cfg(test)]
-pub(crate) use pricing::prediction_to_sqrt_price_x96;
 pub(crate) use pricing::u256_to_f64;
 pub(crate) use swap::FEE_PIPS;
+
+#[cfg(test)]
+pub(crate) use pricing::prediction_to_sqrt_price_x96;
 
 #[cfg(test)]
 mod tests {

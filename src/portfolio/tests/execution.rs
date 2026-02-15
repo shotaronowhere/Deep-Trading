@@ -149,8 +149,7 @@ fn test_execute_optimal_sell_uses_inventory_for_merge() {
     let mut budget = 0.0;
     let mut actions = Vec::new();
     let sold = {
-        let mut exec =
-            ExecutionState::with_balances(&mut sims, &mut budget, &mut actions, &mut sim_balances);
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
         exec.execute_optimal_sell(0, 5.0, f64::INFINITY, true)
     };
 
@@ -178,11 +177,11 @@ fn test_execute_optimal_sell_uses_inventory_for_merge() {
     assert!((*sim_balances.get("M2").unwrap() - 0.0).abs() < 1e-9);
     assert!((*sim_balances.get("M3").unwrap() - 0.0).abs() < 1e-9);
     assert!(
-        (sims[1].price - 0.05).abs() < 1e-9,
+        (sims[1].price() - 0.05).abs() < 1e-9,
         "no buy => no price move"
     );
     assert!(
-        (sims[2].price - 0.05).abs() < 1e-9,
+        (sims[2].price() - 0.05).abs() < 1e-9,
         "no buy => no price move"
     );
 }
@@ -198,8 +197,7 @@ fn test_execute_optimal_sell_buys_only_shortfall() {
     let mut budget = 0.0;
     let mut actions = Vec::new();
     let sold = {
-        let mut exec =
-            ExecutionState::with_balances(&mut sims, &mut budget, &mut actions, &mut sim_balances);
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
         exec.execute_optimal_sell(0, 5.0, f64::INFINITY, true)
     };
 
@@ -242,8 +240,7 @@ fn test_execute_optimal_sell_keeps_profitable_complement_inventory() {
     let mut budget = 0.0;
     let mut actions = Vec::new();
     let sold = {
-        let mut exec =
-            ExecutionState::with_balances(&mut sims, &mut budget, &mut actions, &mut sim_balances);
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
         exec.execute_optimal_sell(
             0, 5.0, 0.0, // phase-1 behavior: preserve profitable inventory
             true,
@@ -301,8 +298,7 @@ fn test_execute_optimal_sell_consumes_low_profit_complements() {
     let mut budget = 0.0;
     let mut actions = Vec::new();
     let sold = {
-        let mut exec =
-            ExecutionState::with_balances(&mut sims, &mut budget, &mut actions, &mut sim_balances);
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
         exec.execute_optimal_sell(
             0, 5.0, 0.0, // complements are unprofitable, so inventory is consumable
             true,
@@ -402,11 +398,11 @@ fn test_merge_route_sells() {
 
     // Other pool prices should have increased (we bought into them)
     assert!(
-        sims[1].price > 0.05,
+        sims[1].price() > 0.05,
         "M2 price should increase after buying"
     );
     assert!(
-        sims[2].price > 0.05,
+        sims[2].price() > 0.05,
         "M3 price should increase after buying"
     );
 }

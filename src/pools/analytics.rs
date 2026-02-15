@@ -30,11 +30,16 @@ fn compute_depth(
     is_token1_outcome: bool,
     prediction: f64,
 ) -> DepthResult {
-    let zero_for_one = pool.token0.to_lowercase() == quote_token.to_lowercase();
-    let liquidity: u128 = pool.liquidity.parse().unwrap();
+    let zero_for_one = pool.token0.eq_ignore_ascii_case(quote_token);
+    let liquidity: u128 = match pool.liquidity.parse() {
+        Ok(v) if v > 0 => v,
+        _ => return DepthResult::default(),
+    };
 
-    let tick_0 = pool.ticks.first().unwrap();
-    let tick_1 = pool.ticks.get(1).unwrap();
+    let (tick_0, tick_1) = match (pool.ticks.first(), pool.ticks.get(1)) {
+        (Some(t0), Some(t1)) => (t0, t1),
+        _ => return DepthResult::default(),
+    };
     let target_tick = if zero_for_one {
         tick_0.tick_idx.min(tick_1.tick_idx)
     } else {
@@ -135,7 +140,7 @@ pub fn profitability_simple(
         .collect();
 
     for prediction in PREDICTIONS_L1.iter() {
-        let pred_name = prediction.market.to_lowercase();
+        let pred_name = normalize_market_name(prediction.market);
 
         let Some(&(slot0, market)) = slot0_by_name.get(&pred_name) else {
             continue;
@@ -146,7 +151,7 @@ pub fn profitability_simple(
             None => continue,
         };
 
-        let is_token1_outcome = pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+        let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
 
         let price = match sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome) {
             Some(p) => p,
@@ -156,8 +161,10 @@ pub fn profitability_simple(
         let price_f64 = u256_to_f64(price);
         let diff = (prediction.prediction - price_f64) / price_f64;
 
-        let liquidity: u128 = pool.liquidity.parse().unwrap_or(0);
-        let has_liquidity = liquidity > 0;
+        let has_liquidity = pool
+            .liquidity
+            .parse::<u128>()
+            .is_ok_and(|liquidity| liquidity > 0);
 
         let depth = if has_liquidity && diff > 0.0 {
             compute_depth(

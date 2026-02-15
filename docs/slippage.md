@@ -192,13 +192,14 @@ Inputs:
 4. cached `l1_fee_per_byte_wei` from a two-point `getL1Fee(bytes)` marginal slope sample (256/512 non-zero bytes) with periodic refresh (default TTL 60s).
 5. heuristic `estimated_calldata_bytes` from group kind + leg counts.
 6. execution path should call `build_group_plans_with_default_edges_and_l1_hydration` for planning passes; it is cache-aware and refreshes on expiry.
-7. if hydration fails (RPC unavailable or malformed response), the helper panics and execution stops immediately.
+7. if hydration fails (RPC unavailable or malformed response), the helper returns a typed planning error (`GroupPlanningError::L1FeeHydration`) and execution fail-closes.
 8. cache refresh is deduplicated with a single in-flight fetch lock so concurrent planning does not stampede RPC on cache expiry.
 9. planner snapshots one effective `l1_fee_per_byte_wei` value once per planning pass and reuses it for all groups in that pass, so group ordering compares a consistent gas baseline.
 10. `eth_call` L1-fee parsing rejects oversized integer payloads (>32 bytes) fail-closed instead of panicking.
 11. non-hydrated diagnostic planning paths still fail closed when no usable fee-per-byte value is available (`gas_total_susd = +inf` -> skipped).
 12. L1-fee RPC calls use bounded HTTP timeouts so hydration cannot hang indefinitely on stalled endpoints.
-13. cached L1-fee-per-byte values are keyed by RPC endpoint; endpoint-agnostic fallback only uses cache when there is exactly one fresh entry, otherwise it fails closed.
+13. explicit caller-provided `l1_fee_per_byte_wei` (positive finite) overrides cache so backtests/replays remain deterministic.
+14. cached L1-fee-per-byte values are keyed by RPC endpoint; endpoint-agnostic fallback only uses cache when there is exactly one fresh entry, otherwise it fails closed.
 
 ### 6.4 Ordering
 Order candidate groups by:

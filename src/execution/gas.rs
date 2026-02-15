@@ -1,5 +1,5 @@
-use std::fmt;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -116,13 +116,10 @@ fn effective_l1_fee_per_byte_wei_with_cache(
     assumptions: &GasAssumptions,
     cached_fee_per_byte_wei: Option<f64>,
 ) -> Option<f64> {
-    if let Some(cached) = cached_fee_per_byte_wei {
-        return Some(cached);
-    }
     if assumptions.l1_fee_per_byte_wei.is_finite() && assumptions.l1_fee_per_byte_wei > 0.0 {
         return Some(assumptions.l1_fee_per_byte_wei);
     }
-    None
+    cached_fee_per_byte_wei
 }
 
 pub fn resolve_l1_fee_per_byte_wei(assumptions: &GasAssumptions) -> Option<f64> {
@@ -259,10 +256,13 @@ pub async fn cached_optimism_l1_fee_per_byte_wei(rpc_url: &str) -> Result<f64, L
     let mut guard = l1_fee_cache()
         .write()
         .map_err(|_| L1FeeOracleError::new("failed to acquire l1 fee cache write lock"))?;
-    guard.insert(rpc_url.to_owned(), CachedL1FeePerByteWei {
-        fee_per_byte_wei: fetched,
-        fetched_at: Instant::now(),
-    });
+    guard.insert(
+        rpc_url.to_owned(),
+        CachedL1FeePerByteWei {
+            fee_per_byte_wei: fetched,
+            fetched_at: Instant::now(),
+        },
+    );
     Ok(fetched)
 }
 
@@ -540,11 +540,18 @@ mod tests {
     }
 
     #[test]
-    fn effective_l1_fee_prefers_cache_over_assumption() {
+    fn effective_l1_fee_prefers_assumption_over_cache() {
         let assumptions = GasAssumptions {
             l1_fee_per_byte_wei: 111.0,
             ..GasAssumptions::default()
         };
+        let effective = effective_l1_fee_per_byte_wei_with_cache(&assumptions, Some(222.0));
+        assert_eq!(effective, Some(111.0));
+    }
+
+    #[test]
+    fn effective_l1_fee_falls_back_to_cache_without_assumption() {
+        let assumptions = GasAssumptions::default();
         let effective = effective_l1_fee_per_byte_wei_with_cache(&assumptions, Some(222.0));
         assert_eq!(effective, Some(222.0));
     }
