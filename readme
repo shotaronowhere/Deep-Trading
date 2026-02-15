@@ -1,3 +1,62 @@
 # Deep Trading Bot
 
-Rebalances portfolio according to predictions across a set of markets, specifically targeting deep funding markets.
+A Rust-based trading bot that rebalances portfolio according to predictions across a set of markets, specifically targeting deep funding markets. The bot connects to Ethereum via WebSocket and interacts with market contracts to execute trades.
+
+## Features
+
+- Connects to Ethereum nodes via WebSocket (Optimism RPC supported)
+- Interfaces with market contracts to fetch outcome data
+- Portfolio rebalancing based on ML predictions
+- Uniswap V3 integration for efficient token swaps
+- Batch routing via Solidity contracts for optimized execution
+
+## Project Structure
+
+```
+Deep-Trading/
+├── src/                    # Rust source code
+│   ├── main.rs            # Entry point
+│   ├── lib.rs             # Library root
+│   ├── markets.rs         # Market data handling
+│   ├── predictions.rs     # Prediction processing
+│   ├── pools.rs           # Pool management
+│   ├── execution/         # Trade execution logic
+│   └── portfolio/         # Portfolio management
+├── contracts/             # Solidity smart contracts
+│   └── BatchRouter.sol   # Batch routing contract
+├── docs/                  # Documentation
+│   ├── architecture.md    # System architecture
+│   ├── model.md           # ML model details
+│   ├── portfolio.md       # Portfolio management
+│   └── ...
+├── test/                  # Smart contract tests
+└── Cargo.toml             # Rust dependencies
+```
+
+## Getting Started
+
+### Prerequisites
+
+- Rust (2024 edition)
+- Foundry (for Solidity contracts)
+
+### Build
+
+```bash
+cd Deep-Trading
+cargo build
+```
+
+### Run
+
+```bash
+cargo run
+```
+
+## Documentation
+
+See the [docs](./docs/) directory for detailed documentation:
+- [Architecture](./docs/architecture.md) - System architecture overview
+- [Model](./docs/model.md) - ML prediction model details
+- [Portfolio](./docs/portfolio.md) - Portfolio management
+- [Slippage](./docs/slippage.md) - Slippage analysis
