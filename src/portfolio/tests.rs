@@ -853,6 +853,114 @@ fn replay_actions_to_market_state(
         .collect()
 }
 
+fn print_portfolio_snapshot(
+    label: &str,
+    stage: &str,
+    holdings: &HashMap<&'static str, f64>,
+    cash: f64,
+) {
+    let mut non_zero_positions: Vec<(&'static str, f64)> = holdings
+        .iter()
+        .map(|(name, units)| (*name, *units))
+        .filter(|(_, units)| units.abs() > 1e-12)
+        .collect();
+    non_zero_positions.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
+
+    println!(
+        "[rebalance][{}] {} portfolio: cash={:.9}, non_zero_positions={}/{}",
+        label,
+        stage,
+        cash,
+        non_zero_positions.len(),
+        holdings.len()
+    );
+    if non_zero_positions.is_empty() {
+        println!("  (no non-zero holdings)");
+        return;
+    }
+
+    for (name, units) in non_zero_positions {
+        println!("  {}: {:.9}", name, units);
+    }
+}
+
+fn print_trade_summary(label: &str, actions: &[Action]) {
+    let mut buy_count = 0usize;
+    let mut buy_units = 0.0_f64;
+    let mut buy_cost = 0.0_f64;
+    let mut sell_count = 0usize;
+    let mut sell_units = 0.0_f64;
+    let mut sell_proceeds = 0.0_f64;
+    let mut mint_count = 0usize;
+    let mut mint_amount = 0.0_f64;
+    let mut merge_count = 0usize;
+    let mut merge_amount = 0.0_f64;
+    let mut flash_count = 0usize;
+    let mut flash_amount = 0.0_f64;
+    let mut repay_count = 0usize;
+    let mut repay_amount = 0.0_f64;
+
+    for action in actions {
+        match action {
+            Action::Buy { amount, cost, .. } => {
+                buy_count += 1;
+                buy_units += *amount;
+                buy_cost += *cost;
+            }
+            Action::Sell {
+                amount, proceeds, ..
+            } => {
+                sell_count += 1;
+                sell_units += *amount;
+                sell_proceeds += *proceeds;
+            }
+            Action::Mint { amount, .. } => {
+                mint_count += 1;
+                mint_amount += *amount;
+            }
+            Action::Merge { amount, .. } => {
+                merge_count += 1;
+                merge_amount += *amount;
+            }
+            Action::FlashLoan { amount } => {
+                flash_count += 1;
+                flash_amount += *amount;
+            }
+            Action::RepayFlashLoan { amount } => {
+                repay_count += 1;
+                repay_amount += *amount;
+            }
+        }
+    }
+
+    println!("[rebalance][{}] trade summary:", label);
+    println!("  actions: {}", actions.len());
+    println!(
+        "  buy: count={}, units={:.9}, cost={:.9}",
+        buy_count, buy_units, buy_cost
+    );
+    println!(
+        "  sell: count={}, units={:.9}, proceeds={:.9}",
+        sell_count, sell_units, sell_proceeds
+    );
+    println!(
+        "  mint: count={}, amount={:.9}",
+        mint_count, mint_amount
+    );
+    println!(
+        "  merge: count={}, amount={:.9}",
+        merge_count, merge_amount
+    );
+    println!(
+        "  flash_loan: count={}, amount={:.9}",
+        flash_count, flash_amount
+    );
+    println!(
+        "  repay_flash_loan: count={}, amount={:.9}",
+        repay_count, repay_amount
+    );
+}
+
 fn ev_from_state(holdings: &HashMap<&'static str, f64>, cash: f64) -> f64 {
     let preds = crate::pools::prediction_map();
     let ev_holdings: f64 = holdings
@@ -864,6 +972,73 @@ fn ev_from_state(holdings: &HashMap<&'static str, f64>, cash: f64) -> f64 {
         })
         .sum();
     cash + ev_holdings
+}
+
+struct EvTrace {
+    initial_holdings: HashMap<&'static str, f64>,
+    final_holdings: HashMap<&'static str, f64>,
+    ev_before: f64,
+    ev_after: f64,
+    final_cash: f64,
+}
+
+fn compute_ev_trace(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    initial_balances: &HashMap<&str, f64>,
+    initial_susd: f64,
+) -> EvTrace {
+    let mut initial_holdings: HashMap<&'static str, f64> = HashMap::new();
+    for (_, market) in slot0_results {
+        initial_holdings.insert(
+            market.name,
+            initial_balances
+                .get(market.name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0),
+        );
+    }
+    let (final_holdings, final_cash) =
+        replay_actions_to_state(actions, slot0_results, initial_balances, initial_susd);
+    let ev_before = ev_from_state(&initial_holdings, initial_susd);
+    let ev_after = ev_from_state(&final_holdings, final_cash);
+    EvTrace {
+        initial_holdings,
+        final_holdings,
+        ev_before,
+        ev_after,
+        final_cash,
+    }
+}
+
+fn assert_strict_ev_gain_with_portfolio_trace(
+    label: &str,
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    initial_balances: &HashMap<&str, f64>,
+    initial_susd: f64,
+) -> (f64, f64, f64) {
+    let trace = compute_ev_trace(actions, slot0_results, initial_balances, initial_susd);
+
+    print_portfolio_snapshot(label, "initial", &trace.initial_holdings, initial_susd);
+    print_trade_summary(label, actions);
+    print_portfolio_snapshot(label, "final", &trace.final_holdings, trace.final_cash);
+
+    let ev_gain = trace.ev_after - trace.ev_before;
+    println!(
+        "[rebalance][{}] expected value: before={:.9}, after={:.9}, gain={:.9}",
+        label, trace.ev_before, trace.ev_after, ev_gain
+    );
+
+    assert!(
+        trace.ev_after > trace.ev_before,
+        "expected value must strictly increase: before={:.9}, after={:.9}",
+        trace.ev_before,
+        trace.ev_after
+    );
+
+    (trace.ev_before, trace.ev_after, trace.final_cash)
 }
 
 fn brute_force_best_gain_mint_direct(

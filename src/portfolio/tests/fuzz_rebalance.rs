@@ -9,9 +9,10 @@ use super::super::sim::{PoolSim, Route, alt_price, profitability};
 use super::super::solver::mint_cost_to_prof;
 use super::super::waterfall::waterfall;
 use super::{
-    Action, TestRng, assert_rebalance_action_invariants, brute_force_best_split_with_inventory,
+    Action, TestRng, assert_rebalance_action_invariants,
+    assert_strict_ev_gain_with_portfolio_trace, brute_force_best_split_with_inventory,
     build_rebalance_fuzz_case, build_slot0_results_for_markets, build_three_sims_with_preds,
-    eligible_l1_markets_with_predictions, mock_slot0_market, replay_actions_to_ev,
+    eligible_l1_markets_with_predictions, mock_slot0_market,
 };
 
 #[test]
@@ -378,7 +379,7 @@ fn test_fuzz_optimal_sell_split_with_inventory_matches_bruteforce() {
 #[test]
 fn test_fuzz_rebalance_end_to_end_full_l1_invariants() {
     let mut rng = TestRng::new(0xFEED_FACE_1234_4321u64);
-    for _ in 0..24 {
+    for case_idx in 0..24 {
         let (slot0_results, balances_static, susd_balance) =
             build_rebalance_fuzz_case(&mut rng, false);
         let balances: HashMap<&str, f64> = balances_static
@@ -393,13 +394,21 @@ fn test_fuzz_rebalance_end_to_end_full_l1_invariants() {
         assert_eq!(format!("{:?}", actions_a), format!("{:?}", actions_b));
 
         assert_rebalance_action_invariants(&actions_a, &slot0_results, &balances, susd_balance);
+        let label = format!("fuzz_full_l1_case_{}", case_idx);
+        let _ = assert_strict_ev_gain_with_portfolio_trace(
+            &label,
+            &actions_a,
+            &slot0_results,
+            &balances,
+            susd_balance,
+        );
     }
 }
 
 #[test]
 fn test_fuzz_rebalance_end_to_end_partial_l1_invariants() {
     let mut rng = TestRng::new(0xABCD_1234_EF99_7788u64);
-    for _ in 0..24 {
+    for case_idx in 0..24 {
         let (slot0_results, balances_static, susd_balance) =
             build_rebalance_fuzz_case(&mut rng, true);
         assert!(
@@ -429,6 +438,14 @@ fn test_fuzz_rebalance_end_to_end_partial_l1_invariants() {
         );
 
         assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
+        let label = format!("fuzz_partial_l1_case_{}", case_idx);
+        let _ = assert_strict_ev_gain_with_portfolio_trace(
+            &label,
+            &actions,
+            &slot0_results,
+            &balances,
+            susd_balance,
+        );
     }
 }
 
@@ -476,8 +493,13 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
     );
     assert_rebalance_action_invariants(&actions_a, &slot0_results, &balances, budget);
 
-    let ev_before = replay_actions_to_ev(&[], &slot0_results, &balances, budget);
-    let ev_after = replay_actions_to_ev(&actions_a, &slot0_results, &balances, budget);
+    let (ev_before, ev_after, _) = assert_strict_ev_gain_with_portfolio_trace(
+        "regression_full_l1_snapshot",
+        &actions_a,
+        &slot0_results,
+        &balances,
+        budget,
+    );
     let gain = ev_after - ev_before;
 
     let buys = actions_a
@@ -598,8 +620,13 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     );
     assert_rebalance_action_invariants(&actions_a, &slot0_results, &balances, budget);
 
-    let ev_before = replay_actions_to_ev(&[], &slot0_results, &balances, budget);
-    let ev_after = replay_actions_to_ev(&actions_a, &slot0_results, &balances, budget);
+    let (ev_before, ev_after, _) = assert_strict_ev_gain_with_portfolio_trace(
+        "regression_full_l1_snapshot_variant_b",
+        &actions_a,
+        &slot0_results,
+        &balances,
+        budget,
+    );
     let gain = ev_after - ev_before;
 
     let buys = actions_a

@@ -7,8 +7,9 @@ use super::super::rebalancer::rebalance;
 use super::super::sim::PoolSim;
 use super::super::trading::{ExecutionState, solve_complete_set_arb_amount};
 use super::{
-    Action, brute_force_best_split, build_slot0_results_for_markets, build_three_sims,
-    build_three_sims_with_preds, eligible_l1_markets_with_predictions, mock_slot0_market,
+    Action, assert_strict_ev_gain_with_portfolio_trace, brute_force_best_split,
+    build_slot0_results_for_markets, build_three_sims, build_three_sims_with_preds,
+    eligible_l1_markets_with_predictions, mock_slot0_market,
 };
 use crate::execution::GroupKind;
 use crate::execution::bounds::{
@@ -546,95 +547,13 @@ fn test_rebalance_perf_full_l1() {
         "should produce actions for underpriced markets"
     );
 
-    // === Expected value verification ===
-    // Before: EV = 100.0 sUSD (no holdings)
-    let initial_budget = 100.0;
-
-    // Compute portfolio after rebalancing
-    let mut holdings: HashMap<&str, f64> = HashMap::new();
-    let mut total_cost = 0.0_f64;
-    let mut total_sell_proceeds = 0.0_f64;
-    for action in &actions {
-        match action {
-            Action::Buy {
-                market_name,
-                amount,
-                cost,
-            } => {
-                *holdings.entry(market_name).or_insert(0.0) += amount;
-                total_cost += cost;
-            }
-            Action::Sell {
-                market_name,
-                amount,
-                proceeds,
-            } => {
-                *holdings.entry(market_name).or_insert(0.0) -= amount;
-                total_sell_proceeds += proceeds;
-            }
-            Action::Mint { amount, .. } => {
-                // Mint gives all outcomes
-                for (slot0, market) in &slot0_results {
-                    let _ = slot0;
-                    *holdings.entry(market.name).or_insert(0.0) += amount;
-                }
-            }
-            Action::Merge { amount, .. } => {
-                // Merge burns all outcomes, returns sUSD
-                for (slot0, market) in &slot0_results {
-                    let _ = slot0;
-                    *holdings.entry(market.name).or_insert(0.0) -= amount;
-                }
-                total_sell_proceeds += amount; // sUSD recovered
-            }
-            _ => {}
-        }
-    }
-    let remaining_budget = initial_budget - total_cost + total_sell_proceeds;
-
-    // EV_after = remaining_sUSD + Σ prediction_i × holdings_i
-    let ev_holdings: f64 = holdings
-        .iter()
-        .map(|(name, &units)| {
-            let key = normalize_market_name(name);
-            let pred = preds.get(&key).copied().unwrap_or(0.0);
-            pred * units
-        })
-        .sum();
-    let ev_after = remaining_budget + ev_holdings;
-
-    // Verify no holdings are negative
-    for (name, &units) in &holdings {
-        assert!(units >= -1e-9, "negative holdings for {}: {}", name, units);
-    }
-
-    // Count unique outcomes bought
-    let outcomes_bought: Vec<_> = holdings.iter().filter(|&(_, &u)| u > 1e-12).collect();
-
-    println!("=== Expected Value Check ===");
-    println!("  EV before:        {:.6} sUSD", initial_budget);
-    println!("  EV after:         {:.6} sUSD", ev_after);
-    println!(
-        "  EV gain:          {:.6} sUSD ({:.2}%)",
-        ev_after - initial_budget,
-        (ev_after / initial_budget - 1.0) * 100.0
-    );
-    println!("  Remaining budget: {:.6} sUSD", remaining_budget);
-    println!("  Holdings EV:      {:.6} sUSD", ev_holdings);
-    println!(
-        "  Outcomes held:    {}/{}",
-        outcomes_bought.len(),
-        slot0_results.len()
-    );
-    println!("  Total buy cost:   {:.6}", total_cost);
-    println!("  Total sell proc:  {:.6}", total_sell_proceeds);
-
-    // EV should increase (we're buying underpriced assets at 50% of prediction)
-    assert!(
-        ev_after > initial_budget,
-        "EV should increase: before={:.6}, after={:.6}",
-        initial_budget,
-        ev_after
+    let initial_balances: HashMap<&str, f64> = HashMap::new();
+    let (_, _, remaining_budget) = assert_strict_ev_gain_with_portfolio_trace(
+        "rebalance_perf_full_l1",
+        &actions,
+        &slot0_results,
+        &initial_balances,
+        100.0,
     );
 
     // Budget accounting: remaining should be non-negative.
