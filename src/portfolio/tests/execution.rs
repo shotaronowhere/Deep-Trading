@@ -1,15 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::super::merge::{
     execute_merge_sell, merge_sell_cap, merge_sell_proceeds, optimal_sell_split,
 };
 use super::super::rebalancer::rebalance;
-use super::super::sim::PoolSim;
+use super::super::sim::{PoolSim, build_sims};
 use super::super::trading::{ExecutionState, solve_complete_set_arb_amount};
 use super::{
-    Action, assert_strict_ev_gain_with_portfolio_trace, brute_force_best_split,
-    build_slot0_results_for_markets, build_three_sims, build_three_sims_with_preds,
-    eligible_l1_markets_with_predictions, mock_slot0_market,
+    Action, assert_rebalance_action_invariants, assert_strict_ev_gain_with_portfolio_trace,
+    brute_force_best_split, build_slot0_results_for_markets, build_three_sims,
+    build_three_sims_with_preds, eligible_l1_markets_with_predictions, ev_from_state,
+    mock_slot0_market, replay_actions_to_market_state, replay_actions_to_state,
 };
 use crate::execution::GroupKind;
 use crate::execution::bounds::{
@@ -792,70 +793,133 @@ fn test_rebalance_never_emits_naked_mint_or_repay() {
 }
 
 #[tokio::test]
-async fn test_rebalance_integration() {
-    if std::env::var("RUN_NETWORK_TESTS").ok().as_deref() != Some("1") {
-        return;
-    }
-    // Integration test with real pool data
+async fn test_rebalance_optimization_full_l1_live_prices() {
+    // Full-L1 optimization test on live pool prices.
     dotenvy::dotenv().ok();
-    let rpc_url = match std::env::var("RPC") {
-        Ok(url) => url,
-        Err(_) => return, // skip if no RPC
-    };
-    let provider = alloy::providers::ProviderBuilder::new().with_reqwest(
-        rpc_url.parse().unwrap(),
-        |builder| {
+    let default_rpc = "https://optimism.drpc.org".to_string();
+    let mut rpc_candidates: Vec<String> = Vec::new();
+    if let Ok(rpc) = std::env::var("RPC") {
+        rpc_candidates.push(rpc);
+    }
+    if !rpc_candidates.iter().any(|rpc| rpc == &default_rpc) {
+        rpc_candidates.push(default_rpc.clone());
+    }
+
+    let expected_markets = eligible_l1_markets_with_predictions();
+    let expected_market_names: HashSet<&'static str> =
+        expected_markets.iter().map(|m| m.name).collect();
+    let mut slot0_results_all: Option<Vec<(Slot0Result, &'static crate::markets::MarketData)>> =
+        None;
+    let mut last_err = String::new();
+    for rpc_url in &rpc_candidates {
+        let Ok(parsed_url) = rpc_url.parse() else {
+            eprintln!(
+                "[rebalance][live_full_l1] skipping invalid RPC URL: {}",
+                rpc_url
+            );
+            continue;
+        };
+        let provider = alloy::providers::ProviderBuilder::new().with_reqwest(parsed_url, |builder| {
             builder
                 .no_proxy()
                 .build()
                 .expect("failed to build reqwest client for tests")
-        },
-    );
-
-    let slot0_results = crate::pools::fetch_all_slot0(provider).await.unwrap();
-
-    let actions = rebalance(&HashMap::new(), 100.0, &slot0_results);
-
-    println!("Rebalance actions ({}):", actions.len());
-    for action in &actions {
-        match action {
-            Action::Mint {
-                contract_1,
-                contract_2,
-                amount,
-                target_market,
-            } => {
+        });
+        match crate::pools::fetch_all_slot0(provider).await {
+            Ok(results) => {
                 println!(
-                    "  MINT {} sets for {} (c1={}, c2={})",
-                    amount, target_market, contract_1, contract_2
-                )
+                    "[rebalance][live_full_l1] using RPC endpoint: {}",
+                    rpc_url
+                );
+                slot0_results_all = Some(results);
+                break;
             }
-            Action::Buy {
-                market_name,
-                amount,
-                cost,
-            } => println!("  BUY {} {} (cost: {:.6})", amount, market_name, cost),
-            Action::Sell {
-                market_name,
-                amount,
-                proceeds,
-            } => println!(
-                "  SELL {} {} (proceeds: {:.6})",
-                amount, market_name, proceeds
-            ),
-            Action::Merge {
-                contract_1,
-                contract_2,
-                amount,
-                source_market,
-            } => {
-                println!(
-                    "  MERGE {} sets from {} (c1={}, c2={})",
-                    amount, source_market, contract_1, contract_2
-                )
+            Err(err) => {
+                last_err = err.to_string();
+                eprintln!(
+                    "[rebalance][live_full_l1] failed RPC endpoint {}: {}",
+                    rpc_url, last_err
+                );
             }
-            Action::FlashLoan { amount } => println!("  FLASH_LOAN {:.6}", amount),
-            Action::RepayFlashLoan { amount } => println!("  REPAY_FLASH_LOAN {:.6}", amount),
         }
     }
+    let Some(slot0_results_all) = slot0_results_all else {
+        eprintln!(
+            "[rebalance][live_full_l1] skipping test: no reachable RPC endpoint; last error: {}",
+            last_err
+        );
+        return;
+    };
+
+    let slot0_results: Vec<_> = slot0_results_all
+        .into_iter()
+        .filter(|(_, market)| expected_market_names.contains(market.name))
+        .collect();
+
+    assert_eq!(
+        slot0_results.len(),
+        expected_markets.len(),
+        "live slot0 fetch must include every tradeable L1 market with predictions"
+    );
+
+    let preds = crate::pools::prediction_map();
+    let sims_before = build_sims(&slot0_results, &preds).expect("live snapshot must map to sims");
+    let mut prices_before: Vec<(&str, f64)> =
+        sims_before.iter().map(|s| (s.market_name, s.price())).collect();
+    prices_before.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    let price_sum_before: f64 = prices_before.iter().map(|(_, p)| *p).sum();
+    println!("[rebalance][live_full_l1] market prices before:");
+    for (name, price) in &prices_before {
+        println!("  {}: {:.9}", name, price);
+    }
+    println!(
+        "[rebalance][live_full_l1] market price sum before={:.9}",
+        price_sum_before
+    );
+
+    let initial_balances: HashMap<&str, f64> = HashMap::new();
+    let initial_susd = 100.0;
+    let actions = rebalance(&initial_balances, initial_susd, &slot0_results);
+    let actions_repeat = rebalance(&initial_balances, initial_susd, &slot0_results);
+
+    assert_eq!(
+        format!("{:?}", actions),
+        format!("{:?}", actions_repeat),
+        "rebalance should be deterministic for a fixed live slot0 snapshot"
+    );
+
+    assert_rebalance_action_invariants(&actions, &slot0_results, &initial_balances, initial_susd);
+
+    let (final_holdings, final_cash) =
+        replay_actions_to_state(&actions, &slot0_results, &initial_balances, initial_susd);
+    let slot0_after = replay_actions_to_market_state(&actions, &slot0_results);
+    let sims_after =
+        build_sims(&slot0_after, &preds).expect("replayed live snapshot must map to sims");
+    let mut prices_after: Vec<(&str, f64)> =
+        sims_after.iter().map(|s| (s.market_name, s.price())).collect();
+    prices_after.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    let price_sum_after: f64 = prices_after.iter().map(|(_, p)| *p).sum();
+    println!("[rebalance][live_full_l1] market prices after:");
+    for (name, price) in &prices_after {
+        println!("  {}: {:.9}", name, price);
+    }
+    println!(
+        "[rebalance][live_full_l1] market price sum after={:.9}",
+        price_sum_after
+    );
+
+    let ev_before = initial_susd;
+    let ev_after = ev_from_state(&final_holdings, final_cash);
+    let ev_gain = ev_after - ev_before;
+    println!(
+        "[rebalance][live_full_l1] expected value: before={:.9}, after={:.9}, gain={:.9}",
+        ev_before, ev_after, ev_gain
+    );
+
+    assert!(
+        ev_after + 1e-6 >= ev_before,
+        "live full-L1 optimization should not reduce expected value: before={:.9}, after={:.9}",
+        ev_before,
+        ev_after
+    );
 }

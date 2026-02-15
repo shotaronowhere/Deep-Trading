@@ -41,3 +41,38 @@ After integration, these tests were run with `--nocapture` to confirm:
 - final portfolio logs are emitted,
 - EV before/after/gain is printed,
 - strict EV improvement assertions hold.
+
+## Live full-L1 optimization test
+
+`src/portfolio/tests/execution.rs` now includes:
+
+- `test_rebalance_optimization_full_l1_live_prices`
+
+This is a live-network integration test that:
+
+1. Fetches live `slot0` for all L1 pools.
+2. Filters to tradeable L1 outcomes with predictions and asserts full coverage.
+3. Prints per-market prices before rebalance and their sum.
+4. Runs `rebalance(...)` on the live snapshot with a fixed budget.
+5. Verifies deterministic output for repeated runs on the same snapshot.
+6. Verifies action-stream invariants.
+7. Replays actions, prints per-market prices after rebalance and their sum, and prints EV before/after/gain.
+8. Asserts expected value is non-decreasing.
+
+RPC behavior:
+
+- Uses `RPC` from environment first if set.
+- Falls back to `https://optimism.drpc.org`.
+- If neither endpoint is reachable, prints a skip message and returns without failing.
+
+Run:
+
+```bash
+cargo test test_rebalance_optimization_full_l1_live_prices -- --nocapture
+```
+
+Optional override:
+
+```bash
+RPC=<your_rpc_url> cargo test test_rebalance_optimization_full_l1_live_prices -- --nocapture
+```
