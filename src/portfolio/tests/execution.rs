@@ -4,13 +4,13 @@ use super::super::merge::{
     execute_merge_sell, merge_sell_cap, merge_sell_proceeds, optimal_sell_split,
 };
 use super::super::rebalancer::{RebalanceMode, rebalance, rebalance_with_mode};
-use super::super::sim::{PoolSim, build_sims};
+use super::super::sim::PoolSim;
 use super::super::trading::{ExecutionState, solve_complete_set_arb_amount};
 use super::{
     Action, assert_rebalance_action_invariants, assert_strict_ev_gain_with_portfolio_trace,
     brute_force_best_split, build_slot0_results_for_markets, build_three_sims,
     build_three_sims_with_preds, eligible_l1_markets_with_predictions, ev_from_state,
-    mock_slot0_market, replay_actions_to_market_state, replay_actions_to_state,
+    mock_slot0_market, print_rebalance_execution_summary, replay_actions_to_state,
 };
 use crate::execution::GroupKind;
 use crate::execution::bounds::{
@@ -917,23 +917,6 @@ async fn test_rebalance_optimization_full_l1_live_prices() {
         "live slot0 fetch must include every tradeable L1 market with predictions"
     );
 
-    let preds = crate::pools::prediction_map();
-    let sims_before = build_sims(&slot0_results, &preds).expect("live snapshot must map to sims");
-    let mut prices_before: Vec<(&str, f64)> = sims_before
-        .iter()
-        .map(|s| (s.market_name, s.price()))
-        .collect();
-    prices_before.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-    let price_sum_before: f64 = prices_before.iter().map(|(_, p)| *p).sum();
-    println!("[rebalance][live_full_l1] market prices before:");
-    for (name, price) in &prices_before {
-        println!("  {}: {:.9}", name, price);
-    }
-    println!(
-        "[rebalance][live_full_l1] market price sum before={:.9}",
-        price_sum_before
-    );
-
     let initial_balances: HashMap<&str, f64> = HashMap::new();
     let initial_susd = 100.0;
     let actions = rebalance(&initial_balances, initial_susd, &slot0_results);
@@ -946,26 +929,9 @@ async fn test_rebalance_optimization_full_l1_live_prices() {
     );
 
     assert_rebalance_action_invariants(&actions, &slot0_results, &initial_balances, initial_susd);
-
+    print_rebalance_execution_summary("live_full_l1", &actions, &slot0_results);
     let (final_holdings, final_cash) =
         replay_actions_to_state(&actions, &slot0_results, &initial_balances, initial_susd);
-    let slot0_after = replay_actions_to_market_state(&actions, &slot0_results);
-    let sims_after =
-        build_sims(&slot0_after, &preds).expect("replayed live snapshot must map to sims");
-    let mut prices_after: Vec<(&str, f64)> = sims_after
-        .iter()
-        .map(|s| (s.market_name, s.price()))
-        .collect();
-    prices_after.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-    let price_sum_after: f64 = prices_after.iter().map(|(_, p)| *p).sum();
-    println!("[rebalance][live_full_l1] market prices after:");
-    for (name, price) in &prices_after {
-        println!("  {}: {:.9}", name, price);
-    }
-    println!(
-        "[rebalance][live_full_l1] market price sum after={:.9}",
-        price_sum_after
-    );
 
     let ev_before = initial_susd;
     let ev_after = ev_from_state(&final_holdings, final_cash);
@@ -1054,23 +1020,6 @@ async fn test_rebalance_arb_only_full_l1_live_prices() {
         "live slot0 fetch must include every tradeable L1 market with predictions"
     );
 
-    let preds = crate::pools::prediction_map();
-    let sims_before = build_sims(&slot0_results, &preds).expect("live snapshot must map to sims");
-    let mut prices_before: Vec<(&str, f64)> = sims_before
-        .iter()
-        .map(|s| (s.market_name, s.price()))
-        .collect();
-    prices_before.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-    let price_sum_before: f64 = prices_before.iter().map(|(_, p)| *p).sum();
-    println!("[rebalance][live_full_l1_arb_only] market prices before:");
-    for (name, price) in &prices_before {
-        println!("  {}: {:.9}", name, price);
-    }
-    println!(
-        "[rebalance][live_full_l1_arb_only] market price sum before={:.9}",
-        price_sum_before
-    );
-
     let initial_balances: HashMap<&str, f64> = HashMap::new();
     let initial_susd = 100.0;
     let actions = rebalance_with_mode(
@@ -1101,26 +1050,10 @@ async fn test_rebalance_arb_only_full_l1_live_prices() {
     );
 
     assert_rebalance_action_invariants(&actions, &slot0_results, &initial_balances, initial_susd);
+    print_rebalance_execution_summary("live_full_l1_arb_only", &actions, &slot0_results);
 
     let (final_holdings, final_cash) =
         replay_actions_to_state(&actions, &slot0_results, &initial_balances, initial_susd);
-    let slot0_after = replay_actions_to_market_state(&actions, &slot0_results);
-    let sims_after =
-        build_sims(&slot0_after, &preds).expect("replayed live snapshot must map to sims");
-    let mut prices_after: Vec<(&str, f64)> = sims_after
-        .iter()
-        .map(|s| (s.market_name, s.price()))
-        .collect();
-    prices_after.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-    let price_sum_after: f64 = prices_after.iter().map(|(_, p)| *p).sum();
-    println!("[rebalance][live_full_l1_arb_only] market prices after:");
-    for (name, price) in &prices_after {
-        println!("  {}: {:.9}", name, price);
-    }
-    println!(
-        "[rebalance][live_full_l1_arb_only] market price sum after={:.9}",
-        price_sum_after
-    );
 
     let ev_before = initial_susd;
     let ev_after = ev_from_state(&final_holdings, final_cash);

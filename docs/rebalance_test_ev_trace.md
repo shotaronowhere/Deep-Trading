@@ -15,10 +15,11 @@ This document describes the shared test instrumentation used by portfolio rebala
 The helper is responsible for:
 
 1. Printing the initial portfolio (`cash` and non-zero holdings).
-2. Printing a trade summary (counts and aggregate amounts for buy/sell/mint/merge/flash-loan actions).
-3. Printing the final portfolio (`cash` and non-zero holdings).
-4. Computing and printing expected value before and after replay.
-5. Enforcing a strict EV improvement assertion: `ev_after > ev_before`.
+2. Printing a trade summary. If a complete-set arb prefix is present (`complete_set_arb` marker), it prints separate `arb_phase`, `non_arb_phase`, and `total` summaries; otherwise it prints a single summary.
+3. Printing one-line per-market price deltas (`before -> after`, percent change, ANSI-colored by direction: green up / red down / gray flat) and market price sums. For split streams, this is printed per phase and for total.
+4. Printing the final portfolio (`cash` and non-zero holdings).
+5. Computing and printing expected value before and after replay.
+6. Enforcing a strict EV improvement assertion: `ev_after > ev_before`.
 
 ## Tests using the helper
 
@@ -52,12 +53,11 @@ This is a live-network integration test that:
 
 1. Fetches live `slot0` for all L1 pools.
 2. Filters to tradeable L1 outcomes with predictions and asserts full coverage.
-3. Prints per-market prices before rebalance and their sum.
-4. Runs `rebalance(...)` on the live snapshot with a fixed budget.
-5. Verifies deterministic output for repeated runs on the same snapshot.
-6. Verifies action-stream invariants.
-7. Replays actions, prints per-market prices after rebalance and their sum, and prints EV before/after/gain.
-8. Asserts expected value is non-decreasing.
+3. Runs `rebalance(...)` on the live snapshot with a fixed budget.
+4. Verifies deterministic output for repeated runs on the same snapshot.
+5. Verifies action-stream invariants.
+6. Prints the shared execution summary (phase-aware trade summaries + colored per-market price deltas + price sums).
+7. Prints EV before/after/gain and asserts expected value is non-decreasing.
 
 RPC behavior:
 
@@ -87,13 +87,12 @@ This is a live-network integration test that:
 
 1. Fetches live `slot0` for all L1 pools.
 2. Filters to tradeable L1 outcomes with predictions and asserts full coverage.
-3. Prints per-market prices before arb-only rebalance and their sum.
-4. Runs `rebalance_with_mode(..., RebalanceMode::ArbOnly)` on the live snapshot with a fixed budget.
-5. Prints the full action list.
-6. Verifies deterministic output for repeated runs on the same snapshot.
-7. Verifies action-stream invariants.
-8. Replays actions, prints per-market prices after rebalance and their sum, and prints EV before/after/gain.
-9. Asserts expected value is non-decreasing.
+3. Runs `rebalance_with_mode(..., RebalanceMode::ArbOnly)` on the live snapshot with a fixed budget.
+4. Prints the full action list.
+5. Verifies deterministic output for repeated runs on the same snapshot.
+6. Verifies action-stream invariants.
+7. Prints the shared execution summary (phase-aware trade summaries + colored per-market price deltas + price sums).
+8. Asserts expected value is non-decreasing.
 
 RPC behavior:
 

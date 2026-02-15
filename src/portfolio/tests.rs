@@ -1187,6 +1187,172 @@ fn replay_actions_to_market_state(
         .collect()
 }
 
+fn sorted_market_prices(
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+) -> Option<Vec<(&'static str, f64)>> {
+    let preds = crate::pools::prediction_map();
+    let sims = build_sims(slot0_results, &preds).ok()?;
+    let mut prices: Vec<(&'static str, f64)> = sims
+        .iter()
+        .map(|sim| (sim.market_name, sim.price()))
+        .collect();
+    prices.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    Some(prices)
+}
+
+fn print_market_price_changes(
+    label: &str,
+    prices_before: &[(&'static str, f64)],
+    prices_after: &[(&'static str, f64)],
+) {
+    let after_by_market: HashMap<&'static str, f64> = prices_after.iter().copied().collect();
+    const RED: &str = "\x1b[31m";
+    const GREEN: &str = "\x1b[32m";
+    const GRAY: &str = "\x1b[90m";
+    const RESET: &str = "\x1b[0m";
+
+    println!("[rebalance][{}] market price changes:", label);
+    for &(market_name, before) in prices_before {
+        let Some(after) = after_by_market.get(market_name).copied() else {
+            println!(
+                "  {}{}: {:.9} -> (missing){}",
+                GRAY, market_name, before, RESET
+            );
+            continue;
+        };
+        let delta = after - before;
+        let pct_change = if before.abs() <= 1e-12 {
+            0.0
+        } else {
+            100.0 * delta / before
+        };
+        let (color, direction) = if delta > 1e-12 {
+            (GREEN, "up")
+        } else if delta < -1e-12 {
+            (RED, "down")
+        } else {
+            (GRAY, "flat")
+        };
+        println!(
+            "  {}{}: {:.9} -> {:.9} ({:+.4}%, {}){}",
+            color, market_name, before, after, pct_change, direction, RESET
+        );
+    }
+}
+
+fn split_actions_by_complete_set_arb_phase(actions: &[Action]) -> (&[Action], &[Action]) {
+    const COMPLETE_SET_ARB: &str = "complete_set_arb";
+    let marker_idx = actions.iter().position(|action| match action {
+        Action::Merge { source_market, .. } => *source_market == COMPLETE_SET_ARB,
+        Action::Mint { target_market, .. } => *target_market == COMPLETE_SET_ARB,
+        _ => false,
+    });
+
+    let Some(marker_idx) = marker_idx else {
+        return (&actions[0..0], actions);
+    };
+
+    let mut arb_end = marker_idx;
+    if matches!(actions.first(), Some(Action::FlashLoan { .. }))
+        && let Some(repay_offset) = actions[marker_idx + 1..]
+            .iter()
+            .position(|action| matches!(action, Action::RepayFlashLoan { .. }))
+    {
+        arb_end = marker_idx + 1 + repay_offset;
+    }
+
+    (&actions[..=arb_end], &actions[arb_end + 1..])
+}
+
+fn print_rebalance_execution_summary(
+    label: &str,
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+) {
+    let Some(prices_before) = sorted_market_prices(slot0_results) else {
+        print_trade_summary(label, actions);
+        println!(
+            "[rebalance][{}] market price deltas unavailable (snapshot could not be mapped to sims)",
+            label
+        );
+        return;
+    };
+    let price_sum_before: f64 = prices_before.iter().map(|(_, p)| *p).sum();
+    let (arb_actions, non_arb_actions) = split_actions_by_complete_set_arb_phase(actions);
+
+    if !arb_actions.is_empty() {
+        let arb_label = format!("{}_arb_phase", label);
+        print_trade_summary(&arb_label, arb_actions);
+        let slot0_after_arb = replay_actions_to_market_state(arb_actions, slot0_results);
+        if let Some(prices_after_arb) = sorted_market_prices(&slot0_after_arb) {
+            let price_sum_after_arb: f64 = prices_after_arb.iter().map(|(_, p)| *p).sum();
+            print_market_price_changes(&arb_label, &prices_before, &prices_after_arb);
+            println!(
+                "[rebalance][{}] market price sum before={:.9}",
+                arb_label, price_sum_before
+            );
+            println!(
+                "[rebalance][{}] market price sum after={:.9}",
+                arb_label, price_sum_after_arb
+            );
+
+            let non_arb_label = format!("{}_non_arb_phase", label);
+            print_trade_summary(&non_arb_label, non_arb_actions);
+            let slot0_after_non_arb =
+                replay_actions_to_market_state(non_arb_actions, &slot0_after_arb);
+            if let Some(prices_after_non_arb) = sorted_market_prices(&slot0_after_non_arb) {
+                let price_sum_after_non_arb: f64 =
+                    prices_after_non_arb.iter().map(|(_, p)| *p).sum();
+                print_market_price_changes(
+                    &non_arb_label,
+                    &prices_after_arb,
+                    &prices_after_non_arb,
+                );
+                println!(
+                    "[rebalance][{}] market price sum before={:.9}",
+                    non_arb_label, price_sum_after_arb
+                );
+                println!(
+                    "[rebalance][{}] market price sum after={:.9}",
+                    non_arb_label, price_sum_after_non_arb
+                );
+
+                let total_label = format!("{}_total", label);
+                print_trade_summary(&total_label, actions);
+                println!(
+                    "[rebalance][{}] market price sum before={:.9}",
+                    total_label, price_sum_before
+                );
+                println!(
+                    "[rebalance][{}] market price sum after={:.9}",
+                    total_label, price_sum_after_non_arb
+                );
+                return;
+            }
+        }
+    }
+
+    print_trade_summary(label, actions);
+    let slot0_after = replay_actions_to_market_state(actions, slot0_results);
+    if let Some(prices_after) = sorted_market_prices(&slot0_after) {
+        let price_sum_after: f64 = prices_after.iter().map(|(_, p)| *p).sum();
+        print_market_price_changes(label, &prices_before, &prices_after);
+        println!(
+            "[rebalance][{}] market price sum before={:.9}",
+            label, price_sum_before
+        );
+        println!(
+            "[rebalance][{}] market price sum after={:.9}",
+            label, price_sum_after
+        );
+    } else {
+        println!(
+            "[rebalance][{}] market price deltas unavailable after replay",
+            label
+        );
+    }
+}
+
 fn print_portfolio_snapshot(
     label: &str,
     stage: &str,
@@ -1350,7 +1516,7 @@ fn assert_strict_ev_gain_with_portfolio_trace(
     let trace = compute_ev_trace(actions, slot0_results, initial_balances, initial_susd);
 
     print_portfolio_snapshot(label, "initial", &trace.initial_holdings, initial_susd);
-    print_trade_summary(label, actions);
+    print_rebalance_execution_summary(label, actions, slot0_results);
     print_portfolio_snapshot(label, "final", &trace.final_holdings, trace.final_cash);
 
     let ev_gain = trace.ev_after - trace.ev_before;
