@@ -5,6 +5,7 @@ use super::merge::{
     merge_sell_cap, merge_sell_cap_with_inventory, split_sell_total_proceeds,
     split_sell_total_proceeds_with_inventory,
 };
+use super::rebalancer::{RebalanceMode, rebalance, rebalance_with_mode};
 use super::sim::{PoolSim, Route, build_sims, profitability};
 use super::trading::{ExecutionState, emit_mint_actions, execute_buy};
 use super::waterfall::waterfall;
@@ -382,6 +383,339 @@ fn test_complete_set_arb_skips_when_unprofitable() {
     assert!(
         (budget - 7.0).abs() < 1e-12,
         "budget should remain unchanged when no arb trade is executed"
+    );
+}
+
+#[test]
+fn test_complete_set_mint_sell_arb_executes_when_profitable() {
+    // Sum prices = 1.5 > 1.0, so mint-all-and-sell should be profitable.
+    let mut sims = build_three_sims_with_preds([0.5, 0.5, 0.5], [0.3, 0.3, 0.3]);
+    let mut actions = Vec::new();
+    let mut budget = 0.0;
+
+    let profit = {
+        let mut unused_bal: HashMap<&str, f64> = HashMap::new();
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut unused_bal);
+        exec.execute_complete_set_mint_sell_arb()
+    };
+    assert!(profit > 0.0, "mint-sell arb should produce positive profit");
+    assert!(
+        (budget - profit).abs() < 1e-9,
+        "budget increase should match realized mint-sell arb profit"
+    );
+
+    assert!(
+        matches!(actions.first(), Some(Action::FlashLoan { .. })),
+        "first action should be flash-loan borrow"
+    );
+    assert!(
+        matches!(
+            actions.get(1),
+            Some(Action::Mint {
+                target_market: "complete_set_arb",
+                ..
+            })
+        ),
+        "second action should be mint tagged as complete_set_arb"
+    );
+    assert!(
+        matches!(actions.last(), Some(Action::RepayFlashLoan { .. })),
+        "last action should be flash-loan repay"
+    );
+    let sell_count = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Sell { .. }))
+        .count();
+    assert_eq!(
+        sell_count, 3,
+        "mint-sell arb should sell every pooled outcome"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "mint-sell arb should not emit buy actions"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+        "mint-sell arb should not emit merge actions"
+    );
+}
+
+#[test]
+fn test_complete_set_mint_sell_arb_skips_when_unprofitable() {
+    // Sum prices = 0.6 < 1.0, so mint-all-and-sell should be non-profitable.
+    let mut sims = build_three_sims_with_preds([0.2, 0.2, 0.2], [0.3, 0.3, 0.3]);
+    let mut actions = Vec::new();
+    let mut budget = 5.0;
+
+    let profit = {
+        let mut unused_bal: HashMap<&str, f64> = HashMap::new();
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut unused_bal);
+        exec.execute_complete_set_mint_sell_arb()
+    };
+    assert!(
+        profit <= 1e-12,
+        "unprofitable setup should not execute mint-sell arb"
+    );
+    assert!(
+        actions.is_empty(),
+        "no actions should be emitted when mint-sell arb is skipped"
+    );
+    assert!(
+        (budget - 5.0).abs() < 1e-12,
+        "budget should remain unchanged when no mint-sell trade is executed"
+    );
+}
+
+#[test]
+fn test_two_sided_complete_set_arb_selects_buy_merge_when_sum_below_one() {
+    let mut sims = build_three_sims_with_preds([0.2, 0.2, 0.2], [0.3, 0.3, 0.3]);
+    let mut actions = Vec::new();
+    let mut budget = 0.0;
+
+    let profit = {
+        let mut unused_bal: HashMap<&str, f64> = HashMap::new();
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut unused_bal);
+        exec.execute_two_sided_complete_set_arb()
+    };
+    assert!(
+        profit > 0.0,
+        "two-sided arb should execute buy-merge branch"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "buy-merge branch should emit buy legs"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+        "buy-merge branch should emit merge leg"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+        "buy-merge branch should not emit mint leg"
+    );
+}
+
+#[test]
+fn test_two_sided_complete_set_arb_selects_mint_sell_when_sum_above_one() {
+    let mut sims = build_three_sims_with_preds([0.5, 0.5, 0.5], [0.3, 0.3, 0.3]);
+    let mut actions = Vec::new();
+    let mut budget = 0.0;
+
+    let profit = {
+        let mut unused_bal: HashMap<&str, f64> = HashMap::new();
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut unused_bal);
+        exec.execute_two_sided_complete_set_arb()
+    };
+    assert!(
+        profit > 0.0,
+        "two-sided arb should execute mint-sell branch"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+        "mint-sell branch should emit mint leg"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Sell { .. })),
+        "mint-sell branch should emit sell legs"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "mint-sell branch should not emit buy legs"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+        "mint-sell branch should not emit merge leg"
+    );
+}
+
+#[test]
+fn test_two_sided_complete_set_arb_skips_near_price_parity() {
+    let mut sims = build_three_sims_with_preds([0.2, 0.3, 0.5], [0.3, 0.3, 0.3]);
+    let mut actions = Vec::new();
+    let mut budget = 4.0;
+
+    let profit = {
+        let mut unused_bal: HashMap<&str, f64> = HashMap::new();
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut unused_bal);
+        exec.execute_two_sided_complete_set_arb()
+    };
+    assert!(
+        profit <= 1e-12,
+        "no arb branch should execute near exact parity"
+    );
+    assert!(
+        actions.is_empty(),
+        "no actions should be emitted near exact parity"
+    );
+    assert!(
+        (budget - 4.0).abs() < 1e-12,
+        "budget should remain unchanged when no branch is taken"
+    );
+}
+
+#[test]
+fn test_rebalance_with_mode_full_matches_rebalance_default() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(8).collect();
+    let multipliers = [1.35, 0.55, 1.40, 0.60, 1.25, 0.70, 1.15, 0.75];
+    let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
+
+    let mut balances = HashMap::new();
+    balances.insert(selected[0].name, 1.0);
+    balances.insert(selected[1].name, 2.0);
+    let susd = 100.0;
+
+    let default_actions = rebalance(&balances, susd, &slot0_results);
+    let mode_actions = rebalance_with_mode(&balances, susd, &slot0_results, RebalanceMode::Full);
+
+    assert_eq!(
+        format!("{default_actions:?}"),
+        format!("{mode_actions:?}"),
+        "full mode should match default rebalance behavior"
+    );
+}
+
+#[test]
+fn test_rebalance_with_mode_arb_only_mint_sell_shape_only() {
+    let markets: Vec<_> = crate::markets::MARKETS_L1
+        .iter()
+        .filter(|m| m.pool.is_some())
+        .collect();
+    let slot0_results: Vec<_> = markets
+        .iter()
+        .map(|market| {
+            let pool = market.pool.as_ref().expect("pooled market required");
+            let is_token1_outcome =
+                pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+            let sqrt_price = prediction_to_sqrt_price_x96(0.02, is_token1_outcome)
+                .unwrap_or(U256::from(1u128 << 96));
+            (
+                Slot0Result {
+                    pool_id: Address::ZERO,
+                    sqrt_price_x96: sqrt_price,
+                    tick: 0,
+                    observation_index: 0,
+                    observation_cardinality: 0,
+                    observation_cardinality_next: 0,
+                    fee_protocol: 0,
+                    unlocked: true,
+                },
+                *market,
+            )
+        })
+        .collect();
+
+    let actions = rebalance_with_mode(&HashMap::new(), 0.0, &slot0_results, RebalanceMode::ArbOnly);
+    assert!(!actions.is_empty(), "arb-only mode should emit arb actions");
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+        "arb-only mode should include mint for sum(prices)>1 case"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Sell { .. })),
+        "arb-only mode should include sell legs in sum(prices)>1 case"
+    );
+    assert!(
+        matches!(actions.first(), Some(Action::FlashLoan { .. }))
+            && matches!(actions.last(), Some(Action::RepayFlashLoan { .. })),
+        "arb-only action stream should be a single flash bracket"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "arb-only mint-sell path should not emit direct buy actions"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+        "arb-only mint-sell path should not emit merge actions"
+    );
+}
+
+#[test]
+fn test_rebalance_with_mode_arb_only_fails_closed_on_partial_snapshot() {
+    let markets: Vec<_> = crate::markets::MARKETS_L1
+        .iter()
+        .filter(|m| m.pool.is_some())
+        .collect();
+    assert!(
+        markets.len() > 1,
+        "expected at least two pooled markets for partial snapshot test"
+    );
+
+    let slot0_results: Vec<_> = markets
+        .iter()
+        .take(markets.len() - 1)
+        .map(|market| {
+            let pool = market.pool.as_ref().expect("pooled market required");
+            let is_token1_outcome =
+                pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+            let sqrt_price = prediction_to_sqrt_price_x96(0.02, is_token1_outcome)
+                .unwrap_or(U256::from(1u128 << 96));
+            (
+                Slot0Result {
+                    pool_id: Address::ZERO,
+                    sqrt_price_x96: sqrt_price,
+                    tick: 0,
+                    observation_index: 0,
+                    observation_cardinality: 0,
+                    observation_cardinality_next: 0,
+                    fee_protocol: 0,
+                    unlocked: true,
+                },
+                *market,
+            )
+        })
+        .collect();
+
+    let actions = rebalance_with_mode(&HashMap::new(), 0.0, &slot0_results, RebalanceMode::ArbOnly);
+    assert!(
+        actions.is_empty(),
+        "arb-only mode should fail closed on incomplete market snapshots"
+    );
+}
+
+#[test]
+fn test_rebalance_with_mode_arb_only_fails_closed_on_duplicate_membership() {
+    let markets: Vec<_> = crate::markets::MARKETS_L1
+        .iter()
+        .filter(|m| m.pool.is_some())
+        .collect();
+    assert!(
+        markets.len() > 1,
+        "expected at least two pooled markets for duplicate-membership test"
+    );
+
+    let mut slot0_results: Vec<_> = markets
+        .iter()
+        .map(|market| {
+            let pool = market.pool.as_ref().expect("pooled market required");
+            let is_token1_outcome =
+                pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+            let sqrt_price = prediction_to_sqrt_price_x96(0.02, is_token1_outcome)
+                .unwrap_or(U256::from(1u128 << 96));
+            (
+                Slot0Result {
+                    pool_id: Address::ZERO,
+                    sqrt_price_x96: sqrt_price,
+                    tick: 0,
+                    observation_index: 0,
+                    observation_cardinality: 0,
+                    observation_cardinality_next: 0,
+                    fee_protocol: 0,
+                    unlocked: true,
+                },
+                *market,
+            )
+        })
+        .collect();
+
+    // Keep vector length unchanged, but replace one member with a duplicate of another.
+    let last = slot0_results.len() - 1;
+    slot0_results[last] = slot0_results[0].clone();
+
+    let actions = rebalance_with_mode(&HashMap::new(), 0.0, &slot0_results, RebalanceMode::ArbOnly);
+    assert!(
+        actions.is_empty(),
+        "arb-only mode should fail closed when outcome membership is malformed"
     );
 }
 
@@ -943,14 +1277,8 @@ fn print_trade_summary(label: &str, actions: &[Action]) {
         "  sell: count={}, units={:.9}, proceeds={:.9}",
         sell_count, sell_units, sell_proceeds
     );
-    println!(
-        "  mint: count={}, amount={:.9}",
-        mint_count, mint_amount
-    );
-    println!(
-        "  merge: count={}, amount={:.9}",
-        merge_count, merge_amount
-    );
+    println!("  mint: count={}, amount={:.9}", mint_count, mint_amount);
+    println!("  merge: count={}, amount={:.9}", merge_count, merge_amount);
     println!(
         "  flash_loan: count={}, amount={:.9}",
         flash_count, flash_amount

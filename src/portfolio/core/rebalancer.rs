@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::pools::Slot0Result;
 
 use super::Action;
-use super::sim::{EPS, PoolSim, SimBuildError, build_sims, profitability, target_price_for_prof};
+use super::sim::{
+    EPS, PoolSim, SimBuildError, build_sims, build_sims_without_predictions, profitability,
+    target_price_for_prof,
+};
 use super::trading::{ExecutionState, portfolio_expected_value};
 use super::types::BalanceMap;
 use super::types::{apply_actions_to_sim_balances, lookup_balance};
@@ -13,6 +16,12 @@ const MAX_PHASE1_ITERS: usize = 128;
 const MAX_PHASE3_ITERS: usize = 8;
 const PHASE3_PROF_REL_TOL: f64 = 1e-9;
 const PHASE3_EV_GUARD_REL_TOL: f64 = 1e-10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebalanceMode {
+    Full,
+    ArbOnly,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum RebalanceInitError {
@@ -59,6 +68,14 @@ fn log_rebalance_init_error(err: RebalanceInitError) {
             );
         }
     }
+}
+
+fn pooled_l1_outcome_names() -> HashSet<&'static str> {
+    crate::markets::MARKETS_L1
+        .iter()
+        .filter(|m| m.pool.is_some())
+        .map(|m| m.name)
+        .collect()
 }
 
 fn held_total(sim_balances: &BalanceMap, market_name: &'static str) -> f64 {
@@ -369,14 +386,7 @@ impl RebalanceContext {
     }
 }
 
-/// Computes optimal rebalancing trades for L1 markets.
-///
-/// 1. Sell overpriced holdings (price > prediction) via swap simulation
-/// 2. Waterfall allocation: deploy capital to highest profitability outcomes,
-///    equalizing profitability progressively
-/// 3. Post-allocation liquidation: sell held outcomes less profitable than
-///    the last bought outcome, reallocate via waterfall
-pub fn rebalance(
+fn rebalance_full(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -397,7 +407,7 @@ pub fn rebalance(
         }
     };
 
-    // ── Phase 0: Complete-set arbitrage (buy all outcomes, merge) ──
+    // ── Phase 0: Complete-set arbitrage (buy-merge only) ──
     // Execute before any discretionary rebalancing so free budget is harvested first.
     if ctx.mint_available {
         let _arb_profit = {
@@ -440,4 +450,82 @@ pub fn rebalance(
     }
 
     ctx.actions
+}
+
+fn rebalance_arb_only(
+    _balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+) -> Vec<Action> {
+    if !susds_balance.is_finite() {
+        log_rebalance_init_error(RebalanceInitError::NonFiniteBudget { susds_balance });
+        return Vec::new();
+    }
+
+    let expected_names = pooled_l1_outcome_names();
+    let expected_count = expected_names.len();
+    let mut sims = build_sims_without_predictions(slot0_results);
+    if sims.is_empty() {
+        log_rebalance_init_error(RebalanceInitError::NoEligibleSims {
+            slot0_result_count: slot0_results.len(),
+            prediction_count: 0,
+            expected_outcome_count: expected_count,
+        });
+        return Vec::new();
+    }
+    let sim_names: HashSet<&'static str> = sims.iter().map(|s| s.market_name).collect();
+    if sims.len() != expected_count || sim_names != expected_names {
+        let missing_count = expected_names.difference(&sim_names).count();
+        let unexpected_count = sim_names.difference(&expected_names).count();
+        tracing::warn!(
+            init_failure = "arb_only_incomplete_outcome_set",
+            slot0_result_count = slot0_results.len(),
+            sim_count = sims.len(),
+            sim_unique_count = sim_names.len(),
+            expected_outcome_count = expected_count,
+            missing_count,
+            unexpected_count,
+            "rebalance initialization failed"
+        );
+        return Vec::new();
+    }
+
+    let mut sim_balances: BalanceMap = HashMap::new();
+
+    let mut actions = Vec::new();
+    let mut budget = susds_balance;
+    {
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
+        let _arb_profit = exec.execute_two_sided_complete_set_arb();
+    }
+
+    actions
+}
+
+/// Computes optimal trades for L1 markets using the requested mode.
+pub fn rebalance_with_mode(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+) -> Vec<Action> {
+    match mode {
+        RebalanceMode::Full => rebalance_full(balances, susds_balance, slot0_results),
+        RebalanceMode::ArbOnly => rebalance_arb_only(balances, susds_balance, slot0_results),
+    }
+}
+
+/// Computes optimal rebalancing trades for L1 markets.
+///
+/// 1. Sell overpriced holdings (price > prediction) via swap simulation
+/// 2. Waterfall allocation: deploy capital to highest profitability outcomes,
+///    equalizing profitability progressively
+/// 3. Post-allocation liquidation: sell held outcomes less profitable than
+///    the last bought outcome, reallocate via waterfall
+pub fn rebalance(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+) -> Vec<Action> {
+    rebalance_with_mode(balances, susds_balance, slot0_results, RebalanceMode::Full)
 }

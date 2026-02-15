@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::super::merge::{
     execute_merge_sell, merge_sell_cap, merge_sell_proceeds, optimal_sell_split,
 };
-use super::super::rebalancer::rebalance;
+use super::super::rebalancer::{RebalanceMode, rebalance, rebalance_with_mode};
 use super::super::sim::{PoolSim, build_sims};
 use super::super::trading::{ExecutionState, solve_complete_set_arb_amount};
 use super::{
@@ -14,8 +14,8 @@ use super::{
 };
 use crate::execution::GroupKind;
 use crate::execution::bounds::{
-    BufferConfig, build_group_plans_with_default_edges, derive_batch_quote_bounds,
-    stamp_plans_with_block,
+    BufferConfig, build_group_plans_from_cashflow, build_group_plans_with_default_edges,
+    derive_batch_quote_bounds, stamp_plans_with_block,
 };
 use crate::execution::gas::GasAssumptions;
 use crate::execution::grouping::group_actions;
@@ -28,6 +28,35 @@ fn sample_rebalance_actions() -> Vec<Action> {
     let multipliers = [1.35, 0.55, 1.40, 0.60, 1.25, 0.70, 1.15, 0.75];
     let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
     rebalance(&HashMap::new(), 100.0, &slot0_results)
+}
+
+fn full_pooled_slot0_results_with_uniform_price(
+    price: f64,
+) -> Vec<(Slot0Result, &'static crate::markets::MarketData)> {
+    crate::markets::MARKETS_L1
+        .iter()
+        .filter(|m| m.pool.is_some())
+        .map(|market| {
+            let pool = market.pool.as_ref().expect("pooled market required");
+            let is_token1_outcome =
+                pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+            let sqrt_price = prediction_to_sqrt_price_x96(price, is_token1_outcome)
+                .unwrap_or(U256::from(1u128 << 96));
+            (
+                Slot0Result {
+                    pool_id: Address::ZERO,
+                    sqrt_price_x96: sqrt_price,
+                    tick: 0,
+                    observation_index: 0,
+                    observation_cardinality: 0,
+                    observation_cardinality_next: 0,
+                    fee_protocol: 0,
+                    unlocked: true,
+                },
+                market,
+            )
+        })
+        .collect()
 }
 
 fn test_gas_assumptions() -> GasAssumptions {
@@ -115,6 +144,34 @@ fn test_optimal_sell_split_matches_bruteforce() {
             }
         }
     }
+}
+
+#[test]
+fn test_arb_only_mint_sell_output_is_groupable_and_plannable_from_cashflow() {
+    let slot0_results = full_pooled_slot0_results_with_uniform_price(0.02);
+    let actions = rebalance_with_mode(&HashMap::new(), 0.0, &slot0_results, RebalanceMode::ArbOnly);
+    assert!(
+        !actions.is_empty(),
+        "arb-only mode should emit actions in a profitable mint-sell setup"
+    );
+
+    let groups = group_actions(&actions).expect("arb-only action stream should be groupable");
+    assert_eq!(groups.len(), 1, "expected one flash-loan bracket group");
+    assert_eq!(groups[0].kind, GroupKind::MintSell);
+
+    let plans = build_group_plans_from_cashflow(
+        &actions,
+        &test_gas_assumptions(),
+        1e-8,
+        3000.0,
+        BufferConfig::default(),
+    )
+    .expect("mint-sell arb stream should be plannable from cashflow");
+    assert!(
+        !plans.is_empty(),
+        "expected at least one group plan for mint-sell arb stream"
+    );
+    assert_eq!(plans[0].kind, GroupKind::MintSell);
 }
 
 #[test]
@@ -819,18 +876,16 @@ async fn test_rebalance_optimization_full_l1_live_prices() {
             );
             continue;
         };
-        let provider = alloy::providers::ProviderBuilder::new().with_reqwest(parsed_url, |builder| {
-            builder
-                .no_proxy()
-                .build()
-                .expect("failed to build reqwest client for tests")
-        });
+        let provider =
+            alloy::providers::ProviderBuilder::new().with_reqwest(parsed_url, |builder| {
+                builder
+                    .no_proxy()
+                    .build()
+                    .expect("failed to build reqwest client for tests")
+            });
         match crate::pools::fetch_all_slot0(provider).await {
             Ok(results) => {
-                println!(
-                    "[rebalance][live_full_l1] using RPC endpoint: {}",
-                    rpc_url
-                );
+                println!("[rebalance][live_full_l1] using RPC endpoint: {}", rpc_url);
                 slot0_results_all = Some(results);
                 break;
             }
@@ -864,8 +919,10 @@ async fn test_rebalance_optimization_full_l1_live_prices() {
 
     let preds = crate::pools::prediction_map();
     let sims_before = build_sims(&slot0_results, &preds).expect("live snapshot must map to sims");
-    let mut prices_before: Vec<(&str, f64)> =
-        sims_before.iter().map(|s| (s.market_name, s.price())).collect();
+    let mut prices_before: Vec<(&str, f64)> = sims_before
+        .iter()
+        .map(|s| (s.market_name, s.price()))
+        .collect();
     prices_before.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
     let price_sum_before: f64 = prices_before.iter().map(|(_, p)| *p).sum();
     println!("[rebalance][live_full_l1] market prices before:");
@@ -895,8 +952,10 @@ async fn test_rebalance_optimization_full_l1_live_prices() {
     let slot0_after = replay_actions_to_market_state(&actions, &slot0_results);
     let sims_after =
         build_sims(&slot0_after, &preds).expect("replayed live snapshot must map to sims");
-    let mut prices_after: Vec<(&str, f64)> =
-        sims_after.iter().map(|s| (s.market_name, s.price())).collect();
+    let mut prices_after: Vec<(&str, f64)> = sims_after
+        .iter()
+        .map(|s| (s.market_name, s.price()))
+        .collect();
     prices_after.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
     let price_sum_after: f64 = prices_after.iter().map(|(_, p)| *p).sum();
     println!("[rebalance][live_full_l1] market prices after:");

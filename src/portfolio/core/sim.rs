@@ -285,6 +285,43 @@ pub(super) fn build_sims(
     Ok(sims)
 }
 
+/// Build PoolSim entries from slot0 results without prediction dependency.
+/// This is used by arb-only mode where route decisions are prediction-agnostic.
+pub(super) fn build_sims_without_predictions(
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+) -> Vec<PoolSim> {
+    let mut sims = Vec::with_capacity(slot0_results.len());
+    let mut dropped_markets: Vec<&'static str> = Vec::new();
+
+    for (slot0, market) in slot0_results {
+        match PoolSim::from_slot0(slot0, market, 0.0) {
+            Some(sim) => sims.push(sim),
+            None => dropped_markets.push(market.name),
+        }
+    }
+
+    if !dropped_markets.is_empty() {
+        let preview = dropped_markets
+            .iter()
+            .take(5)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if dropped_markets.len() > 5 {
+            ", ..."
+        } else {
+            ""
+        };
+        tracing::info!(
+            dropped_count = dropped_markets.len(),
+            markets = %format!("{}{}", preview, suffix),
+            "dropped outcomes from simulation due to invalid pool state"
+        );
+    }
+
+    sims
+}
+
 /// Compute alt price for outcome at `idx`: 1 - sum(other outcome prices).
 /// O(1) when price_sum is precomputed.
 pub(super) fn alt_price(sims: &[PoolSim], idx: usize, price_sum: f64) -> f64 {

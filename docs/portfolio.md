@@ -14,6 +14,15 @@ pub fn rebalance(
 ) -> Vec<Action>
 ```
 
+## Modes
+
+The portfolio module now supports mode-based execution:
+
+- `RebalanceMode::Full` (default): existing prediction-driven rebalancing flow.
+- `RebalanceMode::ArbOnly`: complete-set arbitrage only (`sum(prices) < 1` buy-merge, `sum(prices) > 1` mint-sell).
+
+See [Arb-Only Mode](./arb_mode.md) for API details, sizing equations, and fail-closed behavior.
+
 ## Action Types
 
 ```rust

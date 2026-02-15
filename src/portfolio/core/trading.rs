@@ -56,6 +56,21 @@ pub(super) fn complete_set_marginal_buy_cost(sims: &[PoolSim], amount: f64) -> f
     total
 }
 
+fn bisect_boundary(mut lo: f64, mut hi: f64, mut go_right: impl FnMut(f64) -> bool) -> f64 {
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        if go_right(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo).abs() <= EPS * (1.0 + hi.abs()) {
+            break;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
 pub(super) fn solve_complete_set_arb_amount(sims: &[PoolSim]) -> f64 {
     let cap = complete_set_arb_cap(sims);
     if cap <= DUST {
@@ -73,21 +88,55 @@ pub(super) fn solve_complete_set_arb_amount(sims: &[PoolSim]) -> f64 {
         return cap;
     }
 
-    let mut lo = 0.0_f64;
-    let mut hi = cap_left;
-    for _ in 0..64 {
-        let mid = 0.5 * (lo + hi);
-        let d_mid = complete_set_marginal_buy_cost(sims, mid);
-        if d_mid > 1.0 {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-        if (hi - lo).abs() <= EPS * (1.0 + hi.abs()) {
-            break;
-        }
+    bisect_boundary(0.0, cap_left, |mid| {
+        complete_set_marginal_buy_cost(sims, mid) <= 1.0
+    })
+}
+
+pub(super) fn complete_set_mint_sell_arb_cap(sims: &[PoolSim]) -> f64 {
+    if sims.is_empty() {
+        return 0.0;
     }
-    0.5 * (lo + hi)
+    sims.iter()
+        .map(|s| s.max_sell_tokens())
+        .fold(f64::INFINITY, f64::min)
+}
+
+pub(super) fn complete_set_marginal_sell_proceeds(sims: &[PoolSim], amount: f64) -> f64 {
+    let mut total = 0.0_f64;
+    for s in sims {
+        let kappa = s.kappa();
+        if kappa <= 0.0 || s.price() <= 0.0 {
+            return 0.0;
+        }
+        let d = 1.0 + amount * kappa;
+        if d <= 0.0 {
+            return 0.0;
+        }
+        total += s.price() * FEE_FACTOR / (d * d);
+    }
+    total
+}
+
+pub(super) fn solve_complete_set_mint_sell_arb_amount(sims: &[PoolSim]) -> f64 {
+    let cap = complete_set_mint_sell_arb_cap(sims);
+    if cap <= DUST {
+        return 0.0;
+    }
+
+    let d0 = complete_set_marginal_sell_proceeds(sims, 0.0);
+    if !d0.is_finite() || d0 <= 1.0 {
+        return 0.0;
+    }
+
+    let d_cap = complete_set_marginal_sell_proceeds(sims, cap);
+    if d_cap >= 1.0 {
+        return cap;
+    }
+
+    bisect_boundary(0.0, cap, |mid| {
+        complete_set_marginal_sell_proceeds(sims, mid) >= 1.0
+    })
 }
 
 impl<'a> ExecutionState<'a> {
@@ -147,6 +196,66 @@ impl<'a> ExecutionState<'a> {
 
         *self.budget += profit;
         profit
+    }
+
+    pub(super) fn execute_complete_set_mint_sell_arb(&mut self) -> f64 {
+        let amount = solve_complete_set_mint_sell_arb_amount(self.sims);
+        if amount <= DUST {
+            return 0.0;
+        }
+
+        let mut legs: Vec<(usize, f64, f64)> = Vec::with_capacity(self.sims.len());
+        let mut total_proceeds = 0.0_f64;
+        for (i, s) in self.sims.iter().enumerate() {
+            match s.sell_exact(amount) {
+                Some((sold, proceeds, new_price))
+                    if sold + EPS >= amount && sold > 0.0 && proceeds.is_finite() =>
+                {
+                    legs.push((i, proceeds, new_price));
+                    total_proceeds += proceeds;
+                }
+                _ => return 0.0,
+            }
+        }
+
+        let profit = total_proceeds - amount;
+        if !profit.is_finite() || profit <= EPS {
+            return 0.0;
+        }
+
+        self.actions.push(Action::FlashLoan { amount });
+
+        let (contract_1, contract_2) = action_contract_pair(self.sims);
+        self.actions.push(Action::Mint {
+            contract_1,
+            contract_2,
+            amount,
+            target_market: "complete_set_arb",
+        });
+
+        for (i, proceeds, new_price) in legs {
+            self.sims[i].set_price(new_price);
+            self.actions.push(Action::Sell {
+                market_name: self.sims[i].market_name,
+                amount,
+                proceeds,
+            });
+        }
+
+        self.actions.push(Action::RepayFlashLoan { amount });
+        *self.budget += profit;
+        profit
+    }
+
+    pub(super) fn execute_two_sided_complete_set_arb(&mut self) -> f64 {
+        let price_sum: f64 = self.sims.iter().map(|s| s.price()).sum();
+        if price_sum < 1.0 - EPS {
+            self.execute_complete_set_arb()
+        } else if price_sum > 1.0 + EPS {
+            self.execute_complete_set_mint_sell_arb()
+        } else {
+            0.0
+        }
     }
 
     pub(super) fn execute_planned_routes(
