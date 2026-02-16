@@ -8,7 +8,7 @@ use crate::markets::MarketData;
 use crate::pools::{Slot0Result, prediction_to_sqrt_price_x96};
 
 use super::Action;
-use super::sim::build_sims;
+use super::sim::{build_sims, profitability};
 
 #[derive(Debug, Clone, Copy)]
 pub struct TraceConfig {
@@ -178,10 +178,16 @@ fn sorted_market_prices(
     Some(prices)
 }
 
-fn replay_trade_boundary_hits(
+struct ReplayTradeDiagnostics {
+    boundary_hits: HashMap<usize, bool>,
+    direct_profitability_spans: Option<HashMap<usize, DirectProfitabilitySpan>>,
+}
+
+fn replay_trade_diagnostics(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static MarketData)],
-) -> Option<HashMap<usize, bool>> {
+    collect_direct_profitability_spans: bool,
+) -> Option<ReplayTradeDiagnostics> {
     let preds = crate::pools::prediction_map();
     let mut sims = build_sims(slot0_results, &preds).ok()?;
     let mut idx_by_market: HashMap<&str, usize> = HashMap::new();
@@ -189,7 +195,8 @@ fn replay_trade_boundary_hits(
         idx_by_market.insert(sim.market_name, i);
     }
 
-    let mut hits_by_action: HashMap<usize, bool> = HashMap::new();
+    let mut boundary_hits: HashMap<usize, bool> = HashMap::new();
+    let mut direct_profitability_spans = collect_direct_profitability_spans.then(HashMap::new);
     for (action_index, action) in actions.iter().enumerate() {
         match action {
             Action::Buy {
@@ -200,6 +207,8 @@ fn replay_trade_boundary_hits(
                 let Some(&idx) = idx_by_market.get(market_name) else {
                     continue;
                 };
+                let before = collect_direct_profitability_spans
+                    .then(|| profitability(sims[idx].prediction, sims[idx].price()));
                 let Some((bought, _, new_price)) = sims[idx].buy_exact(*amount) else {
                     continue;
                 };
@@ -209,8 +218,12 @@ fn replay_trade_boundary_hits(
                 let boundary = sims[idx].buy_limit_price;
                 let tol = 1e-9 * (1.0 + boundary.abs().max(new_price.abs()));
                 let hit_boundary = (new_price - boundary).abs() <= tol;
-                hits_by_action.insert(action_index, hit_boundary);
+                boundary_hits.insert(action_index, hit_boundary);
                 sims[idx].set_price(new_price);
+                if let (Some(spans), Some(before)) = (direct_profitability_spans.as_mut(), before) {
+                    let after = profitability(sims[idx].prediction, sims[idx].price());
+                    spans.insert(action_index, DirectProfitabilitySpan { before, after });
+                }
             }
             Action::Sell {
                 market_name,
@@ -220,6 +233,8 @@ fn replay_trade_boundary_hits(
                 let Some(&idx) = idx_by_market.get(market_name) else {
                     continue;
                 };
+                let before = collect_direct_profitability_spans
+                    .then(|| profitability(sims[idx].prediction, sims[idx].price()));
                 let Some((sold, _, new_price)) = sims[idx].sell_exact(*amount) else {
                     continue;
                 };
@@ -229,8 +244,12 @@ fn replay_trade_boundary_hits(
                 let boundary = sims[idx].sell_limit_price;
                 let tol = 1e-9 * (1.0 + boundary.abs().max(new_price.abs()));
                 let hit_boundary = (new_price - boundary).abs() <= tol;
-                hits_by_action.insert(action_index, hit_boundary);
+                boundary_hits.insert(action_index, hit_boundary);
                 sims[idx].set_price(new_price);
+                if let (Some(spans), Some(before)) = (direct_profitability_spans.as_mut(), before) {
+                    let after = profitability(sims[idx].prediction, sims[idx].price());
+                    spans.insert(action_index, DirectProfitabilitySpan { before, after });
+                }
             }
             Action::Mint { .. }
             | Action::Merge { .. }
@@ -239,7 +258,10 @@ fn replay_trade_boundary_hits(
         }
     }
 
-    Some(hits_by_action)
+    Some(ReplayTradeDiagnostics {
+        boundary_hits,
+        direct_profitability_spans,
+    })
 }
 
 fn print_market_price_changes(
@@ -488,6 +510,12 @@ struct BoundaryStats {
     unknown: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DirectProfitabilitySpan {
+    before: f64,
+    after: f64,
+}
+
 impl BoundaryStats {
     fn record(&mut self, hit: Option<bool>) {
         self.trades += 1;
@@ -684,6 +712,10 @@ fn is_mixed_step(group: &ActionGroup) -> bool {
     )
 }
 
+fn group_needs_direct_profitability_annotation(group: &ActionGroup) -> bool {
+    is_mixed_step(group) || matches!(group.kind, GroupKind::DirectBuy | GroupKind::DirectSell)
+}
+
 fn group_display_label(group: &ActionGroup) -> &'static str {
     match group.step_kind {
         ProfitabilityStepKind::MixedDirectBuyMintSell => "Mixed:Buy+MintSell",
@@ -752,6 +784,37 @@ fn action_kind_label(action: &Action) -> &'static str {
         Action::Mint { .. } => "Mint",
         Action::Merge { .. } => "Merge",
     }
+}
+
+fn format_direct_profitability_suffix(
+    direct_profitability_spans: Option<&HashMap<usize, DirectProfitabilitySpan>>,
+    global_action_index: usize,
+) -> String {
+    let Some(span) = direct_profitability_spans.and_then(|spans| spans.get(&global_action_index))
+    else {
+        return String::new();
+    };
+    format!(
+        " direct profitability={:.6}->{:.6}",
+        span.before, span.after
+    )
+}
+
+fn action_outline_detail_with_direct_profitability(
+    action: &Action,
+    local_action_index: usize,
+    global_offset: usize,
+    annotate_direct_profitability: bool,
+    direct_profitability_spans: Option<&HashMap<usize, DirectProfitabilitySpan>>,
+) -> String {
+    let mut detail = action_outline_detail(action);
+    if annotate_direct_profitability {
+        detail.push_str(&format_direct_profitability_suffix(
+            direct_profitability_spans,
+            global_offset + local_action_index,
+        ));
+    }
+    detail
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -855,6 +918,8 @@ struct ActionSetView<'a> {
     global_offset: usize,
     indices: &'a [usize],
     style: ActionSetStyle,
+    annotate_direct_profitability: bool,
+    direct_profitability_spans: Option<&'a HashMap<usize, DirectProfitabilitySpan>>,
 }
 
 impl fmt::Display for ActionSetView<'_> {
@@ -869,7 +934,13 @@ impl fmt::Display for ActionSetView<'_> {
                         "      -> {}[{}] {}",
                         label,
                         self.global_offset + idx,
-                        action_outline_detail(&self.actions[idx])
+                        action_outline_detail_with_direct_profitability(
+                            &self.actions[idx],
+                            idx,
+                            self.global_offset,
+                            self.annotate_direct_profitability,
+                            self.direct_profitability_spans,
+                        )
                     )
                 }
                 _ => {
@@ -887,13 +958,25 @@ impl fmt::Display for ActionSetView<'_> {
                         f,
                         "         first[{}] {}\n",
                         self.global_offset + first,
-                        action_outline_detail(&self.actions[first]),
+                        action_outline_detail_with_direct_profitability(
+                            &self.actions[first],
+                            first,
+                            self.global_offset,
+                            self.annotate_direct_profitability,
+                            self.direct_profitability_spans,
+                        ),
                     )?;
                     write!(
                         f,
                         "         last [{}] {}",
                         self.global_offset + last,
-                        action_outline_detail(&self.actions[last])
+                        action_outline_detail_with_direct_profitability(
+                            &self.actions[last],
+                            last,
+                            self.global_offset,
+                            self.annotate_direct_profitability,
+                            self.direct_profitability_spans,
+                        )
                     )
                 }
             },
@@ -910,7 +993,13 @@ impl fmt::Display for ActionSetView<'_> {
                         "      -> {}[{}] {}",
                         single_label,
                         self.global_offset + idx,
-                        action_outline_detail(&self.actions[idx])
+                        action_outline_detail_with_direct_profitability(
+                            &self.actions[idx],
+                            idx,
+                            self.global_offset,
+                            self.annotate_direct_profitability,
+                            self.direct_profitability_spans,
+                        )
                     )
                 }
                 2 => {
@@ -921,14 +1010,26 @@ impl fmt::Display for ActionSetView<'_> {
                         "      -> {}[{}] {}\n",
                         first_label,
                         self.global_offset + first,
-                        action_outline_detail(&self.actions[first])
+                        action_outline_detail_with_direct_profitability(
+                            &self.actions[first],
+                            first,
+                            self.global_offset,
+                            self.annotate_direct_profitability,
+                            self.direct_profitability_spans,
+                        )
                     )?;
                     write!(
                         f,
                         "      -> {}[{}] {}",
                         last_label,
                         self.global_offset + second,
-                        action_outline_detail(&self.actions[second])
+                        action_outline_detail_with_direct_profitability(
+                            &self.actions[second],
+                            second,
+                            self.global_offset,
+                            self.annotate_direct_profitability,
+                            self.direct_profitability_spans,
+                        )
                     )
                 }
                 _ => {
@@ -939,7 +1040,13 @@ impl fmt::Display for ActionSetView<'_> {
                         "      -> {}[{}] {}\n",
                         first_label,
                         self.global_offset + first,
-                        action_outline_detail(&self.actions[first])
+                        action_outline_detail_with_direct_profitability(
+                            &self.actions[first],
+                            first,
+                            self.global_offset,
+                            self.annotate_direct_profitability,
+                            self.direct_profitability_spans,
+                        )
                     )?;
                     // Only used for homogeneous sequences, so both sides share the same action type.
                     write!(f, "      -> ...\n")?;
@@ -948,7 +1055,13 @@ impl fmt::Display for ActionSetView<'_> {
                         "      -> {}[{}] {}",
                         last_label,
                         self.global_offset + last,
-                        action_outline_detail(&self.actions[last])
+                        action_outline_detail_with_direct_profitability(
+                            &self.actions[last],
+                            last,
+                            self.global_offset,
+                            self.annotate_direct_profitability,
+                            self.direct_profitability_spans,
+                        )
                     )
                 }
             },
@@ -956,7 +1069,23 @@ impl fmt::Display for ActionSetView<'_> {
     }
 }
 
-fn print_mixed_group_outline(actions: &[Action], group: &ActionGroup, global_offset: usize) {
+fn mixed_stage_should_annotate_direct_profitability(
+    step_kind: ProfitabilityStepKind,
+    action_set_kind: ActionSetKind,
+) -> bool {
+    matches!(
+        (step_kind, action_set_kind),
+        (ProfitabilityStepKind::MixedDirectBuyMintSell, ActionSetKind::Buy)
+            | (ProfitabilityStepKind::MixedDirectSellBuyMerge, ActionSetKind::Sell)
+    )
+}
+
+fn print_mixed_group_outline(
+    actions: &[Action],
+    group: &ActionGroup,
+    global_offset: usize,
+    direct_profitability_spans: Option<&HashMap<usize, DirectProfitabilitySpan>>,
+) {
     let specs: &[ActionSetSpec] = match group.step_kind {
         ProfitabilityStepKind::MixedDirectBuyMintSell => &MIXED_BUY_MINT_SELL_SPECS,
         ProfitabilityStepKind::MixedDirectSellBuyMerge => &MIXED_SELL_BUY_MERGE_SPECS,
@@ -979,6 +1108,11 @@ fn print_mixed_group_outline(actions: &[Action], group: &ActionGroup, global_off
                 global_offset,
                 indices: &indices,
                 style: spec.style,
+                annotate_direct_profitability: mixed_stage_should_annotate_direct_profitability(
+                    group.step_kind,
+                    spec.kind,
+                ),
+                direct_profitability_spans,
             }
         );
     }
@@ -1358,6 +1492,7 @@ fn print_action_group_preview(
     group: &ActionGroup,
     global_offset: usize,
     tick_boundary_hits: Option<&HashMap<usize, bool>>,
+    direct_profitability_spans: Option<&HashMap<usize, DirectProfitabilitySpan>>,
     ansi: bool,
 ) {
     let Some(&local_start) = group.action_indices.first() else {
@@ -1380,20 +1515,34 @@ fn print_action_group_preview(
         }
     );
     if is_mixed_step(group) {
-        print_mixed_group_outline(actions, group, global_offset);
+        print_mixed_group_outline(actions, group, global_offset, direct_profitability_spans);
     } else {
+        let annotate_direct_profitability =
+            matches!(group.kind, GroupKind::DirectBuy | GroupKind::DirectSell);
         println!(
             "      first [{}] {:<9} {}",
             global_start,
             action_kind_label(&actions[local_start]),
-            action_outline_detail(&actions[local_start])
+            action_outline_detail_with_direct_profitability(
+                &actions[local_start],
+                local_start,
+                global_offset,
+                annotate_direct_profitability,
+                direct_profitability_spans,
+            )
         );
         if local_end != local_start {
             println!(
                 "      last  [{}] {:<9} {}",
                 global_end,
                 action_kind_label(&actions[local_end]),
-                action_outline_detail(&actions[local_end])
+                action_outline_detail_with_direct_profitability(
+                    &actions[local_end],
+                    local_end,
+                    global_offset,
+                    annotate_direct_profitability,
+                    direct_profitability_spans,
+                )
             );
         }
     }
@@ -1462,13 +1611,43 @@ fn print_compact_action_groups(
         label,
         actions.len()
     );
-    let tick_boundary_hits = replay_trade_boundary_hits(actions, slot0_results);
     let (arb_actions, post_arb_actions) = split_actions_by_complete_set_arb_phase(actions);
+    let arb_groups_result = (!arb_actions.is_empty())
+        .then(|| group_actions_by_profitability_step(arb_actions));
+    let post_groups_result = (!post_arb_actions.is_empty())
+        .then(|| group_actions_by_profitability_step(post_arb_actions));
+
+    let needs_direct_profitability = arb_groups_result
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .any(group_needs_direct_profitability_annotation)
+        })
+        || post_groups_result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .is_some_and(|groups| {
+                groups
+                    .iter()
+                    .any(group_needs_direct_profitability_annotation)
+            });
+
+    let replay_diagnostics =
+        replay_trade_diagnostics(actions, slot0_results, needs_direct_profitability);
+    let tick_boundary_hits = replay_diagnostics.as_ref().map(|d| &d.boundary_hits);
+    let direct_profitability_spans = replay_diagnostics
+        .as_ref()
+        .and_then(|d| d.direct_profitability_spans.as_ref());
     let mut global_offset = 0usize;
 
     if !arb_actions.is_empty() {
         println!("  arb phase:");
-        match group_actions_by_profitability_step(arb_actions) {
+        let Some(arb_groups_result) = arb_groups_result.as_ref() else {
+            return;
+        };
+        match arb_groups_result {
             Ok(groups) => {
                 print_group_preview_header(ansi);
                 for (idx, group) in groups.iter().enumerate() {
@@ -1477,7 +1656,8 @@ fn print_compact_action_groups(
                         idx,
                         group,
                         global_offset,
-                        tick_boundary_hits.as_ref(),
+                        tick_boundary_hits,
+                        direct_profitability_spans,
                         ansi,
                     );
                 }
@@ -1512,7 +1692,10 @@ fn print_compact_action_groups(
         return;
     }
 
-    let groups = match group_actions_by_profitability_step(post_arb_actions) {
+    let Some(post_groups_result) = post_groups_result.as_ref() else {
+        return;
+    };
+    let groups = match post_groups_result {
         Ok(groups) => groups,
         Err(err) => {
             let end = actions.len() - 1;
@@ -1550,7 +1733,8 @@ fn print_compact_action_groups(
                 idx,
                 group,
                 global_offset,
-                tick_boundary_hits.as_ref(),
+                tick_boundary_hits,
+                direct_profitability_spans,
                 ansi,
             );
         }
@@ -1563,18 +1747,19 @@ fn print_compact_action_groups(
             idx,
             group,
             global_offset,
-            tick_boundary_hits.as_ref(),
+            tick_boundary_hits,
+            direct_profitability_spans,
             ansi,
         );
     }
     let tail_start = groups.len() - ACTION_PREVIEW_TAIL_GROUPS;
     print_skipped_group_rollup(
         post_arb_actions,
-        &groups,
+        groups,
         ACTION_PREVIEW_HEAD_GROUPS,
         tail_start,
         global_offset,
-        tick_boundary_hits.as_ref(),
+        tick_boundary_hits,
         ansi,
     );
     for (idx, group) in groups.iter().enumerate().skip(tail_start) {
@@ -1583,7 +1768,8 @@ fn print_compact_action_groups(
             idx,
             group,
             global_offset,
-            tick_boundary_hits.as_ref(),
+            tick_boundary_hits,
+            direct_profitability_spans,
             ansi,
         );
     }
@@ -1815,4 +2001,64 @@ pub fn print_trade_summary(label: &str, actions: &[Action]) {
         "  repay_flash_loan: count={}, amount={:.9}",
         repay_count, repay_amount
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_stage_direct_profitability_annotation_gates_only_direct_active_set_legs() {
+        assert!(mixed_stage_should_annotate_direct_profitability(
+            ProfitabilityStepKind::MixedDirectBuyMintSell,
+            ActionSetKind::Buy
+        ));
+        assert!(!mixed_stage_should_annotate_direct_profitability(
+            ProfitabilityStepKind::MixedDirectBuyMintSell,
+            ActionSetKind::Sell
+        ));
+        assert!(mixed_stage_should_annotate_direct_profitability(
+            ProfitabilityStepKind::MixedDirectSellBuyMerge,
+            ActionSetKind::Sell
+        ));
+        assert!(!mixed_stage_should_annotate_direct_profitability(
+            ProfitabilityStepKind::MixedDirectSellBuyMerge,
+            ActionSetKind::Buy
+        ));
+    }
+
+    #[test]
+    fn action_outline_detail_with_direct_profitability_appends_suffix_when_available() {
+        let action = Action::Buy {
+            market_name: "sample/market",
+            amount: 2.0,
+            cost: 0.5,
+        };
+        let mut spans: HashMap<usize, DirectProfitabilitySpan> = HashMap::new();
+        spans.insert(
+            7,
+            DirectProfitabilitySpan {
+                before: 0.25,
+                after: 0.20,
+            },
+        );
+
+        let with_suffix = action_outline_detail_with_direct_profitability(
+            &action,
+            3,
+            4,
+            true,
+            Some(&spans),
+        );
+        assert!(with_suffix.contains("direct profitability=0.250000->0.200000"));
+
+        let without_suffix = action_outline_detail_with_direct_profitability(
+            &action,
+            3,
+            4,
+            false,
+            Some(&spans),
+        );
+        assert!(!without_suffix.contains("direct profitability="));
+    }
 }
