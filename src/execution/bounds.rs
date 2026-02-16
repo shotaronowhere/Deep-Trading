@@ -12,7 +12,9 @@ use super::gas::{
     GasAssumptions, estimate_group_l2_gas_units, estimate_l2_gas_susd, estimate_total_gas_susd,
     hydrate_cached_optimism_l1_fee_per_byte, resolve_l1_fee_per_byte_wei,
 };
-use super::grouping::{ExecutionGroup, GroupingError, group_execution_actions};
+use super::grouping::{
+    ExecutionGroup, GroupingError, group_execution_actions_by_profitability_step,
+};
 use super::{ExecutionGroupPlan, ExecutionLegPlan, GroupKind, LegKind};
 
 #[derive(Debug, Clone, Copy)]
@@ -210,6 +212,9 @@ pub fn build_group_plan_with_reason(
     Ok(ExecutionGroupPlan {
         kind: group.kind,
         action_indices: group.action_indices.clone(),
+        profitability_step_index: 0,
+        step_subgroup_index: 0,
+        step_subgroup_count: 1,
         legs: leg_plans,
         planned_at_block: None,
         edge_plan_susd,
@@ -235,7 +240,7 @@ where
 {
     // DirectBuy groups have no route-local cashflow edge and must receive
     // externally supplied expected-value edge from the caller.
-    let groups = group_execution_actions(actions)?;
+    let step_groups = group_execution_actions_by_profitability_step(actions)?;
     let mut effective_gas_assumptions = *gas_assumptions;
     if let Some(l1_fee_per_byte_wei) = resolve_l1_fee_per_byte_wei(gas_assumptions) {
         effective_gas_assumptions.l1_fee_per_byte_wei = l1_fee_per_byte_wei;
@@ -249,49 +254,71 @@ where
         );
     }
     let mut plans = Vec::new();
+    let mut group_index = 0usize;
 
-    for (group_index, group) in groups.iter().enumerate() {
-        let first_action_index =
-            group
-                .first_action_index()
-                .ok_or(GroupPlanningError::MissingEdge {
-                    group_index,
+    for (step_index, step_group) in step_groups.iter().enumerate() {
+        let step_subgroup_count = step_group.strict_groups.len();
+        let mut step_plans = Vec::with_capacity(step_subgroup_count);
+        let mut step_failed = false;
+        for (step_subgroup_index, group) in step_group.strict_groups.iter().enumerate() {
+            let subgroup_index = group_index;
+            group_index += 1;
+            let first_action_index =
+                group
+                    .first_action_index()
+                    .ok_or(GroupPlanningError::MissingEdge {
+                        group_index: subgroup_index,
+                        group_kind: group.kind,
+                        first_action_index: 0,
+                    })?;
+
+            let edge =
+                edge_provider(subgroup_index, group).ok_or(GroupPlanningError::MissingEdge {
+                    group_index: subgroup_index,
                     group_kind: group.kind,
-                    first_action_index: 0,
+                    first_action_index,
                 })?;
 
-        let edge = edge_provider(group_index, group).ok_or(GroupPlanningError::MissingEdge {
-            group_index,
-            group_kind: group.kind,
-            first_action_index,
-        })?;
-
-        match build_group_plan_with_reason(
-            group,
-            edge,
-            &effective_gas_assumptions,
-            gas_price_eth,
-            eth_usd_assumed,
-            buffer,
-        ) {
-            Ok(plan) => plans.push(plan),
-            Err(skip_reason) => {
-                tracing::info!(
-                    group_index,
-                    group_kind = ?group.kind,
-                    first_action_index,
-                    %skip_reason,
-                    "skipped group"
-                );
+            match build_group_plan_with_reason(
+                group,
+                edge,
+                &effective_gas_assumptions,
+                gas_price_eth,
+                eth_usd_assumed,
+                buffer,
+            ) {
+                Ok(mut plan) => {
+                    plan.profitability_step_index = step_index;
+                    plan.step_subgroup_index = step_subgroup_index;
+                    plan.step_subgroup_count = step_subgroup_count;
+                    step_plans.push(plan);
+                }
+                Err(skip_reason) => {
+                    tracing::info!(
+                        group_index = subgroup_index,
+                        step_index,
+                        step_subgroup_index,
+                        group_kind = ?group.kind,
+                        first_action_index,
+                        %skip_reason,
+                        "skipped group"
+                    );
+                    step_failed = true;
+                    break;
+                }
             }
         }
-    }
 
-    plans.sort_by(|a, b| {
-        b.guaranteed_profit_floor_susd
-            .total_cmp(&a.guaranteed_profit_floor_susd)
-            .then_with(|| b.edge_plan_susd.total_cmp(&a.edge_plan_susd))
-    });
+        if step_failed {
+            tracing::info!(
+                step_index,
+                step_kind = ?step_group.kind,
+                "stopping planning at first unplannable profitability step to avoid partial-step execution"
+            );
+            break;
+        }
+        plans.extend(step_plans);
+    }
 
     Ok(plans)
 }
@@ -515,29 +542,78 @@ mod tests {
     }
 
     #[test]
-    fn groups_are_sorted_by_guaranteed_profit_floor() {
+    fn plans_preserve_profitability_step_and_subgroup_order() {
         let actions = vec![
             sell("a", 1.0, 10.0),
             sell("b", 1.0, 2.0),
             buy("c", 1.0, 1.0),
         ];
+        let gas = GasAssumptions {
+            direct_sell_l2_units: 0,
+            direct_buy_l2_units: 0,
+            l1_data_fee_floor_susd: 0.0,
+            l1_fee_per_byte_wei: 1.0,
+            ..GasAssumptions::default()
+        };
         let plans = build_group_plans_with_edge_provider(
             &actions,
-            &test_gas_assumptions(),
-            1e-10,
-            3000.0,
-            BufferConfig::default(),
-            |_, group| Some(planned_cashflow_edge_susd(group).max(0.1)),
+            &gas,
+            0.0,
+            0.0,
+            BufferConfig {
+                buffer_frac: 0.0,
+                buffer_min_susd: 0.0,
+            },
+            |_, _| Some(10.0),
         )
         .expect("planning should succeed");
 
-        assert!(!plans.is_empty());
-        for w in plans.windows(2) {
-            assert!(
-                w[0].guaranteed_profit_floor_susd >= w[1].guaranteed_profit_floor_susd,
-                "plans should be sorted by guaranteed profit floor"
-            );
-        }
+        assert_eq!(plans.len(), 3, "expected one plan per strict subgroup");
+        assert_eq!(plans[0].profitability_step_index, 0);
+        assert_eq!(plans[0].step_subgroup_index, 0);
+        assert_eq!(plans[0].step_subgroup_count, 2);
+        assert_eq!(plans[0].action_indices, vec![0]);
+        assert_eq!(plans[1].profitability_step_index, 0);
+        assert_eq!(plans[1].step_subgroup_index, 1);
+        assert_eq!(plans[1].step_subgroup_count, 2);
+        assert_eq!(plans[1].action_indices, vec![1]);
+        assert_eq!(plans[2].profitability_step_index, 1);
+        assert_eq!(plans[2].step_subgroup_index, 0);
+        assert_eq!(plans[2].step_subgroup_count, 1);
+        assert_eq!(plans[2].action_indices, vec![2]);
+    }
+
+    #[test]
+    fn drops_partial_profitability_step_and_halts_following_steps() {
+        let actions = vec![
+            sell("a", 1.0, 10.0),
+            sell("b", 1.0, 0.0),
+            buy("c", 1.0, 1.0),
+        ];
+        let gas = GasAssumptions {
+            direct_sell_l2_units: 0,
+            direct_buy_l2_units: 0,
+            l1_data_fee_floor_susd: 0.0,
+            l1_fee_per_byte_wei: 1.0,
+            ..GasAssumptions::default()
+        };
+        let plans = build_group_plans_with_edge_provider(
+            &actions,
+            &gas,
+            0.0,
+            0.0,
+            BufferConfig {
+                buffer_frac: 0.0,
+                buffer_min_susd: 0.0,
+            },
+            |_, _| Some(10.0),
+        )
+        .expect("planning should not hard-fail on skip");
+
+        assert!(
+            plans.is_empty(),
+            "step with unplannable subgroup must be dropped atomically, and later steps must not be planned"
+        );
     }
 
     #[test]
@@ -995,6 +1071,9 @@ mod tests {
         let plan = ExecutionGroupPlan {
             kind: GroupKind::MintSell,
             action_indices: vec![0, 1],
+            profitability_step_index: 0,
+            step_subgroup_index: 0,
+            step_subgroup_count: 1,
             legs: vec![
                 ExecutionLegPlan {
                     action_index: 0,
@@ -1036,6 +1115,9 @@ mod tests {
         let mut plan = ExecutionGroupPlan {
             kind: GroupKind::DirectBuy,
             action_indices: vec![0],
+            profitability_step_index: 0,
+            step_subgroup_index: 0,
+            step_subgroup_count: 1,
             legs: vec![ExecutionLegPlan {
                 action_index: 0,
                 market_name: Some("a"),

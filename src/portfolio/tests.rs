@@ -6,7 +6,7 @@ use super::merge::{
     split_sell_total_proceeds_with_inventory,
 };
 use super::rebalancer::{RebalanceMode, rebalance, rebalance_with_mode};
-use super::sim::{PoolSim, Route, build_sims, profitability};
+use super::sim::{PoolSim, Route, profitability};
 use super::trading::{ExecutionState, emit_mint_actions, execute_buy};
 use super::waterfall::waterfall;
 use crate::markets::MarketData;
@@ -1074,194 +1074,19 @@ fn replay_actions_to_state(
     initial_balances: &HashMap<&str, f64>,
     initial_susd: f64,
 ) -> (HashMap<&'static str, f64>, f64) {
-    let mut holdings: HashMap<&'static str, f64> = HashMap::new();
-    for (_, market) in slot0_results {
-        holdings.insert(
-            market.name,
-            initial_balances
-                .get(market.name)
-                .copied()
-                .unwrap_or(0.0)
-                .max(0.0),
-        );
-    }
-    let mut cash = initial_susd;
-    for action in actions {
-        match action {
-            Action::Buy {
-                market_name,
-                amount,
-                cost,
-            } => {
-                *holdings.entry(*market_name).or_insert(0.0) += *amount;
-                cash -= *cost;
-            }
-            Action::Sell {
-                market_name,
-                amount,
-                proceeds,
-            } => {
-                *holdings.entry(*market_name).or_insert(0.0) -= *amount;
-                cash += *proceeds;
-            }
-            Action::Mint { amount, .. } => {
-                for (_, market) in slot0_results {
-                    *holdings.entry(market.name).or_insert(0.0) += *amount;
-                }
-            }
-            Action::Merge { amount, .. } => {
-                for (_, market) in slot0_results {
-                    *holdings.entry(market.name).or_insert(0.0) -= *amount;
-                }
-                cash += *amount;
-            }
-            Action::FlashLoan { amount } => cash += *amount,
-            Action::RepayFlashLoan { amount } => cash -= *amount,
-        }
-    }
-    (holdings, cash)
+    super::diagnostics::replay_actions_to_portfolio_state(
+        actions,
+        slot0_results,
+        initial_balances,
+        initial_susd,
+    )
 }
 
 fn replay_actions_to_market_state(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static MarketData)],
 ) -> Vec<(Slot0Result, &'static MarketData)> {
-    let preds = crate::pools::prediction_map();
-    let mut sims =
-        build_sims(slot0_results, &preds).expect("test fixtures should have prediction coverage");
-    let mut idx_by_market: HashMap<&str, usize> = HashMap::new();
-    for (i, sim) in sims.iter().enumerate() {
-        idx_by_market.insert(sim.market_name, i);
-    }
-
-    for action in actions {
-        match action {
-            Action::Buy {
-                market_name,
-                amount,
-                ..
-            } => {
-                if let Some(&idx) = idx_by_market.get(market_name) {
-                    if let Some((bought, _, new_price)) = sims[idx].buy_exact(*amount) {
-                        if bought > 0.0 {
-                            sims[idx].set_price(new_price);
-                        }
-                    }
-                }
-            }
-            Action::Sell {
-                market_name,
-                amount,
-                ..
-            } => {
-                if let Some(&idx) = idx_by_market.get(market_name) {
-                    if let Some((sold, _, new_price)) = sims[idx].sell_exact(*amount) {
-                        if sold > 0.0 {
-                            sims[idx].set_price(new_price);
-                        }
-                    }
-                }
-            }
-            Action::Mint { .. }
-            | Action::Merge { .. }
-            | Action::FlashLoan { .. }
-            | Action::RepayFlashLoan { .. } => {}
-        }
-    }
-
-    slot0_results
-        .iter()
-        .map(|(slot0, market)| {
-            let mut next = slot0.clone();
-            if let Some(&idx) = idx_by_market.get(market.name) {
-                if let Some(pool) = market.pool.as_ref() {
-                    let is_token1_outcome =
-                        pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
-                    let p = sims[idx].price().max(1e-12);
-                    next.sqrt_price_x96 = prediction_to_sqrt_price_x96(p, is_token1_outcome)
-                        .unwrap_or(slot0.sqrt_price_x96);
-                }
-            }
-            (next, *market)
-        })
-        .collect()
-}
-
-fn sorted_market_prices(
-    slot0_results: &[(Slot0Result, &'static MarketData)],
-) -> Option<Vec<(&'static str, f64)>> {
-    let preds = crate::pools::prediction_map();
-    let sims = build_sims(slot0_results, &preds).ok()?;
-    let mut prices: Vec<(&'static str, f64)> = sims
-        .iter()
-        .map(|sim| (sim.market_name, sim.price()))
-        .collect();
-    prices.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-    Some(prices)
-}
-
-fn print_market_price_changes(
-    label: &str,
-    prices_before: &[(&'static str, f64)],
-    prices_after: &[(&'static str, f64)],
-) {
-    let after_by_market: HashMap<&'static str, f64> = prices_after.iter().copied().collect();
-    const RED: &str = "\x1b[31m";
-    const GREEN: &str = "\x1b[32m";
-    const GRAY: &str = "\x1b[90m";
-    const RESET: &str = "\x1b[0m";
-
-    println!("[rebalance][{}] market price changes:", label);
-    for &(market_name, before) in prices_before {
-        let Some(after) = after_by_market.get(market_name).copied() else {
-            println!(
-                "  {}{}: {:.9} -> (missing){}",
-                GRAY, market_name, before, RESET
-            );
-            continue;
-        };
-        let delta = after - before;
-        let pct_change = if before.abs() <= 1e-12 {
-            0.0
-        } else {
-            100.0 * delta / before
-        };
-        let (color, direction) = if delta > 1e-12 {
-            (GREEN, "up")
-        } else if delta < -1e-12 {
-            (RED, "down")
-        } else {
-            (GRAY, "flat")
-        };
-        println!(
-            "  {}{}: {:.9} -> {:.9} ({:+.4}%, {}){}",
-            color, market_name, before, after, pct_change, direction, RESET
-        );
-    }
-}
-
-fn split_actions_by_complete_set_arb_phase(actions: &[Action]) -> (&[Action], &[Action]) {
-    const COMPLETE_SET_ARB: &str = "complete_set_arb";
-    let marker_idx = actions.iter().position(|action| match action {
-        Action::Merge { source_market, .. } => *source_market == COMPLETE_SET_ARB,
-        Action::Mint { target_market, .. } => *target_market == COMPLETE_SET_ARB,
-        _ => false,
-    });
-
-    let Some(marker_idx) = marker_idx else {
-        return (&actions[0..0], actions);
-    };
-
-    let mut arb_end = marker_idx;
-    if matches!(actions.first(), Some(Action::FlashLoan { .. }))
-        && let Some(repay_offset) = actions[marker_idx + 1..]
-            .iter()
-            .position(|action| matches!(action, Action::RepayFlashLoan { .. }))
-    {
-        arb_end = marker_idx + 1 + repay_offset;
-    }
-
-    (&actions[..=arb_end], &actions[arb_end + 1..])
+    super::diagnostics::replay_actions_to_market_state(actions, slot0_results)
 }
 
 fn print_rebalance_execution_summary(
@@ -1269,88 +1094,12 @@ fn print_rebalance_execution_summary(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static MarketData)],
 ) {
-    let Some(prices_before) = sorted_market_prices(slot0_results) else {
-        print_trade_summary(label, actions);
-        println!(
-            "[rebalance][{}] market price deltas unavailable (snapshot could not be mapped to sims)",
-            label
-        );
-        return;
-    };
-    let price_sum_before: f64 = prices_before.iter().map(|(_, p)| *p).sum();
-    let (arb_actions, non_arb_actions) = split_actions_by_complete_set_arb_phase(actions);
-
-    if !arb_actions.is_empty() {
-        let arb_label = format!("{}_arb_phase", label);
-        print_trade_summary(&arb_label, arb_actions);
-        let slot0_after_arb = replay_actions_to_market_state(arb_actions, slot0_results);
-        if let Some(prices_after_arb) = sorted_market_prices(&slot0_after_arb) {
-            let price_sum_after_arb: f64 = prices_after_arb.iter().map(|(_, p)| *p).sum();
-            print_market_price_changes(&arb_label, &prices_before, &prices_after_arb);
-            println!(
-                "[rebalance][{}] market price sum before={:.9}",
-                arb_label, price_sum_before
-            );
-            println!(
-                "[rebalance][{}] market price sum after={:.9}",
-                arb_label, price_sum_after_arb
-            );
-
-            let non_arb_label = format!("{}_non_arb_phase", label);
-            print_trade_summary(&non_arb_label, non_arb_actions);
-            let slot0_after_non_arb =
-                replay_actions_to_market_state(non_arb_actions, &slot0_after_arb);
-            if let Some(prices_after_non_arb) = sorted_market_prices(&slot0_after_non_arb) {
-                let price_sum_after_non_arb: f64 =
-                    prices_after_non_arb.iter().map(|(_, p)| *p).sum();
-                print_market_price_changes(
-                    &non_arb_label,
-                    &prices_after_arb,
-                    &prices_after_non_arb,
-                );
-                println!(
-                    "[rebalance][{}] market price sum before={:.9}",
-                    non_arb_label, price_sum_after_arb
-                );
-                println!(
-                    "[rebalance][{}] market price sum after={:.9}",
-                    non_arb_label, price_sum_after_non_arb
-                );
-
-                let total_label = format!("{}_total", label);
-                print_trade_summary(&total_label, actions);
-                println!(
-                    "[rebalance][{}] market price sum before={:.9}",
-                    total_label, price_sum_before
-                );
-                println!(
-                    "[rebalance][{}] market price sum after={:.9}",
-                    total_label, price_sum_after_non_arb
-                );
-                return;
-            }
-        }
-    }
-
-    print_trade_summary(label, actions);
-    let slot0_after = replay_actions_to_market_state(actions, slot0_results);
-    if let Some(prices_after) = sorted_market_prices(&slot0_after) {
-        let price_sum_after: f64 = prices_after.iter().map(|(_, p)| *p).sum();
-        print_market_price_changes(label, &prices_before, &prices_after);
-        println!(
-            "[rebalance][{}] market price sum before={:.9}",
-            label, price_sum_before
-        );
-        println!(
-            "[rebalance][{}] market price sum after={:.9}",
-            label, price_sum_after
-        );
-    } else {
-        println!(
-            "[rebalance][{}] market price deltas unavailable after replay",
-            label
-        );
-    }
+    super::diagnostics::print_rebalance_execution_summary(
+        label,
+        actions,
+        slot0_results,
+        super::diagnostics::TraceConfig::from_env(),
+    );
 }
 
 fn print_portfolio_snapshot(
@@ -1359,99 +1108,12 @@ fn print_portfolio_snapshot(
     holdings: &HashMap<&'static str, f64>,
     cash: f64,
 ) {
-    let mut non_zero_positions: Vec<(&'static str, f64)> = holdings
-        .iter()
-        .map(|(name, units)| (*name, *units))
-        .filter(|(_, units)| units.abs() > 1e-12)
-        .collect();
-    non_zero_positions.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
-
-    println!(
-        "[rebalance][{}] {} portfolio: cash={:.9}, non_zero_positions={}/{}",
+    super::diagnostics::print_portfolio_snapshot(
         label,
         stage,
+        holdings,
         cash,
-        non_zero_positions.len(),
-        holdings.len()
-    );
-    if non_zero_positions.is_empty() {
-        println!("  (no non-zero holdings)");
-        return;
-    }
-
-    for (name, units) in non_zero_positions {
-        println!("  {}: {:.9}", name, units);
-    }
-}
-
-fn print_trade_summary(label: &str, actions: &[Action]) {
-    let mut buy_count = 0usize;
-    let mut buy_units = 0.0_f64;
-    let mut buy_cost = 0.0_f64;
-    let mut sell_count = 0usize;
-    let mut sell_units = 0.0_f64;
-    let mut sell_proceeds = 0.0_f64;
-    let mut mint_count = 0usize;
-    let mut mint_amount = 0.0_f64;
-    let mut merge_count = 0usize;
-    let mut merge_amount = 0.0_f64;
-    let mut flash_count = 0usize;
-    let mut flash_amount = 0.0_f64;
-    let mut repay_count = 0usize;
-    let mut repay_amount = 0.0_f64;
-
-    for action in actions {
-        match action {
-            Action::Buy { amount, cost, .. } => {
-                buy_count += 1;
-                buy_units += *amount;
-                buy_cost += *cost;
-            }
-            Action::Sell {
-                amount, proceeds, ..
-            } => {
-                sell_count += 1;
-                sell_units += *amount;
-                sell_proceeds += *proceeds;
-            }
-            Action::Mint { amount, .. } => {
-                mint_count += 1;
-                mint_amount += *amount;
-            }
-            Action::Merge { amount, .. } => {
-                merge_count += 1;
-                merge_amount += *amount;
-            }
-            Action::FlashLoan { amount } => {
-                flash_count += 1;
-                flash_amount += *amount;
-            }
-            Action::RepayFlashLoan { amount } => {
-                repay_count += 1;
-                repay_amount += *amount;
-            }
-        }
-    }
-
-    println!("[rebalance][{}] trade summary:", label);
-    println!("  actions: {}", actions.len());
-    println!(
-        "  buy: count={}, units={:.9}, cost={:.9}",
-        buy_count, buy_units, buy_cost
-    );
-    println!(
-        "  sell: count={}, units={:.9}, proceeds={:.9}",
-        sell_count, sell_units, sell_proceeds
-    );
-    println!("  mint: count={}, amount={:.9}", mint_count, mint_amount);
-    println!("  merge: count={}, amount={:.9}", merge_count, merge_amount);
-    println!(
-        "  flash_loan: count={}, amount={:.9}",
-        flash_count, flash_amount
-    );
-    println!(
-        "  repay_flash_loan: count={}, amount={:.9}",
-        repay_count, repay_amount
+        super::diagnostics::TraceConfig::from_env(),
     );
 }
 

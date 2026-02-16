@@ -52,6 +52,9 @@ pub struct ExecutionLegPlan {
 pub struct ExecutionGroupPlan {
     pub kind: GroupKind,
     pub action_indices: Vec<usize>,
+    pub profitability_step_index: usize,
+    pub step_subgroup_index: usize,
+    pub step_subgroup_count: usize,
     pub legs: Vec<ExecutionLegPlan>,
     pub planned_at_block: Option<u64>,
     pub edge_plan_susd: f64,
@@ -260,6 +263,9 @@ mod tests {
         let plan = ExecutionGroupPlan {
             kind: GroupKind::DirectBuy,
             action_indices: vec![0],
+            profitability_step_index: 0,
+            step_subgroup_index: 0,
+            step_subgroup_count: 1,
             legs: vec![ExecutionLegPlan {
                 action_index: 0,
                 market_name: Some("x"),
@@ -290,6 +296,9 @@ mod tests {
         let mut plan = ExecutionGroupPlan {
             kind: GroupKind::DirectSell,
             action_indices: vec![0],
+            profitability_step_index: 0,
+            step_subgroup_index: 0,
+            step_subgroup_count: 1,
             legs: vec![ExecutionLegPlan {
                 action_index: 0,
                 market_name: Some("x"),

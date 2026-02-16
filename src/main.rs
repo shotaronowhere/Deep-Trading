@@ -1,33 +1,105 @@
-use alloy::{
-    primitives::{U256, address},
-    providers::{ProviderBuilder, WsConnect},
-    sol,
-};
+use std::collections::HashMap;
+use std::error::Error;
+use std::str::FromStr;
 
-sol! {
-    #[sol(rpc)]
-    contract Market {
-        function wrappedOutcome(uint256 index) external view returns (address wrapped1155, bytes memory data);
-        function outcomes(uint256) external view returns (string memory);
+use alloy::primitives::Address;
+use deep_trading_bot::pools;
+use deep_trading_bot::portfolio::{self, RebalanceMode, TraceConfig};
+
+fn parse_rebalance_mode() -> RebalanceMode {
+    match std::env::var("REBALANCE_MODE")
+        .ok()
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("arb") | Some("arb_only") | Some("arbonly") => RebalanceMode::ArbOnly,
+        _ => RebalanceMode::Full,
     }
 }
 
+fn parse_starting_susd() -> f64 {
+    std::env::var("STARTING_SUSD")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(100.0)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Connect to an Ethereum node via WebSocket
-    let ws = WsConnect::new("wss://optimism.drpc.org");
-    let provider = ProviderBuilder::new().connect_ws(ws).await?;
-    // Setup the Market contract instance
-    let market_add = address!("0xf93c838e4b5dc163320ca1bd2d23a4f59ad6e57c");
-    let market = Market::new(market_add, &provider);
+    let rpc_url = std::env::var("RPC").unwrap_or_else(|_| "https://optimism.drpc.org".to_string());
+    let provider =
+        alloy::providers::ProviderBuilder::new().with_reqwest(rpc_url.parse()?, |builder| {
+            builder
+                .no_proxy()
+                .build()
+                .expect("failed to build reqwest client")
+        });
 
-    // Example: Fetch wrapped outcome for index 0
-    let outcome = market.outcomes(U256::from(0)).call().await?;
-    println!("Outcome: {:?}", outcome);
+    let slot0_results = pools::fetch_all_slot0(provider.clone()).await?;
+    if slot0_results.is_empty() {
+        tracing::warn!("no pooled markets were fetched; skipping rebalance run");
+        return Ok(());
+    }
+
+    let (initial_susd, balances_owned): (f64, HashMap<&'static str, f64>) =
+        if let Ok(wallet_raw) = std::env::var("WALLET") {
+            let wallet = Address::from_str(wallet_raw.trim())?;
+            tracing::info!(wallet = %wallet, "fetching wallet balances");
+            pools::fetch_balances(provider.clone(), wallet).await?
+        } else {
+            let starting_susd = parse_starting_susd();
+            tracing::info!(
+                starting_susd,
+                "WALLET not set; using synthetic starting state with zero outcome holdings"
+            );
+            (starting_susd, HashMap::new())
+        };
+
+    let balances_view: HashMap<&str, f64> = balances_owned
+        .iter()
+        .map(|(market, units)| (*market as &str, *units))
+        .collect();
+
+    let mode = parse_rebalance_mode();
+    let actions =
+        portfolio::rebalance_with_mode(&balances_view, initial_susd, &slot0_results, mode);
+    let (final_holdings, final_susd) = portfolio::replay_actions_to_portfolio_state(
+        &actions,
+        &slot0_results,
+        &balances_view,
+        initial_susd,
+    );
+    let trace_config = TraceConfig::from_env();
+
+    tracing::info!(
+        mode = ?mode,
+        markets = slot0_results.len(),
+        actions = actions.len(),
+        "completed rebalance planning"
+    );
+
+    portfolio::print_portfolio_snapshot(
+        "runtime",
+        "initial",
+        &balances_owned,
+        initial_susd,
+        trace_config,
+    );
+    portfolio::print_rebalance_execution_summary("runtime", &actions, &slot0_results, trace_config);
+    portfolio::print_portfolio_snapshot(
+        "runtime",
+        "final",
+        &final_holdings,
+        final_susd,
+        trace_config,
+    );
 
     Ok(())
 }

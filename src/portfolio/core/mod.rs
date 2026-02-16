@@ -1,3 +1,4 @@
+pub mod diagnostics;
 mod merge;
 mod planning;
 mod rebalancer;

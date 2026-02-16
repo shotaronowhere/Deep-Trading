@@ -53,11 +53,11 @@ API (deep.seer.pm)
 - **src/pools/analytics.rs**: Profitability/depth analytics
 - **src/pools/rpc.rs**: On-chain pool + balance multicall queries
 - **src/pools/cache.rs**: Local balance cache serialization and staleness checks
-- **src/execution/bounds.rs**: Group planning, strict gating, and execution-plan orchestration
+- **src/execution/bounds.rs**: Profitability-step-aware strict-subgroup planning, strict gating, and prefix-safe execution-plan orchestration
 - **src/execution/edge.rs**: Group cashflow/EV edge derivation helpers
 - **src/execution/batch_bounds.rs**: Aggregate `sell(min)` / `buy(max)` bound derivation + plan stamping
 - **src/execution/gas.rs**: L2/L1 gas estimate model + cached Optimism L1 fee-per-byte hydration
-- **src/execution/grouping.rs**: Action grouping and flash-bracket shape validation
+- **src/execution/grouping.rs**: Strict action grouping, profitability-step formation, and flash-bracket shape validation
 - **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
 - **src/portfolio/core/mod.rs**: Portfolio core aggregation module
 - **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers

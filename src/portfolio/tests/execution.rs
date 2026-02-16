@@ -18,7 +18,7 @@ use crate::execution::bounds::{
     derive_batch_quote_bounds, stamp_plans_with_block,
 };
 use crate::execution::gas::GasAssumptions;
-use crate::execution::grouping::group_actions;
+use crate::execution::grouping::{group_actions, group_execution_actions};
 use crate::pools::{Slot0Result, normalize_market_name, prediction_to_sqrt_price_x96};
 use alloy::primitives::{Address, U256};
 
@@ -783,9 +783,76 @@ fn test_rebalance_output_is_groupable() {
 }
 
 #[test]
-fn test_rebalance_output_is_plannable_with_default_edge_model() {
+fn test_rebalance_mixed_groups_are_route_coupled() {
     let actions = sample_rebalance_actions();
     let groups = group_actions(&actions).expect("rebalance output should be groupable");
+
+    for (group_idx, group) in groups.iter().enumerate() {
+        match group.kind {
+            GroupKind::MintSell => {
+                let mut direct_buy_markets: HashSet<&'static str> = HashSet::new();
+                let mut mint_targets: HashSet<&'static str> = HashSet::new();
+                for &action_idx in &group.action_indices {
+                    match actions[action_idx] {
+                        Action::Buy { market_name, .. } => {
+                            direct_buy_markets.insert(market_name);
+                        }
+                        Action::Mint { target_market, .. } => {
+                            mint_targets.insert(target_market);
+                        }
+                        Action::Sell { .. }
+                        | Action::Merge { .. }
+                        | Action::FlashLoan { .. }
+                        | Action::RepayFlashLoan { .. } => {}
+                    }
+                }
+
+                if !direct_buy_markets.is_empty() {
+                    assert!(
+                        direct_buy_markets
+                            .iter()
+                            .any(|market| mint_targets.contains(market)),
+                        "group #{group_idx} mixes direct buys with mint-sell legs without shared target market"
+                    );
+                }
+            }
+            GroupKind::BuyMerge => {
+                let mut direct_sell_markets: HashSet<&'static str> = HashSet::new();
+                let mut merge_sources: HashSet<&'static str> = HashSet::new();
+                for &action_idx in &group.action_indices {
+                    match actions[action_idx] {
+                        Action::Sell { market_name, .. } => {
+                            direct_sell_markets.insert(market_name);
+                        }
+                        Action::Merge { source_market, .. } => {
+                            merge_sources.insert(source_market);
+                        }
+                        Action::Buy { .. }
+                        | Action::Mint { .. }
+                        | Action::FlashLoan { .. }
+                        | Action::RepayFlashLoan { .. } => {}
+                    }
+                }
+
+                if !direct_sell_markets.is_empty() {
+                    assert!(
+                        direct_sell_markets
+                            .iter()
+                            .any(|market| merge_sources.contains(market)),
+                        "group #{group_idx} mixes direct sells with buy-merge legs without shared source market"
+                    );
+                }
+            }
+            GroupKind::DirectBuy | GroupKind::DirectSell | GroupKind::DirectMerge => {}
+        }
+    }
+}
+
+#[test]
+fn test_rebalance_output_is_plannable_with_default_edge_model() {
+    let actions = sample_rebalance_actions();
+    let strict_groups =
+        group_execution_actions(&actions).expect("rebalance output should be strictly groupable");
 
     let plans = build_group_plans_with_default_edges(
         &actions,
@@ -796,7 +863,7 @@ fn test_rebalance_output_is_plannable_with_default_edge_model() {
     )
     .expect("planning should succeed with built-in direct-buy edge mapping");
 
-    let direct_buy_groups = groups
+    let direct_buy_groups = strict_groups
         .iter()
         .filter(|g| g.kind == GroupKind::DirectBuy)
         .count();
@@ -1039,9 +1106,6 @@ async fn test_rebalance_arb_only_full_l1_live_prices() {
         "[rebalance][live_full_l1_arb_only] actions count={}",
         actions.len()
     );
-    for (i, action) in actions.iter().enumerate() {
-        println!("  [{}] {:?}", i, action);
-    }
 
     assert_eq!(
         format!("{:?}", actions),

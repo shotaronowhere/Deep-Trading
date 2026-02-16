@@ -49,9 +49,25 @@ cargo build
 
 ### Run
 
+Default runtime flow:
+- fetches live L1 `slot0` data,
+- optionally fetches wallet balances when `WALLET` is set,
+- runs portfolio rebalance (`REBALANCE_MODE=full|arb_only`),
+- prints initial/final portfolio snapshots from shared action replay,
+- prints the shared execution diagnostics summary used in tests.
+
 ```bash
 cargo run
 ```
+
+Optional environment:
+- `RPC` (default: `https://optimism.drpc.org`)
+- `WALLET` (EVM address; if unset, runtime uses synthetic zero holdings + `STARTING_SUSD`)
+- `STARTING_SUSD` (default `100.0`, only used when `WALLET` is unset)
+- `RUST_LOG` (tracing filter; can be supplied via shell env or `.env`)
+- `REBALANCE_MODE` (`full` default, or `arb_only`)
+- `REBALANCE_FULL_MARKET_DELTAS=1` (full per-market deltas)
+- `REBALANCE_FULL_PORTFOLIO=1` (full portfolio print)
 
 ## Documentation
 

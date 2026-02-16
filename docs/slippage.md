@@ -21,14 +21,21 @@ We add strict execution guardrails for stale pool states between planning and in
 ## 2. Execution Model
 
 ### 2.1 Group unit
-A group is one dependency-coupled execution unit:
+A strict subgroup is one dependency-coupled execution unit:
 1. Direct buy group: one `Buy`.
 2. Direct sell group: one `Sell`.
 3. Direct merge group: one `Merge` (inventory merge, no pool buys).
 4. Mint-sell group: `FlashLoan -> Mint -> Sell* -> RepayFlashLoan`.
 5. Buy-merge group: `FlashLoan -> Buy* -> Merge -> RepayFlashLoan`.
 
-We execute exactly one group per tx in strict mode.
+Profitability-step grouping builds ordered step blocks from the strict stream:
+1. Pure direct (`DirectBuy`, `DirectSell`, `DirectMerge`)
+2. Pure arb (`MintSell`, `BuyMerge`)
+3. Mixed `DirectBuy + MintSell`
+4. Mixed `DirectSell + BuyMerge`
+
+Each step stores its ordered strict subgroups so execution can preserve waterfall-equality semantics while still deriving per-subgroup basket bounds.
+Strict mode submits one strict subgroup per tx.
 Unsupported action streams outside these shapes fail closed at grouping time (planner error, no submission).
 Flash-loan bracket ordering is strict and validated exactly:
 `Mint` must be the first inner action for `MintSell`, and `Merge` must be the last inner action for `BuyMerge`.
@@ -166,11 +173,16 @@ From existing `Action` stream in `/src/portfolio/core/types.rs`:
 1. Direct groups from standalone `Buy`/`Sell`.
 2. Standalone `Merge` grouped as `DirectMerge`.
 3. Mint-sell and buy-merge groups from flash-loan bracket patterns.
-4. `DirectBuy` edge defaults to prediction EV delta (`amount * prediction - cost`) via normalized market-name lookup.
-5. `derive_batch_quote_bounds(plan, current_block, max_stale_blocks)` maps planned groups into canonical `buy(max)` / `sell(min)` inputs and rejects stale/unstamped plans.
-6. `derive_batch_quote_bounds_unchecked(plan)` remains available for non-execution diagnostics.
-7. Debug builds assert non-negative finite economics on planner-consumed action fields (`amount`, `cost`, `proceeds`) to catch upstream numeric corruption early.
-8. Planner computes cashflow and DEX-leg summaries from a single action pass per group, reducing duplicate iteration and keeping extraction logic aligned.
+4. Profitability-step grouping merges strict groups into ordered step blocks with explicit step kind metadata and embedded strict subgroup list.
+5. Planner emits one `ExecutionGroupPlan` per strict subgroup and stamps each plan with:
+   - `profitability_step_index`
+   - `step_subgroup_index`
+   - `step_subgroup_count`
+6. `DirectBuy` edge defaults to prediction EV delta (`amount * prediction - cost`) via normalized market-name lookup.
+7. `derive_batch_quote_bounds(plan, current_block, max_stale_blocks)` maps planned groups into canonical `buy(max)` / `sell(min)` inputs and rejects stale/unstamped plans.
+8. `derive_batch_quote_bounds_unchecked(plan)` remains available for non-execution diagnostics.
+9. Debug builds assert non-negative finite economics on planner-consumed action fields (`amount`, `cost`, `proceeds`) to catch upstream numeric corruption early.
+10. Planner computes cashflow and DEX-leg summaries from a single action pass per group, reducing duplicate iteration and keeping extraction logic aligned.
 
 ### 6.3 Gas estimation (v1)
 Hardcoded L2 gas units:
@@ -202,12 +214,17 @@ Inputs:
 14. cached L1-fee-per-byte values are keyed by RPC endpoint; endpoint-agnostic fallback only uses cache when there is exactly one fresh entry, otherwise it fails closed.
 
 ### 6.4 Ordering
-Order candidate groups by:
+Plan order is preserved as:
+1. `profitability_step_index` (waterfall order)
+2. `step_subgroup_index` (strict subgroup order inside each step)
+3. Planning is prefix-safe: if any strict subgroup in a step is unplannable, the entire step is dropped and planning stops before later steps (no partial-step execution).
+
+Each subgroup still gates on:
 1. `guaranteed_profit_floor_susd = edge_plan_susd - gas_total_susd - slippage_budget_susd`
 2. for DEX-leg groups, by construction this equals `profit_buffer_susd`
 3. for `DirectMerge`, this is residual post-buffer margin (`edge_plan_susd - gas_total_susd - profit_buffer_susd`)
 
-Execute descending guaranteed profit floor with replan-after-each-group.
+Execution should replan after each submitted subgroup (or after each full step when atomic multi-subgroup submission is supported).
 
 ## 7. Modes
 

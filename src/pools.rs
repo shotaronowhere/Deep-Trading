@@ -16,7 +16,6 @@ pub use swap::{SwapResult, simulate_buy, simulate_swap};
 pub(crate) use pricing::u256_to_f64;
 pub(crate) use swap::FEE_PIPS;
 
-#[cfg(test)]
 pub(crate) use pricing::prediction_to_sqrt_price_x96;
 
 #[cfg(test)]
