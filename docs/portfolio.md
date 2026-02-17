@@ -73,6 +73,9 @@ The waterfall treats each (outcome, route) pair as a separate entry. The same ou
 
 **Monotonicity guard:** If a mint pushes a non-active entry's profitability *above* `current_prof`, it is absorbed into the active set immediately (no cost step) before the next descent. This prevents the water level from moving upward, which would break `solve_prof`'s assumptions.
 
+**Intra-step active-set boundary:** Planning applies boundary step-splitting to **mint** legs only. The split point is the earliest of: (1) a non-active route reaching `current_prof`, or (2) a non-active direct profitability crossing the active mint route's in-step profitability (`prof_non_active >= prof_active_mint`) before `current_prof` is reached. Direct legs are not intra-step truncated. This route-asymmetric policy preserves mint-side coupling control while avoiding EV leakage from fragmented direct execution. A boundary hit is a **step split within the same profitability group**, not a new level and not a terminal stop: after that partial mint leg, the loop promotes all outcomes that now meet `current_prof`, recomputes `skip`, re-ranks non-active outcomes from current pool state (next-highest only), and keeps building the current step until the next lower profitability level is reached.
+If budget is exhausted immediately after such a split, `waterfall` returns the realized post-split marginal profitability (from the executed boundary leg), not the pre-split `current_prof`.
+
 **Ranking example:** Outcome A has direct price 0.05 (prof = 1.0) and mint price 0.03 (prof = 2.33). Outcome B has direct prof = 0.6.
 
 | Entry | Route | Prof |
@@ -194,6 +197,8 @@ Portfolio tests are split across `src/portfolio/tests.rs` (shared fixtures + ear
 - `test_mint_first_order_can_make_zero_cash_plan_feasible`: sampled mixed-route adversarial search proving order-sensitive feasibility; verifies mint-first execution can make a zero-cash plan feasible while direct-first ordering is infeasible.
 - `test_fuzz_rebalance_partial_direct_only_ev_non_decreasing`: partial-L1 direct-only fuzz property asserting `rebalance` does not reduce expected value across randomized prices, holdings, and budgets.
 - `test_fuzz_rebalance_partial_no_legacy_holdings_emits_no_sells`: partial-L1 fuzz property asserting no `Sell`/`Merge` actions are emitted when initial legacy inventory is empty (guards against Phase-3 churn on newly bought positions).
+- `test_fuzz_rebalance_end_to_end_full_l1_invariants`: deterministic seeded 24-case full-L1 corpus asserting determinism, action/accounting invariants, strict EV gain, and strict per-case EV floor checks against `src/portfolio/tests/ev_snapshots.json` (no regression tolerance).
+- `test_fuzz_rebalance_end_to_end_partial_l1_invariants`: deterministic seeded 24-case partial-L1 corpus asserting direct-only route constraints, invariants, strict EV gain, and strict per-case EV floor checks against snapshots (no regression tolerance).
 - `test_rebalance_negative_budget_legacy_sells_self_fund_rebalance`: hardcoded debt-entry fixture (`susds_balance < 0`) showing Phase-1 liquidation can recover cash and avoid EV regression.
 - `test_rebalance_handles_nan_and_infinite_budget_without_non_finite_actions`: defensive-input test that `NaN`/`Infinity` budgets fail closed (no actions emitted).
 - `test_rebalance_non_finite_balances_fail_closed_to_zero_inventory`: defensive-input fixture ensuring `NaN`/`Infinity` holdings are sanitized to zero inventory, preventing invalid liquidation flow.
@@ -205,12 +210,19 @@ Portfolio tests are split across `src/portfolio/tests.rs` (shared fixtures + ear
 - `test_phase1_merge_split_can_leave_source_pool_overpriced`: adversarial Phase-1 fixture showing that when the optimal sell split uses merge legs, the source pool can remain overpriced even when sell sizing is derived from `sell_to_price(prediction)` in direct-price space.
 - `test_fuzz_phase1_sell_order_budget_stability`: sampled order-stability check for Phase-1 liquidation across adversarial 3-outcome fixtures (same holdings/prices, swapped sell order), guarding against unexpected order-sensitive budget recovery drift.
 - `test_fuzz_plan_execute_cost_consistency_near_mint_caps`: seeded near-cap mixed-route search ensuring planned route costs remain consistent with executed budget deltas when mint legs operate close to sell-cap boundaries.
+- `test_intra_step_boundary_rerank_improves_ev_vs_no_split_control`: seeded low-liquidity mixed-route search that compares current split+rerank waterfall execution against a no-intra-step-split control, asserting existence of a strict EV improvement case from boundary-aware active-set refresh.
 - `test_direct_closed_form_target_can_overshoot_tick_boundary`: stress test documenting that all-direct closed-form profitability targets can imply prices above tick boundaries, while execution planning clamps to feasible `buy_limit_price`.
 - `test_oracle_phase3_recycling_two_pool_direct_only_matches_grid_optimum`: direct-only 2-market oracle fixture validating Phase-3-style legacy-capital recycling (sell low-profitability legacy inventory, reallocate into a higher-marginal-profitability market) against a grid-search baseline.
 - `test_fuzz_pool_sim_kappa_lambda_finite_difference_accuracy`: finite-difference fuzz validation that `kappa`/`lambda` sensitivity parameters match observed small-step price derivatives and closed-form price update equations from `buy_exact`/`sell_exact`.
-- `test_rebalance_regression_full_l1_snapshot_invariants`: deterministic full-L1 regression snapshot using real generated L1 market metadata (liquidity/ticks/tokens) with fixed synthetic prices + initial holdings, asserting fixed action-count baseline and fixed EV baseline (tight tolerance) to detect behavioral drift.
-- `test_rebalance_regression_full_l1_snapshot_variant_b_invariants`: second deterministic full-L1 snapshot in a distinct near-fair/mixed-price regime with different holdings and budget, asserting a separate fixed action/EV baseline to reduce overfitting to one market profile.
+- `test_rebalance_regression_full_l1_snapshot_invariants`: deterministic full-L1 regression snapshot using real generated L1 market metadata (liquidity/ticks/tokens) with fixed synthetic prices + initial holdings; asserts deterministic replay, action-stream/accounting invariants, and strict EV floor against baseline.
+- `test_rebalance_regression_full_l1_snapshot_variant_b_invariants`: second deterministic full-L1 snapshot in a distinct near-fair/mixed-price regime with different holdings and budget; asserts deterministic replay, invariants, and a separate strict EV floor to reduce overfitting to one market profile.
 - `test_rebalance_phase1_clears_or_fairs_legacy_overpriced_source_full_l1`: full-L1 adversarial check that legacy overpriced source inventory is not left both held and overpriced after rebalance (legacy inventory must be exhausted or the source price must be brought to prediction/fair level).
+
+EV regression gates are now two-layered:
+- deterministic full/partial seeded fuzz corpora with per-case EV-after snapshots loaded from `src/portfolio/tests/ev_snapshots.json`;
+- deterministic full-L1 regression fixtures with fixed EV-before/EV-after snapshots.
+
+When intentionally changing optimizer economics, refresh `src/portfolio/tests/ev_snapshots.json` in the same PR and keep the EV floor workflow (`EV_new >= EV_old` on the 51-label corpus, no tolerance) as an external release gate.
 
 Phase-1 liquidation now runs iteratively per outcome (bounded) instead of a single sell attempt. This prevents one-shot merge-heavy splits from leaving residual legacy inventory in an overpriced source market.
 Phase-3 liquidation/reallocation now has an EV guardrail: each iteration is dry-run on cloned state and committed only if expected value does not regress (within numerical tolerance).

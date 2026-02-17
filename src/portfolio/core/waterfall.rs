@@ -37,6 +37,14 @@ pub(super) fn best_non_active(
 
 pub(super) const MAX_WATERFALL_ITERS: usize = 1000;
 
+fn realized_step_profitability(sims: &[PoolSim], step: &PlannedRoute, price_sum: f64) -> Option<f64> {
+    let prof = match step.route {
+        Route::Direct => profitability(sims[step.idx].prediction, sims[step.idx].price()),
+        Route::Mint => profitability(sims[step.idx].prediction, alt_price(sims, step.idx, price_sum)),
+    };
+    prof.is_finite().then_some(prof)
+}
+
 /// Waterfall allocation: deploy capital to the highest profitability outcome.
 /// As capital is deployed, profitability drops until it matches the next outcome.
 /// Then deploy to both, then three, etc.
@@ -117,6 +125,7 @@ pub(super) fn waterfall(
             target_prof,
             &skip,
             &mut planning_sim_state,
+            Some(current_prof),
         ) {
             Some(plan) => plan,
             None => {
@@ -124,6 +133,9 @@ pub(super) fn waterfall(
                 break;
             }
         };
+        let full_plan_hits_active_boundary = full_plan
+            .last()
+            .is_some_and(|step| step.active_set_boundary_hit);
 
         if plan_is_budget_feasible(&full_plan, *budget) {
             let executed = {
@@ -138,6 +150,13 @@ pub(super) fn waterfall(
 
             // Refresh price_sum after executions
             price_sum = sims.iter().map(|s| s.price()).sum();
+            if full_plan_hits_active_boundary {
+                last_prof = full_plan
+                    .last()
+                    .and_then(|step| realized_step_profitability(sims, step, price_sum))
+                    .unwrap_or(current_prof);
+                continue;
+            }
             current_prof = target_prof;
             last_prof = target_prof;
 
@@ -159,6 +178,7 @@ pub(super) fn waterfall(
                 achievable,
                 &skip,
                 &mut planning_sim_state,
+                Some(current_prof),
             );
 
             // Numerical guard: tighten toward current_prof until feasible.
@@ -178,6 +198,7 @@ pub(super) fn waterfall(
                         mid,
                         &skip,
                         &mut planning_sim_state,
+                        Some(current_prof),
                     ) {
                         if plan_is_budget_feasible(&plan, *budget) {
                             best = Some((mid, plan));
@@ -206,6 +227,9 @@ pub(super) fn waterfall(
                 last_prof = current_prof;
                 break;
             }
+            let execution_plan_hits_active_boundary = execution_plan
+                .last()
+                .is_some_and(|step| step.active_set_boundary_hit);
             let executed = {
                 waterfall_balances.clear();
                 let mut exec = ExecutionState::new(sims, budget, actions, &mut waterfall_balances);
@@ -214,6 +238,14 @@ pub(super) fn waterfall(
             if !executed {
                 last_prof = current_prof;
                 break;
+            }
+            price_sum = sims.iter().map(|s| s.price()).sum();
+            if execution_plan_hits_active_boundary {
+                last_prof = execution_plan
+                    .last()
+                    .and_then(|step| realized_step_profitability(sims, step, price_sum))
+                    .unwrap_or(current_prof);
+                continue;
             }
             last_prof = achievable;
             break;

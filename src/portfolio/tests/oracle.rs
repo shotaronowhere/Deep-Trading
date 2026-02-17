@@ -2,15 +2,16 @@ use std::collections::{HashMap, HashSet};
 
 use super::super::merge::merge_sell_proceeds;
 use super::super::planning::{
-    PlannedRoute, active_skip_indices, plan_active_routes, plan_is_budget_feasible, solve_prof,
+    PlannedRoute, active_skip_indices, cost_for_route, plan_active_routes,
+    plan_active_routes_with_scratch, plan_is_budget_feasible, solve_prof,
 };
 use super::super::rebalancer::rebalance;
 use super::super::sim::{
-    PoolSim, Route, alt_price, build_sims, profitability, target_price_for_prof,
+    EPS, PoolSim, Route, alt_price, build_sims, profitability, target_price_for_prof,
 };
 use super::super::solver::mint_cost_to_prof;
 use super::super::trading::ExecutionState;
-use super::super::waterfall::{MAX_WATERFALL_ITERS, waterfall};
+use super::super::waterfall::{MAX_WATERFALL_ITERS, best_non_active, waterfall};
 use super::{
     Action, TestRng, assert_action_values_are_finite, assert_flash_loan_ordering,
     assert_rebalance_action_invariants, brute_force_best_gain_mint_direct,
@@ -24,6 +25,180 @@ use super::{
 };
 use proptest::prelude::*;
 use proptest::proptest;
+
+fn waterfall_without_intra_step_boundary_split(
+    sims: &mut [PoolSim],
+    budget: &mut f64,
+    actions: &mut Vec<Action>,
+    mint_available: bool,
+) -> f64 {
+    const BUDGET_EPS: f64 = 1e-12;
+    if *budget <= 0.0 {
+        return 0.0;
+    }
+
+    let mut price_sum: f64 = sims.iter().map(|s| s.price()).sum();
+    let mut active_set: HashSet<(usize, Route)> = HashSet::new();
+
+    let first = match best_non_active(sims, &active_set, mint_available, price_sum) {
+        Some(entry) if entry.2 > 0.0 => entry,
+        _ => return 0.0,
+    };
+
+    let mut active: Vec<(usize, Route)> = vec![(first.0, first.1)];
+    active_set.insert((first.0, first.1));
+    let mut current_prof = first.2;
+    let mut last_prof = 0.0;
+    let mut waterfall_balances: HashMap<&str, f64> = HashMap::new();
+    let mut planning_sim_state: Vec<PoolSim> = Vec::with_capacity(sims.len());
+
+    for _ in 0..MAX_WATERFALL_ITERS {
+        if *budget <= BUDGET_EPS || current_prof <= 0.0 {
+            break;
+        }
+
+        loop {
+            match best_non_active(sims, &active_set, mint_available, price_sum) {
+                Some((idx, route, prof)) if prof > current_prof => {
+                    active.push((idx, route));
+                    active_set.insert((idx, route));
+                }
+                _ => break,
+            }
+        }
+
+        let next = best_non_active(sims, &active_set, mint_available, price_sum);
+        let target_prof = match next {
+            Some((_, _, p)) if p > 0.0 => p,
+            _ => 0.0,
+        };
+
+        loop {
+            let skip = active_skip_indices(&active);
+            let before = active.len();
+            active.retain(|&(idx, route)| {
+                cost_for_route(sims, idx, route, target_prof, &skip, price_sum).is_some()
+            });
+            if active.len() == before || active.is_empty() {
+                break;
+            }
+            active_set = active.iter().copied().collect();
+        }
+        if active.is_empty() {
+            break;
+        }
+
+        let skip = active_skip_indices(&active);
+        let full_plan = match plan_active_routes_with_scratch(
+            sims,
+            &active,
+            target_prof,
+            &skip,
+            &mut planning_sim_state,
+            None,
+        ) {
+            Some(plan) => plan,
+            None => {
+                last_prof = current_prof;
+                break;
+            }
+        };
+
+        if plan_is_budget_feasible(&full_plan, *budget) {
+            let executed = {
+                waterfall_balances.clear();
+                let mut exec = ExecutionState::new(sims, budget, actions, &mut waterfall_balances);
+                exec.execute_planned_routes(&full_plan, &skip)
+            };
+            if !executed {
+                last_prof = current_prof;
+                break;
+            }
+
+            price_sum = sims.iter().map(|s| s.price()).sum();
+            current_prof = target_prof;
+            last_prof = target_prof;
+
+            match best_non_active(sims, &active_set, mint_available, price_sum) {
+                Some((idx, route, prof)) if prof > 0.0 => {
+                    active.push((idx, route));
+                    active_set.insert((idx, route));
+                }
+                _ => break,
+            }
+        } else {
+            let mut achievable =
+                solve_prof(sims, &active, current_prof, target_prof, *budget, &skip);
+            let mut execution_plan = plan_active_routes_with_scratch(
+                sims,
+                &active,
+                achievable,
+                &skip,
+                &mut planning_sim_state,
+                None,
+            );
+
+            if execution_plan
+                .as_ref()
+                .map(|p| !plan_is_budget_feasible(p, *budget))
+                .unwrap_or(true)
+            {
+                let mut lo = achievable;
+                let mut hi = current_prof;
+                let mut best: Option<(f64, Vec<PlannedRoute>)> = None;
+                for _ in 0..32 {
+                    let mid = 0.5 * (lo + hi);
+                    if let Some(plan) = plan_active_routes_with_scratch(
+                        sims,
+                        &active,
+                        mid,
+                        &skip,
+                        &mut planning_sim_state,
+                        None,
+                    ) {
+                        if plan_is_budget_feasible(&plan, *budget) {
+                            best = Some((mid, plan));
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                        }
+                    } else {
+                        lo = mid;
+                    }
+                    if (hi - lo).abs() <= 1e-12 * (1.0 + hi.abs()) {
+                        break;
+                    }
+                }
+                if let Some((best_prof, plan)) = best {
+                    achievable = best_prof;
+                    execution_plan = Some(plan);
+                }
+            }
+
+            let Some(execution_plan) = execution_plan else {
+                last_prof = current_prof;
+                break;
+            };
+            if !plan_is_budget_feasible(&execution_plan, *budget) {
+                last_prof = current_prof;
+                break;
+            }
+            let executed = {
+                waterfall_balances.clear();
+                let mut exec = ExecutionState::new(sims, budget, actions, &mut waterfall_balances);
+                exec.execute_planned_routes(&execution_plan, &skip)
+            };
+            if !executed {
+                last_prof = current_prof;
+                break;
+            }
+            last_prof = achievable;
+            break;
+        }
+    }
+
+    last_prof
+}
 
 #[test]
 fn test_oracle_single_pool_overpriced_no_trade() {
@@ -1186,6 +1361,766 @@ fn test_fuzz_plan_execute_cost_consistency_near_mint_caps() {
         checked >= 1,
         "insufficient valid near-cap mixed-route fixtures: {}",
         checked
+    );
+}
+
+#[test]
+fn test_plan_truncates_mint_when_non_active_hits_current_prof() {
+    let sims = build_three_sims_with_preds([0.20, 0.25, 0.55], [0.80, 0.999, 0.20]);
+    let active = vec![(0usize, Route::Mint)];
+    let skip = active_skip_indices(&active);
+    let price_sum: f64 = sims.iter().map(|s| s.price()).sum();
+    let current_prof = profitability(sims[0].prediction, alt_price(&sims, 0, price_sum));
+    assert!(current_prof > 0.0 && current_prof.is_finite());
+    let target_prof = (current_prof * 0.2).max(0.0);
+
+    let mut scratch = Vec::with_capacity(sims.len());
+    let capped_plan = plan_active_routes_with_scratch(
+        &sims,
+        &active,
+        target_prof,
+        &skip,
+        &mut scratch,
+        Some(current_prof),
+    )
+    .expect("capped mint plan should be plannable");
+    assert_eq!(capped_plan.len(), 1);
+    assert_eq!(capped_plan[0].route, Route::Mint);
+    assert!(
+        capped_plan[0].active_set_boundary_hit,
+        "mint step should stop at active-set join boundary"
+    );
+
+    let join_price = target_price_for_prof(sims[1].prediction, current_prof);
+    let (join_amount, _join_proceeds, _join_new_price) = sims[1]
+        .sell_to_price(join_price)
+        .expect("join boundary should be computable");
+    let amount_tol = 1e-9 * (1.0 + join_amount.abs());
+    assert!(
+        capped_plan[0].amount <= join_amount + amount_tol,
+        "capped mint amount should stop no later than current_prof join boundary: planned={:.12}, join={:.12}, tol={:.12}",
+        capped_plan[0].amount,
+        join_amount,
+        amount_tol
+    );
+
+    let mut capped_state = sims.clone();
+    for (i, sim) in capped_state.iter_mut().enumerate() {
+        if i == 0 || skip.contains(&i) {
+            continue;
+        }
+        if let Some((sold, _proceeds, new_price)) = sim.sell_exact(capped_plan[0].amount)
+            && sold > 1e-18
+        {
+            sim.set_price(new_price);
+        }
+    }
+    let capped_sum: f64 = capped_state.iter().map(|s| s.price()).sum();
+    let active_prof_after = profitability(capped_state[0].prediction, alt_price(&capped_state, 0, capped_sum));
+    let mut best_non_active_prof = f64::NEG_INFINITY;
+    for (i, sim) in capped_state.iter().enumerate() {
+        if i == 0 || skip.contains(&i) {
+            continue;
+        }
+        let prof = profitability(sim.prediction, sim.price());
+        if prof > best_non_active_prof {
+            best_non_active_prof = prof;
+        }
+    }
+    let prof_tol = 5e-10 * (1.0 + active_prof_after.abs() + best_non_active_prof.abs());
+    assert!(
+        best_non_active_prof + prof_tol >= active_prof_after,
+        "capped boundary should make some non-active route catch up with active mint route: active={:.12}, best_non_active={:.12}, tol={:.12}",
+        active_prof_after,
+        best_non_active_prof,
+        prof_tol
+    );
+
+    scratch.clear();
+    let uncapped_plan =
+        plan_active_routes_with_scratch(&sims, &active, target_prof, &skip, &mut scratch, None)
+            .expect("uncapped mint plan should be plannable");
+    assert_eq!(uncapped_plan.len(), 1);
+    assert!(
+        uncapped_plan[0].amount > capped_plan[0].amount + amount_tol,
+        "uncapped mint should continue past join boundary: capped={:.12}, uncapped={:.12}, tol={:.12}",
+        capped_plan[0].amount,
+        uncapped_plan[0].amount,
+        amount_tol
+    );
+    assert!(!uncapped_plan[0].active_set_boundary_hit);
+}
+
+#[test]
+fn test_plan_direct_does_not_truncate_when_non_active_mint_hits_current_prof() {
+    let sims = build_three_sims_with_preds([0.20, 0.30, 0.50], [0.80, 0.60, 0.20]);
+    let active = vec![(0usize, Route::Direct)];
+    let skip = active_skip_indices(&active);
+    let current_prof = profitability(sims[0].prediction, sims[0].price());
+    assert!(current_prof > 0.0 && current_prof.is_finite());
+    let target_prof = (current_prof * 0.2).max(0.0);
+
+    let mut scratch = Vec::with_capacity(sims.len());
+    let capped_plan = plan_active_routes_with_scratch(
+        &sims,
+        &active,
+        target_prof,
+        &skip,
+        &mut scratch,
+        Some(current_prof),
+    )
+    .expect("capped direct plan should be plannable");
+    assert_eq!(capped_plan.len(), 1);
+    assert_eq!(capped_plan[0].route, Route::Direct);
+    assert!(
+        !capped_plan[0].active_set_boundary_hit,
+        "direct step should not be truncated by mint-route boundary caps"
+    );
+
+    scratch.clear();
+    let uncapped_plan =
+        plan_active_routes_with_scratch(&sims, &active, target_prof, &skip, &mut scratch, None)
+            .expect("uncapped direct plan should be plannable");
+    assert_eq!(uncapped_plan.len(), 1);
+    assert!(!uncapped_plan[0].active_set_boundary_hit);
+    let amount_tol = 1e-9 * (1.0 + capped_plan[0].amount.abs() + uncapped_plan[0].amount.abs());
+    assert!(
+        (uncapped_plan[0].amount - capped_plan[0].amount).abs() <= amount_tol,
+        "direct leg should have the same amount with and without boundary cap: capped={:.12}, uncapped={:.12}, tol={:.12}",
+        capped_plan[0].amount,
+        uncapped_plan[0].amount,
+        amount_tol
+    );
+}
+
+#[test]
+fn test_plan_truncates_mint_on_crossover_below_current_prof() {
+    let names = ["CB1", "CB2", "CB3", "CB4"];
+    let tokens = [
+        "0x8888888888888888888888888888888888888888",
+        "0x9999999999999999999999999999999999999999",
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ];
+    let mut rng = TestRng::new(0x4352_4F53_535F_4556u64);
+    let mut witness: Option<(usize, f64, f64, f64, f64, f64)> = None;
+
+    for case_idx in 0..2500 {
+        let mut pred_raw = [0.0_f64; 4];
+        for value in &mut pred_raw {
+            *value = rng.in_range(0.05, 0.45);
+        }
+        let pred_sum: f64 = pred_raw.iter().sum();
+        let mut preds = [0.0_f64; 4];
+        for i in 0..4 {
+            preds[i] = pred_raw[i] / pred_sum;
+        }
+
+        let fragile_idx = 1 + rng.pick(3);
+        let mut prices = [0.0_f64; 4];
+        prices[0] = (preds[0] * rng.in_range(0.22, 0.65)).clamp(0.002, 0.92);
+        for i in 1..4 {
+            let base_mult = if i == fragile_idx {
+                rng.in_range(0.90, 1.05)
+            } else {
+                rng.in_range(0.55, 1.30)
+            };
+            prices[i] = (preds[i] * base_mult).clamp(0.002, 0.92);
+        }
+
+        let mut liquidities = [0_u128; 4];
+        for i in 0..4 {
+            let exp = if i == fragile_idx {
+                rng.in_range(15.0, 16.5)
+            } else {
+                rng.in_range(19.0, 21.5)
+            };
+            liquidities[i] = (10f64.powf(exp)).round().max(1.0) as u128;
+        }
+
+        let slot0_results: Vec<_> = (0..4)
+            .map(|i| {
+                mock_slot0_market_with_liquidity_and_ticks(
+                    names[i],
+                    tokens[i],
+                    prices[i],
+                    liquidities[i],
+                    -220_000,
+                    220_000,
+                )
+            })
+            .collect();
+        let sims: Vec<PoolSim> = slot0_results
+            .iter()
+            .zip(preds.iter())
+            .map(|((slot0, market), pred)| PoolSim::from_slot0(slot0, market, *pred).unwrap())
+            .collect();
+
+        let active = vec![(0usize, Route::Mint)];
+        let skip = active_skip_indices(&active);
+        let price_sum: f64 = sims.iter().map(|s| s.price()).sum();
+        let current_prof = profitability(sims[0].prediction, alt_price(&sims, 0, price_sum));
+        if !current_prof.is_finite() || current_prof <= 1e-8 {
+            continue;
+        }
+        let target_prof = (current_prof * rng.in_range(0.08, 0.75)).max(0.0);
+
+        let mut scratch = Vec::with_capacity(sims.len());
+        let Some(uncapped_plan) =
+            plan_active_routes_with_scratch(&sims, &active, target_prof, &skip, &mut scratch, None)
+        else {
+            continue;
+        };
+        if uncapped_plan.len() != 1 || uncapped_plan[0].route != Route::Mint {
+            continue;
+        }
+        let uncapped_amount = uncapped_plan[0].amount;
+        if uncapped_amount <= 1e-9 {
+            continue;
+        }
+
+        scratch.clear();
+        let Some(capped_plan) = plan_active_routes_with_scratch(
+            &sims,
+            &active,
+            target_prof,
+            &skip,
+            &mut scratch,
+            Some(current_prof),
+        ) else {
+            continue;
+        };
+        if capped_plan.len() != 1 || capped_plan[0].route != Route::Mint {
+            continue;
+        }
+        if !capped_plan[0].active_set_boundary_hit {
+            continue;
+        }
+        let capped_amount = capped_plan[0].amount;
+        if capped_amount + 1e-9 >= uncapped_amount {
+            continue;
+        }
+
+        let summarize = |amount: f64| -> Option<(f64, f64)> {
+            let mut sim_state = sims.clone();
+            if amount > 0.0 {
+                for (i, sim) in sim_state.iter_mut().enumerate() {
+                    if i == 0 || skip.contains(&i) {
+                        continue;
+                    }
+                    if let Some((sold, _proceeds, new_price)) = sim.sell_exact(amount)
+                        && sold > 1e-18
+                    {
+                        sim.set_price(new_price);
+                    }
+                }
+            }
+            let sum_after: f64 = sim_state.iter().map(|s| s.price()).sum();
+            let active_prof_after =
+                profitability(sim_state[0].prediction, alt_price(&sim_state, 0, sum_after));
+            let mut best_non_active_prof = f64::NEG_INFINITY;
+            for (i, sim) in sim_state.iter().enumerate() {
+                if i == 0 || skip.contains(&i) {
+                    continue;
+                }
+                let prof = profitability(sim.prediction, sim.price());
+                if prof > best_non_active_prof {
+                    best_non_active_prof = prof;
+                }
+            }
+            if !active_prof_after.is_finite() || !best_non_active_prof.is_finite() {
+                return None;
+            }
+            Some((active_prof_after, best_non_active_prof))
+        };
+
+        let Some((active_cap, best_cap)) = summarize(capped_amount) else {
+            continue;
+        };
+        let Some((active_full, best_full)) = summarize(uncapped_amount) else {
+            continue;
+        };
+
+        let crossover_tol = 5e-7 * (1.0 + active_cap.abs() + best_cap.abs());
+        if (best_cap - active_cap).abs() > crossover_tol {
+            continue;
+        }
+
+        let below_cap_margin = 1e-4 * (1.0 + current_prof.abs());
+        if best_cap >= current_prof - below_cap_margin {
+            continue;
+        }
+
+        let overshoot_tol = 5e-7 * (1.0 + active_full.abs() + best_full.abs());
+        if best_full <= active_full + overshoot_tol {
+            continue;
+        }
+
+        witness = Some((
+            case_idx,
+            current_prof,
+            capped_amount,
+            uncapped_amount,
+            active_cap,
+            best_cap,
+        ));
+        break;
+    }
+
+    let (case_idx, current_prof, capped_amount, uncapped_amount, active_cap, best_cap) = witness
+        .expect("expected a fixture where mint split is driven by crossover below current_prof");
+    assert!(
+        best_cap < current_prof,
+        "boundary should occur below current_prof in crossover fixture: best={:.12}, current={:.12}",
+        best_cap,
+        current_prof
+    );
+    assert!(
+        capped_amount < uncapped_amount,
+        "crossover split should stop mint earlier than uncapped plan: capped={:.12}, uncapped={:.12}",
+        capped_amount,
+        uncapped_amount
+    );
+    let eq_tol = 5e-7 * (1.0 + active_cap.abs() + best_cap.abs());
+    assert!(
+        (best_cap - active_cap).abs() <= eq_tol,
+        "boundary should equalize active and best non-active profitability: active={:.12}, best={:.12}, tol={:.12}",
+        active_cap,
+        best_cap,
+        eq_tol
+    );
+    println!(
+        "[crossover_boundary_demo] case_idx={} current_prof={:.9} capped_amount={:.9} uncapped_amount={:.9} active_cap={:.9} best_cap={:.9}",
+        case_idx, current_prof, capped_amount, uncapped_amount, active_cap, best_cap
+    );
+}
+
+#[test]
+fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
+    let names = ["BP1", "BP2", "BP3", "BP4"];
+    let tokens = [
+        "0x1212121212121212121212121212121212121212",
+        "0x2323232323232323232323232323232323232323",
+        "0x3434343434343434343434343434343434343434",
+        "0x4545454545454545454545454545454545454545",
+    ];
+    let mut rng = TestRng::new(0x4255_445F_4558_4954u64);
+    let mut witness: Option<(Vec<PoolSim>, f64, usize, f64)> = None;
+
+    for _ in 0..12000 {
+        let mut pred_raw = [0.0_f64; 4];
+        for value in &mut pred_raw {
+            *value = rng.in_range(0.05, 0.45);
+        }
+        let pred_sum: f64 = pred_raw.iter().sum();
+        let mut preds = [0.0_f64; 4];
+        for i in 0..4 {
+            preds[i] = pred_raw[i] / pred_sum;
+        }
+
+        let fragile_idx = 1 + rng.pick(3);
+        let mut prices = [0.0_f64; 4];
+        prices[0] = (preds[0] * rng.in_range(0.22, 0.65)).clamp(0.002, 0.92);
+        for i in 1..4 {
+            let base_mult = if i == fragile_idx {
+                rng.in_range(0.90, 1.05)
+            } else {
+                rng.in_range(0.55, 1.30)
+            };
+            prices[i] = (preds[i] * base_mult).clamp(0.002, 0.92);
+        }
+
+        let mut liquidities = [0_u128; 4];
+        for i in 0..4 {
+            let exp = if i == fragile_idx {
+                rng.in_range(15.0, 16.5)
+            } else {
+                rng.in_range(19.0, 21.5)
+            };
+            liquidities[i] = (10f64.powf(exp)).round().max(1.0) as u128;
+        }
+
+        let slot0_results: Vec<_> = (0..4)
+            .map(|i| {
+                mock_slot0_market_with_liquidity_and_ticks(
+                    names[i],
+                    tokens[i],
+                    prices[i],
+                    liquidities[i],
+                    -220_000,
+                    220_000,
+                )
+            })
+            .collect();
+        let sims: Vec<PoolSim> = slot0_results
+            .iter()
+            .zip(preds.iter())
+            .map(|((slot0, market), pred)| PoolSim::from_slot0(slot0, market, *pred).unwrap())
+            .collect();
+
+        let price_sum: f64 = sims.iter().map(|s| s.price()).sum();
+        let empty_active_set: HashSet<(usize, Route)> = HashSet::new();
+        let Some((seed_idx, seed_route, current_prof)) =
+            best_non_active(&sims, &empty_active_set, true, price_sum)
+        else {
+            continue;
+        };
+        if seed_route != Route::Mint || !current_prof.is_finite() || current_prof <= 1e-8 {
+            continue;
+        }
+
+        let active = vec![(seed_idx, seed_route)];
+        let active_set: HashSet<(usize, Route)> = active.iter().copied().collect();
+        let target_prof = match best_non_active(&sims, &active_set, true, price_sum) {
+            Some((_, _, p)) if p > 0.0 => p,
+            _ => 0.0,
+        };
+        if !(target_prof.is_finite() && target_prof >= 0.0 && target_prof < current_prof) {
+            continue;
+        }
+
+        let skip = active_skip_indices(&active);
+        let mut scratch = Vec::with_capacity(sims.len());
+        let Some(plan) = plan_active_routes_with_scratch(
+            &sims,
+            &active,
+            target_prof,
+            &skip,
+            &mut scratch,
+            Some(current_prof),
+        ) else {
+            continue;
+        };
+        let Some(boundary_step) = plan.last() else {
+            continue;
+        };
+        if !boundary_step.active_set_boundary_hit || boundary_step.route != Route::Mint {
+            continue;
+        }
+        let total_cost: f64 = plan.iter().map(|step| step.cost).sum();
+        if !total_cost.is_finite() || total_cost <= 1e-9 {
+            continue;
+        }
+
+        // Require a true crossover-below-current fixture so stale `last_prof = current_prof`
+        // would be observably wrong at budget exit.
+        let mut exec_sims = sims.clone();
+        let mut exec_budget = total_cost + 1.0;
+        let mut exec_actions = Vec::new();
+        let executed = {
+            let mut balances: HashMap<&str, f64> = HashMap::new();
+            let mut exec =
+                ExecutionState::new(&mut exec_sims, &mut exec_budget, &mut exec_actions, &mut balances);
+            exec.execute_planned_routes(&plan, &skip)
+        };
+        if !executed {
+            continue;
+        }
+        let price_sum_after: f64 = exec_sims.iter().map(|s| s.price()).sum();
+        let realized_prof = profitability(
+            exec_sims[boundary_step.idx].prediction,
+            alt_price(&exec_sims, boundary_step.idx, price_sum_after),
+        );
+        if !realized_prof.is_finite()
+            || realized_prof >= current_prof - 1e-5 * (1.0 + current_prof.abs())
+        {
+            continue;
+        }
+
+        // Keep just enough budget to execute the split, then stop at the top-of-loop budget guard.
+        let budget = total_cost + 0.25 * EPS * (1.0 + total_cost.abs());
+        witness = Some((sims, budget, boundary_step.idx, current_prof));
+        break;
+    }
+
+    let (mut sims, mut budget, seed_idx, current_prof) = witness.expect(
+        "expected a fixture where first waterfall step is a boundary split below current_prof",
+    );
+    let mut actions = Vec::new();
+    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, true);
+
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+        "fixture should execute at least one mint leg"
+    );
+    assert!(
+        budget <= EPS * (1.0 + budget.abs()),
+        "fixture should terminate on budget exhaustion after boundary split: remaining={:.12}",
+        budget
+    );
+
+    let price_sum_after: f64 = sims.iter().map(|s| s.price()).sum();
+    let realized_prof = profitability(
+        sims[seed_idx].prediction,
+        alt_price(&sims, seed_idx, price_sum_after),
+    );
+    assert!(
+        realized_prof.is_finite(),
+        "realized post-split profitability should be finite"
+    );
+    assert!(
+        realized_prof < current_prof - 1e-5 * (1.0 + current_prof.abs()),
+        "fixture should cross below the pre-split level: realized={:.12}, current={:.12}",
+        realized_prof,
+        current_prof
+    );
+    let prof_tol = 2e-7 * (1.0 + realized_prof.abs() + last_prof.abs());
+    assert!(
+        (last_prof - realized_prof).abs() <= prof_tol,
+        "waterfall should report realized profitability after boundary split: last_prof={:.12}, realized={:.12}, tol={:.12}",
+        last_prof,
+        realized_prof,
+        prof_tol
+    );
+}
+
+#[test]
+fn test_waterfall_boundary_splits_refresh_skip_before_next_descent() {
+    let prices = [0.399554, 0.246718, 0.283701, 0.080065];
+    let preds = [0.524024, 0.313937, 0.342533, 0.100115];
+    let initial_budget = 17.358789;
+    let names = ["WB1", "WB2", "WB3", "WB4"];
+    let tokens = [
+        "0x4444444444444444444444444444444444444444",
+        "0x5555555555555555555555555555555555555555",
+        "0x6666666666666666666666666666666666666666",
+        "0x7777777777777777777777777777777777777777",
+    ];
+    let slot0_results: Vec<_> = names
+        .iter()
+        .zip(tokens.iter())
+        .zip(prices.iter())
+        .map(|((name, token), price)| {
+            mock_slot0_market_with_liquidity_and_ticks(
+                name,
+                token,
+                *price,
+                1_000_000_000_000_000_000_000,
+                -220_000,
+                220_000,
+            )
+        })
+        .collect();
+    let mut sims: Vec<PoolSim> = slot0_results
+        .iter()
+        .zip(preds.iter())
+        .map(|((slot0, market), pred)| PoolSim::from_slot0(slot0, market, *pred).unwrap())
+        .collect();
+    let mut budget = initial_budget;
+    let mut actions = Vec::new();
+    let _last_prof = waterfall(&mut sims, &mut budget, &mut actions, true);
+
+    let first_buy_idx = actions
+        .iter()
+        .position(|a| matches!(a, Action::Buy { .. }))
+        .expect("fixture should produce direct buys after initial boundary splits");
+
+    let mut mint_sell_sets: Vec<HashSet<&str>> = Vec::new();
+    let mut mint_spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < first_buy_idx {
+        if !matches!(actions[i], Action::FlashLoan { .. }) {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < first_buy_idx && !matches!(actions[j], Action::RepayFlashLoan { .. }) {
+            j += 1;
+        }
+        if j >= first_buy_idx {
+            break;
+        }
+
+        let mut has_mint = false;
+        let mut sold_markets: HashSet<&str> = HashSet::new();
+        for action in &actions[i..=j] {
+            match action {
+                Action::Mint { .. } => has_mint = true,
+                Action::Sell { market_name, .. } => {
+                    sold_markets.insert(*market_name);
+                }
+                _ => {}
+            }
+        }
+        if has_mint {
+            mint_sell_sets.push(sold_markets);
+            mint_spans.push((i, j));
+        }
+        i = j + 1;
+    }
+
+    assert!(
+        mint_sell_sets.len() >= 2,
+        "fixture should contain at least two mint-sell brackets before first direct buy"
+    );
+
+    let first = &mint_sell_sets[0];
+    let second = &mint_sell_sets[1];
+    let expected_first: HashSet<&str> = ["WB1", "WB2", "WB3"].into_iter().collect();
+    let expected_second: HashSet<&str> = ["WB2", "WB3"].into_iter().collect();
+    assert_eq!(
+        first, &expected_first,
+        "unexpected first mint-sell market set"
+    );
+    assert_eq!(
+        second, &expected_second,
+        "unexpected second mint-sell market set after boundary split"
+    );
+
+    let (_first_start, _first_end) = mint_spans[0];
+    let (_second_start, second_end) = mint_spans[1];
+    let wb1_mint_after_second = actions[(second_end + 1)..first_buy_idx]
+        .iter()
+        .any(|action| {
+            matches!(
+                action,
+                Action::Mint {
+                    target_market: "WB1",
+                    ..
+                }
+            )
+        });
+    assert!(
+        wb1_mint_after_second,
+        "after WB1 leaves the sell set in split 2, it should appear as a mint target before direct-buy descent"
+    );
+    assert!(
+        second.len() < first.len() && second.is_subset(first),
+        "second mint-sell bracket should shrink after active-set refresh"
+    );
+}
+
+#[test]
+fn test_intra_step_boundary_rerank_improves_ev_vs_no_split_control() {
+    let names = ["RS1", "RS2", "RS3", "RS4"];
+    let tokens = [
+        "0x4444444444444444444444444444444444444444",
+        "0x5555555555555555555555555555555555555555",
+        "0x6666666666666666666666666666666666666666",
+        "0x7777777777777777777777777777777777777777",
+    ];
+    let mut rng = TestRng::new(0x5150_4C49_545F_4556u64);
+    let mut best: Option<(f64, f64, f64, usize)> = None;
+
+    for case_idx in 0..2000 {
+        let mut pred_raw = [0.0_f64; 4];
+        for value in &mut pred_raw {
+            *value = rng.in_range(0.05, 0.45);
+        }
+        let pred_sum: f64 = pred_raw.iter().sum();
+        let mut preds = [0.0_f64; 4];
+        for i in 0..4 {
+            preds[i] = pred_raw[i] / pred_sum;
+        }
+
+        let fragile_idx = rng.pick(4);
+        let mut prices = [0.0_f64; 4];
+        for i in 0..4 {
+            let base_mult = if i == fragile_idx {
+                rng.in_range(0.92, 1.04)
+            } else {
+                rng.in_range(0.45, 1.25)
+            };
+            prices[i] = (preds[i] * base_mult).clamp(0.002, 0.92);
+        }
+        let leader_idx = (fragile_idx + 1) % 4;
+        prices[leader_idx] = (preds[leader_idx] * rng.in_range(0.22, 0.55)).clamp(0.002, 0.92);
+
+        let mut liquidities = [0_u128; 4];
+        for i in 0..4 {
+            let exp = if i == fragile_idx {
+                rng.in_range(15.0, 16.5)
+            } else {
+                rng.in_range(19.0, 21.5)
+            };
+            liquidities[i] = (10f64.powf(exp)).round().max(1.0) as u128;
+        }
+
+        let slot0_results: Vec<_> = (0..4)
+            .map(|i| {
+                mock_slot0_market_with_liquidity_and_ticks(
+                    names[i],
+                    tokens[i],
+                    prices[i],
+                    liquidities[i],
+                    -220_000,
+                    220_000,
+                )
+            })
+            .collect();
+
+        let mut sims_split: Vec<PoolSim> = slot0_results
+            .iter()
+            .zip(preds.iter())
+            .map(|((slot0, market), pred)| PoolSim::from_slot0(slot0, market, *pred).unwrap())
+            .collect();
+        let mut sims_no_split = sims_split.clone();
+
+        let initial_budget = rng.in_range(1.0, 40.0);
+        let mut split_budget = initial_budget;
+        let mut no_split_budget = initial_budget;
+        let mut split_actions = Vec::new();
+        let mut no_split_actions = Vec::new();
+
+        let _ = waterfall(&mut sims_split, &mut split_budget, &mut split_actions, true);
+        let _ = waterfall_without_intra_step_boundary_split(
+            &mut sims_no_split,
+            &mut no_split_budget,
+            &mut no_split_actions,
+            true,
+        );
+
+        if !split_actions.iter().any(|a| matches!(a, Action::Mint { .. }))
+            || !split_actions.iter().any(|a| matches!(a, Action::Buy { .. }))
+        {
+            continue;
+        }
+        if !no_split_actions.iter().any(|a| matches!(a, Action::Mint { .. }))
+            || !no_split_actions.iter().any(|a| matches!(a, Action::Buy { .. }))
+        {
+            continue;
+        }
+
+        let balances: HashMap<&str, f64> = HashMap::new();
+        let (split_holdings, split_cash) =
+            replay_actions_to_state(&split_actions, &slot0_results, &balances, initial_budget);
+        let (no_split_holdings, no_split_cash) = replay_actions_to_state(
+            &no_split_actions,
+            &slot0_results,
+            &balances,
+            initial_budget,
+        );
+        let ev_split = split_cash
+            + (0..4)
+                .map(|i| preds[i] * split_holdings.get(names[i]).copied().unwrap_or(0.0))
+                .sum::<f64>();
+        let ev_no_split = no_split_cash
+            + (0..4)
+                .map(|i| preds[i] * no_split_holdings.get(names[i]).copied().unwrap_or(0.0))
+                .sum::<f64>();
+        if !ev_split.is_finite() || !ev_no_split.is_finite() {
+            continue;
+        }
+        let tol = 1e-9 * (1.0 + ev_split.abs() + ev_no_split.abs());
+        if ev_split > ev_no_split + tol {
+            best = Some((ev_split, ev_no_split, initial_budget, case_idx));
+            break;
+        }
+    }
+
+    let (ev_split, ev_no_split, budget, case_idx) = best.expect(
+        "failed to find a low-liquidity coupling fixture where intra-step rerank strictly improves EV",
+    );
+    let gain = ev_split - ev_no_split;
+    assert!(
+        gain > 0.0,
+        "expected strict EV improvement from split+rerank path: split={:.12}, no_split={:.12}",
+        ev_split,
+        ev_no_split
+    );
+    println!(
+        "[rerank_ev_demo] case_idx={} budget={:.6} split_ev={:.12} no_split_ev={:.12} gain={:.12}",
+        case_idx, budget, ev_split, ev_no_split, gain
     );
 }
 

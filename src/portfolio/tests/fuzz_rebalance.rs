@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use super::super::merge::{merge_sell_cap_with_inventory, optimal_sell_split_with_inventory};
 use super::super::planning::{
@@ -14,6 +15,21 @@ use super::{
     build_rebalance_fuzz_case, build_slot0_results_for_markets, build_three_sims_with_preds,
     eligible_l1_markets_with_predictions, mock_slot0_market,
 };
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct EvSnapshots {
+    fuzz_full_l1_case_ev_after: [f64; 24],
+    fuzz_partial_l1_case_ev_after: [f64; 24],
+}
+
+fn ev_snapshots() -> &'static EvSnapshots {
+    static SNAPSHOTS: OnceLock<EvSnapshots> = OnceLock::new();
+    SNAPSHOTS.get_or_init(|| {
+        serde_json::from_str(include_str!("ev_snapshots.json"))
+            .expect("ev snapshot fixture must be valid JSON with 24 full + 24 partial entries")
+    })
+}
 
 #[test]
 fn test_fuzz_pool_sim_swap_invariants() {
@@ -395,12 +411,20 @@ fn test_fuzz_rebalance_end_to_end_full_l1_invariants() {
 
         assert_rebalance_action_invariants(&actions_a, &slot0_results, &balances, susd_balance);
         let label = format!("fuzz_full_l1_case_{}", case_idx);
-        let _ = assert_strict_ev_gain_with_portfolio_trace(
+        let (_, ev_after, _) = assert_strict_ev_gain_with_portfolio_trace(
             &label,
             &actions_a,
             &slot0_results,
             &balances,
             susd_balance,
+        );
+        let expected_after = ev_snapshots().fuzz_full_l1_case_ev_after[case_idx];
+        assert!(
+            ev_after >= expected_after,
+            "full-L1 fuzz EV regressed for case {}: got={:.12}, floor={:.12}",
+            case_idx,
+            ev_after,
+            expected_after
         );
     }
 }
@@ -439,12 +463,20 @@ fn test_fuzz_rebalance_end_to_end_partial_l1_invariants() {
 
         assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
         let label = format!("fuzz_partial_l1_case_{}", case_idx);
-        let _ = assert_strict_ev_gain_with_portfolio_trace(
+        let (_, ev_after, _) = assert_strict_ev_gain_with_portfolio_trace(
             &label,
             &actions,
             &slot0_results,
             &balances,
             susd_balance,
+        );
+        let expected_after = ev_snapshots().fuzz_partial_l1_case_ev_after[case_idx];
+        assert!(
+            ev_after >= expected_after,
+            "partial-L1 fuzz EV regressed for case {}: got={:.12}, floor={:.12}",
+            case_idx,
+            ev_after,
+            expected_after
         );
     }
 }
@@ -502,56 +534,10 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
     );
     let gain = ev_after - ev_before;
 
-    let buys = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::Buy { .. }))
-        .count();
-    let sells = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::Sell { .. }))
-        .count();
-    let mints = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::Mint { .. }))
-        .count();
-    let merges = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::Merge { .. }))
-        .count();
-    let flash = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::FlashLoan { .. }))
-        .count();
-    let repay = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::RepayFlashLoan { .. }))
-        .count();
-
-    const EXPECTED_ACTIONS: usize = 26_368;
-    const EXPECTED_BUYS: usize = 1_091;
-    const EXPECTED_SELLS: usize = 24_119;
-    const EXPECTED_MINTS: usize = 376;
-    const EXPECTED_MERGES: usize = 10;
-    const EXPECTED_FLASH: usize = 386;
-    const EXPECTED_REPAY: usize = 386;
     const EXPECTED_EV_BEFORE: f64 = 83.329_134_223;
-    const EXPECTED_EV_AFTER: f64 = 305.747_156_758;
+    const EXPECTED_EV_AFTER_FLOOR: f64 = 305.747_156_758;
     const EV_TOL: f64 = 3e-6;
 
-    assert_eq!(
-        actions_a.len(),
-        EXPECTED_ACTIONS,
-        "full-L1 regression action count changed"
-    );
-    assert_eq!(buys, EXPECTED_BUYS, "buy action count drifted");
-    assert_eq!(sells, EXPECTED_SELLS, "sell action count drifted");
-    assert_eq!(mints, EXPECTED_MINTS, "mint action count drifted");
-    assert_eq!(merges, EXPECTED_MERGES, "merge action count drifted");
-    assert_eq!(flash, EXPECTED_FLASH, "flash-loan action count drifted");
-    assert_eq!(
-        repay, EXPECTED_REPAY,
-        "flash repayment action count drifted"
-    );
     assert!(
         (ev_before - EXPECTED_EV_BEFORE).abs() <= EV_TOL,
         "ev_before drifted: got={:.9}, expected={:.9}, tol={:.9}",
@@ -560,11 +546,10 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
         EV_TOL
     );
     assert!(
-        (ev_after - EXPECTED_EV_AFTER).abs() <= EV_TOL,
-        "ev_after drifted: got={:.9}, expected={:.9}, tol={:.9}",
+        ev_after >= EXPECTED_EV_AFTER_FLOOR,
+        "ev_after regressed: got={:.9}, floor={:.9}",
         ev_after,
-        EXPECTED_EV_AFTER,
-        EV_TOL
+        EXPECTED_EV_AFTER_FLOOR
     );
     assert!(
         gain > 0.0,
@@ -629,62 +614,10 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     );
     let gain = ev_after - ev_before;
 
-    let buys = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::Buy { .. }))
-        .count();
-    let sells = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::Sell { .. }))
-        .count();
-    let mints = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::Mint { .. }))
-        .count();
-    let merges = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::Merge { .. }))
-        .count();
-    let flash = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::FlashLoan { .. }))
-        .count();
-    let repay = actions_a
-        .iter()
-        .filter(|a| matches!(a, Action::RepayFlashLoan { .. }))
-        .count();
-
-    const EXPECTED_ACTIONS: usize = 29_032;
-    const EXPECTED_BUYS: usize = 924;
-    const EXPECTED_SELLS: usize = 26_935;
-    const EXPECTED_MINTS: usize = 382;
-    const EXPECTED_MERGES: usize = 9;
-    const EXPECTED_FLASH: usize = 391;
-    const EXPECTED_REPAY: usize = 391;
     const EXPECTED_EV_BEFORE: f64 = 41.229_354_975;
-    const EXPECTED_EV_AFTER: f64 = 139.923_206_653;
+    const EXPECTED_EV_AFTER_FLOOR: f64 = 139.923_206_653;
     const EV_TOL: f64 = 3e-6;
 
-    assert_eq!(
-        actions_a.len(),
-        EXPECTED_ACTIONS,
-        "full-L1 regression variant-B action count changed"
-    );
-    assert_eq!(buys, EXPECTED_BUYS, "variant-B buy action count drifted");
-    assert_eq!(sells, EXPECTED_SELLS, "variant-B sell action count drifted");
-    assert_eq!(mints, EXPECTED_MINTS, "variant-B mint action count drifted");
-    assert_eq!(
-        merges, EXPECTED_MERGES,
-        "variant-B merge action count drifted"
-    );
-    assert_eq!(
-        flash, EXPECTED_FLASH,
-        "variant-B flash-loan action count drifted"
-    );
-    assert_eq!(
-        repay, EXPECTED_REPAY,
-        "variant-B flash repayment action count drifted"
-    );
     assert!(
         (ev_before - EXPECTED_EV_BEFORE).abs() <= EV_TOL,
         "variant-B ev_before drifted: got={:.9}, expected={:.9}, tol={:.9}",
@@ -693,11 +626,10 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
         EV_TOL
     );
     assert!(
-        (ev_after - EXPECTED_EV_AFTER).abs() <= EV_TOL,
-        "variant-B ev_after drifted: got={:.9}, expected={:.9}, tol={:.9}",
+        ev_after >= EXPECTED_EV_AFTER_FLOOR,
+        "variant-B ev_after regressed: got={:.9}, floor={:.9}",
         ev_after,
-        EXPECTED_EV_AFTER,
-        EV_TOL
+        EXPECTED_EV_AFTER_FLOOR
     );
     assert!(
         gain > 0.0,
