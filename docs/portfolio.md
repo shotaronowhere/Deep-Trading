@@ -96,7 +96,7 @@ If budget is exhausted immediately after such a split, `waterfall` returns the r
 
 Cost per step uses exact swap simulation:
 - **Direct route**: `compute_swap_step` to target price derived from target profitability. Target price = `prediction / (1 + target_prof)`.
-- **Mint route**: Newton's method finds the mint amount where the alt price (1 - sum of post-sell prices) equals the target price. Warm-started with the linearized first step: m₀ = (P_target - alt(0)) / (2 × Σ Pⱼκⱼ), saving one iteration. Uses the analytical price sensitivity parameter κⱼ = (1-fee) × √priceⱼ × 1e18 / Lⱼ per pool. Each pool's sell volume is capped at `max_sell_tokens()` = (√(price/limit_price) - 1) / κ — the max tokens sellable before hitting the tick boundary. In the Newton solver, each pool's price contribution uses min(m, capⱼ), and the derivative is zero for saturated pools. Net cost uses capped proceeds: proceedsⱼ(m) = priceⱼ × min(m, capⱼ) × (1-fee) / (1 + min(m, capⱼ) × κⱼ). This ensures the analytical estimate matches the tick-bounded execution in `emit_mint_actions`. Active outcomes are excluded from sell simulation.
+- **Mint route**: Newton's method finds the mint amount where the alt price (1 - sum of post-sell prices) equals the target price. Warm-started with the linearized first step: m₀ = (P_target - alt(0)) / (2 × Σ Pⱼκⱼ), saving one iteration. Uses the analytical price sensitivity parameter κⱼ = (1-fee) × √priceⱼ × 1e18 / Lⱼ per pool. Each pool's sell volume is capped at `max_sell_tokens()` = (√(price/limit_price) - 1) / κ — the max tokens sellable before hitting the tick boundary. In the Newton solver, each pool's price contribution uses min(m, capⱼ), and the derivative is zero for saturated pools. Net cost uses capped proceeds: proceedsⱼ(m) = priceⱼ × min(m, capⱼ) × (1-fee) / (1 + min(m, capⱼ) × κⱼ). If a requested profitability level is unreachable under caps, the solver clamps to the saturated-capacity solution instead of dropping the route. This ensures the analytical estimate matches the tick-bounded execution in `emit_mint_actions`. Active outcomes are excluded from sell simulation.
 - The caller specifies the route per entry — `direct_cost_to_prof` or `mint_cost_to_prof` is called directly based on the entry's route, rather than picking the best route internally.
 - Negative costs (arbitrage, where sell proceeds exceed mint cost) are valid and increase the budget.
 
@@ -121,7 +121,7 @@ Outer Newton on π (up to 15 iterations), inner Newton on M (2-3 iterations per 
 - Each outcome's cost is recomputed right before execution (not from stale precomputed values), since mint actions mutate other pools' state.
 - Waterfall route planning reuses a scratch simulation buffer across iterations to avoid repeated `Vec<PoolSim>` allocation/cloning in the hot loop.
 - Per-action budget guard skips actions where cost exceeds remaining budget. Negative costs (arbitrage) are executed — they increase the budget and update pool states. If any outcome is skipped during a step (recomputed cost diverged from estimate), the waterfall breaks early and `last_prof` is set to `current_prof` (the level actually achieved), not the target. This prevents Phase 3 from using a stale profitability threshold.
-- **Prune loop:** when entries fail cost computation (e.g. tick boundary hit), the active set is pruned in a loop that re-derives the skip set after each removal, so remaining entries always see a consistent skip set.
+- **Prune loop:** when entries fail cost computation, the active set is pruned in a loop that re-derives the skip set after each removal, so remaining entries always see a consistent skip set. Mint routes do not get pruned solely because the requested target is unreachable under caps; they clamp to saturated executable size.
 - **Iteration cap:** the waterfall loop is bounded by `MAX_WATERFALL_ITERS` (1000) to prevent infinite cycling from negative-cost arbitrage that grows the budget.
 - `sim_balances` is updated after waterfall by processing all four action types: `Mint` adds `amount` to all outcomes (complete sets), `Merge` subtracts `amount` from all outcomes, `Sell` subtracts sold amount, `Buy` adds directly. This correctly tracks residual unsold tokens when partial sells hit tick boundaries.
 - `skip` in mint sell legs uses the set of all active outcome **indices** (not route-specific). If outcome A is active via both direct and mint, its index appears once in `skip` — preventing sell-then-rebuy regardless of which route triggered the mint.
@@ -197,8 +197,8 @@ Portfolio tests are split across `src/portfolio/tests.rs` (shared fixtures + ear
 - `test_mint_first_order_can_make_zero_cash_plan_feasible`: sampled mixed-route adversarial search proving order-sensitive feasibility; verifies mint-first execution can make a zero-cash plan feasible while direct-first ordering is infeasible.
 - `test_fuzz_rebalance_partial_direct_only_ev_non_decreasing`: partial-L1 direct-only fuzz property asserting `rebalance` does not reduce expected value across randomized prices, holdings, and budgets.
 - `test_fuzz_rebalance_partial_no_legacy_holdings_emits_no_sells`: partial-L1 fuzz property asserting no `Sell`/`Merge` actions are emitted when initial legacy inventory is empty (guards against Phase-3 churn on newly bought positions).
-- `test_fuzz_rebalance_end_to_end_full_l1_invariants`: deterministic seeded 24-case full-L1 corpus asserting determinism, action/accounting invariants, strict EV gain, and strict per-case EV floor checks against `src/portfolio/tests/ev_snapshots.json` (no regression tolerance).
-- `test_fuzz_rebalance_end_to_end_partial_l1_invariants`: deterministic seeded 24-case partial-L1 corpus asserting direct-only route constraints, invariants, strict EV gain, and strict per-case EV floor checks against snapshots (no regression tolerance).
+- `test_fuzz_rebalance_end_to_end_full_l1_invariants`: deterministic seeded 24-case full-L1 corpus asserting determinism, action/accounting invariants, strict EV gain, and per-case EV floor checks against `src/portfolio/tests/ev_snapshots.json` with a tiny floating-point tolerance (`1e-9 * (1 + max(|got|, |floor|))`).
+- `test_fuzz_rebalance_end_to_end_partial_l1_invariants`: deterministic seeded 24-case partial-L1 corpus asserting direct-only route constraints, invariants, strict EV gain, and per-case EV floor checks against snapshots with the same tiny floating-point tolerance.
 - `test_rebalance_negative_budget_legacy_sells_self_fund_rebalance`: hardcoded debt-entry fixture (`susds_balance < 0`) showing Phase-1 liquidation can recover cash and avoid EV regression.
 - `test_rebalance_handles_nan_and_infinite_budget_without_non_finite_actions`: defensive-input test that `NaN`/`Infinity` budgets fail closed (no actions emitted).
 - `test_rebalance_non_finite_balances_fail_closed_to_zero_inventory`: defensive-input fixture ensuring `NaN`/`Infinity` holdings are sanitized to zero inventory, preventing invalid liquidation flow.
@@ -222,10 +222,17 @@ EV regression gates are now two-layered:
 - deterministic full/partial seeded fuzz corpora with per-case EV-after snapshots loaded from `src/portfolio/tests/ev_snapshots.json`;
 - deterministic full-L1 regression fixtures with fixed EV-before/EV-after snapshots.
 
-When intentionally changing optimizer economics, refresh `src/portfolio/tests/ev_snapshots.json` in the same PR and keep the EV floor workflow (`EV_new >= EV_old` on the 51-label corpus, no tolerance) as an external release gate.
+When intentionally changing optimizer economics, refresh `src/portfolio/tests/ev_snapshots.json` in the same PR and keep the EV floor workflow (`EV_new + tol >= EV_old` on the 51-label corpus, where `tol = 1e-9 * (1 + max(|EV_new|, |EV_old|))`) as an external release gate.
 
 Phase-1 liquidation now runs iteratively per outcome (bounded) instead of a single sell attempt. This prevents one-shot merge-heavy splits from leaving residual legacy inventory in an overpriced source market.
 Phase-3 liquidation/reallocation now has an EV guardrail: each iteration is dry-run on cloned state and committed only if expected value does not regress (within numerical tolerance).
+After polish, rebalance now runs a terminal cleanup sequence (sell-overpriced + mixed sweep + bounded direct-only sweeps) to reduce residual local profitable directions before returning final actions.
+
+For tests, each `rebalance(...)` run now reports a post-run local-gradient summary (`[rebalance][post-grad]`) and enforces:
+- max direct local gradient `<= 1e-6`
+- max indirect local gradient `<= 1e-6`
+
+The local-gradient probe uses finite-difference step size `eps = 1e-6` over direct (`buy`, `sell`) and indirect (`mint_sell`, `buy_merge`) directions.
 
 ## Usage
 

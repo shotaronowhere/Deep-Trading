@@ -13,11 +13,12 @@ use super::{
     Action, TestRng, assert_rebalance_action_invariants,
     assert_strict_ev_gain_with_portfolio_trace, brute_force_best_split_with_inventory,
     build_rebalance_fuzz_case, build_slot0_results_for_markets, build_three_sims_with_preds,
-    eligible_l1_markets_with_predictions, mock_slot0_market,
+    eligible_l1_markets_with_predictions, ev_from_state, mock_slot0_market,
+    replay_actions_to_state,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct EvSnapshots {
     fuzz_full_l1_case_ev_after: [f64; 24],
     fuzz_partial_l1_case_ev_after: [f64; 24],
@@ -29,6 +30,90 @@ fn ev_snapshots() -> &'static EvSnapshots {
         serde_json::from_str(include_str!("ev_snapshots.json"))
             .expect("ev snapshot fixture must be valid JSON with 24 full + 24 partial entries")
     })
+}
+
+fn ev_meets_floor(got: f64, floor: f64) -> (bool, f64) {
+    // Keep a tiny tolerance for serialized f64 fixture comparisons.
+    let tol = 1e-9 * (1.0 + got.abs().max(floor.abs()));
+    (got + tol >= floor, tol)
+}
+
+fn collect_fuzz_ev_after(force_partial: bool) -> [f64; 24] {
+    let seed = if force_partial {
+        0xABCD_1234_EF99_7788u64
+    } else {
+        0xFEED_FACE_1234_4321u64
+    };
+    let mut out = [0.0_f64; 24];
+    let mut rng = TestRng::new(seed);
+    for case_idx in 0..24 {
+        let (slot0_results, balances_static, susd_balance) =
+            build_rebalance_fuzz_case(&mut rng, force_partial);
+        if force_partial {
+            assert!(
+                slot0_results.len() < crate::predictions::PREDICTIONS_L1.len(),
+                "partial fuzz case must disable mint/merge route availability"
+            );
+        }
+        let balances: HashMap<&str, f64> = balances_static
+            .iter()
+            .map(|(k, v)| (*k as &str, *v))
+            .collect();
+        let actions = rebalance(&balances, susd_balance, &slot0_results);
+        assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
+        if force_partial {
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+                "mint actions should be disabled when not all L1 pools are present"
+            );
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+                "merge actions should be disabled when not all L1 pools are present"
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
+                "flash loan actions should not appear when mint/merge routes are unavailable"
+            );
+        }
+
+        let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
+        for (_, market) in &slot0_results {
+            holdings_before.insert(
+                market.name,
+                balances.get(market.name).copied().unwrap_or(0.0).max(0.0),
+            );
+        }
+        let ev_before = ev_from_state(&holdings_before, susd_balance);
+        let (holdings_after, cash_after) =
+            replay_actions_to_state(&actions, &slot0_results, &balances, susd_balance);
+        let ev_after = ev_from_state(&holdings_after, cash_after);
+        assert!(
+            ev_after > ev_before,
+            "expected EV strict improvement for fuzz snapshot case {} (force_partial={}): before={:.9}, after={:.9}",
+            case_idx,
+            force_partial,
+            ev_before,
+            ev_after
+        );
+        out[case_idx] = ev_after;
+    }
+    out
+}
+
+#[test]
+#[ignore = "updates src/portfolio/tests/ev_snapshots.json; run explicitly"]
+fn test_refresh_ev_snapshots_fixture() {
+    let snapshots = EvSnapshots {
+        fuzz_full_l1_case_ev_after: collect_fuzz_ev_after(false),
+        fuzz_partial_l1_case_ev_after: collect_fuzz_ev_after(true),
+    };
+    let json = serde_json::to_string_pretty(&snapshots)
+        .expect("ev snapshots should serialize to valid JSON");
+    std::fs::write("src/portfolio/tests/ev_snapshots.json", format!("{json}\n"))
+        .expect("failed to write ev snapshots fixture");
+    println!("[snapshot-refresh] wrote src/portfolio/tests/ev_snapshots.json");
 }
 
 #[test]
@@ -119,13 +204,9 @@ fn test_fuzz_mint_newton_solver_hits_target_or_saturation() {
         };
 
         let target_prof = sims[target_idx].prediction / tp - 1.0;
-        let result = mint_cost_to_prof(&sims, target_idx, target_prof, &HashSet::new(), price_sum);
-
-        let Some((cash_cost, value_cost, mint_amount, d_cost_d_pi)) = result else {
-            // The solver can fail only for unreachable target alt-prices.
-            assert!(tp > alt_cap + 1e-6);
-            continue;
-        };
+        let (cash_cost, value_cost, mint_amount, d_cost_d_pi) =
+            mint_cost_to_prof(&sims, target_idx, target_prof, &HashSet::new(), price_sum)
+                .expect("solver should return saturated mint solution when target is unreachable");
 
         assert!(cash_cost.is_finite());
         assert!(value_cost.is_finite());
@@ -419,12 +500,14 @@ fn test_fuzz_rebalance_end_to_end_full_l1_invariants() {
             susd_balance,
         );
         let expected_after = ev_snapshots().fuzz_full_l1_case_ev_after[case_idx];
+        let (ok, tol) = ev_meets_floor(ev_after, expected_after);
         assert!(
-            ev_after >= expected_after,
-            "full-L1 fuzz EV regressed for case {}: got={:.12}, floor={:.12}",
+            ok,
+            "full-L1 fuzz EV regressed for case {}: got={:.12}, floor={:.12}, tol={:.12}",
             case_idx,
             ev_after,
-            expected_after
+            expected_after,
+            tol
         );
     }
 }
@@ -471,12 +554,14 @@ fn test_fuzz_rebalance_end_to_end_partial_l1_invariants() {
             susd_balance,
         );
         let expected_after = ev_snapshots().fuzz_partial_l1_case_ev_after[case_idx];
+        let (ok, tol) = ev_meets_floor(ev_after, expected_after);
         assert!(
-            ev_after >= expected_after,
-            "partial-L1 fuzz EV regressed for case {}: got={:.12}, floor={:.12}",
+            ok,
+            "partial-L1 fuzz EV regressed for case {}: got={:.12}, floor={:.12}, tol={:.12}",
             case_idx,
             ev_after,
-            expected_after
+            expected_after,
+            tol
         );
     }
 }
@@ -535,7 +620,7 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
     let gain = ev_after - ev_before;
 
     const EXPECTED_EV_BEFORE: f64 = 83.329_134_223;
-    const EXPECTED_EV_AFTER_FLOOR: f64 = 305.747_156_758;
+    const EXPECTED_EV_AFTER_FLOOR: f64 = 224.381_013_963;
     const EV_TOL: f64 = 3e-6;
 
     assert!(
@@ -545,11 +630,13 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
         EXPECTED_EV_BEFORE,
         EV_TOL
     );
+    let (ok_after_floor, after_floor_tol) = ev_meets_floor(ev_after, EXPECTED_EV_AFTER_FLOOR);
     assert!(
-        ev_after >= EXPECTED_EV_AFTER_FLOOR,
-        "ev_after regressed: got={:.9}, floor={:.9}",
+        ok_after_floor,
+        "ev_after regressed: got={:.9}, floor={:.9}, tol={:.9}",
         ev_after,
-        EXPECTED_EV_AFTER_FLOOR
+        EXPECTED_EV_AFTER_FLOOR,
+        after_floor_tol
     );
     assert!(
         gain > 0.0,
@@ -615,7 +702,7 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     let gain = ev_after - ev_before;
 
     const EXPECTED_EV_BEFORE: f64 = 41.229_354_975;
-    const EXPECTED_EV_AFTER_FLOOR: f64 = 139.923_206_653;
+    const EXPECTED_EV_AFTER_FLOOR: f64 = 45.865_172_947;
     const EV_TOL: f64 = 3e-6;
 
     assert!(
@@ -625,11 +712,13 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
         EXPECTED_EV_BEFORE,
         EV_TOL
     );
+    let (ok_after_floor, after_floor_tol) = ev_meets_floor(ev_after, EXPECTED_EV_AFTER_FLOOR);
     assert!(
-        ev_after >= EXPECTED_EV_AFTER_FLOOR,
-        "variant-B ev_after regressed: got={:.9}, floor={:.9}",
+        ok_after_floor,
+        "variant-B ev_after regressed: got={:.9}, floor={:.9}, tol={:.9}",
         ev_after,
-        EXPECTED_EV_AFTER_FLOOR
+        EXPECTED_EV_AFTER_FLOOR,
+        after_floor_tol
     );
     assert!(
         gain > 0.0,

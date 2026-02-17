@@ -1542,5 +1542,7 @@ impl TestRng {
 mod execution;
 #[path = "tests/fuzz_rebalance.rs"]
 mod fuzz_rebalance;
+#[path = "tests/monte_carlo.rs"]
+mod monte_carlo;
 #[path = "tests/oracle.rs"]
 mod oracle;

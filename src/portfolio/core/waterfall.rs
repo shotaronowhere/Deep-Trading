@@ -37,10 +37,17 @@ pub(super) fn best_non_active(
 
 pub(super) const MAX_WATERFALL_ITERS: usize = 1000;
 
-fn realized_step_profitability(sims: &[PoolSim], step: &PlannedRoute, price_sum: f64) -> Option<f64> {
+fn realized_step_profitability(
+    sims: &[PoolSim],
+    step: &PlannedRoute,
+    price_sum: f64,
+) -> Option<f64> {
     let prof = match step.route {
         Route::Direct => profitability(sims[step.idx].prediction, sims[step.idx].price()),
-        Route::Mint => profitability(sims[step.idx].prediction, alt_price(sims, step.idx, price_sum)),
+        Route::Mint => profitability(
+            sims[step.idx].prediction,
+            alt_price(sims, step.idx, price_sum),
+        ),
     };
     prof.is_finite().then_some(prof)
 }

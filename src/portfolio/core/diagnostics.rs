@@ -75,6 +75,7 @@ pub fn replay_actions_to_portfolio_state(
                 for (_, market) in slot0_results {
                     *holdings.entry(market.name).or_insert(0.0) += *amount;
                 }
+                cash -= *amount;
             }
             Action::Merge { amount, .. } => {
                 for (_, market) in slot0_results {
@@ -1075,8 +1076,13 @@ fn mixed_stage_should_annotate_direct_profitability(
 ) -> bool {
     matches!(
         (step_kind, action_set_kind),
-        (ProfitabilityStepKind::MixedDirectBuyMintSell, ActionSetKind::Buy)
-            | (ProfitabilityStepKind::MixedDirectSellBuyMerge, ActionSetKind::Sell)
+        (
+            ProfitabilityStepKind::MixedDirectBuyMintSell,
+            ActionSetKind::Buy
+        ) | (
+            ProfitabilityStepKind::MixedDirectSellBuyMerge,
+            ActionSetKind::Sell
+        )
     )
 }
 
@@ -1612,8 +1618,8 @@ fn print_compact_action_groups(
         actions.len()
     );
     let (arb_actions, post_arb_actions) = split_actions_by_complete_set_arb_phase(actions);
-    let arb_groups_result = (!arb_actions.is_empty())
-        .then(|| group_actions_by_profitability_step(arb_actions));
+    let arb_groups_result =
+        (!arb_actions.is_empty()).then(|| group_actions_by_profitability_step(arb_actions));
     let post_groups_result = (!post_arb_actions.is_empty())
         .then(|| group_actions_by_profitability_step(post_arb_actions));
 
@@ -2043,22 +2049,12 @@ mod tests {
             },
         );
 
-        let with_suffix = action_outline_detail_with_direct_profitability(
-            &action,
-            3,
-            4,
-            true,
-            Some(&spans),
-        );
+        let with_suffix =
+            action_outline_detail_with_direct_profitability(&action, 3, 4, true, Some(&spans));
         assert!(with_suffix.contains("direct profitability=0.250000->0.200000"));
 
-        let without_suffix = action_outline_detail_with_direct_profitability(
-            &action,
-            3,
-            4,
-            false,
-            Some(&spans),
-        );
+        let without_suffix =
+            action_outline_detail_with_direct_profitability(&action, 3, 4, false, Some(&spans));
         assert!(!without_suffix.contains("direct profitability="));
     }
 }

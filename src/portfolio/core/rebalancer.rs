@@ -7,6 +7,8 @@ use super::sim::{
     EPS, PoolSim, SimBuildError, build_sims, build_sims_without_predictions, profitability,
     target_price_for_prof,
 };
+#[cfg(test)]
+use super::sim::DUST;
 use super::trading::{ExecutionState, portfolio_expected_value};
 use super::types::BalanceMap;
 use super::types::{apply_actions_to_sim_balances, lookup_balance};
@@ -16,6 +18,8 @@ const MAX_PHASE1_ITERS: usize = 128;
 const MAX_PHASE3_ITERS: usize = 8;
 const PHASE3_PROF_REL_TOL: f64 = 1e-9;
 const PHASE3_EV_GUARD_REL_TOL: f64 = 1e-10;
+const MAX_POLISH_PASSES: usize = 64;
+const POLISH_EV_REL_TOL: f64 = 1e-10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebalanceMode {
@@ -384,6 +388,85 @@ impl RebalanceContext {
             phase3_prof = new_prof;
         }
     }
+
+    fn commit_trial_actions(&mut self, mut trial: RebalanceContext) {
+        self.actions.append(&mut trial.actions);
+        self.sims = trial.sims;
+        self.sim_balances = trial.sim_balances;
+        self.legacy_remaining = trial.legacy_remaining;
+        self.budget = trial.budget;
+    }
+
+    fn run_polish_reoptimization(&mut self) {
+        for _ in 0..MAX_POLISH_PASSES {
+            if self.budget <= EPS {
+                break;
+            }
+
+            let ev_before = portfolio_expected_value(&self.sims, &self.sim_balances, self.budget);
+            if !ev_before.is_finite() {
+                break;
+            }
+
+            // Build a trial context from the current simulated state; commit only if EV improves.
+            let mut trial = RebalanceContext {
+                actions: Vec::new(),
+                budget: self.budget,
+                sims: self.sims.clone(),
+                mint_available: self.mint_available,
+                sim_balances: self.sim_balances.clone(),
+                // In polish mode, recycle across current inventory (not only initial legacy).
+                legacy_remaining: self.sim_balances.clone(),
+            };
+
+            if trial.mint_available {
+                let _arb_profit = {
+                    let mut exec = ExecutionState::new(
+                        &mut trial.sims,
+                        &mut trial.budget,
+                        &mut trial.actions,
+                        &mut trial.sim_balances,
+                    );
+                    exec.execute_complete_set_arb()
+                };
+            }
+
+            trial.run_phase1_sell_overpriced();
+
+            let actions_before = trial.actions.len();
+            let last_bought_prof = waterfall(
+                &mut trial.sims,
+                &mut trial.budget,
+                &mut trial.actions,
+                trial.mint_available,
+            );
+            apply_actions_to_sim_balances(
+                &trial.actions[actions_before..],
+                &trial.sims,
+                &mut trial.sim_balances,
+            );
+
+            // Recycle lower-profit legacy candidates and reallocate recovered budget.
+            if trial.cap_legacy_to_current_holdings() {
+                trial.run_phase3_recycling(last_bought_prof);
+            }
+
+            if trial.actions.is_empty() {
+                break;
+            }
+
+            let ev_after = portfolio_expected_value(&trial.sims, &trial.sim_balances, trial.budget);
+            if !ev_after.is_finite() {
+                break;
+            }
+            let ev_tol = POLISH_EV_REL_TOL * (1.0 + ev_before.abs() + ev_after.abs());
+            if ev_after <= ev_before + ev_tol {
+                break;
+            }
+
+            self.commit_trial_actions(trial);
+        }
+    }
 }
 
 fn rebalance_full(
@@ -449,7 +532,422 @@ fn rebalance_full(
         ctx.run_phase3_recycling(last_bought_prof);
     }
 
+    // ── Phase 4: Short polish re-optimization loop ──
+    // Run bounded extra passes only when they increase EV.
+    ctx.run_polish_reoptimization();
+
+    // ── Phase 5: Final local cleanup pass ──
+    // Run one final sell-overpriced + waterfall pass so the terminal state
+    // better aligns with first-order local optimality checks used in tests.
+    ctx.run_phase1_sell_overpriced();
+    let actions_before_cleanup = ctx.actions.len();
+    let cleanup_last_prof = waterfall(
+        &mut ctx.sims,
+        &mut ctx.budget,
+        &mut ctx.actions,
+        ctx.mint_available,
+    );
+    apply_actions_to_sim_balances(
+        &ctx.actions[actions_before_cleanup..],
+        &ctx.sims,
+        &mut ctx.sim_balances,
+    );
+    if ctx.mint_available && !ctx.actions[actions_before_cleanup..].is_empty() {
+        // Recycle across full current inventory once more to reduce residual local gradients.
+        ctx.legacy_remaining = ctx.sim_balances.clone();
+        if ctx.has_legacy_holdings() {
+            ctx.run_phase3_recycling(cleanup_last_prof);
+        }
+    }
+    for _ in 0..4 {
+        let start_actions = ctx.actions.len();
+        ctx.run_phase1_sell_overpriced();
+        let actions_before_direct_cleanup = ctx.actions.len();
+        let _ = waterfall(
+            &mut ctx.sims,
+            &mut ctx.budget,
+            &mut ctx.actions,
+            false, // direct-only terminal sweep for residual direct alpha
+        );
+        apply_actions_to_sim_balances(
+            &ctx.actions[actions_before_direct_cleanup..],
+            &ctx.sims,
+            &mut ctx.sim_balances,
+        );
+        if ctx.actions.len() == start_actions {
+            break;
+        }
+    }
+
+    if ctx.mint_available {
+        let actions_before_mixed_cleanup = ctx.actions.len();
+        let mixed_last_prof = waterfall(
+            &mut ctx.sims,
+            &mut ctx.budget,
+            &mut ctx.actions,
+            true,
+        );
+        apply_actions_to_sim_balances(
+            &ctx.actions[actions_before_mixed_cleanup..],
+            &ctx.sims,
+            &mut ctx.sim_balances,
+        );
+        if !ctx.actions[actions_before_mixed_cleanup..].is_empty() {
+            ctx.legacy_remaining = ctx.sim_balances.clone();
+            if ctx.has_legacy_holdings() {
+                ctx.run_phase3_recycling(mixed_last_prof);
+            }
+        }
+        for _ in 0..2 {
+            let start_actions = ctx.actions.len();
+            ctx.run_phase1_sell_overpriced();
+            let actions_before_direct_cleanup = ctx.actions.len();
+            let _ = waterfall(
+                &mut ctx.sims,
+                &mut ctx.budget,
+                &mut ctx.actions,
+                false,
+            );
+            apply_actions_to_sim_balances(
+                &ctx.actions[actions_before_direct_cleanup..],
+                &ctx.sims,
+                &mut ctx.sim_balances,
+            );
+            if ctx.actions.len() == start_actions {
+                break;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    assert_internal_state_matches_replay(&ctx, slot0_results, balances, susds_balance);
+
     ctx.actions
+}
+
+#[cfg(test)]
+fn assert_internal_state_matches_replay(
+    ctx: &RebalanceContext,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    balances: &HashMap<&str, f64>,
+    initial_susd: f64,
+) {
+    let (replay_holdings, replay_cash) = super::diagnostics::replay_actions_to_portfolio_state(
+        &ctx.actions,
+        slot0_results,
+        balances,
+        initial_susd,
+    );
+
+    let cash_tol = 1e-6 * (1.0 + replay_cash.abs().max(ctx.budget.abs()));
+    assert!(
+        (ctx.budget - replay_cash).abs() <= cash_tol,
+        "internal/replay cash mismatch: internal={:.12}, replay={:.12}, tol={:.12}",
+        ctx.budget,
+        replay_cash,
+        cash_tol
+    );
+
+    for sim in &ctx.sims {
+        let internal = ctx.sim_balances.get(sim.market_name).copied().unwrap_or(0.0).max(0.0);
+        let replay = replay_holdings
+            .get(sim.market_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        let tol = 1e-6 * (1.0 + internal.abs().max(replay.abs()));
+        assert!(
+            (internal - replay).abs() <= tol,
+            "internal/replay holding mismatch: market={}, internal={:.12}, replay={:.12}, tol={:.12}",
+            sim.market_name,
+            internal,
+            replay,
+            tol
+        );
+    }
+
+    const LOCAL_GRAD_EPS: f64 = 1e-6;
+    const LOCAL_GRAD_TOL: f64 = 1e-6;
+    let gradients = estimate_local_gradients_for_context(ctx, LOCAL_GRAD_EPS);
+    println!(
+        "[rebalance][post-grad] eps={:.3e} max_direct_grad={:.9} ({}) max_indirect_grad={:.9} ({})",
+        gradients.eps,
+        gradients.max_direct_grad,
+        gradients.best_direct_label,
+        gradients.max_indirect_grad,
+        gradients.best_indirect_label
+    );
+    assert!(
+        gradients.max_direct_grad <= LOCAL_GRAD_TOL,
+        "post-waterfall direct local gradient still positive: grad={:.12}, best={}, tol={:.3e}",
+        gradients.max_direct_grad,
+        gradients.best_direct_label,
+        LOCAL_GRAD_TOL
+    );
+    assert!(
+        gradients.max_indirect_grad <= LOCAL_GRAD_TOL,
+        "post-waterfall indirect local gradient still positive: grad={:.12}, best={}, tol={:.3e}",
+        gradients.max_indirect_grad,
+        gradients.best_indirect_label,
+        LOCAL_GRAD_TOL
+    );
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct LocalGradientState {
+    sims: Vec<PoolSim>,
+    holdings: Vec<f64>,
+    cash: f64,
+    allow_indirect: bool,
+}
+
+#[cfg(test)]
+impl LocalGradientState {
+    fn ev(&self) -> f64 {
+        let holdings_ev: f64 = self
+            .holdings
+            .iter()
+            .zip(self.sims.iter())
+            .map(|(held, sim)| held.max(0.0) * sim.prediction)
+            .sum();
+        self.cash + holdings_ev
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct LocalGradientSummary {
+    eps: f64,
+    max_direct_grad: f64,
+    max_indirect_grad: f64,
+    best_direct_label: String,
+    best_indirect_label: String,
+}
+
+#[cfg(test)]
+fn gradient_state_is_valid(state: &LocalGradientState) -> bool {
+    if !state.cash.is_finite() || state.cash < -1e-9 {
+        return false;
+    }
+    state
+        .holdings
+        .iter()
+        .all(|held| held.is_finite() && *held >= -1e-9)
+}
+
+#[cfg(test)]
+fn eval_direct_buy_gradient(state: &LocalGradientState, idx: usize, eps: f64) -> Option<f64> {
+    if idx >= state.sims.len() {
+        return None;
+    }
+    let cap = state.sims[idx].max_buy_tokens().max(0.0);
+    if cap <= DUST {
+        return None;
+    }
+    let amount = cap * eps;
+    if amount <= DUST {
+        return None;
+    }
+    let (bought, cost, _) = state.sims[idx].buy_exact(amount)?;
+    if bought <= DUST || !cost.is_finite() || cost > state.cash + EPS {
+        return None;
+    }
+    Some((state.sims[idx].prediction * bought - cost) / bought.max(DUST))
+}
+
+#[cfg(test)]
+fn eval_direct_sell_gradient(state: &LocalGradientState, idx: usize, eps: f64) -> Option<f64> {
+    if idx >= state.sims.len() {
+        return None;
+    }
+    let held = state.holdings[idx].max(0.0);
+    let cap = held.min(state.sims[idx].max_sell_tokens().max(0.0));
+    if cap <= DUST {
+        return None;
+    }
+    let amount = cap * eps;
+    if amount <= DUST {
+        return None;
+    }
+    let (sold, proceeds, _) = state.sims[idx].sell_exact(amount)?;
+    if sold <= DUST || !proceeds.is_finite() {
+        return None;
+    }
+    Some((proceeds - state.sims[idx].prediction * sold) / sold.max(DUST))
+}
+
+#[cfg(test)]
+fn eval_mint_sell_gradient(state: &LocalGradientState, target_idx: usize, eps: f64) -> Option<f64> {
+    let n = state.sims.len();
+    if n < 2 || target_idx >= n {
+        return None;
+    }
+
+    let mut cap = f64::INFINITY;
+    for i in 0..n {
+        if i == target_idx {
+            continue;
+        }
+        cap = cap.min(state.sims[i].max_sell_tokens().max(0.0));
+    }
+    if !cap.is_finite() || cap <= DUST {
+        return None;
+    }
+    let amount = cap * eps;
+    if amount <= DUST || amount > state.cash + EPS {
+        return None;
+    }
+
+    let base_ev = state.ev();
+    let mut trial = state.clone();
+    for held in &mut trial.holdings {
+        *held += amount;
+    }
+    trial.cash -= amount;
+
+    for i in 0..n {
+        if i == target_idx {
+            continue;
+        }
+        let (sold, proceeds, new_price) = trial.sims[i].sell_exact(amount)?;
+        if sold <= DUST || !proceeds.is_finite() {
+            return None;
+        }
+        trial.sims[i].set_price(new_price);
+        trial.holdings[i] = (trial.holdings[i] - sold).max(0.0);
+        trial.cash += proceeds;
+    }
+    if !gradient_state_is_valid(&trial) {
+        return None;
+    }
+    Some((trial.ev() - base_ev) / amount.max(DUST))
+}
+
+#[cfg(test)]
+fn eval_buy_merge_gradient(state: &LocalGradientState, source_idx: usize, eps: f64) -> Option<f64> {
+    let n = state.sims.len();
+    if n < 2 || source_idx >= n {
+        return None;
+    }
+    if state.holdings[source_idx] <= DUST {
+        return None;
+    }
+
+    let mut cap = state.holdings[source_idx].max(0.0);
+    for i in 0..n {
+        if i == source_idx {
+            continue;
+        }
+        cap = cap.min(state.holdings[i].max(0.0) + state.sims[i].max_buy_tokens().max(0.0));
+    }
+    if !cap.is_finite() || cap <= DUST {
+        return None;
+    }
+    let amount = cap * eps;
+    if amount <= DUST {
+        return None;
+    }
+
+    let base_ev = state.ev();
+    let mut trial = state.clone();
+    for i in 0..n {
+        if i == source_idx {
+            continue;
+        }
+        let shortfall = (amount - trial.holdings[i].max(0.0)).max(0.0);
+        if shortfall <= DUST {
+            continue;
+        }
+        let (bought, cost, new_price) = trial.sims[i].buy_exact(shortfall)?;
+        if bought + EPS < shortfall || !cost.is_finite() || cost > trial.cash + EPS {
+            return None;
+        }
+        trial.sims[i].set_price(new_price);
+        trial.holdings[i] += bought;
+        trial.cash -= cost;
+    }
+
+    for held in &mut trial.holdings {
+        *held -= amount;
+        if *held < 0.0 && *held > -1e-9 {
+            *held = 0.0;
+        }
+    }
+    trial.cash += amount;
+    if !gradient_state_is_valid(&trial) {
+        return None;
+    }
+    Some((trial.ev() - base_ev) / amount.max(DUST))
+}
+
+#[cfg(test)]
+fn estimate_local_gradients(state: &LocalGradientState, eps: f64) -> LocalGradientSummary {
+    let mut max_direct = f64::NEG_INFINITY;
+    let mut max_indirect = f64::NEG_INFINITY;
+    let mut best_direct = "none".to_string();
+    let mut best_indirect = "none".to_string();
+
+    for i in 0..state.sims.len() {
+        if let Some(g) = eval_direct_buy_gradient(state, i, eps) {
+            if g > max_direct {
+                max_direct = g;
+                best_direct = format!("direct_buy:{}", state.sims[i].market_name);
+            }
+        }
+        if let Some(g) = eval_direct_sell_gradient(state, i, eps) {
+            if g > max_direct {
+                max_direct = g;
+                best_direct = format!("direct_sell:{}", state.sims[i].market_name);
+            }
+        }
+        if state.allow_indirect {
+            if let Some(g) = eval_mint_sell_gradient(state, i, eps) {
+                if g > max_indirect {
+                    max_indirect = g;
+                    best_indirect = format!("mint_sell_target:{}", state.sims[i].market_name);
+                }
+            }
+            if let Some(g) = eval_buy_merge_gradient(state, i, eps) {
+                if g > max_indirect {
+                    max_indirect = g;
+                    best_indirect = format!("buy_merge_source:{}", state.sims[i].market_name);
+                }
+            }
+        }
+    }
+
+    LocalGradientSummary {
+        eps,
+        max_direct_grad: if max_direct.is_finite() {
+            max_direct
+        } else {
+            0.0
+        },
+        max_indirect_grad: if max_indirect.is_finite() {
+            max_indirect
+        } else {
+            0.0
+        },
+        best_direct_label: best_direct,
+        best_indirect_label: best_indirect,
+    }
+}
+
+#[cfg(test)]
+fn estimate_local_gradients_for_context(ctx: &RebalanceContext, eps: f64) -> LocalGradientSummary {
+    let holdings: Vec<f64> = ctx
+        .sims
+        .iter()
+        .map(|sim| ctx.sim_balances.get(sim.market_name).copied().unwrap_or(0.0).max(0.0))
+        .collect();
+    let state = LocalGradientState {
+        sims: ctx.sims.clone(),
+        holdings,
+        cash: ctx.budget,
+        allow_indirect: ctx.mint_available,
+    };
+    estimate_local_gradients(&state, eps)
 }
 
 fn rebalance_arb_only(

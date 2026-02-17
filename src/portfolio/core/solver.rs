@@ -181,13 +181,12 @@ pub(super) fn mint_cost_to_prof(
 
     // Reachability guard:
     // g(m) decreases from g0 (m=0) to g_cap (all legs at cap). If rhs is below g_cap,
-    // target alt price is unreachable with available liquidity.
+    // target alt price is unreachable with available liquidity. Clamp to g_cap so
+    // we return the executable saturated mint amount instead of dropping the route.
     let (_g0, g_cap, g_tol) = mint_reachability_bounds(&params);
-    if rhs < g_cap - g_tol {
-        return None;
-    }
+    let effective_rhs = if rhs < g_cap - g_tol { g_cap } else { rhs };
 
-    let m = solve_mint_amount_newton(&params, tp, current_alt, rhs, g_cap, g_tol);
+    let m = solve_mint_amount_newton(&params, tp, current_alt, effective_rhs, g_cap, g_tol);
 
     if m < DUST {
         return Some((0.0, 0.0, 0.0, 0.0));

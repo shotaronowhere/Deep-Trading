@@ -275,7 +275,13 @@ pub(super) fn plan_active_routes_with_scratch(
             Route::Mint => {
                 if let Some(cap_prof) = active_prof_cap
                     && let Some(boundary_amount) = mint_active_set_boundary_amount(
-                        sim_state, active, idx, target_prof, amount, skip, cap_prof,
+                        sim_state,
+                        active,
+                        idx,
+                        target_prof,
+                        amount,
+                        skip,
+                        cap_prof,
                     )
                 {
                     amount = boundary_amount;

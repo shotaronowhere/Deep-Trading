@@ -1416,7 +1416,10 @@ fn test_plan_truncates_mint_when_non_active_hits_current_prof() {
         }
     }
     let capped_sum: f64 = capped_state.iter().map(|s| s.price()).sum();
-    let active_prof_after = profitability(capped_state[0].prediction, alt_price(&capped_state, 0, capped_sum));
+    let active_prof_after = profitability(
+        capped_state[0].prediction,
+        alt_price(&capped_state, 0, capped_sum),
+    );
     let mut best_non_active_prof = f64::NEG_INFINITY;
     for (i, sim) in capped_state.iter().enumerate() {
         if i == 0 || skip.contains(&i) {
@@ -1809,8 +1812,12 @@ fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
         let mut exec_actions = Vec::new();
         let executed = {
             let mut balances: HashMap<&str, f64> = HashMap::new();
-            let mut exec =
-                ExecutionState::new(&mut exec_sims, &mut exec_budget, &mut exec_actions, &mut balances);
+            let mut exec = ExecutionState::new(
+                &mut exec_sims,
+                &mut exec_budget,
+                &mut exec_actions,
+                &mut balances,
+            );
             exec.execute_planned_routes(&plan, &skip)
         };
         if !executed {
@@ -2070,13 +2077,21 @@ fn test_intra_step_boundary_rerank_improves_ev_vs_no_split_control() {
             true,
         );
 
-        if !split_actions.iter().any(|a| matches!(a, Action::Mint { .. }))
-            || !split_actions.iter().any(|a| matches!(a, Action::Buy { .. }))
+        if !split_actions
+            .iter()
+            .any(|a| matches!(a, Action::Mint { .. }))
+            || !split_actions
+                .iter()
+                .any(|a| matches!(a, Action::Buy { .. }))
         {
             continue;
         }
-        if !no_split_actions.iter().any(|a| matches!(a, Action::Mint { .. }))
-            || !no_split_actions.iter().any(|a| matches!(a, Action::Buy { .. }))
+        if !no_split_actions
+            .iter()
+            .any(|a| matches!(a, Action::Mint { .. }))
+            || !no_split_actions
+                .iter()
+                .any(|a| matches!(a, Action::Buy { .. }))
         {
             continue;
         }
@@ -2084,12 +2099,8 @@ fn test_intra_step_boundary_rerank_improves_ev_vs_no_split_control() {
         let balances: HashMap<&str, f64> = HashMap::new();
         let (split_holdings, split_cash) =
             replay_actions_to_state(&split_actions, &slot0_results, &balances, initial_budget);
-        let (no_split_holdings, no_split_cash) = replay_actions_to_state(
-            &no_split_actions,
-            &slot0_results,
-            &balances,
-            initial_budget,
-        );
+        let (no_split_holdings, no_split_cash) =
+            replay_actions_to_state(&no_split_actions, &slot0_results, &balances, initial_budget);
         let ev_split = split_cash
             + (0..4)
                 .map(|i| preds[i] * split_holdings.get(names[i]).copied().unwrap_or(0.0))
@@ -2273,7 +2284,7 @@ fn test_waterfall_tiny_liquidity_no_nan_no_overspend() {
 }
 
 #[test]
-fn test_mint_cost_to_prof_all_legs_capped_is_unreachable() {
+fn test_mint_cost_to_prof_all_legs_capped_returns_saturated_solution() {
     let mut sims = build_three_sims_with_preds([0.08, 0.09, 0.10], [0.8, 0.1, 0.1]);
     for i in 1..3 {
         sims[i].sell_limit_price = sims[i].price();
@@ -2284,9 +2295,43 @@ fn test_mint_cost_to_prof_all_legs_capped_is_unreachable() {
     let target_prof = sims[0].prediction / tp - 1.0;
 
     let res = mint_cost_to_prof(&sims, 0, target_prof, &HashSet::new(), price_sum);
+    let Some((cash_cost, value_cost, mint_amount, _d_cost_d_pi)) = res else {
+        panic!("solver should return saturated mint result for unreachable target");
+    };
     assert!(
-        res.is_none(),
-        "when all non-target legs are capped and target alt is above cap, mint route should be unreachable"
+        cash_cost.abs() <= 1e-12,
+        "fully capped legs should not spend budget: cash_cost={:.12}",
+        cash_cost
+    );
+    assert!(
+        value_cost.abs() <= 1e-12,
+        "fully capped legs should have zero value_cost: value_cost={:.12}",
+        value_cost
+    );
+    assert!(
+        mint_amount.abs() <= 1e-12,
+        "fully capped legs should mint zero amount: mint_amount={:.12}",
+        mint_amount
+    );
+
+    let mut simulated = sims.clone();
+    for i in 0..simulated.len() {
+        if i == 0 {
+            continue;
+        }
+        if let Some((sold, _proceeds, p_new)) = simulated[i].sell_exact(mint_amount)
+            && sold > 0.0
+        {
+            simulated[i].set_price(p_new);
+        }
+    }
+    let simulated_sum: f64 = simulated.iter().map(|s| s.price()).sum();
+    let alt_after = alt_price(&simulated, 0, simulated_sum);
+    assert!(
+        (alt_after - current_alt).abs() <= 1e-12,
+        "with no executable sell capacity, alt price should stay unchanged: before={:.12}, after={:.12}",
+        current_alt,
+        alt_after
     );
 }
 
