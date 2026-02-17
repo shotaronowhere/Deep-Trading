@@ -193,17 +193,21 @@ Price after buying m: P(m) = P₀ / (1 − mλ)². Cost: m × P₀ / ((1−f)(1�
 
 The merge route is only available when all pools are present (no partial-pool handling). When selling, we optimize a direct/merge split for each token amount and execute the proceeds-maximizing mixture.
 
-## The Full Rebalance: Four Phases
+## The Full Rebalance: Implemented Six-Phase Flow
 
-**Phase 0: Complete-set arbitrage.** Before discretionary rebalancing, check if buying one unit of every outcome and merging is profitable (slippage- and fee-aware, sized optimally). Execute this first to harvest risk-free budget expansion.
+**Phase 0: Complete-set arbitrage pre-pass.** In `RebalanceMode::Full`, run the buy-all/merge side (`sum(prices) < 1`) before discretionary rebalancing to harvest risk-free budget expansion. (Two-sided arb remains isolated to `RebalanceMode::ArbOnly`.)
 
 **Phase 1: Sell overpriced holdings.** For any outcome where the market price exceeds your prediction and you hold tokens, sell until price = prediction or you exhaust holdings. For each sell amount, optimize a **mixture** of direct sells and merge sells (buy all others + merge), because marginal route attractiveness shifts as each route is partially consumed; execute the proceeds-maximizing split. This is unambiguously correct — holding overpriced assets is negative expected value — and the proceeds fund Phase 2.
 
 **Phase 2: Waterfall allocation.** Deploy the budget (initial sUSD + Phase 0 + Phase 1 proceeds) via the waterfall. Returns the final profitability level π_last.
 
-**Phase 3: Liquidation and reallocation to convergence.** After the waterfall, scan holdings. Any holding with profitability below π_last is capital trapped in a suboptimal position. Sell the worst holdings first (only enough to raise their profitability to π_last), optimize direct/merge split per sell, recover capital, run waterfall again, and repeat until no meaningful improvement remains.
+**Phase 3: Legacy liquidation and reallocation.** After the waterfall, scan remaining legacy inventory. Any legacy holding with profitability below π_last is recycled first: sell worst candidates first (only enough to raise profitability toward π_last), optimize direct/merge split per sell, recover capital, run waterfall again, and repeat for bounded iterations. Each iteration is committed only if expected value does not regress.
 
-The four phases ensure: (1) free arbitrage budget is harvested first, (2) no capital sits in overpriced positions, (3) available capital goes to the best opportunities, (4) legacy holdings that lag the portfolio's marginal standard are iteratively recycled.
+**Phase 4: EV-positive polish loop.** Run bounded trial passes (arb pre-pass if mint-available, Phase 1, waterfall, Phase 3) and commit only EV-improving trials.
+
+**Phase 5: Terminal cleanup sweeps.** Run additional bounded sell-overpriced + waterfall cleanup passes (including direct-only sweeps) to reduce residual local profitable directions.
+
+This implemented flow ensures: (1) free arb budget is harvested first, (2) overpriced exposure is reduced, (3) discretionary budget is allocated by waterfall, (4) legacy laggards are recycled with EV guardrails, and (5) terminal local cleanup is attempted without unbounded loops.
 
 ## Why This Works
 

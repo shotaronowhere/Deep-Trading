@@ -2,7 +2,7 @@
 
 ## Overview
 
-`src/portfolio/core/mod.rs` (with `sim.rs`, `planning.rs`, `solver.rs`, `trading.rs`, `waterfall.rs`, `rebalancer.rs`) computes optimal rebalancing trades for L1 prediction markets using exact swap simulation via Uniswap V3 math. Implements the waterfall allocation algorithm: deploy capital to the most profitable outcome, equalize profitability progressively with the next-best outcomes, then liquidate underperforming holdings and reallocate.
+`src/portfolio/core/mod.rs` (with `sim.rs`, `planning.rs`, `solver.rs`, `trading.rs`, `waterfall.rs`, `rebalancer.rs`) computes optimal rebalancing trades for L1 prediction markets using an analytical single-tick `PoolSim` model (`f64`, with explicit tick-boundary caps). Implements the waterfall allocation algorithm: deploy capital to the most profitable outcome, equalize profitability progressively with the next-best outcomes, then recycle lower-profitability inventory.
 
 ## Function: `rebalance`
 
@@ -36,9 +36,17 @@ enum Action {
 }
 ```
 
-Mint routes are wrapped in flash loans: `FlashLoan → Mint → Sell(others) → RepayFlashLoan`. Merge routes are similarly wrapped: `FlashLoan → Buy(all others) → Merge → RepayFlashLoan`. Both decouple the upfront capital requirement from the portfolio's liquid budget.
+Mint routes are wrapped in flash loans: `FlashLoan → Mint → Sell(others) → RepayFlashLoan`. Merge routes use the same bracket when complementary buy legs require external capital (`FlashLoan → Buy(all others) → Merge → RepayFlashLoan`); when complementary inventory fully covers the merge leg, merge can execute without flash borrowing.
 
 ## Algorithm
+
+Implemented full-mode flow:
+1. Phase 0: complete-set arbitrage pre-pass (`buy-all -> merge` only in `RebalanceMode::Full`).
+2. Phase 1: iterative sell-overpriced liquidation.
+3. Phase 2: waterfall allocation.
+4. Phase 3: legacy-inventory recycling (EV-guarded trial commits).
+5. Phase 4: bounded polish re-optimization loop (commit only when EV improves).
+6. Phase 5: terminal cleanup sweeps (mixed + direct-only bounded passes).
 
 ### Phase 1: Sell overpriced holdings
 For each outcome where market_price > prediction and we hold tokens:
@@ -47,7 +55,7 @@ For each outcome where market_price > prediction and we hold tokens:
 - Merge consumes existing complementary holdings first, and buys only any shortfall from pools.
 - Merge capacity is limited by complementary inventory plus buy caps (`held_j + max_buy_tokens_j`) across non-source outcomes; direct handles the remainder.
 - Merge route only available when `mint_available` (all pools present).
-- Pool state (`sqrt_price_x96`) updated after each sell for subsequent calculations.
+- Pool state (`price`) updated after each sell for subsequent calculations.
 
 ### Phase 2: Waterfall allocation
 
@@ -55,7 +63,7 @@ For each outcome where market_price > prediction and we hold tokens:
 
 Each outcome has up to two acquisition routes, each with its own price and profitability:
 
-- **Direct buy**: current pool price from `sqrt_price_x96`. Profitability = `(prediction - direct_price) / direct_price`.
+- **Direct buy**: current pool price from `PoolSim::price()`. Profitability = `(prediction - direct_price) / direct_price`.
 - **Mint** (when all outcomes have liquid pools): price = `1 - sum(other_outcome_prices)`. Profitability = `(prediction - mint_price) / mint_price`.
 
 Route availability:
@@ -88,14 +96,14 @@ If budget is exhausted immediately after such a split, `waterfall` returns the r
 1. Deploy to A_mint until its profitability drops to 1.0 (matches A_direct)
 2. Deploy to both A_mint and A_direct until profitability drops to 0.6 (matches B_direct)
 3. Deploy to A_mint, A_direct, and B_direct until budget exhausted or no profitability remains
-4. When budget is insufficient for a full step, `solve_prof` finds the achievable profitability level (closed-form for all-direct, Newton for mixed)
+4. When budget is insufficient for a full step, `solve_prof` finds the achievable profitability level (closed-form for all-direct, bisection for mixed)
 
-**Route interactions:** The two routes for the same outcome affect different state. Direct buys move the outcome's pool `sqrt_price_x96`. Mint sells push non-target pool prices down (increasing alt price). They are independent price channels, but both drain profitability for the same outcome from different directions.
+**Route interactions:** The two routes for the same outcome affect different state. Direct buys move the outcome pool price. Mint sells push non-target pool prices down (increasing alt price). They are independent price channels, but both drain profitability for the same outcome from different directions.
 
 #### Cost computation
 
-Cost per step uses exact swap simulation:
-- **Direct route**: `compute_swap_step` to target price derived from target profitability. Target price = `prediction / (1 + target_prof)`.
+Cost per step uses the same analytical `PoolSim` formulas used by execution:
+- **Direct route**: `PoolSim::cost_to_price` to target price derived from target profitability (`prediction / (1 + target_prof)`), clamped to `buy_limit_price`.
 - **Mint route**: Newton's method finds the mint amount where the alt price (1 - sum of post-sell prices) equals the target price. Warm-started with the linearized first step: m₀ = (P_target - alt(0)) / (2 × Σ Pⱼκⱼ), saving one iteration. Uses the analytical price sensitivity parameter κⱼ = (1-fee) × √priceⱼ × 1e18 / Lⱼ per pool. Each pool's sell volume is capped at `max_sell_tokens()` = (√(price/limit_price) - 1) / κ — the max tokens sellable before hitting the tick boundary. In the Newton solver, each pool's price contribution uses min(m, capⱼ), and the derivative is zero for saturated pools. Net cost uses capped proceeds: proceedsⱼ(m) = priceⱼ × min(m, capⱼ) × (1-fee) / (1 + min(m, capⱼ) × κⱼ). If a requested profitability level is unreachable under caps, the solver clamps to the saturated-capacity solution instead of dropping the route. This ensures the analytical estimate matches the tick-bounded execution in `emit_mint_actions`. Active outcomes are excluded from sell simulation.
 - The caller specifies the route per entry — `direct_cost_to_prof` or `mint_cost_to_prof` is called directly based on the entry's route, rather than picking the best route internally.
 - Negative costs (arbitrage, where sell proceeds exceed mint cost) are valid and increase the budget.
@@ -108,19 +116,15 @@ When the total cost to bring all active entries to the next profitability level 
 - A = Σᵢ L_eff_i × √pred_i, B = budget + Σᵢ L_eff_i × √price_i
 - **π = (A/B)² - 1** — zero iterations, exact solution.
 
-**Mixed routes (coupled (π, M) Newton):** When mint routes are in the active set, skip semantics collapse inter-mint coupling to a scalar: all non-active pools see the same aggregate sell volume M = Σ mᵢ, and active pool prices are unperturbed by mints. This reduces the problem to 2 unknowns (π, M).
+**Mixed routes (simulation-backed bisection):** When mint routes are in the active set, `solve_prof` does not solve a closed-form coupled `(π, M)` system. Instead, it tests affordability by planning the exact mint-first then direct execution sequence at candidate profitability levels and requiring running-budget feasibility.
 
-The solver partitions outcomes into D\* (direct-active ∪ binding mint target i\*), Q' (mint-active-only, pool price frozen), and N (non-active, sold into by mints). Key equations:
-- **Alt-price constraint** (defines M for given π): `ΔG(M) = δ(π)`, where `δ(π) = Π*/(1+π) - (1-S₀)`, `Π* = Σ_{D*} predⱼ`, `S₀ = Σ_{j∉D*} P⁰ⱼ`
-- **Budget constraint**: `Σ_{D} d_j(π) + C_mint(M(π)) = B`
-
-Outer Newton on π (up to 15 iterations), inner Newton on M (2-3 iterations per outer step). Returns `(profitability, aggregate_M)`. Waterfall executes mints first (M split equally among entries), then directs using post-mint pool state. See `improvements.md` for full derivation and review history.
+The solver searches the interval `[target_prof, current_prof]` with bisection (up to 64 iterations) and returns the lowest feasible profitability level in that interval.
 
 #### Execution safeguards
 
 - Each outcome's cost is recomputed right before execution (not from stale precomputed values), since mint actions mutate other pools' state.
 - Waterfall route planning reuses a scratch simulation buffer across iterations to avoid repeated `Vec<PoolSim>` allocation/cloning in the hot loop.
-- Per-action budget guard skips actions where cost exceeds remaining budget. Negative costs (arbitrage) are executed — they increase the budget and update pool states. If any outcome is skipped during a step (recomputed cost diverged from estimate), the waterfall breaks early and `last_prof` is set to `current_prof` (the level actually achieved), not the target. This prevents Phase 3 from using a stale profitability threshold.
+- Per-step budget feasibility is enforced with a running-budget check over the planned mint-first/direct sequence. If execution cannot proceed, the waterfall stops at the current achieved level.
 - **Prune loop:** when entries fail cost computation, the active set is pruned in a loop that re-derives the skip set after each removal, so remaining entries always see a consistent skip set. Mint routes do not get pruned solely because the requested target is unreachable under caps; they clamp to saturated executable size.
 - **Iteration cap:** the waterfall loop is bounded by `MAX_WATERFALL_ITERS` (1000) to prevent infinite cycling from negative-cost arbitrage that grows the budget.
 - `sim_balances` is updated after waterfall by processing all four action types: `Mint` adds `amount` to all outcomes (complete sets), `Merge` subtracts `amount` from all outcomes, `Sell` subtracts sold amount, `Buy` adds directly. This correctly tracks residual unsold tokens when partial sells hit tick boundaries.
@@ -128,9 +132,16 @@ Outer Newton on π (up to 15 iterations), inner Newton on M (2-3 iterations per 
 
 ### Phase 3: Post-allocation liquidation
 After the waterfall:
-1. Check all held outcomes' profitability against the last profitability level reached. Profitability is computed using the **direct pool price** (`sims[i].price()`), not `best_route`, because this step is a valuation threshold based on immediate pool-exit value.
-2. For holdings with profitability below that level (lowest first), sell only enough to raise profitability to match `last_bought_prof` (avoids round-trip churn from full liquidation). For each such sale, use the same direct/merge split optimizer as Phase 1.
-3. Reallocate recovered capital via another waterfall pass
+1. Check remaining **legacy** holdings' profitability against the last profitability level reached. Profitability is computed using the direct pool price (`sims[i].price()`).
+2. For legacy holdings below that level (lowest first), sell only enough to raise profitability toward `last_bought_prof`, using the same direct/merge split optimizer as Phase 1.
+3. Reallocate recovered capital via another waterfall pass.
+4. Commit the trial pass only if expected value is non-decreasing (EV guardrail).
+
+### Phase 4: Polish Re-optimization
+A bounded loop (`MAX_POLISH_PASSES`) reruns arb pre-pass (if mint-available), Phase 1, waterfall, and Phase 3 on a trial state and commits only EV-improving trials.
+
+### Phase 5: Terminal Cleanup
+A final bounded cleanup sequence runs additional sell-overpriced + waterfall sweeps (including direct-only terminal sweeps) to reduce residual local profitable directions before returning actions.
 
 ## Two Market Contracts
 
@@ -143,7 +154,7 @@ When using the mint route, `Action::Mint` encodes both contracts (derived from d
 ## Pool Simulation (`PoolSim`)
 
 Each outcome's pool state is tracked mutably during the rebalance:
-- `sqrt_price_x96`: updated after each simulated trade
+- `price`: updated after each simulated trade
 - Swap direction determined by token ordering (`zero_for_one_buy`)
 - Tick boundary clamping ensures trades stay within the pool's liquidity range
 

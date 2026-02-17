@@ -61,11 +61,11 @@ API (deep.seer.pm)
 - **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
 - **src/portfolio/core/mod.rs**: Portfolio core aggregation module
 - **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers
-- **src/portfolio/core/planning.rs**: Pure route planning and cost modeling helpers
-- **src/portfolio/core/solver.rs**: Numerical solvers (mint Newton solve and budget-exhaustion profitability solve)
+- **src/portfolio/core/planning.rs**: Route planning/cost modeling helpers plus budget-exhaustion profitability solve (closed-form direct, simulation-backed bisection mixed)
+- **src/portfolio/core/solver.rs**: Numerical mint-route solve helpers (`mint_cost_to_prof` and supporting Newton machinery)
 - **src/portfolio/core/trading.rs**: Trade/plan execution, merge/mint helpers, and inventory accounting (`ExecutionState` centralizes mutable execution state and execution methods)
 - **src/portfolio/core/waterfall.rs**: Waterfall allocation strategy and active-set profitability equalization loop
-- **src/portfolio/core/rebalancer.rs**: Rebalance phase orchestration and phase-specific inventory/budget flows (`RebalanceContext` handles setup/validation)
+- **src/portfolio/core/rebalancer.rs**: Rebalance phase orchestration (`Phase 0-5` flow), EV-guarded trial commits, and phase-specific inventory/budget flows (`RebalanceContext` handles setup/validation)
 - **src/portfolio/tests.rs**: Portfolio test root (shared fixtures + early deterministic tests)
 - **src/portfolio/tests/fuzz_rebalance.rs**: Fuzz and full/partial rebalance regression tests
 - **src/portfolio/tests/oracle.rs**: Oracle parity, phase behavior, and invariants tests

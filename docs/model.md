@@ -143,7 +143,7 @@ simulation-backed bisection on profitability π.
 find lowest π ∈ [π_lo, π_hi] such that feasible_cost(π) ≤ B
 ```
 
-`feasible_cost(π)` is computed by planning the exact execution path used on-chain:
+`feasible_cost(π)` is computed by planning the exact execution path used by the bot:
 - Evaluate each active route at π on current simulated pool state
 - Execute routes in mint-first order (mints can free budget, directs consume budget)
 - Apply each route's simulated price updates before evaluating the next route
@@ -179,10 +179,10 @@ The waterfall equalizes prof across all active outcomes. At the optimum, every p
 | π = (A/B')² - 1 | `solve_prof` (direct branch) | Closed form |
 | g(m) = rhs | `mint_cost_to_prof` | Newton, ≤8 iter, tick-capped, warm-started |
 | total_cost(π) = B | `solve_prof` (mixed branch) | Simulation-backed bisection, ≤64 iter |
-| cost(P₀→P₁) | `PoolSim::cost_to_price` | `compute_swap_step` (U256) |
+| cost(P₀→P₁) | `PoolSim::cost_to_price` | Closed-form f64 target-price move, clamped by tick boundary |
 | proceeds(m) | analytical in `mint_cost_to_prof` | P×min(m,M)×(1-f)/(1+min(m,M)×κ) |
 
-The f64 analytical math drives the optimization (choosing what to trade). The U256 `compute_swap_step` drives execution (computing exact trade amounts with full precision). The two agree within f64 rounding for single-tick-range pools.
+In the portfolio core path, the same f64 analytical model drives both planning and simulated execution (`cost_to_price`, `buy_exact`, `sell_exact`). Pool state is converted from on-chain `sqrtPriceX96` once during `PoolSim` construction, then updated in f64 with explicit tick-boundary caps.
 
 ## Invariants
 

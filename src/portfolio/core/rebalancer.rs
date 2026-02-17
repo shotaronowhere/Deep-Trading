@@ -1015,11 +1015,13 @@ pub fn rebalance_with_mode(
 
 /// Computes optimal rebalancing trades for L1 markets.
 ///
-/// 1. Sell overpriced holdings (price > prediction) via swap simulation
-/// 2. Waterfall allocation: deploy capital to highest profitability outcomes,
-///    equalizing profitability progressively
-/// 3. Post-allocation liquidation: sell held outcomes less profitable than
-///    the last bought outcome, reallocate via waterfall
+/// Implemented full-mode flow:
+/// 0. Complete-set arbitrage pre-pass (`buy-all -> merge`) when mint routes are available
+/// 1. Iterative sell-overpriced liquidation
+/// 2. Waterfall allocation to equalize marginal profitability
+/// 3. Legacy-inventory recycling with EV-guarded trial commits
+/// 4. Bounded polish re-optimization loop (commit only when EV improves)
+/// 5. Terminal cleanup sweeps (mixed + direct-only bounded passes)
 pub fn rebalance(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
