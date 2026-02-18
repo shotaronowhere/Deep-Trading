@@ -5,6 +5,7 @@
 - [ ] Integrate gas/MEV-aware net-PnL objective (EV minus execution costs) once live gas-cost estimator wiring is available.
 - [ ] Replace heuristic L1 data-fee model (estimated calldata bytes + cached two-point `getL1Fee(bytes)` marginal fee/byte estimate) with exact transaction-serialization-based `getL1Fee(txData)` once action->transaction calldata wiring is implemented.
 - [ ] Enforce strict staleness/deadline gating at submission time (`planned_at_block` + `max_stale_blocks`, `deadline_secs`) once action->transaction execution loop is wired.
+- [ ] Extend `GlobalCandidate` from single-tick local-depth modeling (`lambda`/`kappa`, `max_buy_tokens`/`max_sell_tokens`) to arbitrary multi-tick Uniswap V3 depth (piecewise integrated cost/derivatives + cumulative bounds), while keeping `AutoBestReplay` fail-closed adjudication.
 
 ## Deferred
 
@@ -21,3 +22,5 @@
 - [x] **Mint-before-direct execution ordering**: budget-exhaustion branch now executes mints first (aggregate M split equally), then directs using post-mint pool state. (8879ce0)
 - [x] **Coupled (π, M) Newton solver**: `solve_prof` returns `(profitability, aggregate_mint_M)` using D*/S₀ partition, inner Newton on M, outer Newton on π. (8879ce0)
 - [x] **Mixed-route exactness upgrade**: replaced fixed-binding `i*` approximation with simulation-backed bisection over profitability and budget-feasible route planning/execution (mint-first, no partial-step skips).
+- [x] **GlobalCandidate mint bound fix**: decoupled `m_cap` from shallowest per-outcome local sell-cap minimum; `build_bounds` now uses loose finite global mint cap (`cash + Σ(buy_cap + sell_cap + hold_pos)`), preserving direct `u_i` sell caps.
+- [x] **GlobalCandidate barrier retune**: lowered defaults to `barrier_mu_cash = 1e-7`, `barrier_mu_hold = 1e-7` for improved boundary-near EV realization with projected-Newton stability.

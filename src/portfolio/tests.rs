@@ -5,10 +5,14 @@ use super::merge::{
     merge_sell_cap, merge_sell_cap_with_inventory, split_sell_total_proceeds,
     split_sell_total_proceeds_with_inventory,
 };
-use super::rebalancer::{RebalanceMode, rebalance, rebalance_with_mode};
+use super::rebalancer::{
+    RebalanceConfig, RebalanceEngine, RebalanceMode, rebalance,
+    rebalance_with_config_and_diagnostics, rebalance_with_mode,
+};
 use super::sim::{PoolSim, Route, profitability};
 use super::trading::{ExecutionState, emit_mint_actions, execute_buy};
 use super::waterfall::waterfall;
+use crate::execution::grouping::group_execution_actions;
 use crate::markets::MarketData;
 use crate::pools::{Slot0Result, normalize_market_name, prediction_to_sqrt_price_x96};
 use alloy::primitives::{Address, U256};
@@ -572,6 +576,207 @@ fn test_rebalance_with_mode_full_matches_rebalance_default() {
         format!("{default_actions:?}"),
         format!("{mode_actions:?}"),
         "full mode should match default rebalance behavior"
+    );
+}
+
+#[test]
+fn test_rebalance_with_config_incumbent_matches_default() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(8).collect();
+    let multipliers = [1.30, 0.58, 1.27, 0.62, 1.22, 0.66, 1.16, 0.72];
+    let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
+
+    let mut balances = HashMap::new();
+    balances.insert(selected[0].name, 1.25);
+    balances.insert(selected[2].name, 0.75);
+    let susd = 80.0;
+
+    let baseline = rebalance(&balances, susd, &slot0_results);
+    let (with_config, diagnostics) = rebalance_with_config_and_diagnostics(
+        &balances,
+        susd,
+        &slot0_results,
+        RebalanceConfig {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::Incumbent,
+            global: Default::default(),
+        },
+    );
+    assert_eq!(format!("{baseline:?}"), format!("{with_config:?}"));
+    assert_eq!(diagnostics.chosen_engine, RebalanceEngine::Incumbent);
+}
+
+#[test]
+fn test_auto_best_replay_falls_back_on_non_converged_candidate() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(8).collect();
+    let multipliers = [1.38, 0.55, 1.35, 0.58, 1.18, 0.73, 1.12, 0.78];
+    let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
+
+    let mut balances = HashMap::new();
+    balances.insert(selected[0].name, 2.0);
+    let susd = 70.0;
+
+    let (actions, diagnostics) = rebalance_with_config_and_diagnostics(
+        &balances,
+        susd,
+        &slot0_results,
+        RebalanceConfig {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::AutoBestReplay,
+            global: super::global_solver::GlobalSolveConfig {
+                max_iters: 0,
+                ..Default::default()
+            },
+        },
+    );
+
+    assert_eq!(
+        diagnostics.chosen_engine,
+        RebalanceEngine::Incumbent,
+        "auto-best should fall back when candidate does not converge"
+    );
+    assert!(!diagnostics.candidate_valid);
+    assert!(!actions.is_empty() || susd <= 0.0);
+}
+
+#[test]
+fn test_auto_best_replay_selection_matches_ev_ordering_when_candidate_valid() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(10).collect();
+    let multipliers = [1.34, 0.57, 1.29, 0.60, 1.23, 0.65, 1.19, 0.69, 1.15, 0.74];
+    let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
+
+    let mut balances = HashMap::new();
+    balances.insert(selected[0].name, 1.0);
+    balances.insert(selected[1].name, 1.0);
+    let susd = 90.0;
+
+    let (_actions, diagnostics) = rebalance_with_config_and_diagnostics(
+        &balances,
+        susd,
+        &slot0_results,
+        RebalanceConfig {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::AutoBestReplay,
+            global: Default::default(),
+        },
+    );
+
+    if diagnostics.candidate_valid {
+        let tol = 1e-9
+            * (1.0
+                + diagnostics
+                    .incumbent_ev_after
+                    .abs()
+                    .max(diagnostics.candidate_ev_after.abs()));
+        if diagnostics.candidate_ev_after > diagnostics.incumbent_ev_after + tol {
+            assert_eq!(diagnostics.chosen_engine, RebalanceEngine::GlobalCandidate);
+        } else {
+            assert_eq!(diagnostics.chosen_engine, RebalanceEngine::Incumbent);
+        }
+    } else {
+        assert_eq!(diagnostics.chosen_engine, RebalanceEngine::Incumbent);
+    }
+}
+
+#[test]
+fn test_global_candidate_dual_prototype_mode_runs_fail_closed() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(10).collect();
+    let multipliers = [1.34, 0.57, 1.29, 0.60, 1.23, 0.65, 1.19, 0.69, 1.15, 0.74];
+    let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
+
+    let mut balances = HashMap::new();
+    balances.insert(selected[0].name, 1.0);
+    balances.insert(selected[1].name, 1.0);
+    let susd = 90.0;
+
+    let (_actions, diagnostics) = rebalance_with_config_and_diagnostics(
+        &balances,
+        susd,
+        &slot0_results,
+        RebalanceConfig {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::GlobalCandidate,
+            global: super::global_solver::GlobalSolveConfig {
+                optimizer: super::global_solver::GlobalOptimizer::DualDecompositionPrototype,
+                dual_outer_iters: 3,
+                ..Default::default()
+            },
+        },
+    );
+
+    assert_eq!(
+        diagnostics.candidate_optimizer,
+        super::global_solver::GlobalOptimizer::DualDecompositionPrototype
+    );
+    if diagnostics.candidate_valid {
+        assert_eq!(diagnostics.chosen_engine, RebalanceEngine::GlobalCandidate);
+    } else {
+        assert_eq!(diagnostics.chosen_engine, RebalanceEngine::Incumbent);
+    }
+}
+
+#[test]
+fn test_global_candidate_actions_are_groupable_when_selected() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(10).collect();
+    let multipliers = [1.40, 0.54, 1.33, 0.61, 1.20, 0.67, 1.17, 0.71, 1.13, 0.76];
+    let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
+
+    let mut balances = HashMap::new();
+    balances.insert(selected[0].name, 1.5);
+    balances.insert(selected[2].name, 0.5);
+
+    let (actions, diagnostics) = rebalance_with_config_and_diagnostics(
+        &balances,
+        95.0,
+        &slot0_results,
+        RebalanceConfig {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::GlobalCandidate,
+            global: Default::default(),
+        },
+    );
+
+    if diagnostics.chosen_engine == RebalanceEngine::GlobalCandidate {
+        group_execution_actions(&actions).expect("global candidate actions must remain groupable");
+    }
+}
+
+#[test]
+fn test_global_candidate_available_for_sparse_cash_only_portfolio() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(12).collect();
+    let multipliers = [
+        1.34, 0.57, 1.29, 0.60, 1.23, 0.65, 1.19, 0.69, 1.15, 0.74, 1.12, 0.78,
+    ];
+    let slot0_results = build_slot0_results_for_markets(&selected, &multipliers);
+
+    let balances: HashMap<&str, f64> = HashMap::new();
+    let (_actions, diagnostics) = rebalance_with_config_and_diagnostics(
+        &balances,
+        100.0,
+        &slot0_results,
+        RebalanceConfig {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::GlobalCandidate,
+            global: Default::default(),
+        },
+    );
+    println!(
+        "[global-candidate-sparse] chosen={:?} candidate_valid={} incumbent_ev={:.12} candidate_ev={:.12} delta={:.12}",
+        diagnostics.chosen_engine,
+        diagnostics.candidate_valid,
+        diagnostics.incumbent_ev_after,
+        diagnostics.candidate_ev_after,
+        diagnostics.candidate_ev_after - diagnostics.incumbent_ev_after
+    );
+
+    assert!(
+        diagnostics.candidate_ev_after.is_finite(),
+        "global candidate should be available (finite replay EV) for sparse cash-only portfolios"
     );
 }
 
@@ -1540,6 +1745,8 @@ impl TestRng {
 
 #[path = "tests/execution.rs"]
 mod execution;
+#[path = "tests/cfmmrouter_parity.rs"]
+mod cfmmrouter_parity;
 #[path = "tests/fuzz_rebalance.rs"]
 mod fuzz_rebalance;
 #[path = "tests/monte_carlo.rs"]

@@ -66,6 +66,7 @@ API (deep.seer.pm)
 - **src/portfolio/core/trading.rs**: Trade/plan execution, merge/mint helpers, and inventory accounting (`ExecutionState` centralizes mutable execution state and execution methods)
 - **src/portfolio/core/waterfall.rs**: Waterfall allocation strategy and active-set profitability equalization loop
 - **src/portfolio/core/rebalancer.rs**: Rebalance phase orchestration (`Phase 0-5` flow), EV-guarded trial commits, and phase-specific inventory/budget flows (`RebalanceContext` handles setup/validation)
+- **src/portfolio/core/global_solver.rs**: Rust-native projected-Newton global candidate solver, box-constrained optimization state, and candidate action projection/replay consistency checks
 - **src/portfolio/tests.rs**: Portfolio test root (shared fixtures + early deterministic tests)
 - **src/portfolio/tests/fuzz_rebalance.rs**: Fuzz and full/partial rebalance regression tests
 - **src/portfolio/tests/oracle.rs**: Oracle parity, phase behavior, and invariants tests
@@ -98,6 +99,18 @@ Converts Uniswap V3 `sqrtPriceX96` to outcome token prices (18-decimal fixed poi
   - `https://deep.seer.pm/.netlify/functions/get-l1-markets-data`
   - `https://deep.seer.pm/.netlify/functions/get-l2-markets-data`
   - `https://deep.seer.pm/.netlify/functions/get-originality-markets-data`
+
+## Rebalancing Engines
+
+`src/portfolio` now supports dual-track full-mode planning:
+
+1. `RebalanceEngine::Incumbent` keeps the existing phase-based path.
+2. `RebalanceEngine::GlobalCandidate` runs the projected-Newton candidate (`global_solver.rs`).
+3. `RebalanceEngine::AutoBestReplay` evaluates both and selects higher replayed EV when candidate validation passes.
+
+Current solver scope: `GlobalCandidate` uses single-range analytical liquidity primitives (`PoolSim` local `lambda`/`kappa` + tick-boundary caps). Extending to arbitrary multi-tick depth is a planned follow-up (tracked in `docs/TODO.md`); until then, `AutoBestReplay` provides runtime safety by falling back to incumbent when candidate validity/EV checks fail.
+
+`rebalance_with_mode(...)` remains backward-compatible and defaults to incumbent behavior.
 
 ## Build Process
 

@@ -4,6 +4,8 @@
 
 `src/portfolio/core/mod.rs` (with `sim.rs`, `planning.rs`, `solver.rs`, `trading.rs`, `waterfall.rs`, `rebalancer.rs`) computes optimal rebalancing trades for L1 prediction markets using an analytical single-tick `PoolSim` model (`f64`, with explicit tick-boundary caps). Implements the waterfall allocation algorithm: deploy capital to the most profitable outcome, equalize profitability progressively with the next-best outcomes, then recycle lower-profitability inventory.
 
+The projected-Newton `GlobalCandidate` path currently uses the same single-tick analytical depth assumptions; arbitrary multi-tick depth support is tracked in `docs/TODO.md`. `AutoBestReplay` keeps this fail-closed by selecting the candidate only when replayed EV is better and invariants hold.
+
 ## Function: `rebalance`
 
 ```rust
@@ -22,6 +24,36 @@ The portfolio module now supports mode-based execution:
 - `RebalanceMode::ArbOnly`: complete-set arbitrage only (`sum(prices) < 1` buy-merge, `sum(prices) > 1` mint-sell).
 
 See [Arb-Only Mode](./arb_mode.md) for API details, sizing equations, and fail-closed behavior.
+
+## Engine Selection
+
+Full-mode rebalancing now supports engine-level selection through `RebalanceConfig`:
+
+- `RebalanceEngine::Incumbent`: existing phase-based planner (default for `rebalance` and `rebalance_with_mode`).
+- `RebalanceEngine::GlobalCandidate`: projected-Newton global candidate solver path.
+- `RebalanceEngine::AutoBestReplay`: run both, replay both, and pick the higher replay EV valid plan.
+
+Scope note: `GlobalCandidate` currently assumes single-range liquidity per pool (single-tick analytical local model). For future pools with richer tick structures, keep `Incumbent`/`AutoBestReplay` until multi-tick cost/bound primitives are implemented.
+
+Additional APIs:
+
+```rust
+pub fn rebalance_with_config(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    config: RebalanceConfig,
+) -> Vec<Action>
+
+pub fn rebalance_with_config_and_diagnostics(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    config: RebalanceConfig,
+) -> (Vec<Action>, RebalanceDecisionDiagnostics)
+```
+
+`RebalanceDecisionDiagnostics` includes incumbent EV, candidate EV, chosen engine, and candidate validity.
 
 ## Action Types
 

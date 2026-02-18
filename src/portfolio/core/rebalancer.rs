@@ -3,12 +3,17 @@ use std::collections::{HashMap, HashSet};
 use crate::pools::Slot0Result;
 
 use super::Action;
+use super::diagnostics::replay_expected_value;
+use super::global_solver::{
+    GlobalCandidateInvalidReason, GlobalOptimizer, GlobalSolveConfig, GlobalSolveResult,
+    build_global_candidate_plan,
+};
+#[cfg(test)]
+use super::sim::DUST;
 use super::sim::{
     EPS, PoolSim, SimBuildError, build_sims, build_sims_without_predictions, profitability,
     target_price_for_prof,
 };
-#[cfg(test)]
-use super::sim::DUST;
 use super::trading::{ExecutionState, portfolio_expected_value};
 use super::types::BalanceMap;
 use super::types::{apply_actions_to_sim_balances, lookup_balance};
@@ -25,6 +30,101 @@ const POLISH_EV_REL_TOL: f64 = 1e-10;
 pub enum RebalanceMode {
     Full,
     ArbOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebalanceEngine {
+    Incumbent,
+    GlobalCandidate,
+    AutoBestReplay,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RebalanceConfig {
+    pub mode: RebalanceMode,
+    pub engine: RebalanceEngine,
+    pub global: GlobalSolveConfig,
+}
+
+impl RebalanceConfig {
+    pub const fn new(mode: RebalanceMode, engine: RebalanceEngine) -> Self {
+        Self {
+            mode,
+            engine,
+            global: GlobalSolveConfig {
+                optimizer: GlobalOptimizer::LbfgsbProjected,
+                max_iters: 1024,
+                pg_tol: 1e-5,
+                armijo_c1: 1e-4,
+                backtrack_beta: 0.5,
+                max_line_search_trials: 64,
+                line_search_rescue_trials: 16,
+                line_search_rescue_min_decrease: 1e-12,
+                hess_floor: 1e-8,
+                lbfgs_history: 15,
+                lbfgs_min_curvature: 1e-12,
+                active_set_eps: 1e-9,
+                barrier_mu_cash: 1e-8,
+                barrier_mu_hold: 1e-8,
+                barrier_shift: 1e-4,
+                theta_l2_reg: 1e-9,
+                dual_outer_iters: 8,
+                dual_lambda_step: 1e-3,
+                dual_lambda_decay: 0.7,
+                dual_theta_tolerance: 1e-6,
+                dual_router_max_iters: 24,
+                dual_router_pg_tol: 1e-5,
+                dual_router_lbfgs_history: 10,
+                dual_router_primal_restore_iters: 8,
+                dual_router_primal_residual_tol: 1e-8,
+                dual_router_price_floor: 1e-6,
+                buy_sell_churn_reg: 1e-10,
+                solver_budget_eps: 1e-8,
+                zero_trade_band_eps: 1e-8,
+            },
+        }
+    }
+}
+
+impl Default for RebalanceConfig {
+    fn default() -> Self {
+        Self {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::Incumbent,
+            global: GlobalSolveConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RebalanceDecisionDiagnostics {
+    pub incumbent_ev_after: f64,
+    pub candidate_ev_after: f64,
+    pub chosen_engine: RebalanceEngine,
+    pub candidate_optimizer: GlobalOptimizer,
+    pub candidate_valid: bool,
+    pub candidate_invalid_reason: Option<GlobalCandidateInvalidReason>,
+    pub candidate_projected_grad_norm: f64,
+    pub candidate_coupled_residual: f64,
+    pub candidate_replay_cash_delta: f64,
+    pub candidate_replay_holdings_delta: f64,
+    pub candidate_solver_iters: usize,
+    pub candidate_line_search_trials: usize,
+    pub candidate_line_search_accepts: usize,
+    pub candidate_line_search_invalid_evals: usize,
+    pub candidate_line_search_rescue_attempts: usize,
+    pub candidate_line_search_rescue_accepts: usize,
+    pub candidate_feasibility_repairs: usize,
+    pub candidate_feasibility_hold_clamps: usize,
+    pub candidate_feasibility_cash_scales: usize,
+    pub candidate_active_dims: usize,
+    pub candidate_curvature_skips: usize,
+    pub candidate_dual_residual_norm: f64,
+    pub candidate_primal_restore_iters: usize,
+    pub candidate_net_theta: f64,
+    pub candidate_total_buy: f64,
+    pub candidate_total_sell: f64,
+    pub candidate_buy_sell_overlap: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -581,12 +681,7 @@ fn rebalance_full(
 
     if ctx.mint_available {
         let actions_before_mixed_cleanup = ctx.actions.len();
-        let mixed_last_prof = waterfall(
-            &mut ctx.sims,
-            &mut ctx.budget,
-            &mut ctx.actions,
-            true,
-        );
+        let mixed_last_prof = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, true);
         apply_actions_to_sim_balances(
             &ctx.actions[actions_before_mixed_cleanup..],
             &ctx.sims,
@@ -602,12 +697,7 @@ fn rebalance_full(
             let start_actions = ctx.actions.len();
             ctx.run_phase1_sell_overpriced();
             let actions_before_direct_cleanup = ctx.actions.len();
-            let _ = waterfall(
-                &mut ctx.sims,
-                &mut ctx.budget,
-                &mut ctx.actions,
-                false,
-            );
+            let _ = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, false);
             apply_actions_to_sim_balances(
                 &ctx.actions[actions_before_direct_cleanup..],
                 &ctx.sims,
@@ -649,7 +739,12 @@ fn assert_internal_state_matches_replay(
     );
 
     for sim in &ctx.sims {
-        let internal = ctx.sim_balances.get(sim.market_name).copied().unwrap_or(0.0).max(0.0);
+        let internal = ctx
+            .sim_balances
+            .get(sim.market_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
         let replay = replay_holdings
             .get(sim.market_name)
             .copied()
@@ -939,7 +1034,13 @@ fn estimate_local_gradients_for_context(ctx: &RebalanceContext, eps: f64) -> Loc
     let holdings: Vec<f64> = ctx
         .sims
         .iter()
-        .map(|sim| ctx.sim_balances.get(sim.market_name).copied().unwrap_or(0.0).max(0.0))
+        .map(|sim| {
+            ctx.sim_balances
+                .get(sim.market_name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0)
+        })
         .collect();
     let state = LocalGradientState {
         sims: ctx.sims.clone(),
@@ -1000,8 +1101,7 @@ fn rebalance_arb_only(
     actions
 }
 
-/// Computes optimal trades for L1 markets using the requested mode.
-pub fn rebalance_with_mode(
+fn rebalance_incumbent_with_mode(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -1011,6 +1111,626 @@ pub fn rebalance_with_mode(
         RebalanceMode::Full => rebalance_full(balances, susds_balance, slot0_results),
         RebalanceMode::ArbOnly => rebalance_arb_only(balances, susds_balance, slot0_results),
     }
+}
+
+fn choose_higher_ev_plan(
+    incumbent_actions: Vec<Action>,
+    candidate_actions: Vec<Action>,
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+) -> (Vec<Action>, f64, f64, RebalanceEngine) {
+    let incumbent_ev =
+        replay_expected_value(&incumbent_actions, slot0_results, balances, susds_balance)
+            .unwrap_or(f64::NEG_INFINITY);
+    let candidate_ev =
+        replay_expected_value(&candidate_actions, slot0_results, balances, susds_balance)
+            .unwrap_or(f64::NEG_INFINITY);
+
+    if candidate_ev.is_finite() && !incumbent_ev.is_finite() {
+        return (
+            candidate_actions,
+            incumbent_ev,
+            candidate_ev,
+            RebalanceEngine::GlobalCandidate,
+        );
+    }
+    if incumbent_ev.is_finite() && !candidate_ev.is_finite() {
+        return (
+            incumbent_actions,
+            incumbent_ev,
+            candidate_ev,
+            RebalanceEngine::Incumbent,
+        );
+    }
+    if !incumbent_ev.is_finite() && !candidate_ev.is_finite() {
+        return (
+            incumbent_actions,
+            incumbent_ev,
+            candidate_ev,
+            RebalanceEngine::Incumbent,
+        );
+    }
+
+    let tol = 1e-9 * (1.0 + incumbent_ev.abs().max(candidate_ev.abs()));
+    if candidate_ev > incumbent_ev + tol {
+        (
+            candidate_actions,
+            incumbent_ev,
+            candidate_ev,
+            RebalanceEngine::GlobalCandidate,
+        )
+    } else {
+        (
+            incumbent_actions,
+            incumbent_ev,
+            candidate_ev,
+            RebalanceEngine::Incumbent,
+        )
+    }
+}
+
+fn candidate_trade_totals(solve: &GlobalSolveResult) -> (f64, f64, f64) {
+    let total_buy: f64 = solve.direct_buys.iter().copied().sum();
+    let total_sell: f64 = solve.direct_sells.iter().copied().sum();
+    let overlap: f64 = solve
+        .direct_buys
+        .iter()
+        .zip(solve.direct_sells.iter())
+        .map(|(buy, sell)| buy.min(*sell))
+        .sum();
+    (total_buy, total_sell, overlap)
+}
+
+#[cfg(test)]
+#[test]
+fn choose_higher_ev_plan_prefers_finite_candidate_when_incumbent_ev_is_nonfinite() {
+    let balances: HashMap<&str, f64> = HashMap::new();
+    let slot0_results: Vec<(Slot0Result, &'static crate::markets::MarketData)> = Vec::new();
+
+    let incumbent_actions = vec![Action::Buy {
+        market_name: "dummy",
+        amount: 1.0,
+        cost: f64::INFINITY,
+    }];
+    let candidate_actions: Vec<Action> = Vec::new();
+
+    let (selected, incumbent_ev, candidate_ev, chosen) = choose_higher_ev_plan(
+        incumbent_actions,
+        candidate_actions,
+        &balances,
+        1.0,
+        &slot0_results,
+    );
+
+    assert!(incumbent_ev.is_infinite() && incumbent_ev.is_sign_negative());
+    assert!(candidate_ev.is_finite());
+    assert_eq!(chosen, RebalanceEngine::GlobalCandidate);
+    assert!(selected.is_empty());
+}
+
+pub fn rebalance_with_config_and_diagnostics(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    config: RebalanceConfig,
+) -> (Vec<Action>, RebalanceDecisionDiagnostics) {
+    match config.mode {
+        RebalanceMode::ArbOnly => {
+            let actions = rebalance_arb_only(balances, susds_balance, slot0_results);
+            (
+                actions,
+                RebalanceDecisionDiagnostics {
+                    incumbent_ev_after: f64::NAN,
+                    candidate_ev_after: f64::NAN,
+                    chosen_engine: RebalanceEngine::Incumbent,
+                    candidate_optimizer: config.global.optimizer,
+                    candidate_valid: false,
+                    candidate_invalid_reason: None,
+                    candidate_projected_grad_norm: f64::NAN,
+                    candidate_coupled_residual: f64::NAN,
+                    candidate_replay_cash_delta: f64::NAN,
+                    candidate_replay_holdings_delta: f64::NAN,
+                    candidate_solver_iters: 0,
+                    candidate_line_search_trials: 0,
+                    candidate_line_search_accepts: 0,
+                    candidate_line_search_invalid_evals: 0,
+                    candidate_line_search_rescue_attempts: 0,
+                    candidate_line_search_rescue_accepts: 0,
+                    candidate_feasibility_repairs: 0,
+                    candidate_feasibility_hold_clamps: 0,
+                    candidate_feasibility_cash_scales: 0,
+                    candidate_active_dims: 0,
+                    candidate_curvature_skips: 0,
+                    candidate_dual_residual_norm: f64::NAN,
+                    candidate_primal_restore_iters: 0,
+                    candidate_net_theta: 0.0,
+                    candidate_total_buy: 0.0,
+                    candidate_total_sell: 0.0,
+                    candidate_buy_sell_overlap: 0.0,
+                },
+            )
+        }
+        RebalanceMode::Full => {
+            let incumbent_actions =
+                rebalance_incumbent_with_mode(balances, susds_balance, slot0_results, config.mode);
+            let incumbent_ev_after =
+                replay_expected_value(&incumbent_actions, slot0_results, balances, susds_balance)
+                    .unwrap_or(f64::NEG_INFINITY);
+
+            match config.engine {
+                RebalanceEngine::Incumbent => (
+                    incumbent_actions,
+                    RebalanceDecisionDiagnostics {
+                        incumbent_ev_after,
+                        candidate_ev_after: f64::NEG_INFINITY,
+                        chosen_engine: RebalanceEngine::Incumbent,
+                        candidate_optimizer: config.global.optimizer,
+                        candidate_valid: false,
+                        candidate_invalid_reason: None,
+                        candidate_projected_grad_norm: f64::NAN,
+                        candidate_coupled_residual: f64::NAN,
+                        candidate_replay_cash_delta: f64::NAN,
+                        candidate_replay_holdings_delta: f64::NAN,
+                        candidate_solver_iters: 0,
+                        candidate_line_search_trials: 0,
+                        candidate_line_search_accepts: 0,
+                        candidate_line_search_invalid_evals: 0,
+                        candidate_line_search_rescue_attempts: 0,
+                        candidate_line_search_rescue_accepts: 0,
+                        candidate_feasibility_repairs: 0,
+                        candidate_feasibility_hold_clamps: 0,
+                        candidate_feasibility_cash_scales: 0,
+                        candidate_active_dims: 0,
+                        candidate_curvature_skips: 0,
+                        candidate_dual_residual_norm: f64::NAN,
+                        candidate_primal_restore_iters: 0,
+                        candidate_net_theta: 0.0,
+                        candidate_total_buy: 0.0,
+                        candidate_total_sell: 0.0,
+                        candidate_buy_sell_overlap: 0.0,
+                    },
+                ),
+                RebalanceEngine::GlobalCandidate => {
+                    if let Some(candidate) = build_global_candidate_plan(
+                        balances,
+                        susds_balance,
+                        slot0_results,
+                        None,
+                        config.global,
+                    ) {
+                        let candidate_ev_after = replay_expected_value(
+                            &candidate.actions,
+                            slot0_results,
+                            balances,
+                            susds_balance,
+                        )
+                        .unwrap_or(f64::NEG_INFINITY);
+                        let (candidate_total_buy, candidate_total_sell, candidate_buy_sell_overlap) =
+                            candidate_trade_totals(&candidate.solve);
+
+                        if candidate.candidate_valid {
+                            tracing::info!(
+                                candidate_pg_norm = candidate.solve.projected_grad_norm,
+                                candidate_coupled_residual = candidate.solve.coupled_residual,
+                                candidate_optimizer = ?candidate.solve.optimizer,
+                                candidate_active_dims = candidate.solve.active_dims,
+                                candidate_curvature_skips = candidate.solve.curvature_skips,
+                                replay_cash_delta = candidate.replay_cash_delta,
+                                replay_holdings_delta = candidate.replay_holdings_delta,
+                                solver_iters = candidate.solve.outer_iters,
+                                line_search_trials = candidate.solve.line_search_trials,
+                                line_search_accepts = candidate.solve.line_search_accepts,
+                                line_search_invalid_evals = candidate.solve.line_search_invalid_evals,
+                                line_search_rescue_attempts = candidate.solve.line_search_rescue_attempts,
+                                line_search_rescue_accepts = candidate.solve.line_search_rescue_accepts,
+                                feasibility_repairs = candidate.solve.feasibility_repairs,
+                                feasibility_hold_clamps = candidate.solve.feasibility_hold_clamps,
+                                feasibility_cash_scales = candidate.solve.feasibility_cash_scales,
+                                incumbent_ev_after,
+                                candidate_ev_after,
+                                chosen_engine = ?RebalanceEngine::GlobalCandidate,
+                                "global candidate rebalance decision"
+                            );
+                            (
+                                candidate.actions,
+                                RebalanceDecisionDiagnostics {
+                                    incumbent_ev_after,
+                                    candidate_ev_after,
+                                    chosen_engine: RebalanceEngine::GlobalCandidate,
+                                    candidate_optimizer: candidate.solve.optimizer,
+                                    candidate_valid: true,
+                                    candidate_invalid_reason: None,
+                                    candidate_projected_grad_norm: candidate
+                                        .solve
+                                        .projected_grad_norm,
+                                    candidate_coupled_residual: candidate.solve.coupled_residual,
+                                    candidate_replay_cash_delta: candidate.replay_cash_delta,
+                                    candidate_replay_holdings_delta: candidate
+                                        .replay_holdings_delta,
+                                    candidate_solver_iters: candidate.solve.outer_iters,
+                                    candidate_line_search_trials: candidate
+                                        .solve
+                                        .line_search_trials,
+                                    candidate_line_search_accepts: candidate
+                                        .solve
+                                        .line_search_accepts,
+                                    candidate_line_search_invalid_evals: candidate
+                                        .solve
+                                        .line_search_invalid_evals,
+                                    candidate_line_search_rescue_attempts: candidate
+                                        .solve
+                                        .line_search_rescue_attempts,
+                                    candidate_line_search_rescue_accepts: candidate
+                                        .solve
+                                        .line_search_rescue_accepts,
+                                    candidate_feasibility_repairs: candidate
+                                        .solve
+                                        .feasibility_repairs,
+                                    candidate_feasibility_hold_clamps: candidate
+                                        .solve
+                                        .feasibility_hold_clamps,
+                                    candidate_feasibility_cash_scales: candidate
+                                        .solve
+                                        .feasibility_cash_scales,
+                                    candidate_active_dims: candidate.solve.active_dims,
+                                    candidate_curvature_skips: candidate.solve.curvature_skips,
+                                    candidate_dual_residual_norm: candidate.solve.dual_residual_norm,
+                                    candidate_primal_restore_iters: candidate
+                                        .solve
+                                        .primal_restore_iters,
+                                    candidate_net_theta: candidate.solve.net_complete_set,
+                                    candidate_total_buy,
+                                    candidate_total_sell,
+                                    candidate_buy_sell_overlap,
+                                },
+                            )
+                        } else {
+                            tracing::warn!(
+                                candidate_pg_norm = candidate.solve.projected_grad_norm,
+                                candidate_coupled_residual = candidate.solve.coupled_residual,
+                                candidate_optimizer = ?candidate.solve.optimizer,
+                                candidate_active_dims = candidate.solve.active_dims,
+                                candidate_curvature_skips = candidate.solve.curvature_skips,
+                                replay_cash_delta = candidate.replay_cash_delta,
+                                replay_holdings_delta = candidate.replay_holdings_delta,
+                                solver_iters = candidate.solve.outer_iters,
+                                line_search_trials = candidate.solve.line_search_trials,
+                                line_search_accepts = candidate.solve.line_search_accepts,
+                                line_search_invalid_evals = candidate.solve.line_search_invalid_evals,
+                                line_search_rescue_attempts = candidate.solve.line_search_rescue_attempts,
+                                line_search_rescue_accepts = candidate.solve.line_search_rescue_accepts,
+                                feasibility_repairs = candidate.solve.feasibility_repairs,
+                                feasibility_hold_clamps = candidate.solve.feasibility_hold_clamps,
+                                feasibility_cash_scales = candidate.solve.feasibility_cash_scales,
+                                invalid_reason = ?candidate.invalid_reason,
+                                "global candidate invalid; falling back to incumbent"
+                            );
+                            (
+                                incumbent_actions,
+                                RebalanceDecisionDiagnostics {
+                                    incumbent_ev_after,
+                                    candidate_ev_after,
+                                    chosen_engine: RebalanceEngine::Incumbent,
+                                    candidate_optimizer: candidate.solve.optimizer,
+                                    candidate_valid: false,
+                                    candidate_invalid_reason: candidate.invalid_reason,
+                                    candidate_projected_grad_norm: candidate
+                                        .solve
+                                        .projected_grad_norm,
+                                    candidate_coupled_residual: candidate.solve.coupled_residual,
+                                    candidate_replay_cash_delta: candidate.replay_cash_delta,
+                                    candidate_replay_holdings_delta: candidate
+                                        .replay_holdings_delta,
+                                    candidate_solver_iters: candidate.solve.outer_iters,
+                                    candidate_line_search_trials: candidate
+                                        .solve
+                                        .line_search_trials,
+                                    candidate_line_search_accepts: candidate
+                                        .solve
+                                        .line_search_accepts,
+                                    candidate_line_search_invalid_evals: candidate
+                                        .solve
+                                        .line_search_invalid_evals,
+                                    candidate_line_search_rescue_attempts: candidate
+                                        .solve
+                                        .line_search_rescue_attempts,
+                                    candidate_line_search_rescue_accepts: candidate
+                                        .solve
+                                        .line_search_rescue_accepts,
+                                    candidate_feasibility_repairs: candidate
+                                        .solve
+                                        .feasibility_repairs,
+                                    candidate_feasibility_hold_clamps: candidate
+                                        .solve
+                                        .feasibility_hold_clamps,
+                                    candidate_feasibility_cash_scales: candidate
+                                        .solve
+                                        .feasibility_cash_scales,
+                                    candidate_active_dims: candidate.solve.active_dims,
+                                    candidate_curvature_skips: candidate.solve.curvature_skips,
+                                    candidate_dual_residual_norm: candidate.solve.dual_residual_norm,
+                                    candidate_primal_restore_iters: candidate
+                                        .solve
+                                        .primal_restore_iters,
+                                    candidate_net_theta: candidate.solve.net_complete_set,
+                                    candidate_total_buy,
+                                    candidate_total_sell,
+                                    candidate_buy_sell_overlap,
+                                },
+                            )
+                        }
+                    } else {
+                        tracing::warn!("global candidate unavailable; falling back to incumbent");
+                        (
+                            incumbent_actions,
+                            RebalanceDecisionDiagnostics {
+                                incumbent_ev_after,
+                                candidate_ev_after: f64::NEG_INFINITY,
+                                chosen_engine: RebalanceEngine::Incumbent,
+                                candidate_optimizer: config.global.optimizer,
+                                candidate_valid: false,
+                                candidate_invalid_reason: None,
+                                candidate_projected_grad_norm: f64::NAN,
+                                candidate_coupled_residual: f64::NAN,
+                                candidate_replay_cash_delta: f64::NAN,
+                                candidate_replay_holdings_delta: f64::NAN,
+                                candidate_solver_iters: 0,
+                                candidate_line_search_trials: 0,
+                                candidate_line_search_accepts: 0,
+                                candidate_line_search_invalid_evals: 0,
+                                candidate_line_search_rescue_attempts: 0,
+                                candidate_line_search_rescue_accepts: 0,
+                                candidate_feasibility_repairs: 0,
+                                candidate_feasibility_hold_clamps: 0,
+                                candidate_feasibility_cash_scales: 0,
+                                candidate_active_dims: 0,
+                                candidate_curvature_skips: 0,
+                                candidate_dual_residual_norm: f64::NAN,
+                                candidate_primal_restore_iters: 0,
+                                candidate_net_theta: 0.0,
+                                candidate_total_buy: 0.0,
+                                candidate_total_sell: 0.0,
+                                candidate_buy_sell_overlap: 0.0,
+                            },
+                        )
+                    }
+                }
+                RebalanceEngine::AutoBestReplay => {
+                    if let Some(candidate) = build_global_candidate_plan(
+                        balances,
+                        susds_balance,
+                        slot0_results,
+                        Some(&incumbent_actions),
+                        config.global,
+                    ) {
+                        if candidate.candidate_valid {
+                            let (candidate_total_buy, candidate_total_sell, candidate_buy_sell_overlap) =
+                                candidate_trade_totals(&candidate.solve);
+                            let (selected, inc_ev, cand_ev, chosen) = choose_higher_ev_plan(
+                                incumbent_actions,
+                                candidate.actions,
+                                balances,
+                                susds_balance,
+                                slot0_results,
+                            );
+                            tracing::info!(
+                                incumbent_ev_after = inc_ev,
+                                candidate_ev_after = cand_ev,
+                                chosen_engine = ?chosen,
+                                candidate_pg_norm = candidate.solve.projected_grad_norm,
+                                candidate_coupled_residual = candidate.solve.coupled_residual,
+                                candidate_optimizer = ?candidate.solve.optimizer,
+                                candidate_active_dims = candidate.solve.active_dims,
+                                candidate_curvature_skips = candidate.solve.curvature_skips,
+                                solver_iters = candidate.solve.outer_iters,
+                                line_search_trials = candidate.solve.line_search_trials,
+                                line_search_accepts = candidate.solve.line_search_accepts,
+                                line_search_invalid_evals = candidate.solve.line_search_invalid_evals,
+                                line_search_rescue_attempts = candidate.solve.line_search_rescue_attempts,
+                                line_search_rescue_accepts = candidate.solve.line_search_rescue_accepts,
+                                feasibility_repairs = candidate.solve.feasibility_repairs,
+                                feasibility_hold_clamps = candidate.solve.feasibility_hold_clamps,
+                                feasibility_cash_scales = candidate.solve.feasibility_cash_scales,
+                                "auto-best replay decision"
+                            );
+                            (
+                                selected,
+                                RebalanceDecisionDiagnostics {
+                                    incumbent_ev_after: inc_ev,
+                                    candidate_ev_after: cand_ev,
+                                    chosen_engine: chosen,
+                                    candidate_optimizer: candidate.solve.optimizer,
+                                    candidate_valid: true,
+                                    candidate_invalid_reason: None,
+                                    candidate_projected_grad_norm: candidate
+                                        .solve
+                                        .projected_grad_norm,
+                                    candidate_coupled_residual: candidate.solve.coupled_residual,
+                                    candidate_replay_cash_delta: candidate.replay_cash_delta,
+                                    candidate_replay_holdings_delta: candidate
+                                        .replay_holdings_delta,
+                                    candidate_solver_iters: candidate.solve.outer_iters,
+                                    candidate_line_search_trials: candidate
+                                        .solve
+                                        .line_search_trials,
+                                    candidate_line_search_accepts: candidate
+                                        .solve
+                                        .line_search_accepts,
+                                    candidate_line_search_invalid_evals: candidate
+                                        .solve
+                                        .line_search_invalid_evals,
+                                    candidate_line_search_rescue_attempts: candidate
+                                        .solve
+                                        .line_search_rescue_attempts,
+                                    candidate_line_search_rescue_accepts: candidate
+                                        .solve
+                                        .line_search_rescue_accepts,
+                                    candidate_feasibility_repairs: candidate
+                                        .solve
+                                        .feasibility_repairs,
+                                    candidate_feasibility_hold_clamps: candidate
+                                        .solve
+                                        .feasibility_hold_clamps,
+                                    candidate_feasibility_cash_scales: candidate
+                                        .solve
+                                        .feasibility_cash_scales,
+                                    candidate_active_dims: candidate.solve.active_dims,
+                                    candidate_curvature_skips: candidate.solve.curvature_skips,
+                                    candidate_dual_residual_norm: candidate.solve.dual_residual_norm,
+                                    candidate_primal_restore_iters: candidate
+                                        .solve
+                                        .primal_restore_iters,
+                                    candidate_net_theta: candidate.solve.net_complete_set,
+                                    candidate_total_buy,
+                                    candidate_total_sell,
+                                    candidate_buy_sell_overlap,
+                                },
+                            )
+                        } else {
+                            let (candidate_total_buy, candidate_total_sell, candidate_buy_sell_overlap) =
+                                candidate_trade_totals(&candidate.solve);
+                            tracing::warn!(
+                                candidate_pg_norm = candidate.solve.projected_grad_norm,
+                                candidate_coupled_residual = candidate.solve.coupled_residual,
+                                candidate_optimizer = ?candidate.solve.optimizer,
+                                candidate_active_dims = candidate.solve.active_dims,
+                                candidate_curvature_skips = candidate.solve.curvature_skips,
+                                replay_cash_delta = candidate.replay_cash_delta,
+                                replay_holdings_delta = candidate.replay_holdings_delta,
+                                solver_iters = candidate.solve.outer_iters,
+                                line_search_trials = candidate.solve.line_search_trials,
+                                line_search_accepts = candidate.solve.line_search_accepts,
+                                line_search_invalid_evals = candidate.solve.line_search_invalid_evals,
+                                line_search_rescue_attempts = candidate.solve.line_search_rescue_attempts,
+                                line_search_rescue_accepts = candidate.solve.line_search_rescue_accepts,
+                                feasibility_repairs = candidate.solve.feasibility_repairs,
+                                feasibility_hold_clamps = candidate.solve.feasibility_hold_clamps,
+                                feasibility_cash_scales = candidate.solve.feasibility_cash_scales,
+                                invalid_reason = ?candidate.invalid_reason,
+                                "auto-best replay candidate invalid; using incumbent"
+                            );
+                            (
+                                incumbent_actions,
+                                RebalanceDecisionDiagnostics {
+                                    incumbent_ev_after,
+                                    candidate_ev_after: f64::NEG_INFINITY,
+                                    chosen_engine: RebalanceEngine::Incumbent,
+                                    candidate_optimizer: candidate.solve.optimizer,
+                                    candidate_valid: false,
+                                    candidate_invalid_reason: candidate.invalid_reason,
+                                    candidate_projected_grad_norm: candidate
+                                        .solve
+                                        .projected_grad_norm,
+                                    candidate_coupled_residual: candidate.solve.coupled_residual,
+                                    candidate_replay_cash_delta: candidate.replay_cash_delta,
+                                    candidate_replay_holdings_delta: candidate
+                                        .replay_holdings_delta,
+                                    candidate_solver_iters: candidate.solve.outer_iters,
+                                    candidate_line_search_trials: candidate
+                                        .solve
+                                        .line_search_trials,
+                                    candidate_line_search_accepts: candidate
+                                        .solve
+                                        .line_search_accepts,
+                                    candidate_line_search_invalid_evals: candidate
+                                        .solve
+                                        .line_search_invalid_evals,
+                                    candidate_line_search_rescue_attempts: candidate
+                                        .solve
+                                        .line_search_rescue_attempts,
+                                    candidate_line_search_rescue_accepts: candidate
+                                        .solve
+                                        .line_search_rescue_accepts,
+                                    candidate_feasibility_repairs: candidate
+                                        .solve
+                                        .feasibility_repairs,
+                                    candidate_feasibility_hold_clamps: candidate
+                                        .solve
+                                        .feasibility_hold_clamps,
+                                    candidate_feasibility_cash_scales: candidate
+                                        .solve
+                                        .feasibility_cash_scales,
+                                    candidate_active_dims: candidate.solve.active_dims,
+                                    candidate_curvature_skips: candidate.solve.curvature_skips,
+                                    candidate_dual_residual_norm: candidate.solve.dual_residual_norm,
+                                    candidate_primal_restore_iters: candidate
+                                        .solve
+                                        .primal_restore_iters,
+                                    candidate_net_theta: candidate.solve.net_complete_set,
+                                    candidate_total_buy,
+                                    candidate_total_sell,
+                                    candidate_buy_sell_overlap,
+                                },
+                            )
+                        }
+                    } else {
+                        tracing::warn!("auto-best replay candidate unavailable; using incumbent");
+                        (
+                            incumbent_actions,
+                            RebalanceDecisionDiagnostics {
+                                incumbent_ev_after,
+                                candidate_ev_after: f64::NEG_INFINITY,
+                                chosen_engine: RebalanceEngine::Incumbent,
+                                candidate_optimizer: config.global.optimizer,
+                                candidate_valid: false,
+                                candidate_invalid_reason: None,
+                                candidate_projected_grad_norm: f64::NAN,
+                                candidate_coupled_residual: f64::NAN,
+                                candidate_replay_cash_delta: f64::NAN,
+                                candidate_replay_holdings_delta: f64::NAN,
+                                candidate_solver_iters: 0,
+                                candidate_line_search_trials: 0,
+                                candidate_line_search_accepts: 0,
+                                candidate_line_search_invalid_evals: 0,
+                                candidate_line_search_rescue_attempts: 0,
+                                candidate_line_search_rescue_accepts: 0,
+                                candidate_feasibility_repairs: 0,
+                                candidate_feasibility_hold_clamps: 0,
+                                candidate_feasibility_cash_scales: 0,
+                                candidate_active_dims: 0,
+                                candidate_curvature_skips: 0,
+                                candidate_dual_residual_norm: f64::NAN,
+                                candidate_primal_restore_iters: 0,
+                                candidate_net_theta: 0.0,
+                                candidate_total_buy: 0.0,
+                                candidate_total_sell: 0.0,
+                                candidate_buy_sell_overlap: 0.0,
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn rebalance_with_config(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    config: RebalanceConfig,
+) -> Vec<Action> {
+    rebalance_with_config_and_diagnostics(balances, susds_balance, slot0_results, config).0
+}
+
+/// Computes optimal trades for L1 markets using the requested mode.
+pub fn rebalance_with_mode(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+) -> Vec<Action> {
+    rebalance_with_config(
+        balances,
+        susds_balance,
+        slot0_results,
+        RebalanceConfig {
+            mode,
+            engine: RebalanceEngine::Incumbent,
+            global: GlobalSolveConfig::default(),
+        },
+    )
 }
 
 /// Computes optimal rebalancing trades for L1 markets.

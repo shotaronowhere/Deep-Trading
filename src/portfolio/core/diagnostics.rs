@@ -91,6 +91,30 @@ pub fn replay_actions_to_portfolio_state(
     (holdings, cash)
 }
 
+/// Replays actions and returns expected value under the L1 prediction table.
+/// Returns `None` when any replayed market lacks a prediction mapping.
+pub fn replay_expected_value(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    initial_balances: &HashMap<&str, f64>,
+    initial_susd: f64,
+) -> Option<f64> {
+    let (holdings, cash) =
+        replay_actions_to_portfolio_state(actions, slot0_results, initial_balances, initial_susd);
+    if !cash.is_finite() {
+        return None;
+    }
+    let predictions = crate::pools::prediction_map();
+    let mut ev = cash;
+    for (_, market) in slot0_results {
+        let key = crate::pools::normalize_market_name(market.name);
+        let prediction = predictions.get(&key).copied()?;
+        let held = holdings.get(market.name).copied().unwrap_or(0.0).max(0.0);
+        ev += held * prediction;
+    }
+    ev.is_finite().then_some(ev)
+}
+
 fn try_replay_actions_to_market_state(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static MarketData)],
