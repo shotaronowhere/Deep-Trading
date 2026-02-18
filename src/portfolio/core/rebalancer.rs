@@ -18,6 +18,9 @@ const MAX_PHASE1_ITERS: usize = 128;
 const MAX_PHASE3_ITERS: usize = 8;
 const PHASE3_PROF_REL_TOL: f64 = 1e-9;
 const PHASE3_EV_GUARD_REL_TOL: f64 = 1e-10;
+const PHASE3_ESCALATION_PROF_REL_GAP: f64 = 1e-6;
+const PHASE3_ESCALATION_MIN_REMAINING_FRAC: f64 = 0.20;
+const PHASE3_ESCALATION_MIN_REMAINING_ABS: f64 = 1e-6;
 const MAX_POLISH_PASSES: usize = 64;
 const POLISH_EV_REL_TOL: f64 = 1e-10;
 
@@ -343,6 +346,26 @@ impl RebalanceContext {
                 if sold_total > EPS {
                     let legacy = trial.legacy_remaining.entry(market_name).or_insert(0.0);
                     *legacy = (*legacy - sold_total).max(0.0);
+
+                    let remaining_legacy =
+                        held_legacy(&trial.balances, &trial.legacy_remaining, market_name);
+                    let post_prof = profitability(trial.sims[idx].prediction, trial.sims[idx].price());
+                    let prof_gap_tol = PHASE3_ESCALATION_PROF_REL_GAP
+                        * (1.0 + phase3_prof.abs().max(post_prof.abs()));
+                    let remaining_min = PHASE3_ESCALATION_MIN_REMAINING_ABS
+                        .max(PHASE3_ESCALATION_MIN_REMAINING_FRAC * legacy_amount);
+                    if remaining_legacy > remaining_min && post_prof + prof_gap_tol < phase3_prof {
+                        let sold_extra = trial.execute_optimal_sell(
+                            idx,
+                            remaining_legacy,
+                            phase3_prof,
+                            self.mint_available,
+                        );
+                        if sold_extra > EPS {
+                            let legacy = trial.legacy_remaining.entry(market_name).or_insert(0.0);
+                            *legacy = (*legacy - sold_extra).max(0.0);
+                        }
+                    }
                 }
             }
 

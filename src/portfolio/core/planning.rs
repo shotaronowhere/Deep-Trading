@@ -4,6 +4,23 @@ use super::sim::{DUST, EPS, PoolSim, Route, alt_price, profitability, target_pri
 use super::solver::mint_cost_to_prof;
 
 const SOLVE_PROF_ITERS: usize = 64;
+const MIN_BOUNDARY_SPLIT_REMAINING_FRAC: f64 = 1e-3;
+const MIN_BOUNDARY_SPLIT_REMAINING_ABS: f64 = 1e-9;
+
+fn boundary_split_is_meaningful(boundary_amount: f64, planned_amount: f64) -> bool {
+    if !boundary_amount.is_finite()
+        || !planned_amount.is_finite()
+        || boundary_amount <= DUST
+        || boundary_amount + EPS >= planned_amount
+    {
+        return false;
+    }
+    let remaining = planned_amount - boundary_amount;
+    let min_remaining = MIN_BOUNDARY_SPLIT_REMAINING_ABS
+        .max(MIN_BOUNDARY_SPLIT_REMAINING_FRAC * planned_amount.abs())
+        .max(EPS * (1.0 + planned_amount.abs()));
+    remaining > min_remaining
+}
 
 /// For the direct route, compute cost to bring an outcome's profitability to `target_prof`.
 /// Returns (cost, outcome_amount, new_price).
@@ -173,8 +190,7 @@ fn mint_active_set_boundary_amount(
         let current_prof = profitability(sim.prediction, sim.price());
         if !profitability_level_reached(current_prof, active_prof_cap)
             && let Some(amount_to_cap) = mint_amount_to_reach_profitability(sim, active_prof_cap)
-            && amount_to_cap > DUST
-            && amount_to_cap + EPS < planned_amount
+            && boundary_split_is_meaningful(amount_to_cap, planned_amount)
         {
             boundary_amount = Some(boundary_amount.map_or(amount_to_cap, |b| b.min(amount_to_cap)));
         }
@@ -221,14 +237,14 @@ fn mint_active_set_boundary_amount(
                         break;
                     }
                 }
-                if converged && hi > DUST && hi + EPS < planned_amount {
+                if converged && boundary_split_is_meaningful(hi, planned_amount) {
                     boundary_amount = Some(boundary_amount.map_or(hi, |b| b.min(hi)));
                 }
             }
         }
     }
 
-    boundary_amount
+    boundary_amount.filter(|&amount| boundary_split_is_meaningful(amount, planned_amount))
 }
 
 #[cfg(test)]

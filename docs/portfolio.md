@@ -83,6 +83,7 @@ The waterfall treats each (outcome, route) pair as a separate entry. The same ou
 
 **Intra-step active-set boundary:** Planning applies boundary step-splitting to **mint** legs only. The split point is the earliest of: (1) a non-active route reaching `current_prof`, or (2) a non-active direct profitability crossing the active mint route's in-step profitability (`prof_non_active >= prof_active_mint`) before `current_prof` is reached. Direct legs are not intra-step truncated. This route-asymmetric policy preserves mint-side coupling control while avoiding EV leakage from fragmented direct execution. A boundary hit is a **step split within the same profitability group**, not a new level and not a terminal stop: after that partial mint leg, the loop promotes all outcomes that now meet `current_prof`, recomputes `skip`, re-ranks non-active outcomes from current pool state (next-highest only), and keeps building the current step until the next lower profitability level is reached.
 If budget is exhausted immediately after such a split, `waterfall` returns the realized post-split marginal profitability (from the executed boundary leg), not the pre-split `current_prof`.
+If budget is exhausted on a non-boundary partial step, `waterfall` now continues from `current_prof = achievable` instead of terminating immediately, allowing newly profitable entries (from pool-state changes) to join in subsequent iterations.
 
 **Ranking example:** Outcome A has direct price 0.05 (prof = 1.0) and mint price 0.03 (prof = 2.33). Outcome B has direct prof = 0.6.
 
@@ -127,6 +128,7 @@ The solver searches the interval `[target_prof, current_prof]` with bisection (u
 - Per-step budget feasibility is enforced with a running-budget check over the planned mint-first/direct sequence. If execution cannot proceed, the waterfall stops at the current achieved level.
 - **Prune loop:** when entries fail cost computation, the active set is pruned in a loop that re-derives the skip set after each removal, so remaining entries always see a consistent skip set. Mint routes do not get pruned solely because the requested target is unreachable under caps; they clamp to saturated executable size.
 - **Iteration cap:** the waterfall loop is bounded by `MAX_WATERFALL_ITERS` (1000) to prevent infinite cycling from negative-cost arbitrage that grows the budget.
+- **No-progress guard:** budget-partial continuation paths are bounded by a stalled-progress guard (`MAX_STALLED_CONTINUES = 4`) that exits if neither profitability nor budget changes meaningfully across repeated continues.
 - `sim_balances` is updated after waterfall by processing all four action types: `Mint` adds `amount` to all outcomes (complete sets), `Merge` subtracts `amount` from all outcomes, `Sell` subtracts sold amount, `Buy` adds directly. This correctly tracks residual unsold tokens when partial sells hit tick boundaries.
 - `skip` in mint sell legs uses the set of all active outcome **indices** (not route-specific). If outcome A is active via both direct and mint, its index appears once in `skip` — preventing sell-then-rebuy regardless of which route triggered the mint.
 
@@ -134,8 +136,9 @@ The solver searches the interval `[target_prof, current_prof]` with bisection (u
 After the waterfall:
 1. Check remaining **legacy** holdings' profitability against the last profitability level reached. Profitability is computed using the direct pool price (`sims[i].price()`).
 2. For legacy holdings below that level (lowest first), sell only enough to raise profitability toward `last_bought_prof`, using the same direct/merge split optimizer as Phase 1.
-3. Reallocate recovered capital via another waterfall pass.
-4. Commit the trial pass only if expected value is non-decreasing (EV guardrail).
+3. If a sell leaves meaningful residual legacy and profitability remains clearly below the frontier, run one bounded follow-up sell escalation in the same trial iteration.
+4. Reallocate recovered capital via another waterfall pass.
+5. Commit the trial pass only if expected value is non-decreasing (EV guardrail).
 
 ### Phase 4: Polish Re-optimization
 A bounded loop (`MAX_POLISH_PASSES`) reruns arb pre-pass (if mint-available), Phase 1, waterfall, and Phase 3 on a trial state and commits only EV-improving trials.
@@ -216,12 +219,16 @@ Portfolio tests are split across `src/portfolio/tests.rs` (shared fixtures + ear
 - `test_rebalance_zero_liquidity_outcome_disables_mint_merge_routes`: explicit full-L1 fixture with one forced zero-liquidity outcome; verifies mint/merge/flash routes are disabled while direct buys continue for remaining underpriced pools.
 - `test_phase3_near_tie_low_liquidity_avoids_ev_regression`: tiny-liquidity near-equal-profitability fixture guarding against Phase-3 churn causing net EV loss.
 - `test_phase3_recycling_full_l1_with_mint_routes_reduces_low_prof_legacy`: full-L1 mint-enabled fixture with near-fair legacy bucket; verifies low-marginal legacy holdings are actually reduced while preserving EV and flash-loan accounting.
+- `test_phase3_full_l1_recycling_limits_tiny_legacy_sell_fragmentation`: phase-3 de-fragmentation check that bounded follow-up escalation does not devolve into tiny residual sell churn in a crafted legacy scenario.
 - `test_fuzz_flash_loan_action_stream_ordering_invariants`: full-L1 fuzz property for flash-loan bracket structure (no nesting, matched repay amount, no dangling loan).
 - `test_waterfall_misnormalized_prediction_sums_remain_finite`: robustness test for miscalibrated belief vectors (`sum(pred) > 1` and `< 1`) to ensure waterfall state and actions remain finite.
 - `test_phase1_merge_split_can_leave_source_pool_overpriced`: adversarial Phase-1 fixture showing that when the optimal sell split uses merge legs, the source pool can remain overpriced even when sell sizing is derived from `sell_to_price(prediction)` in direct-price space.
 - `test_fuzz_phase1_sell_order_budget_stability`: sampled order-stability check for Phase-1 liquidation across adversarial 3-outcome fixtures (same holdings/prices, swapped sell order), guarding against unexpected order-sensitive budget recovery drift.
 - `test_fuzz_plan_execute_cost_consistency_near_mint_caps`: seeded near-cap mixed-route search ensuring planned route costs remain consistent with executed budget deltas when mint legs operate close to sell-cap boundaries.
 - `test_intra_step_boundary_rerank_improves_ev_vs_no_split_control`: seeded low-liquidity mixed-route search that compares current split+rerank waterfall execution against a no-intra-step-split control, asserting existence of a strict EV improvement case from boundary-aware active-set refresh.
+- `test_plan_near_full_mint_boundary_does_not_split`: verifies near-full mint boundary intersections are treated as numerically non-meaningful and do not trigger split churn.
+- `test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasing`: checks realized profitability along mint boundary splits remains monotone non-increasing.
+- `test_waterfall_budget_partial_continue_can_improve_ev_vs_break_control`: control-vs-current fixture showing continuation after budget-partial execution can improve EV (or match) vs legacy break-after-partial behavior.
 - `test_direct_closed_form_target_can_overshoot_tick_boundary`: stress test documenting that all-direct closed-form profitability targets can imply prices above tick boundaries, while execution planning clamps to feasible `buy_limit_price`.
 - `test_oracle_phase3_recycling_two_pool_direct_only_matches_grid_optimum`: direct-only 2-market oracle fixture validating Phase-3-style legacy-capital recycling (sell low-profitability legacy inventory, reallocate into a higher-marginal-profitability market) against a grid-search baseline.
 - `test_fuzz_pool_sim_kappa_lambda_finite_difference_accuracy`: finite-difference fuzz validation that `kappa`/`lambda` sensitivity parameters match observed small-step price derivatives and closed-form price update equations from `buy_exact`/`sell_exact`.

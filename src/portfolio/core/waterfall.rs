@@ -36,6 +36,22 @@ pub(super) fn best_non_active(
 }
 
 pub(super) const MAX_WATERFALL_ITERS: usize = 1000;
+const MAX_STALLED_CONTINUES: usize = 4;
+
+fn iteration_made_progress(
+    prev_prof: f64,
+    next_prof: f64,
+    prev_budget: f64,
+    next_budget: f64,
+) -> bool {
+    let prof_tol = EPS * (1.0 + prev_prof.abs().max(next_prof.abs()));
+    if (next_prof - prev_prof).abs() > prof_tol {
+        return true;
+    }
+
+    let budget_tol = EPS * (1.0 + prev_budget.abs().max(next_budget.abs()));
+    (next_budget - prev_budget).abs() > budget_tol
+}
 
 fn realized_step_profitability(
     sims: &[PoolSim],
@@ -83,11 +99,14 @@ pub(super) fn waterfall(
     let mut last_prof = 0.0;
     let mut waterfall_balances: HashMap<&str, f64> = HashMap::new();
     let mut planning_sim_state: Vec<PoolSim> = Vec::with_capacity(sims.len());
+    let mut stalled_continues = 0usize;
 
     for _iter in 0..MAX_WATERFALL_ITERS {
         if *budget <= EPS || current_prof <= 0.0 {
             break;
         }
+        let iter_start_prof = current_prof;
+        let iter_start_budget = *budget;
 
         // Dynamically find the next best entry from current pool state.
         // If a mint perturbed prices and pushed an entry above current_prof,
@@ -158,14 +177,30 @@ pub(super) fn waterfall(
             // Refresh price_sum after executions
             price_sum = sims.iter().map(|s| s.price()).sum();
             if full_plan_hits_active_boundary {
-                last_prof = full_plan
+                let realized_prof = full_plan
                     .last()
                     .and_then(|step| realized_step_profitability(sims, step, price_sum))
                     .unwrap_or(current_prof);
+                last_prof = realized_prof;
+                current_prof = realized_prof;
+                if !iteration_made_progress(
+                    iter_start_prof,
+                    current_prof,
+                    iter_start_budget,
+                    *budget,
+                ) {
+                    stalled_continues += 1;
+                    if stalled_continues >= MAX_STALLED_CONTINUES {
+                        break;
+                    }
+                } else {
+                    stalled_continues = 0;
+                }
                 continue;
             }
             current_prof = target_prof;
             last_prof = target_prof;
+            stalled_continues = 0;
 
             // Re-query best entry from post-execution state
             match best_non_active(sims, &active_set, mint_available, price_sum) {
@@ -248,14 +283,43 @@ pub(super) fn waterfall(
             }
             price_sum = sims.iter().map(|s| s.price()).sum();
             if execution_plan_hits_active_boundary {
-                last_prof = execution_plan
+                let realized_prof = execution_plan
                     .last()
                     .and_then(|step| realized_step_profitability(sims, step, price_sum))
                     .unwrap_or(current_prof);
+                last_prof = realized_prof;
+                current_prof = realized_prof;
+                if !iteration_made_progress(
+                    iter_start_prof,
+                    current_prof,
+                    iter_start_budget,
+                    *budget,
+                ) {
+                    stalled_continues += 1;
+                    if stalled_continues >= MAX_STALLED_CONTINUES {
+                        break;
+                    }
+                } else {
+                    stalled_continues = 0;
+                }
                 continue;
             }
             last_prof = achievable;
-            break;
+            current_prof = achievable;
+            if !iteration_made_progress(
+                iter_start_prof,
+                current_prof,
+                iter_start_budget,
+                *budget,
+            ) {
+                stalled_continues += 1;
+                if stalled_continues >= MAX_STALLED_CONTINUES {
+                    break;
+                }
+            } else {
+                stalled_continues = 0;
+            }
+            continue;
         }
     }
 
