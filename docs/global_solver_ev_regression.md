@@ -38,6 +38,29 @@ Cases where candidate beat incumbent:
 - `fuzz_full_l1_case_18`: `delta=+1.387274542502`
 - `regression_full_l1_snapshot`: `delta=+1.856221833414`
 
+## Pure Solver-Only Benchmark (route refinement disabled)
+
+Command:
+
+```bash
+GLOBAL_SOLVER_ENABLE_ROUTE_REFINEMENT=false cargo test test_compare_global_vs_incumbent_ev_across_rebalance_fixtures -- --ignored --nocapture --test-threads=1
+```
+
+Artifact:
+
+- `/tmp/global_ev_default_pure_1771417465226.jsonl`
+
+Results:
+
+- `candidate_valid=50/50`
+- overall `mean_delta=-19.762219369469`
+- full-L1 fuzz (`n=24`): `mean_delta=-34.604352163150`
+- partial-L1 (`n=24`): `mean_delta=-3.304407858962`
+- full-L1 regression snapshots (`n=2`): `mean_delta=-39.150363971376`
+- `candidate_better=2/50`
+
+Interpretation: the raw projected solver remains far below incumbent EV; most recovered EV comes from the route-refinement layers.
+
 ## Stage Checkpoint Summary
 
 Before stage 1-3:

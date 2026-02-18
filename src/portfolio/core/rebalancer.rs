@@ -79,6 +79,7 @@ impl RebalanceConfig {
                 dual_router_primal_residual_tol: 1e-8,
                 dual_router_price_floor: 1e-6,
                 buy_sell_churn_reg: 1e-10,
+                enable_route_refinement: true,
                 solver_budget_eps: 1e-8,
                 zero_trade_band_eps: 1e-8,
             },

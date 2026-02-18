@@ -23,6 +23,16 @@ Dual override (`GLOBAL_SOLVER_OPTIMIZER=dual`) at this checkpoint:
 
 - not re-profiled after this recovery update.
 
+Pure solver-only checkpoint (`GLOBAL_SOLVER_ENABLE_ROUTE_REFINEMENT=false`):
+
+- `candidate_valid=50/50`
+- overall `mean_delta=-19.762219369469`
+- full-L1 fuzz family: `mean_delta=-34.604352163150`
+- partial-L1 family: `mean_delta=-3.304407858962`
+- full-L1 regression snapshots: `mean_delta=-39.150363971376`
+- `candidate_better=2/50`
+- artifact: `/tmp/global_ev_default_pure_1771417465226.jsonl`
+
 Dual-router override (`GLOBAL_SOLVER_OPTIMIZER=dual_router`) currently resolves mostly via primal fallback and matches default aggregate EV:
 
 - not re-profiled after this recovery update.

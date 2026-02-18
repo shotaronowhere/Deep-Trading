@@ -129,6 +129,13 @@ Any projection/replay mismatch fails closed and falls back to incumbent selectio
   - `GLOBAL_SOLVER_DUAL_ROUTER_PRIMAL_RESIDUAL_TOL`
   - `GLOBAL_SOLVER_DUAL_ROUTER_PRICE_FLOOR`
   - `GLOBAL_SOLVER_BUY_SELL_CHURN_REG`
+  - `GLOBAL_SOLVER_ENABLE_ROUTE_REFINEMENT`
+
+Pure solver-only benchmark (disable all route-refinement layers in primal candidate path):
+
+```bash
+GLOBAL_SOLVER_ENABLE_ROUTE_REFINEMENT=false cargo test test_compare_global_vs_incumbent_ev_across_rebalance_fixtures -- --ignored --nocapture --test-threads=1
+```
 
 Per-case JSONL telemetry is emitted to `/tmp/global_ev_*.jsonl` and includes:
 

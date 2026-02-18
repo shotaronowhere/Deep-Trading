@@ -19,8 +19,8 @@ use super::{
     Action, TestRng, assert_rebalance_action_invariants,
     assert_strict_ev_gain_with_portfolio_trace, brute_force_best_split_with_inventory,
     build_rebalance_fuzz_case, build_slot0_results_for_markets, build_three_sims_with_preds,
-    eligible_l1_markets_with_predictions, ev_from_state, mock_slot0_market,
-    replay_actions_to_state,
+    eligible_l1_markets_with_predictions, ev_from_state, group_execution_actions,
+    mock_slot0_market, replay_actions_to_state, Slot0Result,
 };
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +108,311 @@ fn collect_fuzz_ev_after(force_partial: bool) -> [f64; 24] {
     out
 }
 
+#[derive(Debug, Default)]
+struct ActionDiagnostics {
+    buy_count: usize,
+    sell_count: usize,
+    mint_count: usize,
+    merge_count: usize,
+    flash_count: usize,
+    repay_count: usize,
+    buy_amount: f64,
+    sell_amount: f64,
+    mint_amount: f64,
+    merge_amount: f64,
+    buy_cost: f64,
+    sell_proceeds: f64,
+    flash_amount: f64,
+    repay_amount: f64,
+    zero_buy_count: usize,
+    zero_sell_count: usize,
+    zero_flash_count: usize,
+    touched_buy_markets: HashSet<&'static str>,
+    touched_sell_markets: HashSet<&'static str>,
+    direct_net_tokens: HashMap<&'static str, f64>,
+}
+
+fn action_diagnostics(actions: &[Action]) -> ActionDiagnostics {
+    let mut out = ActionDiagnostics::default();
+    for action in actions {
+        match action {
+            Action::Buy {
+                market_name,
+                amount,
+                cost,
+            } => {
+                out.buy_count += 1;
+                out.buy_amount += amount.max(0.0);
+                out.buy_cost += cost.max(0.0);
+                if amount.abs() <= 1e-12 {
+                    out.zero_buy_count += 1;
+                }
+                out.touched_buy_markets.insert(*market_name);
+                *out.direct_net_tokens.entry(*market_name).or_insert(0.0) += amount.max(0.0);
+            }
+            Action::Sell {
+                market_name,
+                amount,
+                proceeds,
+            } => {
+                out.sell_count += 1;
+                out.sell_amount += amount.max(0.0);
+                out.sell_proceeds += proceeds.max(0.0);
+                if amount.abs() <= 1e-12 {
+                    out.zero_sell_count += 1;
+                }
+                out.touched_sell_markets.insert(*market_name);
+                *out.direct_net_tokens.entry(*market_name).or_insert(0.0) -= amount.max(0.0);
+            }
+            Action::Mint { amount, .. } => {
+                out.mint_count += 1;
+                out.mint_amount += amount.max(0.0);
+            }
+            Action::Merge { amount, .. } => {
+                out.merge_count += 1;
+                out.merge_amount += amount.max(0.0);
+            }
+            Action::FlashLoan { amount } => {
+                out.flash_count += 1;
+                out.flash_amount += amount.max(0.0);
+                if amount.abs() <= 1e-12 {
+                    out.zero_flash_count += 1;
+                }
+            }
+            Action::RepayFlashLoan { amount } => {
+                out.repay_count += 1;
+                out.repay_amount += amount.max(0.0);
+            }
+        }
+    }
+    out
+}
+
+fn top_direct_net_tokens(diag: &ActionDiagnostics, top_k: usize) -> Vec<(&'static str, f64)> {
+    let mut rows: Vec<(&'static str, f64)> = diag
+        .direct_net_tokens
+        .iter()
+        .map(|(market, value)| (*market, *value))
+        .collect();
+    rows.sort_by(|lhs, rhs| rhs.1.abs().total_cmp(&lhs.1.abs()));
+    rows.truncate(top_k);
+    rows
+}
+
+fn build_fuzz_full_l1_case(case_idx: usize) -> (
+    Vec<(Slot0Result, &'static crate::markets::MarketData)>,
+    HashMap<&'static str, f64>,
+    f64,
+) {
+    assert!(case_idx < 24, "fuzz full-L1 case index out of range");
+    let mut rng = TestRng::new(0xFEED_FACE_1234_4321u64);
+    let mut out = None;
+    for idx in 0..=case_idx {
+        let case = build_rebalance_fuzz_case(&mut rng, false);
+        if idx == case_idx {
+            out = Some(case);
+        }
+    }
+    out.expect("expected fuzz full-L1 case to exist")
+}
+
+fn build_regression_snapshot_a_case() -> (
+    Vec<(Slot0Result, &'static crate::markets::MarketData)>,
+    HashMap<&'static str, f64>,
+    f64,
+) {
+    let markets = eligible_l1_markets_with_predictions();
+    let multipliers: Vec<f64> = (0..markets.len())
+        .map(|i| match i % 10 {
+            0 => 0.46,
+            1 => 0.58,
+            2 => 0.72,
+            3 => 0.87,
+            4 => 0.99,
+            5 => 1.08,
+            6 => 1.19,
+            7 => 1.31,
+            8 => 0.64,
+            _ => 0.53,
+        })
+        .collect();
+    let slot0_results = build_slot0_results_for_markets(&markets, &multipliers);
+    let mut balances: HashMap<&'static str, f64> = HashMap::new();
+    for (i, market) in markets.iter().enumerate() {
+        if i % 9 == 0 {
+            balances.insert(market.name, 1.25 + (i % 5) as f64 * 0.9);
+        } else if i % 13 == 0 {
+            balances.insert(market.name, 0.65);
+        }
+    }
+    (slot0_results, balances, 83.0)
+}
+
+fn print_case_action_comparison(
+    case: &str,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    balances_static: &HashMap<&'static str, f64>,
+    susd_balance: f64,
+) {
+    let balances: HashMap<&str, f64> = balances_static
+        .iter()
+        .map(|(k, v)| (*k as &str, *v))
+        .collect();
+
+    let (inc_actions, inc_diag) = rebalance_with_config_and_diagnostics(
+        &balances,
+        susd_balance,
+        slot0_results,
+        RebalanceConfig {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::Incumbent,
+            global: Default::default(),
+        },
+    );
+    let (cand_actions, cand_diag) = rebalance_with_config_and_diagnostics(
+        &balances,
+        susd_balance,
+        slot0_results,
+        RebalanceConfig {
+            mode: RebalanceMode::Full,
+            engine: RebalanceEngine::GlobalCandidate,
+            global: super::super::global_solver::GlobalSolveConfig::default(),
+        },
+    );
+
+    let inc_ev = inc_diag.incumbent_ev_after;
+    let cand_ev = cand_diag.candidate_ev_after;
+    let delta = cand_ev - inc_ev;
+    let inc = action_diagnostics(&inc_actions);
+    let cand = action_diagnostics(&cand_actions);
+    let inc_groups = group_execution_actions(&inc_actions)
+        .expect("incumbent action stream should remain groupable")
+        .len();
+    let cand_groups = group_execution_actions(&cand_actions)
+        .expect("candidate action stream should remain groupable")
+        .len();
+
+    let inc_buy_avg = if inc.buy_count > 0 {
+        inc.buy_amount / inc.buy_count as f64
+    } else {
+        0.0
+    };
+    let cand_buy_avg = if cand.buy_count > 0 {
+        cand.buy_amount / cand.buy_count as f64
+    } else {
+        0.0
+    };
+    let inc_sell_avg = if inc.sell_count > 0 {
+        inc.sell_amount / inc.sell_count as f64
+    } else {
+        0.0
+    };
+    let cand_sell_avg = if cand.sell_count > 0 {
+        cand.sell_amount / cand.sell_count as f64
+    } else {
+        0.0
+    };
+
+    println!(
+        "[action-diff][{}] delta_ev={:+.12} inc_ev={:.12} cand_ev={:.12}",
+        case, delta, inc_ev, cand_ev
+    );
+    println!(
+        "[action-diff][{}] counts inc={{buy:{}, sell:{}, mint:{}, merge:{}, flash:{}, repay:{}, groups:{}}} cand={{buy:{}, sell:{}, mint:{}, merge:{}, flash:{}, repay:{}, groups:{}}}",
+        case,
+        inc.buy_count,
+        inc.sell_count,
+        inc.mint_count,
+        inc.merge_count,
+        inc.flash_count,
+        inc.repay_count,
+        inc_groups,
+        cand.buy_count,
+        cand.sell_count,
+        cand.mint_count,
+        cand.merge_count,
+        cand.flash_count,
+        cand.repay_count,
+        cand_groups
+    );
+    println!(
+        "[action-diff][{}] size_avg inc={{buy:{:.9}, sell:{:.9}}} cand={{buy:{:.9}, sell:{:.9}}}",
+        case, inc_buy_avg, inc_sell_avg, cand_buy_avg, cand_sell_avg
+    );
+    println!(
+        "[action-diff][{}] totals inc={{buy_amt:{:.9}, sell_amt:{:.9}, mint_amt:{:.9}, merge_amt:{:.9}, buy_cost:{:.9}, sell_proceeds:{:.9}}} cand={{buy_amt:{:.9}, sell_amt:{:.9}, mint_amt:{:.9}, merge_amt:{:.9}, buy_cost:{:.9}, sell_proceeds:{:.9}}}",
+        case,
+        inc.buy_amount,
+        inc.sell_amount,
+        inc.mint_amount,
+        inc.merge_amount,
+        inc.buy_cost,
+        inc.sell_proceeds,
+        cand.buy_amount,
+        cand.sell_amount,
+        cand.mint_amount,
+        cand.merge_amount,
+        cand.buy_cost,
+        cand.sell_proceeds
+    );
+    println!(
+        "[action-diff][{}] zero-ish inc={{buy:{}, sell:{}, flash:{}}} cand={{buy:{}, sell:{}, flash:{}}}",
+        case,
+        inc.zero_buy_count,
+        inc.zero_sell_count,
+        inc.zero_flash_count,
+        cand.zero_buy_count,
+        cand.zero_sell_count,
+        cand.zero_flash_count
+    );
+    println!(
+        "[action-diff][{}] touched_markets inc={{buy:{}, sell:{}}} cand={{buy:{}, sell:{}}}",
+        case,
+        inc.touched_buy_markets.len(),
+        inc.touched_sell_markets.len(),
+        cand.touched_buy_markets.len(),
+        cand.touched_sell_markets.len()
+    );
+    println!(
+        "[action-diff][{}] direct_net_top5_inc={:?}",
+        case,
+        top_direct_net_tokens(&inc, 5)
+    );
+    println!(
+        "[action-diff][{}] direct_net_top5_cand={:?}",
+        case,
+        top_direct_net_tokens(&cand, 5)
+    );
+}
+
+#[test]
+#[ignore = "manual action-list comparison for candidate-winning cases"]
+fn test_compare_action_lists_for_candidate_wins() {
+    let (slot0_case0, balances_case0, susd_case0) = build_fuzz_full_l1_case(0);
+    print_case_action_comparison(
+        "fuzz_full_l1_case_0",
+        &slot0_case0,
+        &balances_case0,
+        susd_case0,
+    );
+
+    let (slot0_case18, balances_case18, susd_case18) = build_fuzz_full_l1_case(18);
+    print_case_action_comparison(
+        "fuzz_full_l1_case_18",
+        &slot0_case18,
+        &balances_case18,
+        susd_case18,
+    );
+
+    let (slot0_reg, balances_reg, susd_reg) = build_regression_snapshot_a_case();
+    print_case_action_comparison(
+        "regression_full_l1_snapshot",
+        &slot0_reg,
+        &balances_reg,
+        susd_reg,
+    );
+}
+
 #[test]
 #[ignore = "updates src/portfolio/tests/ev_snapshots.json; run explicitly"]
 fn test_refresh_ev_snapshots_fixture() {
@@ -132,6 +437,14 @@ fn test_compare_global_vs_incumbent_ev_across_rebalance_fixtures() {
     }
     fn env_f64(key: &str) -> Option<f64> {
         std::env::var(key).ok()?.parse::<f64>().ok()
+    }
+    fn env_bool(key: &str) -> Option<bool> {
+        let raw = std::env::var(key).ok()?;
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
     }
     fn parse_optimizer_override(value: &str) -> Option<GlobalOptimizer> {
         match value.to_ascii_lowercase().as_str() {
@@ -323,10 +636,17 @@ fn test_compare_global_vs_incumbent_ev_across_rebalance_fixtures() {
     if let Some(value) = buy_sell_churn_reg_override {
         println!("[ev-compare] buy_sell_churn_reg_override={:.12e}", value);
     }
+    let route_refinement_override = env_bool("GLOBAL_SOLVER_ENABLE_ROUTE_REFINEMENT");
+    if let Some(value) = route_refinement_override {
+        println!("[ev-compare] enable_route_refinement_override={}", value);
+    }
 
-    let optimizer_tag = optimizer_override
+    let mut optimizer_tag = optimizer_override
         .map(|value| format!("{value:?}").to_ascii_lowercase())
         .unwrap_or_else(|| "default".to_string());
+    if let Some(false) = route_refinement_override {
+        optimizer_tag.push_str("_pure");
+    }
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
@@ -461,6 +781,9 @@ fn test_compare_global_vs_incumbent_ev_across_rebalance_fixtures() {
         }
         if let Some(value) = buy_sell_churn_reg_override {
             candidate_global_cfg.buy_sell_churn_reg = value;
+        }
+        if let Some(value) = route_refinement_override {
+            candidate_global_cfg.enable_route_refinement = value;
         }
 
         let (inc_actions, inc_diag) = rebalance_with_config_and_diagnostics(

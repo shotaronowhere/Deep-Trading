@@ -62,6 +62,7 @@ pub struct GlobalSolveConfig {
     pub dual_router_primal_residual_tol: f64,
     pub dual_router_price_floor: f64,
     pub buy_sell_churn_reg: f64,
+    pub enable_route_refinement: bool,
     pub solver_budget_eps: f64,
     pub zero_trade_band_eps: f64,
 }
@@ -96,6 +97,7 @@ impl Default for GlobalSolveConfig {
             dual_router_primal_residual_tol: 1e-8,
             dual_router_price_floor: 1e-6,
             buy_sell_churn_reg: 1e-10,
+            enable_route_refinement: true,
             solver_budget_eps: 1e-8,
             zero_trade_band_eps: 1e-8,
         }
@@ -2033,7 +2035,7 @@ pub(super) fn build_global_candidate_plan_primal(
             Err(reason) => (Vec::new(), Some(reason)),
         };
 
-    if invalid_reason.is_none() {
+    if invalid_reason.is_none() && cfg.enable_route_refinement {
         let (post_holdings, mut post_cash) =
             replay_actions_to_portfolio_state(&actions, slot0_results, balances, susds_balance);
         if post_cash.is_finite() && post_cash > DUST {
@@ -2099,7 +2101,7 @@ pub(super) fn build_global_candidate_plan_primal(
     let hold_tol = cfg.solver_budget_eps.max(1e-6 * hold_tol_scale);
     let coupled_tol = cfg.solver_budget_eps.max(1e-6);
 
-    if invalid_reason.is_none() {
+    if invalid_reason.is_none() && cfg.enable_route_refinement {
         if let Some(route_actions) =
             build_route_refinement_actions(balances, susds_balance, slot0_results)
         {
@@ -2122,7 +2124,9 @@ pub(super) fn build_global_candidate_plan_primal(
                 actions = route_actions;
             }
         }
+    }
 
+    if invalid_reason.is_none() {
         if !trace.eval.cost_sum.is_finite()
             || trace.objective_trace.iter().any(|value| !value.is_finite())
         {
