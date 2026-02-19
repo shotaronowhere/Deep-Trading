@@ -2,10 +2,10 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
-import {BatchRouter, IV3SwapRouter} from "../contracts/BatchRouter.sol";
+import {BatchSwapRouter, IV3SwapRouter} from "../contracts/BatchSwapRouter.sol";
 import {UniswapV3Fixture} from "./utils/UniswapV3Fixture.sol";
 
-contract BatchRouterTest is Test, UniswapV3Fixture {
+contract BatchSwapRouterTest is Test, UniswapV3Fixture {
     function setUp() public {
         _deployFixture();
     }
@@ -33,7 +33,7 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
 
     function testSellSingleSwap() public {
         uint256 amountIn = 2 ether;
-        tokenIn.transfer(address(batchRouter), amountIn);
+        tokenIn.transfer(address(BatchSwapRouter), amountIn);
 
         IV3SwapRouter.ExactInputSingleParams[] memory swaps = new IV3SwapRouter.ExactInputSingleParams[](1);
         swaps[0] = IV3SwapRouter.ExactInputSingleParams({
@@ -47,17 +47,17 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
         });
 
         uint256 outBefore = tokenOut.balanceOf(address(this));
-        uint256 amountOut = batchRouter.sell(swaps, 0);
+        uint256 amountOut = BatchSwapRouter.sell(swaps, 0);
 
         assertEq(tokenOut.balanceOf(address(this)) - outBefore, amountOut);
-        assertEq(tokenIn.balanceOf(address(batchRouter)), 0);
+        assertEq(tokenIn.balanceOf(address(BatchSwapRouter)), 0);
         assertGt(amountOut, 0);
     }
 
     function testSellMultiSwapAggregatesAmountOut() public {
         uint256 firstIn = 1 ether;
         uint256 secondIn = 3 ether;
-        tokenIn.transfer(address(batchRouter), firstIn + secondIn);
+        tokenIn.transfer(address(BatchSwapRouter), firstIn + secondIn);
 
         IV3SwapRouter.ExactInputSingleParams[] memory swaps = new IV3SwapRouter.ExactInputSingleParams[](2);
         swaps[0] = IV3SwapRouter.ExactInputSingleParams({
@@ -80,16 +80,16 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
         });
 
         uint256 outBefore = tokenOut.balanceOf(address(this));
-        uint256 amountOut = batchRouter.sell(swaps, 0);
+        uint256 amountOut = BatchSwapRouter.sell(swaps, 0);
 
         assertEq(tokenOut.balanceOf(address(this)) - outBefore, amountOut);
-        assertEq(tokenIn.balanceOf(address(batchRouter)), 0);
+        assertEq(tokenIn.balanceOf(address(BatchSwapRouter)), 0);
         assertGt(amountOut, 0);
     }
 
     function testSellRevertsWhenAggregateMinNotMet() public {
         uint256 amountIn = 1 ether;
-        tokenIn.transfer(address(batchRouter), amountIn);
+        tokenIn.transfer(address(BatchSwapRouter), amountIn);
 
         IV3SwapRouter.ExactInputSingleParams[] memory swaps = new IV3SwapRouter.ExactInputSingleParams[](1);
         swaps[0] = IV3SwapRouter.ExactInputSingleParams({
@@ -102,13 +102,13 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
             sqrtPriceLimitX96: 0
         });
 
-        vm.expectRevert(BatchRouter.SlippageExceeded.selector);
-        batchRouter.sell(swaps, type(uint256).max);
+        vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
+        BatchSwapRouter.sell(swaps, type(uint256).max);
     }
 
     function testSellRevertsWhenPerSwapAmountOutMinimumNotMet() public {
         uint256 amountIn = 1 ether;
-        tokenIn.transfer(address(batchRouter), amountIn);
+        tokenIn.transfer(address(BatchSwapRouter), amountIn);
 
         IV3SwapRouter.ExactInputSingleParams[] memory swaps = new IV3SwapRouter.ExactInputSingleParams[](1);
         swaps[0] = IV3SwapRouter.ExactInputSingleParams({
@@ -122,7 +122,7 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
         });
 
         vm.expectRevert(bytes("Too little received"));
-        batchRouter.sell(swaps, 0);
+        BatchSwapRouter.sell(swaps, 0);
     }
 
     function testBuySingleSwapRefundsUnusedInput() public {
@@ -132,7 +132,7 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
         uint256 tokenInBefore = tokenIn.balanceOf(address(this));
         uint256 tokenOutBefore = tokenOut.balanceOf(address(this));
 
-        tokenIn.transfer(address(batchRouter), maxIn);
+        tokenIn.transfer(address(BatchSwapRouter), maxIn);
 
         IV3SwapRouter.ExactOutputSingleParams[] memory swaps = new IV3SwapRouter.ExactOutputSingleParams[](1);
         swaps[0] = IV3SwapRouter.ExactOutputSingleParams({
@@ -145,14 +145,14 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
             sqrtPriceLimitX96: 0
         });
 
-        uint256 spent = batchRouter.buy(swaps, maxIn);
+        uint256 spent = BatchSwapRouter.buy(swaps, maxIn);
 
         uint256 tokenInAfter = tokenIn.balanceOf(address(this));
         uint256 tokenOutAfter = tokenOut.balanceOf(address(this));
 
         assertEq(tokenInBefore - tokenInAfter, spent);
         assertEq(tokenOutAfter - tokenOutBefore, amountOutTarget);
-        assertEq(tokenIn.balanceOf(address(batchRouter)), 0);
+        assertEq(tokenIn.balanceOf(address(BatchSwapRouter)), 0);
         assertGt(maxIn, spent);
     }
 
@@ -162,7 +162,7 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
         uint256 tokenInBefore = tokenIn.balanceOf(address(this));
         uint256 tokenOutBefore = tokenOut.balanceOf(address(this));
 
-        tokenIn.transfer(address(batchRouter), maxIn);
+        tokenIn.transfer(address(BatchSwapRouter), maxIn);
 
         IV3SwapRouter.ExactOutputSingleParams[] memory swaps = new IV3SwapRouter.ExactOutputSingleParams[](2);
         swaps[0] = IV3SwapRouter.ExactOutputSingleParams({
@@ -184,14 +184,14 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
             sqrtPriceLimitX96: 0
         });
 
-        uint256 spent = batchRouter.buy(swaps, maxIn);
+        uint256 spent = BatchSwapRouter.buy(swaps, maxIn);
 
         uint256 tokenInAfter = tokenIn.balanceOf(address(this));
         uint256 tokenOutAfter = tokenOut.balanceOf(address(this));
 
         assertEq(tokenInBefore - tokenInAfter, spent);
         assertEq(tokenOutAfter - tokenOutBefore, 0.02 ether);
-        assertEq(tokenIn.balanceOf(address(batchRouter)), 0);
+        assertEq(tokenIn.balanceOf(address(BatchSwapRouter)), 0);
         assertGt(maxIn, spent);
     }
 
@@ -199,27 +199,27 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
         IV3SwapRouter.ExactOutputSingleParams[] memory swaps = new IV3SwapRouter.ExactOutputSingleParams[](0);
 
         vm.expectRevert(stdError.indexOOBError);
-        batchRouter.buy(swaps, 0);
+        BatchSwapRouter.buy(swaps, 0);
     }
 
     function testSellEmptyArrayReturnsZeroWhenMinZero() public {
         IV3SwapRouter.ExactInputSingleParams[] memory swaps = new IV3SwapRouter.ExactInputSingleParams[](0);
 
-        uint256 amountOut = batchRouter.sell(swaps, 0);
+        uint256 amountOut = BatchSwapRouter.sell(swaps, 0);
         assertEq(amountOut, 0);
     }
 
     function testSellEmptyArrayRevertsWhenMinPositive() public {
         IV3SwapRouter.ExactInputSingleParams[] memory swaps = new IV3SwapRouter.ExactInputSingleParams[](0);
 
-        vm.expectRevert(BatchRouter.SlippageExceeded.selector);
-        batchRouter.sell(swaps, 1);
+        vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
+        BatchSwapRouter.sell(swaps, 1);
     }
 
     function testSellSupportsDifferentTokenOutPerSwapByContractDesign() public {
         uint256 amountInFirst = 1 ether;
         uint256 amountInSecond = 1 ether;
-        tokenIn.transfer(address(batchRouter), amountInFirst + amountInSecond);
+        tokenIn.transfer(address(BatchSwapRouter), amountInFirst + amountInSecond);
 
         IV3SwapRouter.ExactInputSingleParams[] memory swaps = new IV3SwapRouter.ExactInputSingleParams[](2);
         swaps[0] = IV3SwapRouter.ExactInputSingleParams({
@@ -244,7 +244,7 @@ contract BatchRouterTest is Test, UniswapV3Fixture {
         uint256 outBefore = tokenOut.balanceOf(address(this));
         uint256 outAltBefore = tokenOutAlt.balanceOf(address(this));
 
-        uint256 amountOut = batchRouter.sell(swaps, 0);
+        uint256 amountOut = BatchSwapRouter.sell(swaps, 0);
 
         uint256 outDelta = tokenOut.balanceOf(address(this)) - outBefore;
         uint256 outAltDelta = tokenOutAlt.balanceOf(address(this)) - outAltBefore;

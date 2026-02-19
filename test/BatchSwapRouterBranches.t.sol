@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
-import {BatchRouter, IV3SwapRouter, IERC20} from "../contracts/BatchRouter.sol";
+import {BatchSwapRouter, IV3SwapRouter, IERC20} from "../contracts/BatchSwapRouter.sol";
 
 interface IERC20Extended is IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -88,17 +88,17 @@ contract MockV3SwapRouterForBranches is IV3SwapRouter {
     }
 }
 
-contract BatchRouterBranchTest is Test {
+contract BatchSwapRouterBranchTest is Test {
     ToggleERC20 private token;
     ToggleERC20 private tokenOut;
     MockV3SwapRouterForBranches private router;
-    BatchRouter private batch;
+    BatchSwapRouter private batch;
 
     function setUp() public {
         token = new ToggleERC20();
         tokenOut = new ToggleERC20();
         router = new MockV3SwapRouterForBranches();
-        batch = new BatchRouter(address(router));
+        batch = new BatchSwapRouter(address(router));
     }
 
     function testSellRevertsOnApprovalFailed() public {
@@ -115,7 +115,7 @@ contract BatchRouterBranchTest is Test {
             sqrtPriceLimitX96: 0
         });
 
-        vm.expectRevert(BatchRouter.ApprovalFailed.selector);
+        vm.expectRevert(BatchSwapRouter.ApprovalFailed.selector);
         batch.sell(swaps, 0);
     }
 
@@ -133,11 +133,11 @@ contract BatchRouterBranchTest is Test {
             sqrtPriceLimitX96: 0
         });
 
-        vm.expectRevert(BatchRouter.ApprovalFailed.selector);
+        vm.expectRevert(BatchSwapRouter.ApprovalFailed.selector);
         batch.buy(swaps, 10);
     }
 
-    // This mock-only test covers BatchRouter's defense-in-depth aggregate max check.
+    // This mock-only test covers BatchSwapRouter's defense-in-depth aggregate max check.
     // With a standard router/token flow, per-swap amountInMaximum usually prevents this path.
     function testBuyRevertsWhenAggregateAmountExceedsMax_DefenseInDepthMockPath() public {
         router.setExactOutputSingleReturn(7);
@@ -154,7 +154,7 @@ contract BatchRouterBranchTest is Test {
         });
         swaps[1] = swaps[0];
 
-        vm.expectRevert(BatchRouter.SlippageExceeded.selector);
+        vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
         batch.buy(swaps, 10);
     }
 
@@ -196,7 +196,7 @@ contract BatchRouterBranchTest is Test {
             sqrtPriceLimitX96: 0
         });
 
-        vm.expectRevert(BatchRouter.TransferFailed.selector);
+        vm.expectRevert(BatchSwapRouter.TransferFailed.selector);
         batch.buy(swaps, 10);
     }
 }
