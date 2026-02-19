@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // https://github.com/seer-pm/ai-prediction-markets/blob/1b58498d284e890ea11f003c8206342c95b9382a/src/contracts/TradeExecutor.sol
-pragma solidity 0.8.31;
+pragma solidity ^0.8.24;
 
 contract TradeExecutor {
     struct Call {

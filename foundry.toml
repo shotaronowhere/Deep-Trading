@@ -3,6 +3,13 @@ src = "contracts"
 test = "test"
 out = "out"
 libs = ["lib"]
-solc_version = "0.8.24"
 optimizer = true
 optimizer_runs = 200
+fs_permissions = [{ access = "read", path = "./node_modules" }]
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "@uniswap/v3-core/=lib/v3-core/",
+    "@uniswap/v3-periphery/=lib/v3-periphery/",
+    "@openzeppelin/contracts/drafts/=lib/openzeppelin-contracts/contracts/token/ERC20/extensions/",
+    "@openzeppelin/=lib/openzeppelin-contracts/"
+]
