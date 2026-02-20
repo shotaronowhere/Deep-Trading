@@ -3,10 +3,11 @@ pragma solidity ^0.8.24;
 
 import {IV3SwapRouter} from "./interfaces/IV3SwapRouter.sol";
 import {IERC20} from "./interfaces/IERC20.sol";
+import {IBatchSwapRouter} from "./interfaces/IBatchSwapRouter.sol";
 
 /// @title Batch Swap Router for Uniswap V3
 /// @notice Batches Uniswap V3 swaps with aggregate slippage protection.
-contract BatchSwapRouter {
+contract BatchSwapRouter is IBatchSwapRouter {
     error SlippageExceeded();
     error ApprovalFailed();
     error TransferFailed();
@@ -17,49 +18,69 @@ contract BatchSwapRouter {
         router = IV3SwapRouter(_router);
     }
 
-    /// @notice Batch sells equal amounts of tokenIns for the same tokenOut.
     /// @param swaps Array of ExactInputSingleParams for each swap.
-    /// @param min Minimum total amount of output tokens to receive.
-    /// @return amount Total amount of output tokens received.
-    /// @dev Caller must transfer tokenIn to this contract before calling.
-    /// @dev To enforce only group slippage protection, set each swap's amountOutMinimum to zero.
-    /// @dev tokenOut is assumed to be the same for all swaps in swaps.
-    /// @dev tokenOut is sent to recipient specified in each swaps[i].
-    function sell(
-        IV3SwapRouter.ExactInputSingleParams[] calldata swaps,
-        uint256 min
-    ) external returns (uint256 amount) {
+    /// @param amountOutMin Minimum total amount of output tokens to receive.
+    /// @return amountOut Total amount of output tokens received.
+    /// @dev Caller must approve tokenIn to this contract before calling.
+    function exactInput(
+        IERC20 tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        SwapParam[] calldata swaps
+    ) external returns (uint256 amountOut) {
         for (uint i = 0; i < swaps.length; i++) {
-            IERC20 tokenIn = IERC20(swaps[i].tokenIn);
-            bool success = tokenIn.approve(address(router), swaps[i].amountIn);
+            IERC20 tokenIn = swaps[i].token;
+            bool success = tokenIn.transferFrom(msg.sender, address(this), amountIn);
+            require(success, TransferFailed());
+            success = tokenIn.approve(address(router), amountIn);
             require(success, ApprovalFailed());
-            // TRUSTED: external call to Uniswap V3 swap router
-            amount += router.exactInputSingle(swaps[i]);
+            amountOut += router.exactInputSingle(
+                IV3SwapRouter.ExactInputSingleParams({
+                    tokenIn: address(tokenIn),
+                    tokenOut: address(tokenOut), // same tokenOut for all swaps
+                    fee: swaps[i].fee,
+                    recipient: msg.sender,
+                    amountIn: amountIn, // same amountIn for all swaps
+                    amountOutMinimum: 0, // No psqrtPriceLimitX96er-swap slippage protection; aggregate checked at the end
+                    sqrtPriceLimitX96: swaps[i].sqrtPriceLimitX96
+                })
+            );
         }
-        require(amount >= min, SlippageExceeded());
+        require(amountOut >= amountOutMin, SlippageExceeded());
     }
 
     /// @notice Batch buys equal amounts of tokenOuts for the same tokenIn.
     /// @param swaps Array of ExactOutputSingleParams for each swap.
-    /// @param max Maximum total amount of input tokens to spend.
-    /// @return amount Total amount of input tokens spent.
-    /// @dev Caller must transfer tokenInMax to this contract before calling.
-    /// @dev To enforce only group slippage protection, set each swap's amountOutMinimum to zero.
-    /// @dev tokenIn is assumed to be the same for all swaps in swaps.
-    /// @dev tokenOut is sent to recipient specified in each swaps[i].
-    function buy(
-        IV3SwapRouter.ExactOutputSingleParams[] calldata swaps,
-        uint256 max
-    ) external returns (uint256 amount) {
+    /// @param amountInMax Maximum total amount of input tokens to spend.
+    /// @return amountIn Total amount of input tokens spent.
+    /// @dev Caller must approve tokenInMax to this contract before calling.
+    function exactOutput(
+        IERC20 tokenIn,
+        uint256 amountOut,
+        uint256 amountInMax,
+        SwapParam[] calldata swaps
+    ) external returns (uint256 amountIn) {
+        // precondition msg.sender has approved tokenIn to this contract for amountInMax
+        bool success = tokenIn.transferFrom(msg.sender, address(this), amountInMax);
+        require(success, TransferFailed());
+
         // tokenIn is same for all swaps, so approve once
-        IERC20 tokenIn = IERC20(swaps[0].tokenIn);
-        bool success = tokenIn.approve(address(router), max);
+        success = tokenIn.approve(address(router), amountInMax);
         require(success, ApprovalFailed());
         for (uint i = 0; i < swaps.length; i++) {
-            // TRUSTED: external call to Uniswap V3 swap router
-            amount += router.exactOutputSingle(swaps[i]);
+            amountIn += router.exactOutputSingle(
+                IV3SwapRouter.ExactOutputSingleParams({
+                    tokenIn: address(tokenIn),
+                    tokenOut: address(swaps[i].token), // same tokenOut for all swaps
+                    fee: swaps[i].fee,
+                    recipient: msg.sender,
+                    amountOut: amountOut, // same amountOut for all swaps
+                    amountInMaximum: 0, // No per-swap slippage protection; aggregate checked at the end
+                    sqrtPriceLimitX96: swaps[i].sqrtPriceLimitX96
+                })
+            );
         }
-        require(amount <= max, SlippageExceeded());
+        require(amountIn <= amountInMax, SlippageExceeded());
         // Refund unused tokenIn to caller
         uint256 remaining = tokenIn.balanceOf(address(this));
         if (remaining > 0) {

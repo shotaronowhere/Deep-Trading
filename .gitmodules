@@ -1,3 +1,6 @@
 [submodule ".rust-skills"]
 	path = .rust-skills
 	url = https://github.com/ZhangHanDong/rust-skills.git
+[submodule "lib/v4-core"]
+	path = lib/v4-core
+	url = https://github.com/Uniswap/v4-core
