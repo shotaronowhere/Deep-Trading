@@ -47,26 +47,28 @@ contract BatchSwapRouter is IBatchSwapRouter {
             );
         }
         require(amountOut >= amountOutMin, SlippageExceeded());
+        bool success = tokenOut.transfer(msg.sender, amountOut);
+        require(success, TransferFailed());
     }
 
     /// @notice Batch buys equal amounts of tokenOuts for the same tokenIn.
     /// @param swaps Array of ExactOutputSingleParams for each swap.
     /// @param amountInMax Maximum total amount of input tokens to spend.
     /// @return amountIn Total amount of input tokens spent.
-    /// @dev Caller must approve tokenInMax to this contract before calling.
+    /// @dev Caller must approve amountInMax to this contract before calling.
     function exactOutput(
         IERC20 tokenIn,
         uint256 amountOut,
         uint256 amountInMax,
         SwapParam[] calldata swaps
     ) external returns (uint256 amountIn) {
-        // precondition msg.sender has approved tokenIn to this contract for amountInMax
         bool success = tokenIn.transferFrom(msg.sender, address(this), amountInMax);
         require(success, TransferFailed());
-
+        
         // tokenIn is same for all swaps, so approve once
         success = tokenIn.approve(address(router), amountInMax);
         require(success, ApprovalFailed());
+
         for (uint i = 0; i < swaps.length; i++) {
             amountIn += router.exactOutputSingle(
                 IV3SwapRouter.ExactOutputSingleParams({
@@ -79,6 +81,8 @@ contract BatchSwapRouter is IBatchSwapRouter {
                     sqrtPriceLimitX96: swaps[i].sqrtPriceLimitX96
                 })
             );
+            success = swaps[i].token.transfer(msg.sender, amountOut); // transfer tokenOut to caller
+            require(success, TransferFailed());
         }
         require(amountIn <= amountInMax, SlippageExceeded());
         // Refund unused tokenIn to caller
