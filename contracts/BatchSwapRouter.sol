@@ -47,8 +47,6 @@ contract BatchSwapRouter is IBatchSwapRouter {
             );
         }
         require(amountOut >= amountOutMin, SlippageExceeded());
-        bool success = tokenOut.transfer(msg.sender, amountOut);
-        require(success, TransferFailed());
     }
 
     /// @notice Batch buys equal amounts of tokenOuts for the same tokenIn.
@@ -64,7 +62,7 @@ contract BatchSwapRouter is IBatchSwapRouter {
     ) external returns (uint256 amountIn) {
         bool success = tokenIn.transferFrom(msg.sender, address(this), amountInMax);
         require(success, TransferFailed());
-        
+
         // tokenIn is same for all swaps, so approve once
         success = tokenIn.approve(address(router), amountInMax);
         require(success, ApprovalFailed());
@@ -81,8 +79,6 @@ contract BatchSwapRouter is IBatchSwapRouter {
                     sqrtPriceLimitX96: swaps[i].sqrtPriceLimitX96
                 })
             );
-            success = swaps[i].token.transfer(msg.sender, amountOut); // transfer tokenOut to caller
-            require(success, TransferFailed());
         }
         require(amountIn <= amountInMax, SlippageExceeded());
         // Refund unused tokenIn to caller
