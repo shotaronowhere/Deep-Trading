@@ -5,7 +5,11 @@ out = "out"
 libs = ["lib"]
 optimizer = true
 optimizer_runs = 200
-fs_permissions = [{ access = "read", path = "./node_modules" }]
+fs_permissions = [
+    { access = "read", path = "./node_modules" },
+    { access = "read", path = "./lib/swap-router-contracts/node_modules" },
+    { access = "read", path = "./lib/swap-router-contracts/artifacts" }
+]
 remappings = [
     "forge-std/=lib/forge-std/src/",
     "@uniswap/v3-core/=lib/v3-core/",

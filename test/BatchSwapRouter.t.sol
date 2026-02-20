@@ -8,6 +8,7 @@ import {MockERC20, MockV3SwapRouter} from "./utils/BatchSwapRouterMocks.sol";
 
 contract BatchSwapRouterTest is Test {
     MockERC20 internal tokenIn;
+    MockERC20 internal tokenInAlt;
     MockERC20 internal tokenOut;
     MockERC20 internal tokenOutAlt;
     MockV3SwapRouter internal router;
@@ -15,13 +16,16 @@ contract BatchSwapRouterTest is Test {
 
     function setUp() public {
         tokenIn = new MockERC20();
+        tokenInAlt = new MockERC20();
         tokenOut = new MockERC20();
         tokenOutAlt = new MockERC20();
         router = new MockV3SwapRouter();
         batch = new BatchSwapRouter(address(router));
 
         tokenIn.mint(address(this), 1_000_000);
+        tokenInAlt.mint(address(this), 1_000_000);
         tokenIn.approve(address(batch), type(uint256).max);
+        tokenInAlt.approve(address(batch), type(uint256).max);
     }
 
     function testConstructorSetsImmutableRouter() public {
@@ -39,8 +43,14 @@ contract BatchSwapRouterTest is Test {
         assertEq(out, 15);
         assertEq(tokenOut.balanceOf(address(this)), 15);
         assertEq(router.exactInputCalls(), 1);
-        (, , , , uint256 amountIn, , uint160 sqrtPriceLimitX96) = router.lastExactInput();
+        (address lastTokenIn, address lastTokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) =
+            router.lastExactInput();
+        assertEq(lastTokenIn, address(tokenIn));
+        assertEq(lastTokenOut, address(tokenOut));
+        assertEq(fee, 500);
+        assertEq(recipient, address(this));
         assertEq(amountIn, 10);
+        assertEq(amountOutMinimum, 0);
         assertEq(sqrtPriceLimitX96, 77);
     }
 
@@ -56,6 +66,23 @@ contract BatchSwapRouterTest is Test {
         assertEq(out, 12);
         assertEq(tokenOut.balanceOf(address(this)), 12);
         assertEq(router.exactInputCalls(), 2);
+    }
+
+    function testExactInputSupportsDifferentInputTokensPerSwap() public {
+        router.setExactInputSingleReturn(5);
+
+        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
+        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenIn, fee: 500, sqrtPriceLimitX96: 0});
+        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenInAlt, fee: 3_000, sqrtPriceLimitX96: 0});
+
+        uint256 out = batch.exactInput(tokenOut, 10, 10, swaps);
+
+        assertEq(out, 10);
+        assertEq(tokenOut.balanceOf(address(this)), 10);
+        assertEq(tokenIn.balanceOf(address(this)), 1_000_000 - 10);
+        assertEq(tokenInAlt.balanceOf(address(this)), 1_000_000 - 10);
+        assertEq(tokenIn.allowance(address(batch), address(router)), 10);
+        assertEq(tokenInAlt.allowance(address(batch), address(router)), 10);
     }
 
     function testExactInputEmptyArrayReturnsZeroAtMinZero() public {
@@ -79,8 +106,14 @@ contract BatchSwapRouterTest is Test {
         assertEq(tokenOut.balanceOf(address(this)), 4);
         assertEq(tokenIn.balanceOf(address(this)), 1_000_000 - 7);
         assertEq(router.exactOutputCalls(), 1);
-        (, , , , , uint256 amountInMaximum, uint160 sqrtPriceLimitX96) = router.lastExactOutput();
-        assertEq(amountInMaximum, 0);
+        (address lastTokenIn, address lastTokenOut, uint24 fee, address recipient, uint256 outAmount, uint256 amountInMaximum, uint160 sqrtPriceLimitX96) =
+            router.lastExactOutput();
+        assertEq(lastTokenIn, address(tokenIn));
+        assertEq(lastTokenOut, address(tokenOut));
+        assertEq(fee, 500);
+        assertEq(recipient, address(this));
+        assertEq(outAmount, 4);
+        assertEq(amountInMaximum, 10);
         assertEq(sqrtPriceLimitX96, 123);
     }
 
@@ -98,6 +131,42 @@ contract BatchSwapRouterTest is Test {
         assertEq(tokenOutAlt.balanceOf(address(this)), 5);
         assertEq(tokenIn.balanceOf(address(this)), 1_000_000 - 6);
         assertEq(router.exactOutputCalls(), 2);
+    }
+
+    function testExactOutputThreeSwapTightBudgetTracksRemainingMaximum() public {
+        router.setExactOutputSingleReturn(3);
+        router.setEnforceAmountInMaximumOnExactOutput(true);
+
+        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](3);
+        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
+        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenOutAlt, fee: 3_000, sqrtPriceLimitX96: 0});
+        swaps[2] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 10_000, sqrtPriceLimitX96: 0});
+
+        uint256 inSpent = batch.exactOutput(tokenIn, 1, 9, swaps);
+
+        assertEq(inSpent, 9);
+        assertEq(router.exactOutputCalls(), 3);
+        assertEq(router.exactOutputAmountInMaximumHistory(0), 9);
+        assertEq(router.exactOutputAmountInMaximumHistory(1), 6);
+        assertEq(router.exactOutputAmountInMaximumHistory(2), 3);
+        assertEq(tokenIn.balanceOf(address(this)), 1_000_000 - 9);
+    }
+
+    function testExactOutputTwoSwapCanSpendExactlyTotalMax() public {
+        router.setExactOutputSingleReturn(5);
+        router.setEnforceAmountInMaximumOnExactOutput(true);
+
+        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
+        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
+        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenOutAlt, fee: 3_000, sqrtPriceLimitX96: 0});
+
+        uint256 inSpent = batch.exactOutput(tokenIn, 2, 10, swaps);
+
+        assertEq(inSpent, 10);
+        assertEq(tokenIn.balanceOf(address(batch)), 0);
+        assertEq(tokenIn.balanceOf(address(this)), 1_000_000 - 10);
+        assertEq(router.exactOutputAmountInMaximumHistory(0), 10);
+        assertEq(router.exactOutputAmountInMaximumHistory(1), 5);
     }
 
     function testExactOutputZeroRemainingSkipsRefundTransfer() public {

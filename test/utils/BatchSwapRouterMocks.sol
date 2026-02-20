@@ -65,15 +65,19 @@ contract MockERC20 is IERC20, IMintableToken {
 }
 
 contract MockV3SwapRouter is IV3SwapRouter {
+    error AmountInMaximumExceeded();
+
     uint256 public exactInputSingleReturn;
     uint256 public exactOutputSingleReturn;
 
     bool public mintTokenOutOnExactInput = true;
     bool public mintTokenOutOnExactOutput = true;
     bool public pullTokenInOnExactOutput = true;
+    bool public enforceAmountInMaximumOnExactOutput;
 
     uint256 public exactInputCalls;
     uint256 public exactOutputCalls;
+    uint256[] public exactOutputAmountInMaximumHistory;
 
     ExactInputSingleParams public lastExactInput;
     ExactOutputSingleParams public lastExactOutput;
@@ -98,13 +102,17 @@ contract MockV3SwapRouter is IV3SwapRouter {
         pullTokenInOnExactOutput = value;
     }
 
+    function setEnforceAmountInMaximumOnExactOutput(bool value) external {
+        enforceAmountInMaximumOnExactOutput = value;
+    }
+
     function exactInputSingle(ExactInputSingleParams calldata params) external payable override returns (uint256 amountOut) {
         exactInputCalls += 1;
         lastExactInput = params;
         amountOut = exactInputSingleReturn;
 
         if (mintTokenOutOnExactInput && amountOut > 0) {
-            IMintableToken(params.tokenOut).mint(msg.sender, amountOut);
+            IMintableToken(params.tokenOut).mint(params.recipient, amountOut);
         }
     }
 
@@ -117,13 +125,18 @@ contract MockV3SwapRouter is IV3SwapRouter {
         exactOutputCalls += 1;
         lastExactOutput = params;
         amountIn = exactOutputSingleReturn;
+        exactOutputAmountInMaximumHistory.push(params.amountInMaximum);
+
+        if (enforceAmountInMaximumOnExactOutput && amountIn > params.amountInMaximum) {
+            revert AmountInMaximumExceeded();
+        }
 
         if (pullTokenInOnExactOutput && amountIn > 0) {
             IERC20(params.tokenIn).transferFrom(msg.sender, address(this), amountIn);
         }
 
         if (mintTokenOutOnExactOutput && params.amountOut > 0) {
-            IMintableToken(params.tokenOut).mint(msg.sender, params.amountOut);
+            IMintableToken(params.tokenOut).mint(params.recipient, params.amountOut);
         }
     }
 }

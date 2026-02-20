@@ -52,15 +52,16 @@ contract BatchSwapRouterBranchTest is Test {
         batch.exactInput(tokenOut, 1, 4, swaps);
     }
 
-    function testExactInputRevertsOnFinalTransferFailed() public {
+    function testExactInputIgnoresTokenOutTransferFlag() public {
         router.setExactInputSingleReturn(2);
         tokenOut.setTransferResult(false);
 
         IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](1);
         swaps[0] = IBatchSwapRouter.SwapParam({token: tokenIn, fee: 500, sqrtPriceLimitX96: 0});
 
-        vm.expectRevert(BatchSwapRouter.TransferFailed.selector);
-        batch.exactInput(tokenOut, 1, 0, swaps);
+        uint256 amountOut = batch.exactInput(tokenOut, 1, 0, swaps);
+        assertEq(amountOut, 2);
+        assertEq(tokenOut.balanceOf(address(this)), 2);
     }
 
     function testExactInputEmptyArrayRevertsForPositiveMin() public {
@@ -90,15 +91,16 @@ contract BatchSwapRouterBranchTest is Test {
         batch.exactOutput(tokenIn, 1, 10, swaps);
     }
 
-    function testExactOutputRevertsOnTokenOutTransferFailed() public {
+    function testExactOutputIgnoresTokenOutTransferFlag() public {
         router.setExactOutputSingleReturn(2);
         tokenOut.setTransferResult(false);
 
         IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](1);
         swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
 
-        vm.expectRevert(BatchSwapRouter.TransferFailed.selector);
-        batch.exactOutput(tokenIn, 1, 10, swaps);
+        uint256 amountIn = batch.exactOutput(tokenIn, 1, 10, swaps);
+        assertEq(amountIn, 2);
+        assertEq(tokenOut.balanceOf(address(this)), 1);
     }
 
     function testExactOutputRevertsWhenAggregateSpentExceedsMax() public {
@@ -109,6 +111,18 @@ contract BatchSwapRouterBranchTest is Test {
         swaps[1] = swaps[0];
 
         vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
+        batch.exactOutput(tokenIn, 1, 10, swaps);
+    }
+
+    function testExactOutputRevertsWhenPerSwapRemainingMaximumExceeded() public {
+        router.setExactOutputSingleReturn(6);
+        router.setEnforceAmountInMaximumOnExactOutput(true);
+
+        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
+        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
+        swaps[1] = swaps[0];
+
+        vm.expectRevert(MockV3SwapRouter.AmountInMaximumExceeded.selector);
         batch.exactOutput(tokenIn, 1, 10, swaps);
     }
 
