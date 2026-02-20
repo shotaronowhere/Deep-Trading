@@ -1,3 +1,12 @@
 {
-    "solidity.compileUsingRemoteVersion": "v0.8.31+commit.fd3a2265"
+    "solidity.defaultCompiler": "remote",
+    "solidity.compileUsingRemoteVersion": "v0.8.31+commit.fd3a2265",
+    "solidity.packageDefaultDependenciesDirectory": "lib",
+    "solidity.remappings": [
+        "forge-std/=lib/forge-std/src/",
+        "@uniswap/v3-core/=lib/v3-core/",
+        "@uniswap/v3-periphery/=lib/v3-periphery/",
+        "@openzeppelin/contracts/drafts/=lib/openzeppelin-contracts/contracts/token/ERC20/extensions/",
+        "@openzeppelin/=lib/openzeppelin-contracts/"
+    ]
 }
