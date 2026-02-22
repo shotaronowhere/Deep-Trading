@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 
 import {BatchSwapRouter} from "../contracts/BatchSwapRouter.sol";
-import {IBatchSwapRouter} from "../contracts/interfaces/IBatchSwapRouter.sol";
 import {MockERC20} from "./utils/BatchSwapRouterMocks.sol";
 
 interface INonfungiblePositionManagerLike {
@@ -97,15 +96,15 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
     function testExactInputAgainstRealSwapRouter02AcrossTwoPools() public {
         uint256 amountInPerSwap = 1_000 ether;
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenA, fee: FEE, sqrtPriceLimitX96: 0});
-        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenB, fee: FEE, sqrtPriceLimitX96: 0});
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
 
         uint256 stableBefore = stable.balanceOf(address(this));
         uint256 tokenABefore = tokenA.balanceOf(address(this));
         uint256 tokenBBefore = tokenB.balanceOf(address(this));
 
-        uint256 amountOut = batch.exactInput(stable, amountInPerSwap, 1, swaps);
+        uint256 amountOut = batch.exactInput(stable, amountInPerSwap, 1, FEE, 0, tokens);
 
         assertGt(amountOut, 0);
         assertEq(stable.balanceOf(address(this)) - stableBefore, amountOut);
@@ -119,15 +118,15 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
         uint256 amountOutPerSwap = 100 ether;
         uint256 amountInMax = 5_000 ether;
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenA, fee: FEE, sqrtPriceLimitX96: 0});
-        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenB, fee: FEE, sqrtPriceLimitX96: 0});
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
 
         uint256 stableBefore = stable.balanceOf(address(this));
         uint256 tokenABefore = tokenA.balanceOf(address(this));
         uint256 tokenBBefore = tokenB.balanceOf(address(this));
 
-        uint256 amountIn = batch.exactOutput(stable, amountOutPerSwap, amountInMax, swaps);
+        uint256 amountIn = batch.exactOutput(stable, amountOutPerSwap, amountInMax, FEE, 0, tokens);
 
         assertGt(amountIn, 0);
         assertLe(amountIn, amountInMax);

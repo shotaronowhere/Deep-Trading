@@ -3,7 +3,6 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import {BatchSwapRouter} from "../contracts/BatchSwapRouter.sol";
-import {IBatchSwapRouter} from "../contracts/interfaces/IBatchSwapRouter.sol";
 import {MockERC20, MockV3SwapRouter} from "./utils/BatchSwapRouterMocks.sol";
 
 contract BatchSwapRouterFuzzTest is Test {
@@ -40,19 +39,15 @@ contract BatchSwapRouterFuzzTest is Test {
 
         router.setExactInputSingleReturn(outPerSwap);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](count);
+        address[] memory tokens = new address[](count);
         for (uint256 i = 0; i < count; i++) {
-            swaps[i] = IBatchSwapRouter.SwapParam({
-                token: i % 2 == 0 ? tokenIn : tokenInAlt,
-                fee: 500,
-                sqrtPriceLimitX96: 0
-            });
+            tokens[i] = i % 2 == 0 ? address(tokenIn) : address(tokenInAlt);
         }
 
         uint256 tokenInBefore = tokenIn.balanceOf(address(this));
         uint256 tokenInAltBefore = tokenInAlt.balanceOf(address(this));
 
-        uint256 amountOut = batch.exactInput(tokenOut, amountInPerSwap, expectedOut, swaps);
+        uint256 amountOut = batch.exactInput(tokenOut, amountInPerSwap, expectedOut, 500, 0, tokens);
 
         uint256 tokenInSwapCount = (count + 1) / 2;
         uint256 tokenInAltSwapCount = count - tokenInSwapCount;
@@ -76,17 +71,13 @@ contract BatchSwapRouterFuzzTest is Test {
 
         router.setExactInputSingleReturn(outPerSwap);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](count);
+        address[] memory tokens = new address[](count);
         for (uint256 i = 0; i < count; i++) {
-            swaps[i] = IBatchSwapRouter.SwapParam({
-                token: i % 2 == 0 ? tokenIn : tokenInAlt,
-                fee: 500,
-                sqrtPriceLimitX96: 0
-            });
+            tokens[i] = i % 2 == 0 ? address(tokenIn) : address(tokenInAlt);
         }
 
         vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
-        batch.exactInput(tokenOut, amountInPerSwap, minimumTooHigh, swaps);
+        batch.exactInput(tokenOut, amountInPerSwap, minimumTooHigh, 500, 0, tokens);
     }
 
     function testFuzzExactOutputTracksRemainingBudgetAndRefunds(
@@ -105,20 +96,16 @@ contract BatchSwapRouterFuzzTest is Test {
         router.setExactOutputSingleReturn(costPerSwap);
         router.setEnforceAmountInMaximumOnExactOutput(true);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](count);
+        address[] memory tokens = new address[](count);
         for (uint256 i = 0; i < count; i++) {
-            swaps[i] = IBatchSwapRouter.SwapParam({
-                token: i % 2 == 0 ? tokenOut : tokenOutAlt,
-                fee: 500,
-                sqrtPriceLimitX96: 0
-            });
+            tokens[i] = i % 2 == 0 ? address(tokenOut) : address(tokenOutAlt);
         }
 
         uint256 tokenInBefore = tokenIn.balanceOf(address(this));
         uint256 tokenOutBefore = tokenOut.balanceOf(address(this));
         uint256 tokenOutAltBefore = tokenOutAlt.balanceOf(address(this));
 
-        uint256 amountIn = batch.exactOutput(tokenIn, amountOutPerSwap, amountInTotalMax, swaps);
+        uint256 amountIn = batch.exactOutput(tokenIn, amountOutPerSwap, amountInTotalMax, 500, 0, tokens);
 
         uint256 tokenOutSwapCount = (count + 1) / 2;
         uint256 tokenOutAltSwapCount = count - tokenOutSwapCount;
@@ -148,12 +135,12 @@ contract BatchSwapRouterFuzzTest is Test {
         router.setExactOutputSingleReturn(costPerSwap);
         router.setEnforceAmountInMaximumOnExactOutput(true);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](count);
+        address[] memory tokens = new address[](count);
         for (uint256 i = 0; i < count; i++) {
-            swaps[i] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
+            tokens[i] = address(tokenOut);
         }
 
         vm.expectRevert(MockV3SwapRouter.AmountInMaximumExceeded.selector);
-        batch.exactOutput(tokenIn, 1, amountInTotalMax, swaps);
+        batch.exactOutput(tokenIn, 1, amountInTotalMax, 500, 0, tokens);
     }
 }

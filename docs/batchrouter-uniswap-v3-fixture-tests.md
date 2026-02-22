@@ -3,6 +3,11 @@
 ## Goal
 Keep `contracts/BatchSwapRouter.sol` fully covered after the API update to `exactInput` and `exactOutput`.
 
+## API under test
+- `exactInput(IERC20 _tokenOut, uint256 _amountIn, uint256 _amountOutTotalMinimum, uint24 _fee, uint160 _sqrtPriceLimitX96, address[] _tokens)`
+- `exactOutput(IERC20 _tokenIn, uint256 _amountOut, uint256 _amountInTotalMax, uint24 _fee, uint160 _sqrtPriceLimitX96, address[] _tokens)`
+- `address[] _tokens` selects per-swap token addresses; `_fee` and `_sqrtPriceLimitX96` are shared across the batch.
+
 ## Test strategy
 The suite now has two layers:
 - deterministic unit tests for explicit branch control
@@ -33,12 +38,12 @@ For `UniswapV3Factory` and `NonfungiblePositionManager`, tests first try root `n
 - single swap success
 - multi swap aggregate output
 - multi swap with distinct input tokens and per-token router approvals
-- empty swaps with `amountOutMin == 0`
+- empty swaps with `_amountOutTotalMinimum == 0`
 - revert on `tokenIn.transferFrom` failure
 - revert on `tokenIn.approve` failure
-- revert on aggregate slippage (`amountOut < amountOutMin`)
+- revert on aggregate slippage (`amountOut < _amountOutTotalMinimum`)
 - success path remains valid even when output token `transfer` is disabled in mock (router sends directly to recipient)
-- empty swaps with positive `amountOutMin` revert
+- empty swaps with positive `_amountOutTotalMinimum` revert
 - fuzzed aggregation invariants over bounded swap counts, amounts, and slippage thresholds
 
 `exactOutput` coverage:
@@ -50,7 +55,7 @@ For `UniswapV3Factory` and `NonfungiblePositionManager`, tests first try root `n
 - revert on initial `tokenIn.transferFrom` failure
 - revert on `tokenIn.approve` failure
 - success path remains valid even when output token `transfer` is disabled in mock (no output transfer by `BatchSwapRouter`)
-- revert on aggregate slippage (`amountIn > amountInMax`)
+- revert on aggregate slippage (`amountIn > _amountInTotalMax`)
 - revert when strict per-swap remaining maximum is exceeded
 - revert on refund transfer failure
 - empty swaps path returning full refund and `amountIn == 0`

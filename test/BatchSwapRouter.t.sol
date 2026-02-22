@@ -3,7 +3,6 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import {BatchSwapRouter} from "../contracts/BatchSwapRouter.sol";
-import {IBatchSwapRouter} from "../contracts/interfaces/IBatchSwapRouter.sol";
 import {MockERC20, MockV3SwapRouter} from "./utils/BatchSwapRouterMocks.sol";
 
 contract BatchSwapRouterTest is Test {
@@ -35,10 +34,10 @@ contract BatchSwapRouterTest is Test {
     function testExactInputSingleSwapSuccess() public {
         router.setExactInputSingleReturn(15);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](1);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenIn, fee: 500, sqrtPriceLimitX96: 77});
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tokenIn);
 
-        uint256 out = batch.exactInput(tokenOut, 10, 0, swaps);
+        uint256 out = batch.exactInput(tokenOut, 10, 0, 500, 77, tokens);
 
         assertEq(out, 15);
         assertEq(tokenOut.balanceOf(address(this)), 15);
@@ -57,11 +56,11 @@ contract BatchSwapRouterTest is Test {
     function testExactInputMultiSwapAggregatesOutput() public {
         router.setExactInputSingleReturn(6);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenIn, fee: 500, sqrtPriceLimitX96: 0});
-        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenIn, fee: 3_000, sqrtPriceLimitX96: 0});
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenIn);
+        tokens[1] = address(tokenIn);
 
-        uint256 out = batch.exactInput(tokenOut, 10, 12, swaps);
+        uint256 out = batch.exactInput(tokenOut, 10, 12, 500, 0, tokens);
 
         assertEq(out, 12);
         assertEq(tokenOut.balanceOf(address(this)), 12);
@@ -71,11 +70,11 @@ contract BatchSwapRouterTest is Test {
     function testExactInputSupportsDifferentInputTokensPerSwap() public {
         router.setExactInputSingleReturn(5);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenIn, fee: 500, sqrtPriceLimitX96: 0});
-        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenInAlt, fee: 3_000, sqrtPriceLimitX96: 0});
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenIn);
+        tokens[1] = address(tokenInAlt);
 
-        uint256 out = batch.exactInput(tokenOut, 10, 10, swaps);
+        uint256 out = batch.exactInput(tokenOut, 10, 10, 500, 0, tokens);
 
         assertEq(out, 10);
         assertEq(tokenOut.balanceOf(address(this)), 10);
@@ -86,9 +85,9 @@ contract BatchSwapRouterTest is Test {
     }
 
     function testExactInputEmptyArrayReturnsZeroAtMinZero() public {
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](0);
+        address[] memory tokens = new address[](0);
 
-        uint256 out = batch.exactInput(tokenOut, 10, 0, swaps);
+        uint256 out = batch.exactInput(tokenOut, 10, 0, 500, 0, tokens);
 
         assertEq(out, 0);
         assertEq(router.exactInputCalls(), 0);
@@ -97,10 +96,10 @@ contract BatchSwapRouterTest is Test {
     function testExactOutputSingleSwapSuccessWithRefund() public {
         router.setExactOutputSingleReturn(7);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](1);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 123});
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tokenOut);
 
-        uint256 inSpent = batch.exactOutput(tokenIn, 4, 10, swaps);
+        uint256 inSpent = batch.exactOutput(tokenIn, 4, 10, 500, 123, tokens);
 
         assertEq(inSpent, 7);
         assertEq(tokenOut.balanceOf(address(this)), 4);
@@ -120,11 +119,11 @@ contract BatchSwapRouterTest is Test {
     function testExactOutputMultiSwapAggregatesInputAndTransfersEachToken() public {
         router.setExactOutputSingleReturn(3);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
-        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenOutAlt, fee: 3_000, sqrtPriceLimitX96: 0});
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenOut);
+        tokens[1] = address(tokenOutAlt);
 
-        uint256 inSpent = batch.exactOutput(tokenIn, 5, 10, swaps);
+        uint256 inSpent = batch.exactOutput(tokenIn, 5, 10, 500, 0, tokens);
 
         assertEq(inSpent, 6);
         assertEq(tokenOut.balanceOf(address(this)), 5);
@@ -137,12 +136,12 @@ contract BatchSwapRouterTest is Test {
         router.setExactOutputSingleReturn(3);
         router.setEnforceAmountInMaximumOnExactOutput(true);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](3);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
-        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenOutAlt, fee: 3_000, sqrtPriceLimitX96: 0});
-        swaps[2] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 10_000, sqrtPriceLimitX96: 0});
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tokenOut);
+        tokens[1] = address(tokenOutAlt);
+        tokens[2] = address(tokenOut);
 
-        uint256 inSpent = batch.exactOutput(tokenIn, 1, 9, swaps);
+        uint256 inSpent = batch.exactOutput(tokenIn, 1, 9, 500, 0, tokens);
 
         assertEq(inSpent, 9);
         assertEq(router.exactOutputCalls(), 3);
@@ -156,11 +155,11 @@ contract BatchSwapRouterTest is Test {
         router.setExactOutputSingleReturn(5);
         router.setEnforceAmountInMaximumOnExactOutput(true);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](2);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
-        swaps[1] = IBatchSwapRouter.SwapParam({token: tokenOutAlt, fee: 3_000, sqrtPriceLimitX96: 0});
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenOut);
+        tokens[1] = address(tokenOutAlt);
 
-        uint256 inSpent = batch.exactOutput(tokenIn, 2, 10, swaps);
+        uint256 inSpent = batch.exactOutput(tokenIn, 2, 10, 500, 0, tokens);
 
         assertEq(inSpent, 10);
         assertEq(tokenIn.balanceOf(address(batch)), 0);
@@ -172,11 +171,11 @@ contract BatchSwapRouterTest is Test {
     function testExactOutputZeroRemainingSkipsRefundTransfer() public {
         router.setExactOutputSingleReturn(10);
 
-        IBatchSwapRouter.SwapParam[] memory swaps = new IBatchSwapRouter.SwapParam[](1);
-        swaps[0] = IBatchSwapRouter.SwapParam({token: tokenOut, fee: 500, sqrtPriceLimitX96: 0});
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tokenOut);
 
         uint256 before = tokenIn.balanceOf(address(this));
-        uint256 inSpent = batch.exactOutput(tokenIn, 1, 10, swaps);
+        uint256 inSpent = batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
 
         assertEq(inSpent, 10);
         assertEq(tokenIn.balanceOf(address(this)), before - 10);
