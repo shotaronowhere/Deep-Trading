@@ -17,7 +17,19 @@ const L1_FEE_CACHE_TTL: Duration = Duration::from_secs(60);
 const L1_FEE_RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const L1_FEE_SLOPE_SAMPLE_SMALL_BYTES: usize = 256;
 const L1_FEE_SLOPE_SAMPLE_LARGE_BYTES: usize = 512;
-const L1_FEE_SAMPLE_FILL_BYTE: u8 = 1;
+/// Build a non-uniform probe payload that approximates real calldata byte entropy.
+/// Uses a deterministic LCG so the result is reproducible and non-trivially compressible.
+/// Any single repeated byte (0x00, 0x01, 0xAB, etc.) compresses to ~11 bytes under
+/// Fjord/Brotli regardless of value — this sequence avoids that collapse.
+fn make_l1_fee_probe_bytes(len: usize) -> Vec<u8> {
+    let mut state: u32 = 0xDEAD_BEEF;
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u8
+        })
+        .collect()
+}
 static OP_L1_FEE_PER_BYTE_WEI_CACHE: OnceLock<RwLock<HashMap<String, CachedL1FeePerByteWei>>> =
     OnceLock::new();
 static OP_L1_FEE_PER_BYTE_FETCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -356,7 +368,7 @@ async fn fetch_optimism_l1_fee_wei_for_payload_len(
     }
 
     let call_data = getL1FeeCall {
-        payload: Bytes::from(vec![L1_FEE_SAMPLE_FILL_BYTE; payload_len]),
+        payload: Bytes::from(make_l1_fee_probe_bytes(payload_len)),
     }
     .abi_encode();
     let payload = serde_json::json!({
@@ -429,6 +441,27 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
+
+    #[test]
+    fn probe_bytes_are_non_uniform() {
+        // Regression guard: the L1 fee probe must NOT be a single repeated byte.
+        // Under Fjord Brotli, ANY uniform vec![b; N] compresses to ~11 bytes regardless
+        // of which byte `b` is. This causes the marginal fee slope to collapse to ~0.
+        // The probe must have enough byte diversity to simulate real calldata entropy.
+        let small = make_l1_fee_probe_bytes(L1_FEE_SLOPE_SAMPLE_SMALL_BYTES);
+        let large = make_l1_fee_probe_bytes(L1_FEE_SLOPE_SAMPLE_LARGE_BYTES);
+        // At least 4 distinct byte values
+        let distinct_small: std::collections::HashSet<u8> = small.iter().copied().collect();
+        let distinct_large: std::collections::HashSet<u8> = large.iter().copied().collect();
+        assert!(
+            distinct_small.len() >= 4,
+            "probe bytes have only {} distinct values (need ≥4 for realistic entropy)",
+            distinct_small.len()
+        );
+        assert_eq!(small.len(), L1_FEE_SLOPE_SAMPLE_SMALL_BYTES);
+        assert_eq!(large.len(), L1_FEE_SLOPE_SAMPLE_LARGE_BYTES);
+        let _ = distinct_large; // large inherits same generator
+    }
 
     fn with_cache_lock<T>(f: impl FnOnce() -> T) -> T {
         static CACHE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -633,5 +666,74 @@ mod tests {
 
             assert_eq!(cached_optimism_l1_fee_per_byte_wei_value(), None);
         });
+    }
+
+    #[test]
+    fn exact_input_single_payload_without_selector_is_224_bytes() {
+        // Verify that 7 EVM word fields = 7 × 32 = 224 bytes.
+        // SWAP_BYTES = 224 excludes the 4-byte selector (which lives in BATCH_CALL_BASE_BYTES).
+        use alloy::sol;
+        use alloy::sol_types::SolCall;
+
+        sol! {
+            struct ExactInputSingleParams {
+                address tokenIn;
+                address tokenOut;
+                uint24 fee;
+                address recipient;
+                uint256 amountIn;
+                uint256 amountOutMinimum;
+                uint160 sqrtPriceLimitX96;
+            }
+            function exactInputSingle(ExactInputSingleParams params) external returns (uint256);
+        }
+
+        let call = exactInputSingleCall {
+            params: ExactInputSingleParams {
+                tokenIn: alloy::primitives::Address::ZERO,
+                tokenOut: alloy::primitives::Address::ZERO,
+                fee: 100,
+                recipient: alloy::primitives::Address::ZERO,
+                amountIn: alloy::primitives::U256::ZERO,
+                amountOutMinimum: alloy::primitives::U256::ZERO,
+                sqrtPriceLimitX96: alloy::primitives::U256::ZERO.into(),
+            },
+        };
+        let encoded = call.abi_encode();
+        // selector(4) + 7 × 32 = 228 total; payload without selector = 224
+        assert_eq!(
+            encoded.len() - 4,
+            224,
+            "exactInputSingle payload (no selector) must be 224 bytes; got {}",
+            encoded.len() - 4
+        );
+    }
+
+    #[test]
+    fn split_position_full_call_is_100_bytes() {
+        // Verify CTF splitPosition: selector(4) + 3 × address/uint256 words = 100 bytes.
+        // Internal L2 calls (splitPosition is called by BatchSwapRouter internally) do NOT
+        // contribute to L1 calldata — only the outer EOA tx bytes matter for L1 data fee.
+        use alloy::sol;
+        use alloy::sol_types::SolCall;
+
+        sol! {
+            function splitPosition(address collateralToken, address conditionId, uint256 amount) external;
+        }
+
+        let call = splitPositionCall {
+            collateralToken: alloy::primitives::Address::ZERO,
+            conditionId: alloy::primitives::Address::ZERO,
+            amount: alloy::primitives::U256::ZERO,
+        };
+        let encoded = call.abi_encode();
+        assert_eq!(encoded.len(), 100, "splitPosition ABI encoding must be 100 bytes");
+    }
+
+    #[test]
+    fn direct_buy_calldata_estimate_is_434_bytes() {
+        // DirectBuy: TX_ENVELOPE(110) + BATCH_CALL_BASE(100) + SWAP_BYTES(224) = 434
+        let estimate = estimate_group_calldata_bytes(GroupKind::DirectBuy, 0, 0);
+        assert_eq!(estimate, 434, "DirectBuy calldata estimate should be 434 bytes");
     }
 }
