@@ -15,5 +15,4 @@ remappings = [
     "@uniswap/v3-core/=lib/v3-core/",
     "@uniswap/v3-periphery/=lib/v3-periphery/",
     "@openzeppelin/contracts/drafts/=lib/openzeppelin-contracts/contracts/token/ERC20/extensions/",
-    "@openzeppelin/=lib/openzeppelin-contracts/"
 ]
