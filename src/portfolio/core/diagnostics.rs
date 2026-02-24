@@ -83,8 +83,6 @@ pub fn replay_actions_to_portfolio_state(
                 }
                 cash += *amount;
             }
-            Action::FlashLoan { amount } => cash += *amount,
-            Action::RepayFlashLoan { amount } => cash -= *amount,
         }
     }
 
@@ -130,10 +128,7 @@ fn try_replay_actions_to_market_state(
                     }
                 }
             }
-            Action::Mint { .. }
-            | Action::Merge { .. }
-            | Action::FlashLoan { .. }
-            | Action::RepayFlashLoan { .. } => {}
+            Action::Mint { .. } | Action::Merge { .. } => {}
         }
     }
 
@@ -252,10 +247,7 @@ fn replay_trade_diagnostics(
                     spans.insert(action_index, DirectProfitabilitySpan { before, after });
                 }
             }
-            Action::Mint { .. }
-            | Action::Merge { .. }
-            | Action::FlashLoan { .. }
-            | Action::RepayFlashLoan { .. } => {}
+            Action::Mint { .. } | Action::Merge { .. } => {}
         }
     }
 
@@ -465,7 +457,7 @@ fn print_market_price_changes(
 
 fn split_actions_by_complete_set_arb_phase(actions: &[Action]) -> (&[Action], &[Action]) {
     const COMPLETE_SET_ARB: &str = "complete_set_arb";
-    let marker_idx = actions.iter().position(|action| match action {
+    let marker_idx = actions.iter().rposition(|action| match action {
         Action::Merge { source_market, .. } => *source_market == COMPLETE_SET_ARB,
         Action::Mint { target_market, .. } => *target_market == COMPLETE_SET_ARB,
         _ => false,
@@ -476,12 +468,25 @@ fn split_actions_by_complete_set_arb_phase(actions: &[Action]) -> (&[Action], &[
     };
 
     let mut arb_end = marker_idx;
-    if matches!(actions.first(), Some(Action::FlashLoan { .. }))
-        && let Some(repay_offset) = actions[marker_idx + 1..]
-            .iter()
-            .position(|action| matches!(action, Action::RepayFlashLoan { .. }))
+    if let Action::Mint {
+        amount: mint_amount,
+        ..
+    } = &actions[marker_idx]
     {
-        arb_end = marker_idx + 1 + repay_offset;
+        let mut i = marker_idx + 1;
+        while i < actions.len() {
+            match &actions[i] {
+                Action::Sell { amount, .. } => {
+                    let tol = 1e-12 * (1.0 + mint_amount.abs().max(amount.abs()));
+                    if (amount - mint_amount).abs() > tol {
+                        break;
+                    }
+                    arb_end = i;
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
     }
 
     (&actions[..=arb_end], &actions[arb_end + 1..])
@@ -490,8 +495,8 @@ fn split_actions_by_complete_set_arb_phase(actions: &[Action]) -> (&[Action], &[
 const LARGE_ACTION_PREVIEW_MIN_ACTIONS: usize = 20;
 const ACTION_PREVIEW_HEAD_GROUPS: usize = 2;
 const ACTION_PREVIEW_TAIL_GROUPS: usize = 2;
-const FLASH_SUBGROUP_PREVIEW_HEAD: usize = 2;
-const FLASH_SUBGROUP_PREVIEW_TAIL: usize = 1;
+const INDIRECT_SUBGROUP_PREVIEW_HEAD: usize = 2;
+const INDIRECT_SUBGROUP_PREVIEW_TAIL: usize = 1;
 const MARKET_DELTA_PREVIEW_ROWS: usize = 16;
 const PORTFOLIO_PREVIEW_ROWS: usize = 20;
 const GROUP_KIND_COL_WIDTH: usize = 28;
@@ -677,7 +682,7 @@ fn format_group_badges(
 ) -> String {
     let mut badges: Vec<String> = Vec::new();
     if matches!(group.kind, GroupKind::MintSell | GroupKind::BuyMerge) {
-        badges.push(colorize(ansi, ANSI_CYAN, "[FLASH]"));
+        badges.push(colorize(ansi, ANSI_CYAN, "[INDIRECT]"));
     }
     let boundary_stats = collect_boundary_stats(
         actions,
@@ -753,8 +758,6 @@ fn action_outline_detail(action: &Action) -> String {
             proceeds,
             proceeds / amount.max(1e-18)
         ),
-        Action::FlashLoan { amount } => format!("amount={:.6}", amount),
-        Action::RepayFlashLoan { amount } => format!("amount={:.6}", amount),
         Action::Mint {
             amount,
             target_market,
@@ -780,8 +783,6 @@ fn action_kind_label(action: &Action) -> &'static str {
     match action {
         Action::Buy { .. } => "Buy",
         Action::Sell { .. } => "Sell",
-        Action::FlashLoan { .. } => "FlashLoan",
-        Action::RepayFlashLoan { .. } => "Repay",
         Action::Mint { .. } => "Mint",
         Action::Merge { .. } => "Merge",
     }
@@ -822,10 +823,8 @@ fn action_outline_detail_with_direct_profitability(
 enum ActionSetKind {
     Buy,
     Sell,
-    FlashLoan,
     Mint,
     Merge,
-    RepayFlashLoan,
 }
 
 impl ActionSetKind {
@@ -833,10 +832,8 @@ impl ActionSetKind {
         match self {
             Self::Buy => matches!(action, Action::Buy { .. }),
             Self::Sell => matches!(action, Action::Sell { .. }),
-            Self::FlashLoan => matches!(action, Action::FlashLoan { .. }),
             Self::Mint => matches!(action, Action::Mint { .. }),
             Self::Merge => matches!(action, Action::Merge { .. }),
-            Self::RepayFlashLoan => matches!(action, Action::RepayFlashLoan { .. }),
         }
     }
 }
@@ -884,22 +881,18 @@ impl ActionSetSpec {
     }
 }
 
-const MIXED_BUY_MINT_SELL_SPECS: [ActionSetSpec; 6] = [
+const MIXED_BUY_MINT_SELL_SPECS: [ActionSetSpec; 4] = [
     ActionSetSpec::stage(ActionSetKind::Buy, "Buy"),
-    ActionSetSpec::stage(ActionSetKind::FlashLoan, "Flash Loan"),
     ActionSetSpec::stage(ActionSetKind::Mint, "Mint"),
     ActionSetSpec::homogeneous(ActionSetKind::Sell, "Sell", "First Sell", "Last Sell"),
     ActionSetSpec::stage(ActionSetKind::Merge, "Merge"),
-    ActionSetSpec::stage(ActionSetKind::RepayFlashLoan, "Repay"),
 ];
 
-const MIXED_SELL_BUY_MERGE_SPECS: [ActionSetSpec; 6] = [
+const MIXED_SELL_BUY_MERGE_SPECS: [ActionSetSpec; 4] = [
     ActionSetSpec::stage(ActionSetKind::Sell, "Sell"),
-    ActionSetSpec::stage(ActionSetKind::FlashLoan, "Flash Loan"),
     ActionSetSpec::homogeneous(ActionSetKind::Buy, "Buy", "First Buy", "Last Buy"),
     ActionSetSpec::stage(ActionSetKind::Mint, "Mint"),
     ActionSetSpec::stage(ActionSetKind::Merge, "Merge"),
-    ActionSetSpec::stage(ActionSetKind::RepayFlashLoan, "Repay"),
 ];
 
 fn collect_action_set_indices(
@@ -1156,7 +1149,7 @@ fn trade_preview_values(action: &Action) -> Option<(&'static str, &'static str, 
     }
 }
 
-fn print_flash_trade_preview(
+fn print_indirect_trade_preview(
     actions: &[Action],
     group: &ActionGroup,
     global_offset: usize,
@@ -1214,47 +1207,32 @@ fn print_flash_trade_preview(
     let mut subgroups: Vec<SubgroupSummary> = Vec::new();
     let mut i = 0usize;
     while i < group.action_indices.len() {
-        let idx = group.action_indices[i];
-        let Action::FlashLoan { .. } = actions[idx] else {
-            i += 1;
-            continue;
-        };
+        match group.kind {
+            GroupKind::MintSell => {
+                let start_idx = group.action_indices[i];
+                if !matches!(actions[start_idx], Action::Mint { .. }) {
+                    i += 1;
+                    continue;
+                }
 
-        let mut j = i + 1;
-        let mut saw_mint = false;
-        let mut saw_merge = false;
-        let mut buys_in_bracket: Vec<usize> = Vec::new();
-        let mut sells_in_bracket: Vec<usize> = Vec::new();
-
-        while j < group.action_indices.len() {
-            let inner_idx = group.action_indices[j];
-            match actions[inner_idx] {
-                Action::Mint { .. } => saw_mint = true,
-                Action::Merge { .. } => saw_merge = true,
-                Action::Buy { .. } => buys_in_bracket.push(inner_idx),
-                Action::Sell { .. } => sells_in_bracket.push(inner_idx),
-                Action::RepayFlashLoan { .. } => break,
-                Action::FlashLoan { .. } => break,
-            }
-            j += 1;
-        }
-
-        if j >= group.action_indices.len()
-            || !matches!(
-                actions[group.action_indices[j]],
-                Action::RepayFlashLoan { .. }
-            )
-        {
-            i += 1;
-            continue;
-        }
-
-        if saw_mint {
-            let sum_p = if sells_in_bracket.is_empty() {
-                None
-            } else {
-                Some(
-                    sells_in_bracket
+                let mut j = i + 1;
+                let mut sells: Vec<usize> = Vec::new();
+                while j < group.action_indices.len() {
+                    let action_idx = group.action_indices[j];
+                    if matches!(actions[action_idx], Action::Sell { .. }) {
+                        sells.push(action_idx);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if sells.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let end_idx = *sells.last().unwrap_or(&start_idx);
+                let sum_p = Some(
+                    sells
                         .iter()
                         .filter_map(|&k| match actions[k] {
                             Action::Sell {
@@ -1263,45 +1241,68 @@ fn print_flash_trade_preview(
                             _ => None,
                         })
                         .sum(),
-                )
-            };
-            subgroups.push(SubgroupSummary {
-                start_idx: idx,
-                end_idx: group.action_indices[j],
-                trade_indices: sells_in_bracket,
-                sum_p,
-                execution_price: sum_p.map(|v| 1.0 - v),
-                label: "mint+sell trades",
-            });
-        } else if saw_merge {
-            let sum_p = if buys_in_bracket.is_empty() {
-                None
-            } else {
-                Some(
-                    buys_in_bracket
-                        .iter()
+                );
+                subgroups.push(SubgroupSummary {
+                    start_idx,
+                    end_idx,
+                    trade_indices: sells,
+                    sum_p,
+                    execution_price: sum_p.map(|v| 1.0 - v),
+                    label: "mint+sell trades",
+                });
+                i = j;
+            }
+            GroupKind::BuyMerge => {
+                let start_idx = group.action_indices[i];
+                if !matches!(actions[start_idx], Action::Buy { .. }) {
+                    i += 1;
+                    continue;
+                }
+
+                let mut j = i;
+                let mut buys: Vec<usize> = Vec::new();
+                while j < group.action_indices.len() {
+                    let action_idx = group.action_indices[j];
+                    if matches!(actions[action_idx], Action::Buy { .. }) {
+                        buys.push(action_idx);
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if buys.is_empty() || j >= group.action_indices.len() {
+                    i += 1;
+                    continue;
+                }
+                let merge_idx = group.action_indices[j];
+                if !matches!(actions[merge_idx], Action::Merge { .. }) {
+                    i += 1;
+                    continue;
+                }
+                let sum_p = Some(
+                    buys.iter()
                         .filter_map(|&k| match actions[k] {
                             Action::Buy { amount, cost, .. } if amount > 0.0 => Some(cost / amount),
                             _ => None,
                         })
                         .sum(),
-                )
-            };
-            subgroups.push(SubgroupSummary {
-                start_idx: idx,
-                end_idx: group.action_indices[j],
-                trade_indices: buys_in_bracket,
-                sum_p,
-                execution_price: sum_p.map(|v| 1.0 - v),
-                label: "buy+merge trades",
-            });
+                );
+                subgroups.push(SubgroupSummary {
+                    start_idx,
+                    end_idx: merge_idx,
+                    trade_indices: buys,
+                    sum_p,
+                    execution_price: sum_p.map(|v| 1.0 - v),
+                    label: "buy+merge trades",
+                });
+                i = j + 1;
+            }
+            _ => break,
         }
-
-        i = j + 1;
     }
 
     if subgroups.is_empty() {
-        println!("      flash-trade subgroup: unavailable (no flash bracket found)");
+        println!("      indirect subgroup: unavailable");
         return;
     }
 
@@ -1373,7 +1374,7 @@ fn print_flash_trade_preview(
         );
     };
 
-    if subgroups.len() <= FLASH_SUBGROUP_PREVIEW_HEAD + FLASH_SUBGROUP_PREVIEW_TAIL {
+    if subgroups.len() <= INDIRECT_SUBGROUP_PREVIEW_HEAD + INDIRECT_SUBGROUP_PREVIEW_TAIL {
         for (sub_idx, subgroup) in subgroups.iter().enumerate() {
             print_subgroup(sub_idx, subgroup);
         }
@@ -1382,20 +1383,20 @@ fn print_flash_trade_preview(
 
     for (sub_idx, subgroup) in subgroups
         .iter()
-        .take(FLASH_SUBGROUP_PREVIEW_HEAD)
+        .take(INDIRECT_SUBGROUP_PREVIEW_HEAD)
         .enumerate()
     {
         print_subgroup(sub_idx, subgroup);
     }
 
-    let tail_start = subgroups.len() - FLASH_SUBGROUP_PREVIEW_TAIL;
-    let skipped = &subgroups[FLASH_SUBGROUP_PREVIEW_HEAD..tail_start];
+    let tail_start = subgroups.len() - INDIRECT_SUBGROUP_PREVIEW_TAIL;
+    let skipped = &subgroups[INDIRECT_SUBGROUP_PREVIEW_HEAD..tail_start];
     let skipped_trade_count: usize = skipped
         .iter()
         .map(|subgroup| subgroup.trade_indices.len())
         .sum();
     println!(
-        "      ... skipped {} flash subgroups ({} trades)",
+        "      ... skipped {} indirect subgroups ({} trades)",
         skipped.len(),
         skipped_trade_count
     );
@@ -1555,7 +1556,7 @@ fn print_action_group_preview(
     if matches!(group.kind, GroupKind::DirectBuy | GroupKind::DirectSell) {
         print_direct_group_execution_price(actions, group, global_offset, tick_boundary_hits, ansi);
     } else if matches!(group.kind, GroupKind::MintSell | GroupKind::BuyMerge) {
-        print_flash_trade_preview(actions, group, global_offset, tick_boundary_hits, ansi);
+        print_indirect_trade_preview(actions, group, global_offset, tick_boundary_hits, ansi);
     }
 }
 
@@ -1574,7 +1575,7 @@ fn print_skipped_group_rollup(
     let skipped = &groups[start..end];
     let skipped_group_count = skipped.len();
     let skipped_actions: usize = skipped.iter().map(|group| group.action_indices.len()).sum();
-    let skipped_flash = skipped
+    let skipped_indirect = skipped
         .iter()
         .filter(|group| matches!(group.kind, GroupKind::MintSell | GroupKind::BuyMerge))
         .count();
@@ -1590,13 +1591,13 @@ fn print_skipped_group_rollup(
     }
     if let Some(boundary_badge) = format_boundary_badge(boundary_stats, ansi) {
         println!(
-            "    ... skipped {} groups ({} actions, flash={}, mixed={}) {}",
-            skipped_group_count, skipped_actions, skipped_flash, skipped_mixed, boundary_badge
+            "    ... skipped {} groups ({} actions, indirect={}, mixed={}) {}",
+            skipped_group_count, skipped_actions, skipped_indirect, skipped_mixed, boundary_badge
         );
     } else {
         println!(
-            "    ... skipped {} groups ({} actions, flash={}, mixed={})",
-            skipped_group_count, skipped_actions, skipped_flash, skipped_mixed
+            "    ... skipped {} groups ({} actions, indirect={}, mixed={})",
+            skipped_group_count, skipped_actions, skipped_indirect, skipped_mixed
         );
     }
 }
@@ -1949,10 +1950,6 @@ pub fn print_trade_summary(label: &str, actions: &[Action]) {
     let mut mint_amount = 0.0_f64;
     let mut merge_count = 0usize;
     let mut merge_amount = 0.0_f64;
-    let mut flash_count = 0usize;
-    let mut flash_amount = 0.0_f64;
-    let mut repay_count = 0usize;
-    let mut repay_amount = 0.0_f64;
 
     for action in actions {
         match action {
@@ -1976,14 +1973,6 @@ pub fn print_trade_summary(label: &str, actions: &[Action]) {
                 merge_count += 1;
                 merge_amount += *amount;
             }
-            Action::FlashLoan { amount } => {
-                flash_count += 1;
-                flash_amount += *amount;
-            }
-            Action::RepayFlashLoan { amount } => {
-                repay_count += 1;
-                repay_amount += *amount;
-            }
         }
     }
 
@@ -1999,19 +1988,105 @@ pub fn print_trade_summary(label: &str, actions: &[Action]) {
     );
     println!("  mint: count={}, amount={:.9}", mint_count, mint_amount);
     println!("  merge: count={}, amount={:.9}", merge_count, merge_amount);
-    println!(
-        "  flash_loan: count={}, amount={:.9}",
-        flash_count, flash_amount
-    );
-    println!(
-        "  repay_flash_loan: count={}, amount={:.9}",
-        repay_count, repay_amount
-    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn buy(market_name: &'static str, amount: f64, cost: f64) -> Action {
+        Action::Buy {
+            market_name,
+            amount,
+            cost,
+        }
+    }
+
+    fn sell(market_name: &'static str, amount: f64, proceeds: f64) -> Action {
+        Action::Sell {
+            market_name,
+            amount,
+            proceeds,
+        }
+    }
+
+    fn mint(target_market: &'static str, amount: f64) -> Action {
+        Action::Mint {
+            contract_1: "c1",
+            contract_2: "c2",
+            amount,
+            target_market,
+        }
+    }
+
+    fn merge(source_market: &'static str, amount: f64) -> Action {
+        Action::Merge {
+            contract_1: "c1",
+            contract_2: "c2",
+            amount,
+            source_market,
+        }
+    }
+
+    #[test]
+    fn split_actions_by_complete_set_arb_phase_returns_empty_when_marker_missing() {
+        let actions = vec![buy("x", 1.0, 0.7), sell("x", 1.0, 0.8)];
+        let (arb, post_arb) = split_actions_by_complete_set_arb_phase(&actions);
+        assert!(arb.is_empty());
+        assert_eq!(post_arb.len(), 2);
+    }
+
+    #[test]
+    fn split_actions_by_complete_set_arb_phase_includes_all_mint_rounds() {
+        let actions = vec![
+            mint("complete_set_arb", 2.0),
+            sell("a", 2.0, 1.0),
+            mint("complete_set_arb", 1.0),
+            sell("b", 1.0, 0.6),
+            buy("z", 1.0, 0.4),
+        ];
+        let (arb, post_arb) = split_actions_by_complete_set_arb_phase(&actions);
+        assert_eq!(arb.len(), 4);
+        assert_eq!(post_arb.len(), 1);
+        assert!(matches!(arb[3], Action::Sell { .. }));
+        assert!(matches!(post_arb[0], Action::Buy { .. }));
+    }
+
+    #[test]
+    fn split_actions_by_complete_set_arb_phase_stops_before_direct_sell_tail() {
+        let actions = vec![
+            mint("complete_set_arb", 2.0),
+            sell("a", 2.0, 1.0),
+            sell("b", 2.0, 0.9),
+            sell("post", 0.7, 0.3),
+        ];
+        let (arb, post_arb) = split_actions_by_complete_set_arb_phase(&actions);
+        assert_eq!(arb.len(), 3);
+        assert_eq!(post_arb.len(), 1);
+        assert!(matches!(
+            post_arb[0],
+            Action::Sell {
+                market_name: "post",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn split_actions_by_complete_set_arb_phase_includes_all_buy_merge_rounds() {
+        let actions = vec![
+            buy("x", 1.0, 0.5),
+            merge("complete_set_arb", 1.0),
+            buy("y", 1.0, 0.5),
+            merge("complete_set_arb", 1.0),
+            sell("post", 1.0, 0.5),
+        ];
+        let (arb, post_arb) = split_actions_by_complete_set_arb_phase(&actions);
+        assert_eq!(arb.len(), 4);
+        assert_eq!(post_arb.len(), 1);
+        assert!(matches!(arb[3], Action::Merge { .. }));
+        assert!(matches!(post_arb[0], Action::Sell { .. }));
+    }
 
     #[test]
     fn mixed_stage_direct_profitability_annotation_gates_only_direct_active_set_legs() {

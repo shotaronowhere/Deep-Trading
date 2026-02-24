@@ -10,14 +10,10 @@ The pass condition is strict EV non-decrease per trial:
 - `EV_after >= EV_before - tol`
 - `tol = 1e-8 * (1 + max(|EV_before|, |EV_after|))`
 
-Flash loans are treated as liquidity plumbing only and are included via replayed cash neutrality
-(borrow and repay), with no explicit fee model in this validation.
-
 Replay accounting note:
 
 - `Mint(amount)` consumes `amount` cash (collateral outlay).
 - `Merge(amount)` returns `amount` cash.
-- `FlashLoan`/`RepayFlashLoan` are modeled as temporary cash bracket entries.
 
 The stress summary reports EV delta extremes (best/worst), not averages:
 

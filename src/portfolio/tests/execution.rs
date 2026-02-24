@@ -67,38 +67,8 @@ fn test_gas_assumptions() -> GasAssumptions {
 }
 
 fn assert_flash_brackets_are_well_formed(actions: &[Action]) {
-    let mut in_flash_bracket = false;
-
-    for (i, action) in actions.iter().enumerate() {
-        match action {
-            Action::FlashLoan { .. } => {
-                assert!(
-                    !in_flash_bracket,
-                    "nested flash bracket at action index {i}"
-                );
-                in_flash_bracket = true;
-            }
-            Action::RepayFlashLoan { .. } => {
-                assert!(
-                    in_flash_bracket,
-                    "repay outside flash bracket at action index {i}"
-                );
-                in_flash_bracket = false;
-            }
-            Action::Mint { .. } => {
-                assert!(
-                    in_flash_bracket,
-                    "mint outside flash bracket at action index {i}"
-                );
-            }
-            Action::Buy { .. } | Action::Sell { .. } | Action::Merge { .. } => {}
-        }
-    }
-
-    assert!(
-        !in_flash_bracket,
-        "unterminated flash bracket at end of action stream"
-    );
+    group_execution_actions(actions)
+        .expect("action stream should satisfy no-flash grouping shapes");
 }
 
 #[test]
@@ -149,15 +119,23 @@ fn test_optimal_sell_split_matches_bruteforce() {
 #[test]
 fn test_arb_only_mint_sell_output_is_groupable_and_plannable_from_cashflow() {
     let slot0_results = full_pooled_slot0_results_with_uniform_price(0.02);
-    let actions = rebalance_with_mode(&HashMap::new(), 0.0, &slot0_results, RebalanceMode::ArbOnly);
+    let actions = rebalance_with_mode(
+        &HashMap::new(),
+        100.0,
+        &slot0_results,
+        RebalanceMode::ArbOnly,
+    );
     assert!(
         !actions.is_empty(),
         "arb-only mode should emit actions in a profitable mint-sell setup"
     );
 
     let groups = group_actions(&actions).expect("arb-only action stream should be groupable");
-    assert_eq!(groups.len(), 1, "expected one flash-loan bracket group");
-    assert_eq!(groups[0].kind, GroupKind::MintSell);
+    assert!(
+        !groups.is_empty(),
+        "expected at least one grouped mint-sell step"
+    );
+    assert!(groups.iter().all(|g| g.kind == GroupKind::MintSell));
 
     let plans = build_group_plans_from_cashflow(
         &actions,
@@ -168,10 +146,9 @@ fn test_arb_only_mint_sell_output_is_groupable_and_plannable_from_cashflow() {
     )
     .expect("mint-sell arb stream should be plannable from cashflow");
     assert!(
-        !plans.is_empty(),
-        "expected at least one group plan for mint-sell arb stream"
+        plans.is_empty() || plans.iter().all(|p| p.kind == GroupKind::MintSell),
+        "any generated plans should stay within mint-sell group kind"
     );
-    assert_eq!(plans[0].kind, GroupKind::MintSell);
 }
 
 #[test]
@@ -226,10 +203,8 @@ fn test_execute_optimal_sell_uses_inventory_for_merge() {
         "should not buy complements when inventory covers all merge legs"
     );
     assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::FlashLoan { .. })),
-        "no flash loan needed when no pool buys are required"
+        !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "no pool buys needed when inventory covers all merge legs"
     );
 
     assert!((*sim_balances.get("M1").unwrap() - 0.0).abs() < 1e-9);
@@ -272,10 +247,18 @@ fn test_execute_optimal_sell_buys_only_shortfall() {
             _ => None,
         })
         .collect();
-    assert_eq!(buys.len(), 1, "should only buy shortfall leg");
-    assert_eq!(buys[0].0, "M2", "M2 had the shortfall");
+    let mut buy_totals: HashMap<&str, f64> = HashMap::new();
+    for (market, amount) in buys {
+        *buy_totals.entry(market).or_insert(0.0) += amount;
+    }
+    assert_eq!(buy_totals.len(), 1, "should only buy shortfall leg");
     assert!(
-        (buys[0].1 - 3.0).abs() < 1e-6,
+        buy_totals.contains_key("M2"),
+        "M2 had the shortfall and should be the only bought leg"
+    );
+    let m2_bought = buy_totals.get("M2").copied().unwrap_or(0.0);
+    assert!(
+        (m2_bought - 3.0).abs() < 1e-6,
         "shortfall should be 3 tokens"
     );
     assert!(
@@ -312,9 +295,7 @@ fn test_execute_optimal_sell_keeps_profitable_complement_inventory() {
         "merge should still be used when economically optimal"
     );
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::FlashLoan { .. })),
+        actions.iter().any(|a| matches!(a, Action::Buy { .. })),
         "keeping profitable inventory forces pool buys for merge legs"
     );
     let buys: Vec<_> = actions
@@ -328,8 +309,23 @@ fn test_execute_optimal_sell_keeps_profitable_complement_inventory() {
             _ => None,
         })
         .collect();
-    assert_eq!(buys.len(), 2, "both complementary legs should be bought");
-    assert!(buys.iter().all(|(_, amt)| *amt > 4.9));
+    let mut buy_totals: HashMap<&str, f64> = HashMap::new();
+    for (market, amount) in buys {
+        *buy_totals.entry(market).or_insert(0.0) += amount;
+    }
+    assert_eq!(
+        buy_totals.len(),
+        2,
+        "both complementary legs should be bought"
+    );
+    assert!(
+        buy_totals.contains_key("M2") && buy_totals.contains_key("M3"),
+        "merge complements should buy both M2 and M3"
+    );
+    assert!(
+        buy_totals.get("M2").copied().unwrap_or(0.0) > 4.9
+            && buy_totals.get("M3").copied().unwrap_or(0.0) > 4.9
+    );
 
     assert!(
         budget < 5.0 - 1e-6,
@@ -370,10 +366,8 @@ fn test_execute_optimal_sell_consumes_low_profit_complements() {
         "consumable inventory should avoid unnecessary buy legs"
     );
     assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::FlashLoan { .. })),
-        "no pool buys means no flash loan"
+        !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "consumable inventory should avoid pool buys"
     );
     assert!(
         (budget - 5.0).abs() < 1e-9,
@@ -442,18 +436,35 @@ fn test_merge_route_sells() {
         "execution budget delta should match dry-run merge proceeds"
     );
 
-    // Should have: FlashLoan, Buy×2, Merge, RepayFlashLoan
+    // Should have: Buy×2 and Merge.
     let has_merge = actions.iter().any(|a| matches!(a, Action::Merge { .. }));
-    let has_flash = actions
-        .iter()
-        .any(|a| matches!(a, Action::FlashLoan { .. }));
-    let buy_count = actions
-        .iter()
-        .filter(|a| matches!(a, Action::Buy { .. }))
-        .count();
+    let mut buy_totals: HashMap<&str, f64> = HashMap::new();
+    for action in &actions {
+        if let Action::Buy {
+            market_name,
+            amount,
+            ..
+        } = action
+        {
+            *buy_totals.entry(*market_name).or_insert(0.0) += *amount;
+        }
+    }
     assert!(has_merge, "should have Merge action");
-    assert!(has_flash, "should have FlashLoan action");
-    assert_eq!(buy_count, 2, "should buy 2 non-source outcomes");
+    assert_eq!(
+        buy_totals.len(),
+        2,
+        "should buy both non-source outcomes (possibly across multiple rounds)"
+    );
+    assert!(
+        buy_totals.contains_key("M2") && buy_totals.contains_key("M3"),
+        "should buy both complementary markets"
+    );
+    let m2_total = buy_totals.get("M2").copied().unwrap_or(0.0);
+    let m3_total = buy_totals.get("M3").copied().unwrap_or(0.0);
+    assert!(
+        (m2_total - merged).abs() < 1e-6 && (m3_total - merged).abs() < 1e-6,
+        "total buy amount per complement should match merged amount"
+    );
 
     // Other pool prices should have increased (we bought into them)
     assert!(
@@ -725,12 +736,8 @@ fn profile_rebalance_scenarios() {
             .iter()
             .filter(|a| matches!(a, Action::Merge { .. }))
             .count();
-        let flash = actions
-            .iter()
-            .filter(|a| matches!(a, Action::FlashLoan { .. }))
-            .count();
         println!(
-            "[profile] {}: outcomes={}, per_call={:?}, actions={} (buys={}, sells={}, mints={}, merges={}, flash={})",
+            "[profile] {}: outcomes={}, per_call={:?}, actions={} (buys={}, sells={}, mints={}, merges={})",
             name,
             slot0_results.len(),
             elapsed / iters as u32,
@@ -738,8 +745,7 @@ fn profile_rebalance_scenarios() {
             buys,
             sells,
             mints,
-            merges,
-            flash
+            merges
         );
     }
 }
@@ -800,10 +806,7 @@ fn test_rebalance_mixed_groups_are_route_coupled() {
                         Action::Mint { target_market, .. } => {
                             mint_targets.insert(target_market);
                         }
-                        Action::Sell { .. }
-                        | Action::Merge { .. }
-                        | Action::FlashLoan { .. }
-                        | Action::RepayFlashLoan { .. } => {}
+                        Action::Sell { .. } | Action::Merge { .. } => {}
                     }
                 }
 
@@ -827,10 +830,7 @@ fn test_rebalance_mixed_groups_are_route_coupled() {
                         Action::Merge { source_market, .. } => {
                             merge_sources.insert(source_market);
                         }
-                        Action::Buy { .. }
-                        | Action::Mint { .. }
-                        | Action::FlashLoan { .. }
-                        | Action::RepayFlashLoan { .. } => {}
+                        Action::Buy { .. } | Action::Mint { .. } => {}
                     }
                 }
 

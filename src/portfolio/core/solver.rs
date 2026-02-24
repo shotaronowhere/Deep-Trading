@@ -43,17 +43,22 @@ fn build_mint_leg_params(
         .collect()
 }
 
-fn mint_reachability_bounds(params: &[MintLegParam]) -> (f64, f64, f64) {
+fn mint_reachability_bounds(params: &[MintLegParam]) -> (f64, f64, f64, f64) {
     let g0: f64 = params.iter().map(|p| p.price).sum();
+    let m_cap: f64 = params.iter().map(|p| p.cap).fold(f64::INFINITY, f64::min);
+    if !m_cap.is_finite() || m_cap <= DUST {
+        let g_tol = EPS * (1.0 + g0.abs());
+        return (g0, g0, g_tol, 0.0);
+    }
     let g_cap: f64 = params
         .iter()
         .map(|p| {
-            let d = 1.0 + p.cap * p.kappa;
+            let d = 1.0 + m_cap * p.kappa;
             p.price / (d * d)
         })
         .sum();
     let g_tol = EPS * (1.0 + g0.abs() + g_cap.abs());
-    (g0, g_cap, g_tol)
+    (g0, g_cap, g_tol, m_cap)
 }
 
 fn solve_mint_amount_newton(
@@ -63,11 +68,11 @@ fn solve_mint_amount_newton(
     rhs: f64,
     g_cap: f64,
     g_tol: f64,
+    m_upper: f64,
 ) -> f64 {
     // Warm start: first Newton step from m=0 gives m = (g(0) - rhs) / (-g'(0))
     // = (tp - current_alt) / (2 × Σ Pⱼκⱼ), saving one iteration.
     let sum_pk: f64 = params.iter().map(|p| p.price * p.kappa).sum();
-    let m_upper: f64 = params.iter().map(|p| p.cap).fold(0.0, f64::max);
     let mut m = if sum_pk > 1e-30 {
         ((target_price - current_alt) / (2.0 * sum_pk)).max(0.0)
     } else {
@@ -183,10 +188,21 @@ pub(super) fn mint_cost_to_prof(
     // g(m) decreases from g0 (m=0) to g_cap (all legs at cap). If rhs is below g_cap,
     // target alt price is unreachable with available liquidity. Clamp to g_cap so
     // we return the executable saturated mint amount instead of dropping the route.
-    let (_g0, g_cap, g_tol) = mint_reachability_bounds(&params);
+    let (_g0, g_cap, g_tol, m_upper) = mint_reachability_bounds(&params);
+    if m_upper <= DUST {
+        return Some((0.0, 0.0, 0.0, 0.0));
+    }
     let effective_rhs = if rhs < g_cap - g_tol { g_cap } else { rhs };
 
-    let m = solve_mint_amount_newton(&params, tp, current_alt, effective_rhs, g_cap, g_tol);
+    let m = solve_mint_amount_newton(
+        &params,
+        tp,
+        current_alt,
+        effective_rhs,
+        g_cap,
+        g_tol,
+        m_upper,
+    );
 
     if m < DUST {
         return Some((0.0, 0.0, 0.0, 0.0));

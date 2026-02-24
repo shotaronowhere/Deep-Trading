@@ -6,7 +6,9 @@ use super::merge::{
 };
 use super::planning::PlannedRoute;
 use super::sim::{DUST, EPS, FEE_FACTOR, PoolSim, Route, sanitize_nonnegative_finite};
-use super::types::{BalanceMap, subtract_balance};
+use super::types::{BalanceMap, apply_actions_to_sim_balances, subtract_balance};
+
+const MAX_ALT_ROUTE_ROUNDS: usize = 256;
 
 pub(super) struct ExecutionState<'a> {
     pub(super) sims: &'a mut [PoolSim],
@@ -139,112 +141,244 @@ pub(super) fn solve_complete_set_mint_sell_arb_amount(sims: &[PoolSim]) -> f64 {
     })
 }
 
+fn complete_set_buy_cost(sims: &[PoolSim], amount: f64) -> Option<f64> {
+    if amount <= DUST {
+        return Some(0.0);
+    }
+    let mut total = 0.0_f64;
+    for sim in sims {
+        match sim.buy_exact(amount) {
+            Some((bought, cost, _)) if bought + EPS >= amount && cost.is_finite() => {
+                total += cost;
+            }
+            _ => return None,
+        }
+    }
+    Some(total)
+}
+
+fn preview_complete_set_buy_round(
+    sims: &[PoolSim],
+    amount: f64,
+) -> Option<(Vec<(usize, f64, f64)>, f64)> {
+    if amount <= DUST {
+        return Some((Vec::new(), 0.0));
+    }
+    let mut legs: Vec<(usize, f64, f64)> = Vec::with_capacity(sims.len());
+    let mut total_buy_cost = 0.0_f64;
+    for (i, sim) in sims.iter().enumerate() {
+        match sim.buy_exact(amount) {
+            Some((bought, cost, new_price))
+                if bought + EPS >= amount && bought > 0.0 && cost.is_finite() =>
+            {
+                legs.push((i, cost, new_price));
+                total_buy_cost += cost;
+            }
+            _ => return None,
+        }
+    }
+    Some((legs, total_buy_cost))
+}
+
+fn affordable_complete_set_buy_amount(sims: &[PoolSim], upper: f64, budget: f64) -> f64 {
+    if upper <= DUST || budget <= DUST {
+        return 0.0;
+    }
+    let max_cost = match complete_set_buy_cost(sims, upper) {
+        Some(cost) => cost,
+        None => return 0.0,
+    };
+    if max_cost <= budget + EPS {
+        return upper;
+    }
+    bisect_boundary(0.0, upper, |mid| {
+        complete_set_buy_cost(sims, mid)
+            .map(|cost| cost <= budget + EPS)
+            .unwrap_or(false)
+    })
+}
+
+fn find_profitable_complete_set_buy_round(
+    sims: &[PoolSim],
+    upper: f64,
+    budget: f64,
+) -> Option<(f64, Vec<(usize, f64, f64)>, f64)> {
+    let mut round_amount = affordable_complete_set_buy_amount(sims, upper, budget);
+    for _ in 0..64 {
+        if round_amount <= DUST {
+            return None;
+        }
+        let Some((legs, total_buy_cost)) = preview_complete_set_buy_round(sims, round_amount)
+        else {
+            round_amount *= 0.5;
+            continue;
+        };
+        if total_buy_cost > budget + EPS {
+            round_amount *= 0.5;
+            continue;
+        }
+        let round_profit = round_amount - total_buy_cost;
+        if round_profit.is_finite() && round_profit > EPS {
+            return Some((round_amount, legs, total_buy_cost));
+        }
+        round_amount *= 0.5;
+    }
+    None
+}
+
+fn preview_complete_set_mint_sell_round(
+    sims: &[PoolSim],
+    amount: f64,
+) -> Option<(Vec<(usize, f64, f64)>, f64)> {
+    if amount <= DUST {
+        return Some((Vec::new(), 0.0));
+    }
+    let mut legs: Vec<(usize, f64, f64)> = Vec::with_capacity(sims.len());
+    let mut proceeds = 0.0_f64;
+    for (i, sim) in sims.iter().enumerate() {
+        match sim.sell_exact(amount) {
+            Some((sold, leg_proceeds, new_price))
+                if sold + EPS >= amount && sold > 0.0 && leg_proceeds.is_finite() =>
+            {
+                legs.push((i, leg_proceeds, new_price));
+                proceeds += leg_proceeds;
+            }
+            _ => return None,
+        }
+    }
+    Some((legs, proceeds))
+}
+
+fn find_profitable_complete_set_mint_sell_round(
+    sims: &[PoolSim],
+    upper: f64,
+) -> Option<(f64, Vec<(usize, f64, f64)>, f64)> {
+    let mut round_amount = upper;
+    for _ in 0..64 {
+        if round_amount <= DUST {
+            return None;
+        }
+        let Some((legs, proceeds)) = preview_complete_set_mint_sell_round(sims, round_amount)
+        else {
+            round_amount *= 0.5;
+            continue;
+        };
+        let round_profit = proceeds - round_amount;
+        if round_profit.is_finite() && round_profit > EPS {
+            return Some((round_amount, legs, proceeds));
+        }
+        round_amount *= 0.5;
+    }
+    None
+}
+
 impl<'a> ExecutionState<'a> {
     pub(super) fn execute_complete_set_arb(&mut self) -> f64 {
-        let amount = solve_complete_set_arb_amount(self.sims);
-        if amount <= DUST {
+        let mut remaining = solve_complete_set_arb_amount(self.sims);
+        if remaining <= DUST {
             return 0.0;
         }
 
-        let mut legs: Vec<(usize, f64, f64)> = Vec::with_capacity(self.sims.len());
-        let mut total_buy_cost = 0.0_f64;
-        for (i, s) in self.sims.iter().enumerate() {
-            match s.buy_exact(amount) {
-                Some((bought, cost, new_price))
-                    if bought + EPS >= amount && bought > 0.0 && cost.is_finite() =>
-                {
-                    legs.push((i, cost, new_price));
-                    total_buy_cost += cost;
-                }
-                _ => return 0.0,
+        let mut realized_profit = 0.0_f64;
+        for _ in 0..MAX_ALT_ROUTE_ROUNDS {
+            if remaining <= DUST {
+                break;
             }
-        }
 
-        let profit = amount - total_buy_cost;
-        if !profit.is_finite() || profit <= EPS {
-            return 0.0;
-        }
+            let liquidity_cap = complete_set_arb_cap(self.sims);
+            if liquidity_cap <= DUST {
+                break;
+            }
 
-        if total_buy_cost > DUST {
-            self.actions.push(Action::FlashLoan {
-                amount: total_buy_cost,
+            let round_upper = remaining.min(liquidity_cap);
+            let Some((round_amount, legs, total_buy_cost)) =
+                find_profitable_complete_set_buy_round(self.sims, round_upper, *self.budget)
+            else {
+                break;
+            };
+            let round_profit = round_amount - total_buy_cost;
+
+            *self.budget -= total_buy_cost;
+            for (i, cost, new_price) in legs {
+                self.sims[i].set_price(new_price);
+                self.actions.push(Action::Buy {
+                    market_name: self.sims[i].market_name,
+                    amount: round_amount,
+                    cost,
+                });
+            }
+
+            let (contract_1, contract_2) = action_contract_pair(self.sims);
+            self.actions.push(Action::Merge {
+                contract_1,
+                contract_2,
+                amount: round_amount,
+                source_market: "complete_set_arb",
             });
+
+            *self.budget += round_amount;
+            realized_profit += round_profit;
+            remaining -= round_amount;
         }
 
-        for (i, cost, new_price) in legs {
-            self.sims[i].set_price(new_price);
-            self.actions.push(Action::Buy {
-                market_name: self.sims[i].market_name,
-                amount,
-                cost,
-            });
-        }
-
-        let (contract_1, contract_2) = action_contract_pair(self.sims);
-        self.actions.push(Action::Merge {
-            contract_1,
-            contract_2,
-            amount,
-            source_market: "complete_set_arb",
-        });
-
-        if total_buy_cost > DUST {
-            self.actions.push(Action::RepayFlashLoan {
-                amount: total_buy_cost,
-            });
-        }
-
-        *self.budget += profit;
-        profit
+        realized_profit
     }
 
     pub(super) fn execute_complete_set_mint_sell_arb(&mut self) -> f64 {
-        let amount = solve_complete_set_mint_sell_arb_amount(self.sims);
-        if amount <= DUST {
+        let mut remaining = solve_complete_set_mint_sell_arb_amount(self.sims);
+        if remaining <= DUST {
             return 0.0;
         }
 
-        let mut legs: Vec<(usize, f64, f64)> = Vec::with_capacity(self.sims.len());
-        let mut total_proceeds = 0.0_f64;
-        for (i, s) in self.sims.iter().enumerate() {
-            match s.sell_exact(amount) {
-                Some((sold, proceeds, new_price))
-                    if sold + EPS >= amount && sold > 0.0 && proceeds.is_finite() =>
-                {
-                    legs.push((i, proceeds, new_price));
-                    total_proceeds += proceeds;
-                }
-                _ => return 0.0,
+        let mut realized_profit = 0.0_f64;
+
+        for _ in 0..MAX_ALT_ROUTE_ROUNDS {
+            if remaining <= DUST {
+                break;
             }
-        }
 
-        let profit = total_proceeds - amount;
-        if !profit.is_finite() || profit <= EPS {
-            return 0.0;
-        }
+            let liquidity_cap = complete_set_mint_sell_arb_cap(self.sims);
+            if liquidity_cap <= DUST {
+                break;
+            }
 
-        self.actions.push(Action::FlashLoan { amount });
+            let cash_cap = (*self.budget).max(0.0);
+            if cash_cap <= DUST {
+                break;
+            }
 
-        let (contract_1, contract_2) = action_contract_pair(self.sims);
-        self.actions.push(Action::Mint {
-            contract_1,
-            contract_2,
-            amount,
-            target_market: "complete_set_arb",
-        });
+            let round_amount = remaining.min(liquidity_cap).min(cash_cap);
+            let Some((round_amount, legs, proceeds)) =
+                find_profitable_complete_set_mint_sell_round(self.sims, round_amount)
+            else {
+                break;
+            };
+            let round_profit = proceeds - round_amount;
 
-        for (i, proceeds, new_price) in legs {
-            self.sims[i].set_price(new_price);
-            self.actions.push(Action::Sell {
-                market_name: self.sims[i].market_name,
-                amount,
-                proceeds,
+            *self.budget -= round_amount;
+            *self.budget += proceeds;
+
+            let (contract_1, contract_2) = action_contract_pair(self.sims);
+            self.actions.push(Action::Mint {
+                contract_1,
+                contract_2,
+                amount: round_amount,
+                target_market: "complete_set_arb",
             });
+            for (i, leg_proceeds, new_price) in legs {
+                self.sims[i].set_price(new_price);
+                self.actions.push(Action::Sell {
+                    market_name: self.sims[i].market_name,
+                    amount: round_amount,
+                    proceeds: leg_proceeds,
+                });
+            }
+
+            realized_profit += round_profit;
+            remaining -= round_amount;
         }
 
-        self.actions.push(Action::RepayFlashLoan { amount });
-        *self.budget += profit;
-        profit
+        realized_profit
     }
 
     pub(super) fn execute_two_sided_complete_set_arb(&mut self) -> f64 {
@@ -267,7 +401,7 @@ impl<'a> ExecutionState<'a> {
             if step.cost > *self.budget + EPS {
                 return false;
             }
-            execute_buy(
+            if !execute_buy(
                 self,
                 step.idx,
                 step.cost,
@@ -275,7 +409,9 @@ impl<'a> ExecutionState<'a> {
                 step.route,
                 step.new_price,
                 skip,
-            );
+            ) {
+                return false;
+            }
         }
         true
     }
@@ -372,7 +508,32 @@ pub(super) fn emit_mint_actions(
     amount: f64,
     actions: &mut Vec<Action>,
     skip: &HashSet<usize>,
-) -> f64 {
+) -> Option<f64> {
+    if amount <= DUST {
+        return Some(0.0);
+    }
+
+    let mut legs: Vec<(usize, f64, f64, f64)> = Vec::with_capacity(sims.len().saturating_sub(1));
+    let mut total_proceeds = 0.0_f64;
+    for (i, sim) in sims.iter().enumerate() {
+        if i == target_idx || skip.contains(&i) {
+            continue;
+        }
+        match sim.sell_exact(amount) {
+            Some((sold, proceeds, new_price))
+                if sold + EPS >= amount && sold > 0.0 && proceeds.is_finite() =>
+            {
+                total_proceeds += proceeds;
+                legs.push((i, sold, proceeds, new_price));
+            }
+            _ => return None,
+        }
+    }
+
+    if legs.is_empty() {
+        return None;
+    }
+
     let (contract_1, contract_2) = action_contract_pair(sims);
     actions.push(Action::Mint {
         contract_1,
@@ -382,24 +543,147 @@ pub(super) fn emit_mint_actions(
     });
 
     // Sell all other outcomes across both contracts, update pool states
-    let mut total_proceeds = 0.0;
-    for (i, sim) in sims.iter_mut().enumerate() {
+    for (i, sold, proceeds, new_price) in legs {
+        sims[i].set_price(new_price);
+        actions.push(Action::Sell {
+            market_name: sims[i].market_name,
+            amount: sold,
+            proceeds,
+        });
+    }
+    Some(total_proceeds)
+}
+
+fn mint_route_round_liquidity_cap(
+    sims: &[PoolSim],
+    target_idx: usize,
+    skip: &HashSet<usize>,
+) -> f64 {
+    let mut cap = f64::INFINITY;
+    let mut has_leg = false;
+    for (i, sim) in sims.iter().enumerate() {
         if i == target_idx || skip.contains(&i) {
             continue;
         }
-        if let Some((sold, proceeds, new_price)) = sim.sell_exact(amount)
-            && sold > 0.0
-        {
-            total_proceeds += proceeds;
-            sim.set_price(new_price);
-            actions.push(Action::Sell {
-                market_name: sim.market_name,
-                amount: sold,
-                proceeds,
-            });
+        has_leg = true;
+        cap = cap.min(sim.max_sell_tokens().max(0.0));
+    }
+    if has_leg { cap } else { 0.0 }
+}
+
+fn mint_route_round_net_cost(
+    sims: &[PoolSim],
+    target_idx: usize,
+    amount: f64,
+    skip: &HashSet<usize>,
+) -> Option<f64> {
+    if amount <= DUST {
+        return Some(0.0);
+    }
+    let mut proceeds = 0.0_f64;
+    let mut has_leg = false;
+    for (i, sim) in sims.iter().enumerate() {
+        if i == target_idx || skip.contains(&i) {
+            continue;
+        }
+        has_leg = true;
+        let (sold, leg_proceeds, _) = sim.sell_exact(amount)?;
+        if sold + EPS < amount || sold <= 0.0 || !leg_proceeds.is_finite() {
+            return None;
+        }
+        proceeds += leg_proceeds;
+    }
+    if !has_leg {
+        return None;
+    }
+    Some(amount - proceeds)
+}
+
+fn affordable_mint_route_round_amount(
+    sims: &[PoolSim],
+    target_idx: usize,
+    upper: f64,
+    skip: &HashSet<usize>,
+    available_cash: f64,
+) -> f64 {
+    if upper <= DUST || available_cash <= DUST {
+        return 0.0;
+    }
+    let affordable = |amount: f64| -> bool {
+        mint_route_round_net_cost(sims, target_idx, amount, skip)
+            .map(|net_cost| net_cost <= available_cash + EPS)
+            .unwrap_or(false)
+    };
+
+    if affordable(upper) {
+        return upper;
+    }
+
+    let mut lo = 0.0_f64;
+    let mut hi = upper;
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        if affordable(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo) <= EPS * (1.0 + hi.abs()) {
+            break;
         }
     }
-    total_proceeds
+    lo
+}
+
+fn execute_mint_buy_in_rounds(
+    exec: &mut ExecutionState<'_>,
+    target_idx: usize,
+    total_amount: f64,
+    skip: &HashSet<usize>,
+) -> f64 {
+    let mut remaining = total_amount;
+    let mut minted_total = 0.0_f64;
+
+    for _ in 0..MAX_ALT_ROUTE_ROUNDS {
+        if remaining <= DUST {
+            break;
+        }
+
+        let liquidity_cap = mint_route_round_liquidity_cap(exec.sims, target_idx, skip);
+        if liquidity_cap <= DUST {
+            break;
+        }
+
+        let cash_cap = (*exec.budget).max(0.0);
+        if cash_cap <= DUST {
+            break;
+        }
+
+        let round_upper = remaining.min(liquidity_cap).min(cash_cap);
+        let round_amount =
+            affordable_mint_route_round_amount(exec.sims, target_idx, round_upper, skip, cash_cap);
+        if round_amount <= DUST {
+            break;
+        }
+
+        let action_start = exec.actions.len();
+        *exec.budget -= round_amount;
+        let proceeds =
+            match emit_mint_actions(exec.sims, target_idx, round_amount, exec.actions, skip) {
+                Some(value) => value,
+                None => {
+                    *exec.budget += round_amount;
+                    break;
+                }
+            };
+        *exec.budget += proceeds;
+        apply_actions_to_sim_balances(&exec.actions[action_start..], exec.sims, exec.sim_balances);
+
+        minted_total += round_amount;
+        remaining -= round_amount;
+    }
+
+    minted_total
 }
 
 /// Execute a buy via the chosen route, updating state.
@@ -411,31 +695,45 @@ pub(super) fn execute_buy(
     route: Route,
     new_price: Option<f64>,
     skip: &HashSet<usize>,
-) {
+) -> bool {
     if amount <= 0.0 {
-        return;
+        return true;
     }
     match route {
         Route::Direct => {
-            if let Some(np) = new_price {
-                exec.sims[idx].set_price(np);
-            }
+            let Some(np) = new_price else {
+                return false;
+            };
             *exec.budget -= cost;
             exec.actions.push(Action::Buy {
                 market_name: exec.sims[idx].market_name,
                 amount,
                 cost,
             });
+            exec.sims[idx].set_price(np);
+            *exec
+                .sim_balances
+                .entry(exec.sims[idx].market_name)
+                .or_insert(0.0) += amount;
+            true
         }
         Route::Mint => {
-            // Flash loan funds the mint upfront; net cost comes from budget
-            let upfront = amount; // 1 sUSD per set
-            exec.actions.push(Action::FlashLoan { amount: upfront });
-            let proceeds = emit_mint_actions(exec.sims, idx, amount, exec.actions, skip);
-            exec.actions
-                .push(Action::RepayFlashLoan { amount: upfront });
-            let net_cost = upfront - proceeds;
-            *exec.budget -= net_cost;
+            // Keep mint execution atomic at step level: either satisfy the planned
+            // amount, or revert all interim round mutations before failing closed.
+            let budget_before = *exec.budget;
+            let actions_len_before = exec.actions.len();
+            let sims_before = exec.sims.to_vec();
+            let balances_before = exec.sim_balances.clone();
+            let minted = execute_mint_buy_in_rounds(exec, idx, amount, skip);
+            if minted + EPS >= amount {
+                true
+            } else {
+                *exec.budget = budget_before;
+                exec.actions.truncate(actions_len_before);
+                exec.sims.clone_from_slice(&sims_before);
+                *exec.sim_balances = balances_before;
+                false
+            }
         }
     }
 }

@@ -170,7 +170,11 @@ pub(super) fn waterfall(
                 exec.execute_planned_routes(&full_plan, &skip)
             };
             if !executed {
-                last_prof = current_prof;
+                price_sum = sims.iter().map(|s| s.price()).sum();
+                last_prof = full_plan
+                    .last()
+                    .and_then(|step| realized_step_profitability(sims, step, price_sum))
+                    .unwrap_or(current_prof);
                 break;
             }
 
@@ -278,7 +282,11 @@ pub(super) fn waterfall(
                 exec.execute_planned_routes(&execution_plan, &skip)
             };
             if !executed {
-                last_prof = current_prof;
+                price_sum = sims.iter().map(|s| s.price()).sum();
+                last_prof = execution_plan
+                    .last()
+                    .and_then(|step| realized_step_profitability(sims, step, price_sum))
+                    .unwrap_or(current_prof);
                 break;
             }
             price_sum = sims.iter().map(|s| s.price()).sum();
@@ -306,12 +314,7 @@ pub(super) fn waterfall(
             }
             last_prof = achievable;
             current_prof = achievable;
-            if !iteration_made_progress(
-                iter_start_prof,
-                current_prof,
-                iter_start_budget,
-                *budget,
-            ) {
+            if !iteration_made_progress(iter_start_prof, current_prof, iter_start_budget, *budget) {
                 stalled_continues += 1;
                 if stalled_continues >= MAX_STALLED_CONTINUES {
                     break;

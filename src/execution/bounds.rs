@@ -508,7 +508,6 @@ mod tests {
     #[test]
     fn leg_allocations_sum_to_group_budget() {
         let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
             Action::Mint {
                 contract_1: "c1",
                 contract_2: "c2",
@@ -517,7 +516,6 @@ mod tests {
             },
             sell("a", 10.0, 7.0),
             sell("b", 10.0, 7.0),
-            Action::RepayFlashLoan { amount: 10.0 },
         ];
 
         let groups = group_execution_actions(&actions).expect("grouping should succeed");
@@ -661,13 +659,13 @@ mod tests {
     }
 
     #[test]
-    fn planning_fails_closed_on_unsupported_flash_arb_shape() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            buy("a", 1.0, 0.8),
-            sell("b", 1.0, 0.9),
-            Action::RepayFlashLoan { amount: 10.0 },
-        ];
+    fn planning_fails_closed_on_invalid_mint_sell_shape() {
+        let actions = vec![Action::Mint {
+            contract_1: "c1",
+            contract_2: "c2",
+            amount: 10.0,
+            target_market: "a",
+        }];
         let err = build_group_plans_from_cashflow(
             &actions,
             &test_gas_assumptions(),
@@ -675,12 +673,12 @@ mod tests {
             3000.0,
             BufferConfig::default(),
         )
-        .expect_err("unsupported flash-arb shape should fail closed");
+        .expect_err("invalid mint-sell shape should fail closed");
         assert!(matches!(
             err,
-            GroupPlanningError::Grouping(GroupingError::InvalidFlashLoanBracket {
+            GroupPlanningError::Grouping(GroupingError::InvalidMintSellGroup {
                 start_index: 0,
-                end_index: 3,
+                end_index: 0,
             })
         ));
     }
@@ -703,7 +701,10 @@ mod tests {
         .expect_err("standalone mint should fail closed");
         assert!(matches!(
             err,
-            GroupPlanningError::Grouping(GroupingError::UnexpectedActionOutsideGroup { index: 0 })
+            GroupPlanningError::Grouping(GroupingError::InvalidMintSellGroup {
+                start_index: 0,
+                end_index: 0
+            })
         ));
     }
 
@@ -822,7 +823,6 @@ mod tests {
     #[test]
     fn cashflow_builder_drops_negative_edge_mint_sell_group() {
         let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
             Action::Mint {
                 contract_1: "c1",
                 contract_2: "c2",
@@ -831,7 +831,6 @@ mod tests {
             },
             sell("a", 10.0, 2.0),
             sell("b", 10.0, 2.0),
-            Action::RepayFlashLoan { amount: 10.0 },
         ];
         let plans = build_group_plans_from_cashflow(
             &actions,
@@ -919,7 +918,6 @@ mod tests {
     #[test]
     fn derives_batch_sell_bounds_from_sell_legs() {
         let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
             Action::Mint {
                 contract_1: "c1",
                 contract_2: "c2",
@@ -928,7 +926,6 @@ mod tests {
             },
             sell("a", 10.0, 7.0),
             sell("b", 10.0, 7.0),
-            Action::RepayFlashLoan { amount: 10.0 },
         ];
         let groups = group_execution_actions(&actions).expect("grouping should succeed");
         let plan = build_group_plan(
@@ -1000,13 +997,7 @@ mod tests {
 
     #[test]
     fn derives_batch_buy_bounds_from_buy_merge_group() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            buy("a", 1.0, 0.4),
-            buy("b", 1.0, 0.5),
-            merge(1.0),
-            Action::RepayFlashLoan { amount: 10.0 },
-        ];
+        let actions = vec![buy("a", 1.0, 0.4), buy("b", 1.0, 0.5), merge(1.0)];
         let groups = group_execution_actions(&actions).expect("grouping should succeed");
         assert_eq!(groups[0].kind, GroupKind::BuyMerge);
 

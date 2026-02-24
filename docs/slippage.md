@@ -25,8 +25,8 @@ A strict subgroup is one dependency-coupled execution unit:
 1. Direct buy group: one `Buy`.
 2. Direct sell group: one `Sell`.
 3. Direct merge group: one `Merge` (inventory merge, no pool buys).
-4. Mint-sell group: `FlashLoan -> Mint -> Sell* -> RepayFlashLoan`.
-5. Buy-merge group: `FlashLoan -> Buy* -> Merge -> RepayFlashLoan`.
+4. Mint-sell group: `Mint -> Sell*`.
+5. Buy-merge group: `Buy* -> Merge`.
 
 Profitability-step grouping builds ordered step blocks from the strict stream:
 1. Pure direct (`DirectBuy`, `DirectSell`, `DirectMerge`)
@@ -37,10 +37,8 @@ Profitability-step grouping builds ordered step blocks from the strict stream:
 Each step stores its ordered strict subgroups so execution can preserve waterfall-equality semantics while still deriving per-subgroup basket bounds.
 Strict mode submits one strict subgroup per tx.
 Unsupported action streams outside these shapes fail closed at grouping time (planner error, no submission).
-Flash-loan bracket ordering is strict and validated exactly:
-`Mint` must be the first inner action for `MintSell`, and `Merge` must be the last inner action for `BuyMerge`.
-Flash loans are modeled as zero-fee in this executor path: `FlashLoan.amount` must match
-`RepayFlashLoan.amount` (within tolerance) or grouping fails closed.
+Route ordering is strict and validated exactly:
+`MintSell` must be `Mint` followed by one-or-more `Sell` legs, and `BuyMerge` must be one-or-more `Buy` legs followed by `Merge`.
 
 ### 2.2 Profitability invariants
 For group `g`:
@@ -172,7 +170,7 @@ Add execution-specific structs (no changes to optimizer math):
 From existing `Action` stream in `/src/portfolio/core/types.rs`:
 1. Direct groups from standalone `Buy`/`Sell`.
 2. Standalone `Merge` grouped as `DirectMerge`.
-3. Mint-sell and buy-merge groups from flash-loan bracket patterns.
+3. Mint-sell and buy-merge groups from contiguous route patterns (`Mint->Sell+`, `Buy+->Merge`).
 4. Profitability-step grouping merges strict groups into ordered step blocks with explicit step kind metadata and embedded strict subgroup list.
 5. Planner emits one `ExecutionGroupPlan` per strict subgroup and stamps each plan with:
    - `profitability_step_index`

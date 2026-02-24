@@ -45,8 +45,6 @@ impl ExecutionGroup {
     }
 }
 
-pub const ZERO_FEE_REL_TOL: f64 = 1e-8;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfitabilityStepKind {
     ArbMintSell,
@@ -83,25 +81,25 @@ impl ProfitabilityStepGroup {
     }
 }
 
-fn classify_step_kind(groups: &[ExecutionGroup]) -> ProfitabilityStepKind {
+fn classify_step_kind(groups: &[ExecutionGroup]) -> Option<ProfitabilityStepKind> {
     debug_assert!(!groups.is_empty(), "step group cannot be empty");
     let has = |kind: GroupKind| groups.iter().any(|g| g.kind == kind);
     let all = |kind: GroupKind| groups.iter().all(|g| g.kind == kind);
 
     if all(GroupKind::MintSell) {
-        return ProfitabilityStepKind::ArbMintSell;
+        return Some(ProfitabilityStepKind::ArbMintSell);
     }
     if all(GroupKind::BuyMerge) {
-        return ProfitabilityStepKind::ArbBuyMerge;
+        return Some(ProfitabilityStepKind::ArbBuyMerge);
     }
     if all(GroupKind::DirectBuy) {
-        return ProfitabilityStepKind::PureDirectBuy;
+        return Some(ProfitabilityStepKind::PureDirectBuy);
     }
     if all(GroupKind::DirectSell) {
-        return ProfitabilityStepKind::PureDirectSell;
+        return Some(ProfitabilityStepKind::PureDirectSell);
     }
     if all(GroupKind::DirectMerge) {
-        return ProfitabilityStepKind::PureDirectMerge;
+        return Some(ProfitabilityStepKind::PureDirectMerge);
     }
     if has(GroupKind::MintSell)
         && has(GroupKind::DirectBuy)
@@ -109,7 +107,7 @@ fn classify_step_kind(groups: &[ExecutionGroup]) -> ProfitabilityStepKind {
             .iter()
             .all(|g| matches!(g.kind, GroupKind::MintSell | GroupKind::DirectBuy))
     {
-        return ProfitabilityStepKind::MixedDirectBuyMintSell;
+        return Some(ProfitabilityStepKind::MixedDirectBuyMintSell);
     }
     if has(GroupKind::BuyMerge)
         && has(GroupKind::DirectSell)
@@ -117,28 +115,38 @@ fn classify_step_kind(groups: &[ExecutionGroup]) -> ProfitabilityStepKind {
             .iter()
             .all(|g| matches!(g.kind, GroupKind::BuyMerge | GroupKind::DirectSell))
     {
-        return ProfitabilityStepKind::MixedDirectSellBuyMerge;
+        return Some(ProfitabilityStepKind::MixedDirectSellBuyMerge);
     }
 
-    unreachable!("unsupported profitability-step kind composition")
+    None
 }
 
-fn step_group_from_route_groups(route_groups: &[ExecutionGroup]) -> ProfitabilityStepGroup {
+fn step_group_from_route_groups(
+    route_groups: &[ExecutionGroup],
+) -> Result<ProfitabilityStepGroup, GroupingError> {
     let mut action_indices = Vec::new();
     for group in route_groups {
         action_indices.extend_from_slice(&group.action_indices);
     }
-    ProfitabilityStepGroup {
-        kind: classify_step_kind(route_groups),
+    let kind = classify_step_kind(route_groups).ok_or_else(|| {
+        let start_index = action_indices.first().copied().unwrap_or(0);
+        let end_index = action_indices.last().copied().unwrap_or(start_index);
+        GroupingError::UnsupportedProfitabilityStepComposition {
+            start_index,
+            end_index,
+        }
+    })?;
+    Ok(ProfitabilityStepGroup {
+        kind,
         action_indices,
         strict_groups: route_groups.to_vec(),
-    }
+    })
 }
 
 fn merge_profitability_step_groups(
     actions: &[Action],
     route_groups: &[ExecutionGroup],
-) -> Vec<ProfitabilityStepGroup> {
+) -> Result<Vec<ProfitabilityStepGroup>, GroupingError> {
     let mut merged = Vec::new();
     let mut i = 0usize;
 
@@ -189,7 +197,7 @@ fn merge_profitability_step_groups(
         route_groups: &[ExecutionGroup],
         start: usize,
         kind: GroupKind,
-    ) -> Option<(ProfitabilityStepGroup, usize)> {
+    ) -> Option<usize> {
         if route_groups[start].kind != kind {
             return None;
         }
@@ -207,11 +215,7 @@ fn merge_profitability_step_groups(
             end += 1;
         }
 
-        if end > start + 1 {
-            Some((step_group_from_route_groups(&route_groups[start..end]), end))
-        } else {
-            None
-        }
+        if end > start + 1 { Some(end) } else { None }
     }
 
     fn block_is_route_coupled(
@@ -272,7 +276,7 @@ fn merge_profitability_step_groups(
         start: usize,
         a: GroupKind,
         b: GroupKind,
-    ) -> Option<(ProfitabilityStepGroup, usize)> {
+    ) -> Option<usize> {
         let first_kind = route_groups[start].kind;
         if first_kind != a && first_kind != b {
             return None;
@@ -302,50 +306,50 @@ fn merge_profitability_step_groups(
         }
 
         if saw_a && saw_b && block_is_route_coupled(actions, &route_groups[start..end], a, b) {
-            Some((step_group_from_route_groups(&route_groups[start..end]), end))
+            Some(end)
         } else {
             None
         }
     }
 
     while i < route_groups.len() {
-        if let Some((group, next_i)) = merge_two_kind_block(
+        if let Some(next_i) = merge_two_kind_block(
             actions,
             route_groups,
             i,
             GroupKind::MintSell,
             GroupKind::DirectBuy,
         ) {
-            merged.push(group);
+            merged.push(step_group_from_route_groups(&route_groups[i..next_i])?);
             i = next_i;
             continue;
         }
 
-        if let Some((group, next_i)) = merge_two_kind_block(
+        if let Some(next_i) = merge_two_kind_block(
             actions,
             route_groups,
             i,
             GroupKind::BuyMerge,
             GroupKind::DirectSell,
         ) {
-            merged.push(group);
+            merged.push(step_group_from_route_groups(&route_groups[i..next_i])?);
             i = next_i;
             continue;
         }
 
-        if let Some((group, next_i)) =
+        if let Some(next_i) =
             merge_same_kind_unique_market_block(actions, route_groups, i, route_groups[i].kind)
         {
-            merged.push(group);
+            merged.push(step_group_from_route_groups(&route_groups[i..next_i])?);
             i = next_i;
             continue;
         }
 
-        merged.push(step_group_from_route_groups(&route_groups[i..=i]));
+        merged.push(step_group_from_route_groups(&route_groups[i..=i])?);
         i += 1;
     }
 
-    merged
+    Ok(merged)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,17 +357,15 @@ pub enum GroupingError {
     UnexpectedActionOutsideGroup {
         index: usize,
     },
-    NestedFlashLoan {
-        index: usize,
-    },
-    MissingRepayFlashLoan {
-        flash_loan_index: usize,
-    },
-    InvalidFlashLoanBracket {
+    InvalidMintSellGroup {
         start_index: usize,
         end_index: usize,
     },
-    UnsupportedFlashLoanFee {
+    InvalidBuyMergeGroup {
+        start_index: usize,
+        end_index: usize,
+    },
+    UnsupportedProfitabilityStepComposition {
         start_index: usize,
         end_index: usize,
     },
@@ -378,53 +380,32 @@ impl fmt::Display for GroupingError {
                     "unsupported action shape outside execution groups at index {index}"
                 )
             }
-            Self::NestedFlashLoan { index } => {
-                write!(f, "nested flash loan bracket at index {index}")
-            }
-            Self::MissingRepayFlashLoan { flash_loan_index } => {
-                write!(
-                    f,
-                    "missing repay flash loan for bracket starting at index {flash_loan_index}"
-                )
-            }
-            Self::InvalidFlashLoanBracket {
+            Self::InvalidMintSellGroup {
                 start_index,
                 end_index,
             } => write!(
                 f,
-                "unsupported flash-loan bracket shape between indices {start_index} and {end_index}"
+                "unsupported mint-sell group shape between indices {start_index} and {end_index}"
             ),
-            Self::UnsupportedFlashLoanFee {
+            Self::InvalidBuyMergeGroup {
                 start_index,
                 end_index,
             } => write!(
                 f,
-                "flash-loan fee is not supported between indices {start_index} and {end_index}"
+                "unsupported buy-merge group shape between indices {start_index} and {end_index}"
+            ),
+            Self::UnsupportedProfitabilityStepComposition {
+                start_index,
+                end_index,
+            } => write!(
+                f,
+                "unsupported profitability-step composition between indices {start_index} and {end_index}"
             ),
         }
     }
 }
 
 impl std::error::Error for GroupingError {}
-
-fn collect_flash_loan_end(
-    actions: &[Action],
-    flash_loan_index: usize,
-) -> Result<usize, GroupingError> {
-    let mut i = flash_loan_index + 1;
-    while i < actions.len() {
-        match &actions[i] {
-            Action::FlashLoan { .. } => {
-                return Err(GroupingError::NestedFlashLoan { index: i });
-            }
-            Action::RepayFlashLoan { .. } => {
-                return Ok(i);
-            }
-            _ => i += 1,
-        }
-    }
-    Err(GroupingError::MissingRepayFlashLoan { flash_loan_index })
-}
 
 fn typed_group_from_actions(
     actions: &[Action],
@@ -505,7 +486,6 @@ fn typed_group_from_actions(
                 );
                 planned_proceeds_susd += amount.max(0.0);
             }
-            Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
         }
     }
 
@@ -526,8 +506,8 @@ fn typed_group_from_actions(
 ///
 /// Supported shapes:
 /// - `DirectBuy`, `DirectSell`, `DirectMerge`
-/// - `MintSell` flash bracket: `FlashLoan -> Mint -> Sell+ -> RepayFlashLoan`
-/// - `BuyMerge` flash bracket: `FlashLoan -> Buy+ -> Merge -> RepayFlashLoan`
+/// - `MintSell`: `Mint -> Sell+`
+/// - `BuyMerge`: `Buy+ -> Merge`
 ///
 /// Any unsupported shape returns an error (fail closed) so callers can skip submission.
 pub fn group_execution_actions(actions: &[Action]) -> Result<Vec<ExecutionGroup>, GroupingError> {
@@ -537,12 +517,27 @@ pub fn group_execution_actions(actions: &[Action]) -> Result<Vec<ExecutionGroup>
     while i < actions.len() {
         match &actions[i] {
             Action::Buy { .. } => {
-                groups.push(typed_group_from_actions(
-                    actions,
-                    GroupKind::DirectBuy,
-                    vec![i],
-                ));
-                i += 1;
+                let start = i;
+                let mut end = i;
+                while end < actions.len() && matches!(actions[end], Action::Buy { .. }) {
+                    end += 1;
+                }
+                if end < actions.len() && matches!(actions[end], Action::Merge { .. }) {
+                    let action_indices = (start..=end).collect();
+                    groups.push(typed_group_from_actions(
+                        actions,
+                        GroupKind::BuyMerge,
+                        action_indices,
+                    ));
+                    i = end + 1;
+                } else {
+                    groups.push(typed_group_from_actions(
+                        actions,
+                        GroupKind::DirectBuy,
+                        vec![i],
+                    ));
+                    i += 1;
+                }
             }
             Action::Sell { .. } => {
                 groups.push(typed_group_from_actions(
@@ -560,16 +555,25 @@ pub fn group_execution_actions(actions: &[Action]) -> Result<Vec<ExecutionGroup>
                 ));
                 i += 1;
             }
-            Action::FlashLoan { .. } => {
+            Action::Mint { .. } => {
                 let start = i;
-                let end_index = collect_flash_loan_end(actions, start)?;
-                let kind = classify_flash_loan_bracket(actions, start, end_index)?;
-                let action_indices = (start..=end_index).collect();
-                groups.push(typed_group_from_actions(actions, kind, action_indices));
-                i = end_index + 1;
-            }
-            Action::Mint { .. } | Action::RepayFlashLoan { .. } => {
-                return Err(GroupingError::UnexpectedActionOutsideGroup { index: i });
+                let mut end = i + 1;
+                while end < actions.len() && matches!(actions[end], Action::Sell { .. }) {
+                    end += 1;
+                }
+                if end == start + 1 {
+                    return Err(GroupingError::InvalidMintSellGroup {
+                        start_index: start,
+                        end_index: start,
+                    });
+                }
+                let action_indices = (start..end).collect();
+                groups.push(typed_group_from_actions(
+                    actions,
+                    GroupKind::MintSell,
+                    action_indices,
+                ));
+                i = end;
             }
         }
     }
@@ -595,7 +599,7 @@ pub fn group_execution_actions_by_profitability_step(
     actions: &[Action],
 ) -> Result<Vec<ProfitabilityStepGroup>, GroupingError> {
     let route_groups = group_execution_actions(actions)?;
-    Ok(merge_profitability_step_groups(actions, &route_groups))
+    merge_profitability_step_groups(actions, &route_groups)
 }
 
 /// Maps typed profitability-step groups into lightweight action-index groups.
@@ -623,66 +627,6 @@ pub fn group_actions(actions: &[Action]) -> Result<Vec<ActionGroup>, GroupingErr
     group_actions_by_profitability_step(actions)
 }
 
-fn classify_flash_loan_bracket(
-    actions: &[Action],
-    start_index: usize,
-    end_index: usize,
-) -> Result<GroupKind, GroupingError> {
-    let borrowed = match actions.get(start_index) {
-        Some(Action::FlashLoan { amount }) => *amount,
-        _ => {
-            return Err(GroupingError::InvalidFlashLoanBracket {
-                start_index,
-                end_index,
-            });
-        }
-    };
-    let repaid = match actions.get(end_index) {
-        Some(Action::RepayFlashLoan { amount }) => *amount,
-        _ => {
-            return Err(GroupingError::InvalidFlashLoanBracket {
-                start_index,
-                end_index,
-            });
-        }
-    };
-    let tol = ZERO_FEE_REL_TOL * (1.0 + borrowed.abs() + repaid.abs());
-    if !borrowed.is_finite()
-        || !repaid.is_finite()
-        || borrowed < 0.0
-        || repaid < 0.0
-        || (borrowed - repaid).abs() > tol
-    {
-        return Err(GroupingError::UnsupportedFlashLoanFee {
-            start_index,
-            end_index,
-        });
-    }
-
-    let inner = &actions[(start_index + 1)..end_index];
-
-    if let Some((first, rest)) = inner.split_first()
-        && matches!(first, Action::Mint { .. })
-        && !rest.is_empty()
-        && rest.iter().all(|a| matches!(a, Action::Sell { .. }))
-    {
-        return Ok(GroupKind::MintSell);
-    }
-
-    if let Some((last, rest)) = inner.split_last()
-        && matches!(last, Action::Merge { .. })
-        && !rest.is_empty()
-        && rest.iter().all(|a| matches!(a, Action::Buy { .. }))
-    {
-        return Ok(GroupKind::BuyMerge);
-    }
-
-    Err(GroupingError::InvalidFlashLoanBracket {
-        start_index,
-        end_index,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,28 +647,32 @@ mod tests {
         }
     }
 
+    fn mint(target_market: &'static str, amount: f64) -> Action {
+        Action::Mint {
+            contract_1: "c1",
+            contract_2: "c2",
+            amount,
+            target_market,
+        }
+    }
+
+    fn merge(source_market: &'static str, amount: f64) -> Action {
+        Action::Merge {
+            contract_1: "c1",
+            contract_2: "c2",
+            amount,
+            source_market,
+        }
+    }
+
     #[test]
-    fn groups_direct_and_bracket_actions() {
+    fn groups_direct_and_indirect_actions() {
         let actions = vec![
             buy("a", 1.0, 2.0),
-            Action::FlashLoan { amount: 10.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 10.0,
-                target_market: "t",
-            },
+            mint("t", 10.0),
             sell("b", 10.0, 4.0),
-            Action::RepayFlashLoan { amount: 10.0 },
-            Action::FlashLoan { amount: 5.0 },
             buy("x", 5.0, 1.5),
-            Action::Merge {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 5.0,
-                source_market: "x",
-            },
-            Action::RepayFlashLoan { amount: 5.0 },
+            merge("x", 5.0),
             sell("z", 1.0, 1.0),
         ];
 
@@ -734,22 +682,15 @@ mod tests {
         assert_eq!(groups[1].kind, GroupKind::MintSell);
         assert_eq!(groups[2].kind, GroupKind::BuyMerge);
         assert_eq!(groups[3].kind, GroupKind::DirectSell);
+        assert_eq!(groups[0].action_indices, vec![0]);
+        assert_eq!(groups[1].action_indices, vec![1, 2]);
+        assert_eq!(groups[2].action_indices, vec![3, 4]);
+        assert_eq!(groups[3].action_indices, vec![5]);
     }
 
     #[test]
     fn typed_groups_capture_cashflow_and_dex_legs() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 10.0,
-                target_market: "t",
-            },
-            sell("a", 10.0, 7.0),
-            sell("b", 10.0, 6.0),
-            Action::RepayFlashLoan { amount: 10.0 },
-        ];
+        let actions = vec![mint("t", 10.0), sell("a", 10.0, 7.0), sell("b", 10.0, 6.0)];
 
         let groups = group_execution_actions(&actions).expect("grouping should succeed");
         assert_eq!(groups.len(), 1);
@@ -762,377 +703,39 @@ mod tests {
     }
 
     #[test]
-    fn strict_grouping_keeps_mixed_route_stream_split() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 10.0,
-                target_market: "t",
-            },
-            sell("a", 10.0, 7.0),
-            Action::RepayFlashLoan { amount: 10.0 },
-            buy("x", 1.0, 0.6),
-            buy("y", 1.0, 0.5),
-        ];
+    fn typed_buy_merge_group_tracks_cost_and_proceeds() {
+        let actions = vec![buy("x", 2.0, 0.7), buy("y", 2.0, 0.8), merge("x", 2.0)];
 
-        let groups = group_execution_actions(&actions).expect("strict grouping should succeed");
-        assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].kind, GroupKind::MintSell);
-        assert_eq!(groups[1].kind, GroupKind::DirectBuy);
-        assert_eq!(groups[2].kind, GroupKind::DirectBuy);
+        let groups = group_execution_actions(&actions).expect("grouping should succeed");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, GroupKind::BuyMerge);
+        assert_eq!(groups[0].planned_cost_susd, 1.5);
+        assert_eq!(groups[0].planned_proceeds_susd, 2.0);
+        assert_eq!(groups[0].buy_legs, 2);
+        assert_eq!(groups[0].sell_legs, 0);
+        assert_eq!(groups[0].legs.len(), 2);
     }
 
     #[test]
-    fn profitability_step_grouping_exposes_explicit_mixed_step_kind() {
-        let actions = vec![
-            buy("x", 1.0, 0.6),
-            buy("y", 1.0, 0.5),
-            Action::FlashLoan { amount: 6.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 6.0,
-                target_market: "x",
-            },
-            sell("a", 6.0, 4.0),
-            Action::RepayFlashLoan { amount: 6.0 },
-        ];
-
-        let steps = group_execution_actions_by_profitability_step(&actions)
-            .expect("profitability-step grouping should succeed");
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].kind, ProfitabilityStepKind::MixedDirectBuyMintSell);
-        assert_eq!(steps[0].strict_groups.len(), 3);
-        assert_eq!(steps[0].strict_groups[0].kind, GroupKind::DirectBuy);
-        assert_eq!(steps[0].strict_groups[1].kind, GroupKind::DirectBuy);
-        assert_eq!(steps[0].strict_groups[2].kind, GroupKind::MintSell);
-    }
-
-    #[test]
-    fn profitability_step_grouping_merges_mint_sell_with_trailing_direct_buys() {
-        let actions = vec![
-            Action::FlashLoan { amount: 6.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 6.0,
-                target_market: "x",
-            },
-            sell("a", 6.0, 4.0),
-            Action::RepayFlashLoan { amount: 6.0 },
-            Action::FlashLoan { amount: 5.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 5.0,
-                target_market: "x",
-            },
-            sell("b", 5.0, 3.0),
-            Action::RepayFlashLoan { amount: 5.0 },
-            buy("x", 1.0, 0.6),
-            buy("y", 1.0, 0.5),
-            sell("z", 1.0, 0.4),
-        ];
-
-        let groups = group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].kind, GroupKind::MintSell);
-        assert_eq!(groups[0].action_indices, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(groups[1].kind, GroupKind::DirectSell);
-        assert_eq!(groups[1].action_indices, vec![10]);
-    }
-
-    #[test]
-    fn profitability_step_grouping_merges_buy_merge_with_trailing_direct_sell() {
-        let actions = vec![
-            Action::FlashLoan { amount: 5.0 },
-            buy("x", 1.0, 0.7),
-            Action::Merge {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 1.0,
-                source_market: "x",
-            },
-            Action::RepayFlashLoan { amount: 5.0 },
-            sell("x", 0.4, 0.3),
-        ];
-
-        let strict_groups =
-            group_execution_actions(&actions).expect("strict grouping should succeed");
-        assert_eq!(strict_groups.len(), 2);
-        assert_eq!(strict_groups[0].kind, GroupKind::BuyMerge);
-        assert_eq!(strict_groups[1].kind, GroupKind::DirectSell);
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 1);
-        assert_eq!(step_groups[0].kind, GroupKind::BuyMerge);
-        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn profitability_step_grouping_merges_leading_direct_buys_with_mint_sell() {
-        let actions = vec![
-            buy("x", 1.0, 0.6),
-            buy("y", 1.0, 0.5),
-            Action::FlashLoan { amount: 6.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 6.0,
-                target_market: "x",
-            },
-            sell("a", 6.0, 4.0),
-            Action::RepayFlashLoan { amount: 6.0 },
-        ];
-
-        let strict_groups =
-            group_execution_actions(&actions).expect("strict grouping should succeed");
-        assert_eq!(strict_groups.len(), 3);
-        assert_eq!(strict_groups[0].kind, GroupKind::DirectBuy);
-        assert_eq!(strict_groups[1].kind, GroupKind::DirectBuy);
-        assert_eq!(strict_groups[2].kind, GroupKind::MintSell);
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 1);
-        assert_eq!(step_groups[0].kind, GroupKind::MintSell);
-        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn profitability_step_grouping_merges_leading_direct_sell_with_buy_merge() {
-        let actions = vec![
-            sell("x", 0.4, 0.3),
-            Action::FlashLoan { amount: 5.0 },
-            buy("x", 1.0, 0.7),
-            Action::Merge {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 1.0,
-                source_market: "x",
-            },
-            Action::RepayFlashLoan { amount: 5.0 },
-        ];
-
-        let strict_groups =
-            group_execution_actions(&actions).expect("strict grouping should succeed");
-        assert_eq!(strict_groups.len(), 2);
-        assert_eq!(strict_groups[0].kind, GroupKind::DirectSell);
-        assert_eq!(strict_groups[1].kind, GroupKind::BuyMerge);
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 1);
-        assert_eq!(step_groups[0].kind, GroupKind::BuyMerge);
-        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn profitability_step_grouping_keeps_repeated_mixed_mint_buy_phases_separate() {
-        let actions = vec![
-            Action::FlashLoan { amount: 6.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 6.0,
-                target_market: "x",
-            },
-            sell("a", 6.0, 4.0),
-            Action::RepayFlashLoan { amount: 6.0 },
-            buy("x", 1.0, 0.6),
-            Action::FlashLoan { amount: 5.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 5.0,
-                target_market: "y",
-            },
-            sell("b", 5.0, 3.0),
-            Action::RepayFlashLoan { amount: 5.0 },
-            buy("y", 1.0, 0.5),
-        ];
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 2);
-        assert_eq!(step_groups[0].kind, GroupKind::MintSell);
-        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3, 4]);
-        assert_eq!(step_groups[1].kind, GroupKind::MintSell);
-        assert_eq!(step_groups[1].action_indices, vec![5, 6, 7, 8, 9]);
-    }
-
-    #[test]
-    fn profitability_step_grouping_keeps_repeated_mixed_sell_merge_phases_separate() {
-        let actions = vec![
-            Action::FlashLoan { amount: 5.0 },
-            buy("x", 1.0, 0.7),
-            Action::Merge {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 1.0,
-                source_market: "x",
-            },
-            Action::RepayFlashLoan { amount: 5.0 },
-            sell("x", 0.4, 0.3),
-            Action::FlashLoan { amount: 4.0 },
-            buy("y", 1.0, 0.6),
-            Action::Merge {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 1.0,
-                source_market: "y",
-            },
-            Action::RepayFlashLoan { amount: 4.0 },
-            sell("y", 0.3, 0.2),
-        ];
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 2);
-        assert_eq!(step_groups[0].kind, GroupKind::BuyMerge);
-        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3, 4]);
-        assert_eq!(step_groups[1].kind, GroupKind::BuyMerge);
-        assert_eq!(step_groups[1].action_indices, vec![5, 6, 7, 8, 9]);
-    }
-
-    #[test]
-    fn profitability_step_grouping_does_not_merge_unrelated_mint_and_direct_buy_blocks() {
-        let actions = vec![
-            Action::FlashLoan { amount: 6.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 6.0,
-                target_market: "x",
-            },
-            sell("a", 6.0, 4.0),
-            Action::RepayFlashLoan { amount: 6.0 },
-            buy("y", 1.0, 0.5),
-        ];
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 2);
-        assert_eq!(step_groups[0].kind, GroupKind::MintSell);
-        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3]);
-        assert_eq!(step_groups[1].kind, GroupKind::DirectBuy);
-        assert_eq!(step_groups[1].action_indices, vec![4]);
-    }
-
-    #[test]
-    fn profitability_step_grouping_does_not_merge_unrelated_buy_merge_and_direct_sell_blocks() {
-        let actions = vec![
-            Action::FlashLoan { amount: 5.0 },
-            buy("x", 1.0, 0.7),
-            Action::Merge {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 1.0,
-                source_market: "x",
-            },
-            Action::RepayFlashLoan { amount: 5.0 },
-            sell("y", 0.4, 0.3),
-        ];
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 2);
-        assert_eq!(step_groups[0].kind, GroupKind::BuyMerge);
-        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3]);
-        assert_eq!(step_groups[1].kind, GroupKind::DirectSell);
-        assert_eq!(step_groups[1].action_indices, vec![4]);
-    }
-
-    #[test]
-    fn profitability_step_grouping_merges_pure_direct_buy_waterfall_steps() {
-        // Step-like direct buy stream:
-        // step1: [a], step2: [a, b], step3: [a, b, c]
-        let actions = vec![
-            buy("a", 1.0, 0.1),
-            buy("a", 1.0, 0.1),
-            buy("b", 1.0, 0.1),
-            buy("a", 1.0, 0.1),
-            buy("b", 1.0, 0.1),
-            buy("c", 1.0, 0.1),
-        ];
-
-        let strict_groups =
-            group_execution_actions(&actions).expect("strict grouping should succeed");
-        assert_eq!(strict_groups.len(), 6);
-        assert!(strict_groups.iter().all(|g| g.kind == GroupKind::DirectBuy));
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 3);
-        assert!(step_groups.iter().all(|g| g.kind == GroupKind::DirectBuy));
-        assert_eq!(step_groups[0].action_indices, vec![0]);
-        assert_eq!(step_groups[1].action_indices, vec![1, 2]);
-        assert_eq!(step_groups[2].action_indices, vec![3, 4, 5]);
-
-        let typed_steps = group_execution_actions_by_profitability_step(&actions)
-            .expect("typed profitability-step grouping should succeed");
-        assert_eq!(typed_steps.len(), 3);
-        assert!(
-            typed_steps
-                .iter()
-                .all(|step| step.kind == ProfitabilityStepKind::PureDirectBuy)
-        );
-        assert_eq!(typed_steps[0].strict_groups.len(), 1);
-        assert_eq!(typed_steps[1].strict_groups.len(), 2);
-        assert_eq!(typed_steps[2].strict_groups.len(), 3);
-    }
-
-    #[test]
-    fn profitability_step_grouping_merges_pure_mint_sell_waterfall_steps() {
-        // Step-like mint stream:
-        // step1 targets [a], step2 targets [a, b]
-        let actions = vec![
-            Action::FlashLoan { amount: 2.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 2.0,
-                target_market: "a",
-            },
-            sell("x", 2.0, 0.9),
-            Action::RepayFlashLoan { amount: 2.0 },
-            Action::FlashLoan { amount: 2.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 2.0,
-                target_market: "a",
-            },
-            sell("x", 2.0, 0.9),
-            Action::RepayFlashLoan { amount: 2.0 },
-            Action::FlashLoan { amount: 2.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 2.0,
-                target_market: "b",
-            },
-            sell("x", 2.0, 0.9),
-            Action::RepayFlashLoan { amount: 2.0 },
-        ];
-
-        let strict_groups =
-            group_execution_actions(&actions).expect("strict grouping should succeed");
-        assert_eq!(strict_groups.len(), 3);
-        assert!(strict_groups.iter().all(|g| g.kind == GroupKind::MintSell));
-
-        let step_groups =
-            group_actions(&actions).expect("profitability-step grouping should succeed");
-        assert_eq!(step_groups.len(), 2);
-        assert!(step_groups.iter().all(|g| g.kind == GroupKind::MintSell));
-        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3]);
+    fn errors_when_mint_group_has_no_sell_leg() {
+        let actions = vec![mint("m", 1.0)];
+        let err = group_actions(&actions).expect_err("standalone mint should fail");
         assert_eq!(
-            step_groups[1].action_indices,
-            vec![4, 5, 6, 7, 8, 9, 10, 11]
+            err,
+            GroupingError::InvalidMintSellGroup {
+                start_index: 0,
+                end_index: 0,
+            }
         );
+    }
+
+    #[test]
+    fn groups_standalone_merge_as_direct_merge() {
+        let actions = vec![merge("s", 1.0)];
+        let groups = group_actions(&actions).expect("standalone merge should group");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, GroupKind::DirectMerge);
+        assert_eq!(groups[0].action_indices, vec![0]);
     }
 
     #[test]
@@ -1150,226 +753,95 @@ mod tests {
     }
 
     #[test]
-    fn errors_when_flash_loan_bracket_is_unclosed() {
-        let actions = vec![Action::FlashLoan { amount: 1.0 }, buy("a", 1.0, 1.0)];
-        let err = group_actions(&actions).expect_err("missing repay must error");
-        assert_eq!(
-            err,
-            GroupingError::MissingRepayFlashLoan {
-                flash_loan_index: 0
-            }
-        );
-    }
-
-    #[test]
-    fn errors_when_mint_appears_outside_bracket() {
-        let actions = vec![Action::Mint {
-            contract_1: "c1",
-            contract_2: "c2",
-            amount: 1.0,
-            target_market: "m",
-        }];
-        let err = group_actions(&actions).expect_err("standalone mint should error");
-        assert_eq!(
-            err,
-            GroupingError::UnexpectedActionOutsideGroup { index: 0 }
-        );
-    }
-
-    #[test]
-    fn groups_standalone_merge_as_direct_merge() {
-        let actions = vec![Action::Merge {
-            contract_1: "c1",
-            contract_2: "c2",
-            amount: 1.0,
-            source_market: "s",
-        }];
-        let groups = group_actions(&actions).expect("standalone merge should group");
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].kind, GroupKind::DirectMerge);
-        assert_eq!(groups[0].action_indices, vec![0]);
-    }
-
-    #[test]
-    fn errors_on_flash_arb_pattern_without_mint_or_merge() {
+    fn profitability_step_grouping_merges_leading_direct_buys_with_mint_sell_when_coupled() {
         let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            buy("a", 1.0, 0.8),
-            sell("b", 1.0, 0.9),
-            Action::RepayFlashLoan { amount: 10.0 },
+            buy("x", 1.0, 0.6),
+            buy("y", 1.0, 0.5),
+            mint("x", 6.0),
+            sell("a", 6.0, 4.0),
         ];
-        let err = group_actions(&actions).expect_err("unsupported flash arb must error");
+
+        let strict_groups =
+            group_execution_actions(&actions).expect("strict grouping should succeed");
+        assert_eq!(strict_groups.len(), 3);
+        assert_eq!(strict_groups[0].kind, GroupKind::DirectBuy);
+        assert_eq!(strict_groups[1].kind, GroupKind::DirectBuy);
+        assert_eq!(strict_groups[2].kind, GroupKind::MintSell);
+
+        let step_groups = group_execution_actions_by_profitability_step(&actions)
+            .expect("step grouping should succeed");
+        assert_eq!(step_groups.len(), 1);
+        assert_eq!(
+            step_groups[0].kind,
+            ProfitabilityStepKind::MixedDirectBuyMintSell
+        );
+        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn profitability_step_grouping_does_not_merge_unrelated_mint_and_direct_buy_blocks() {
+        let actions = vec![mint("x", 6.0), sell("a", 6.0, 4.0), buy("y", 1.0, 0.5)];
+
+        let step_groups =
+            group_actions(&actions).expect("profitability-step grouping should succeed");
+        assert_eq!(step_groups.len(), 2);
+        assert_eq!(step_groups[0].kind, GroupKind::MintSell);
+        assert_eq!(step_groups[0].action_indices, vec![0, 1]);
+        assert_eq!(step_groups[1].kind, GroupKind::DirectBuy);
+        assert_eq!(step_groups[1].action_indices, vec![2]);
+    }
+
+    #[test]
+    fn profitability_step_grouping_merges_buy_merge_with_trailing_direct_sell_when_coupled() {
+        let actions = vec![buy("x", 1.0, 0.7), merge("x", 1.0), sell("x", 0.4, 0.3)];
+
+        let strict_groups =
+            group_execution_actions(&actions).expect("strict grouping should succeed");
+        assert_eq!(strict_groups.len(), 2);
+        assert_eq!(strict_groups[0].kind, GroupKind::BuyMerge);
+        assert_eq!(strict_groups[1].kind, GroupKind::DirectSell);
+
+        let step_groups =
+            group_actions(&actions).expect("profitability-step grouping should succeed");
+        assert_eq!(step_groups.len(), 1);
+        assert_eq!(step_groups[0].kind, GroupKind::BuyMerge);
+        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn profitability_step_grouping_keeps_repeated_mixed_mint_buy_phases_separate() {
+        let actions = vec![
+            mint("x", 6.0),
+            sell("a", 6.0, 4.0),
+            buy("x", 1.0, 0.6),
+            mint("y", 5.0),
+            sell("b", 5.0, 3.0),
+            buy("y", 1.0, 0.5),
+        ];
+
+        let step_groups =
+            group_actions(&actions).expect("profitability-step grouping should succeed");
+        assert_eq!(step_groups.len(), 2);
+        assert_eq!(step_groups[0].kind, GroupKind::MintSell);
+        assert_eq!(step_groups[0].action_indices, vec![0, 1, 2]);
+        assert_eq!(step_groups[1].kind, GroupKind::MintSell);
+        assert_eq!(step_groups[1].action_indices, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn step_group_classification_fails_closed_on_unsupported_kind_mix() {
+        let actions = vec![merge("m", 1.0), buy("m", 1.0, 0.5)];
+        let route_groups = vec![
+            typed_group_from_actions(&actions, GroupKind::DirectMerge, vec![0]),
+            typed_group_from_actions(&actions, GroupKind::DirectBuy, vec![1]),
+        ];
+        let err = step_group_from_route_groups(&route_groups)
+            .expect_err("unsupported mixed composition must fail closed");
         assert_eq!(
             err,
-            GroupingError::InvalidFlashLoanBracket {
+            GroupingError::UnsupportedProfitabilityStepComposition {
                 start_index: 0,
-                end_index: 3
-            }
-        );
-    }
-
-    #[test]
-    fn errors_when_mint_bracket_contains_buy_leg() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 10.0,
-                target_market: "t",
-            },
-            buy("a", 1.0, 0.8),
-            Action::RepayFlashLoan { amount: 10.0 },
-        ];
-        let err = group_actions(&actions).expect_err("mint bracket with buy leg must error");
-        assert_eq!(
-            err,
-            GroupingError::InvalidFlashLoanBracket {
-                start_index: 0,
-                end_index: 3
-            }
-        );
-    }
-
-    #[test]
-    fn errors_when_buy_merge_bracket_contains_sell_leg() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            buy("a", 1.0, 0.8),
-            sell("b", 1.0, 0.9),
-            Action::Merge {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 1.0,
-                source_market: "s",
-            },
-            Action::RepayFlashLoan { amount: 10.0 },
-        ];
-        let err = group_actions(&actions).expect_err("buy-merge bracket with sell leg must error");
-        assert_eq!(
-            err,
-            GroupingError::InvalidFlashLoanBracket {
-                start_index: 0,
-                end_index: 4
-            }
-        );
-    }
-
-    #[test]
-    fn errors_when_mint_sell_bracket_is_out_of_order() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            sell("a", 1.0, 0.8),
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 10.0,
-                target_market: "t",
-            },
-            Action::RepayFlashLoan { amount: 10.0 },
-        ];
-        let err = group_actions(&actions).expect_err("out-of-order mint-sell bracket must error");
-        assert_eq!(
-            err,
-            GroupingError::InvalidFlashLoanBracket {
-                start_index: 0,
-                end_index: 3
-            }
-        );
-    }
-
-    #[test]
-    fn errors_when_buy_merge_bracket_is_out_of_order() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            Action::Merge {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 1.0,
-                source_market: "s",
-            },
-            buy("a", 1.0, 0.8),
-            Action::RepayFlashLoan { amount: 10.0 },
-        ];
-        let err = group_actions(&actions).expect_err("out-of-order buy-merge bracket must error");
-        assert_eq!(
-            err,
-            GroupingError::InvalidFlashLoanBracket {
-                start_index: 0,
-                end_index: 3
-            }
-        );
-    }
-
-    #[test]
-    fn errors_when_flash_loan_fee_is_non_zero() {
-        let actions = vec![
-            Action::FlashLoan { amount: 10.0 },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: 10.0,
-                target_market: "t",
-            },
-            sell("a", 10.0, 7.0),
-            Action::RepayFlashLoan { amount: 10.001 },
-        ];
-        let err = group_actions(&actions).expect_err("non-zero flash-loan fee must error");
-        assert_eq!(
-            err,
-            GroupingError::UnsupportedFlashLoanFee {
-                start_index: 0,
-                end_index: 3
-            }
-        );
-    }
-
-    #[test]
-    fn accepts_flash_loan_fee_at_tolerance_boundary() {
-        let borrowed = 10.0;
-        // Solve d = tol * (1 + |borrowed| + |borrowed + d|) exactly for boundary d.
-        let boundary_diff = ZERO_FEE_REL_TOL * (1.0 + 2.0 * borrowed) / (1.0 - ZERO_FEE_REL_TOL);
-        let actions = vec![
-            Action::FlashLoan { amount: borrowed },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: borrowed,
-                target_market: "t",
-            },
-            sell("a", borrowed, 7.0),
-            Action::RepayFlashLoan {
-                amount: borrowed + boundary_diff,
-            },
-        ];
-        let groups = group_actions(&actions).expect("boundary fee tolerance should be accepted");
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].kind, GroupKind::MintSell);
-    }
-
-    #[test]
-    fn rejects_flash_loan_fee_just_above_tolerance_boundary() {
-        let borrowed = 10.0;
-        let boundary_diff = ZERO_FEE_REL_TOL * (1.0 + 2.0 * borrowed) / (1.0 - ZERO_FEE_REL_TOL);
-        let actions = vec![
-            Action::FlashLoan { amount: borrowed },
-            Action::Mint {
-                contract_1: "c1",
-                contract_2: "c2",
-                amount: borrowed,
-                target_market: "t",
-            },
-            sell("a", borrowed, 7.0),
-            Action::RepayFlashLoan {
-                amount: borrowed + boundary_diff * (1.0 + 1e-6),
-            },
-        ];
-        let err = group_actions(&actions).expect_err("fee just above tolerance should be rejected");
-        assert_eq!(
-            err,
-            GroupingError::UnsupportedFlashLoanFee {
-                start_index: 0,
-                end_index: 3
+                end_index: 1,
             }
         );
     }

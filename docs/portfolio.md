@@ -31,12 +31,13 @@ enum Action {
     Merge { contract_1, contract_2, amount, source_market }, // Buy others + merge to sell
     Buy { market_name, amount, cost },                       // Buy outcome tokens from pool
     Sell { market_name, amount, proceeds },                  // Sell outcome tokens for sUSD
-    FlashLoan { amount },                                    // Borrow sUSD to fund minting
-    RepayFlashLoan { amount },                               // Repay after selling minted tokens
 }
 ```
 
-Mint routes are wrapped in flash loans: `FlashLoan → Mint → Sell(others) → RepayFlashLoan`. Merge routes use the same bracket when complementary buy legs require external capital (`FlashLoan → Buy(all others) → Merge → RepayFlashLoan`); when complementary inventory fully covers the merge leg, merge can execute without flash borrowing.
+Indirect routes are self-funded and execute in bounded rounds:
+- Mint route: `Mint → Sell(others)` in repeated liquidity/cash-feasible chunks.
+- Buy-merge route: `Buy(others) → Merge` in repeated liquidity/cash-feasible chunks.
+- No flash-loan actions are emitted.
 
 ## Algorithm
 
@@ -105,7 +106,7 @@ If budget is exhausted on a non-boundary partial step, `waterfall` now continues
 
 Cost per step uses the same analytical `PoolSim` formulas used by execution:
 - **Direct route**: `PoolSim::cost_to_price` to target price derived from target profitability (`prediction / (1 + target_prof)`), clamped to `buy_limit_price`.
-- **Mint route**: Newton's method finds the mint amount where the alt price (1 - sum of post-sell prices) equals the target price. Warm-started with the linearized first step: m₀ = (P_target - alt(0)) / (2 × Σ Pⱼκⱼ), saving one iteration. Uses the analytical price sensitivity parameter κⱼ = (1-fee) × √priceⱼ × 1e18 / Lⱼ per pool. Each pool's sell volume is capped at `max_sell_tokens()` = (√(price/limit_price) - 1) / κ — the max tokens sellable before hitting the tick boundary. In the Newton solver, each pool's price contribution uses min(m, capⱼ), and the derivative is zero for saturated pools. Net cost uses capped proceeds: proceedsⱼ(m) = priceⱼ × min(m, capⱼ) × (1-fee) / (1 + min(m, capⱼ) × κⱼ). If a requested profitability level is unreachable under caps, the solver clamps to the saturated-capacity solution instead of dropping the route. This ensures the analytical estimate matches the tick-bounded execution in `emit_mint_actions`. Active outcomes are excluded from sell simulation.
+- **Mint route**: Newton's method finds the mint amount where the alt price (1 - sum of post-sell prices) equals the target price. Warm-started with the linearized first step: m₀ = (P_target - alt(0)) / (2 × Σ Pⱼκⱼ), saving one iteration. Uses the analytical price sensitivity parameter κⱼ = (1-fee) × √priceⱼ × 1e18 / Lⱼ per pool. Each pool's sell volume is capped at `max_sell_tokens()` = (√(price/limit_price) - 1) / κ. The solver clamps mint sizing by the **minimum** cap across required sell legs so planned mint legs remain executable as full `Mint->Sell` rounds (no synthetic flash bracket and no unsold-leg dependency). If a requested profitability level is unreachable under that cap, the solver clamps to the capped executable solution instead of dropping the route. Active outcomes are excluded from sell simulation.
 - The caller specifies the route per entry — `direct_cost_to_prof` or `mint_cost_to_prof` is called directly based on the entry's route, rather than picking the best route internally.
 - Negative costs (arbitrage, where sell proceeds exceed mint cost) are valid and increase the budget.
 
@@ -216,11 +217,11 @@ Portfolio tests are split across `src/portfolio/tests.rs` (shared fixtures + ear
 - `test_rebalance_negative_budget_legacy_sells_self_fund_rebalance`: hardcoded debt-entry fixture (`susds_balance < 0`) showing Phase-1 liquidation can recover cash and avoid EV regression.
 - `test_rebalance_handles_nan_and_infinite_budget_without_non_finite_actions`: defensive-input test that `NaN`/`Infinity` budgets fail closed (no actions emitted).
 - `test_rebalance_non_finite_balances_fail_closed_to_zero_inventory`: defensive-input fixture ensuring `NaN`/`Infinity` holdings are sanitized to zero inventory, preventing invalid liquidation flow.
-- `test_rebalance_zero_liquidity_outcome_disables_mint_merge_routes`: explicit full-L1 fixture with one forced zero-liquidity outcome; verifies mint/merge/flash routes are disabled while direct buys continue for remaining underpriced pools.
+- `test_rebalance_zero_liquidity_outcome_disables_mint_merge_routes`: explicit full-L1 fixture with one forced zero-liquidity outcome; verifies mint/merge routes are disabled while direct buys continue for remaining underpriced pools.
 - `test_phase3_near_tie_low_liquidity_avoids_ev_regression`: tiny-liquidity near-equal-profitability fixture guarding against Phase-3 churn causing net EV loss.
-- `test_phase3_recycling_full_l1_with_mint_routes_reduces_low_prof_legacy`: full-L1 mint-enabled fixture with near-fair legacy bucket; verifies low-marginal legacy holdings are actually reduced while preserving EV and flash-loan accounting.
+- `test_phase3_recycling_full_l1_with_mint_routes_reduces_low_prof_legacy`: full-L1 mint-enabled fixture with near-fair legacy bucket; verifies low-marginal legacy holdings are actually reduced while preserving EV.
 - `test_phase3_full_l1_recycling_limits_tiny_legacy_sell_fragmentation`: phase-3 de-fragmentation check that bounded follow-up escalation does not devolve into tiny residual sell churn in a crafted legacy scenario.
-- `test_fuzz_flash_loan_action_stream_ordering_invariants`: full-L1 fuzz property for flash-loan bracket structure (no nesting, matched repay amount, no dangling loan).
+- Full-L1 action-stream invariants include indirect-route shape checks (`Mint->Sell+`, `Buy+->Merge`) alongside accounting consistency.
 - `test_waterfall_misnormalized_prediction_sums_remain_finite`: robustness test for miscalibrated belief vectors (`sum(pred) > 1` and `< 1`) to ensure waterfall state and actions remain finite.
 - `test_phase1_merge_split_can_leave_source_pool_overpriced`: adversarial Phase-1 fixture showing that when the optimal sell split uses merge legs, the source pool can remain overpriced even when sell sizing is derived from `sell_to_price(prediction)` in direct-price space.
 - `test_fuzz_phase1_sell_order_budget_stability`: sampled order-stability check for Phase-1 liquidation across adversarial 3-outcome fixtures (same holdings/prices, swapped sell order), guarding against unexpected order-sensitive budget recovery drift.

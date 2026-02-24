@@ -4,6 +4,8 @@ use super::Action;
 use super::sim::{DUST, EPS, FEE_FACTOR, PoolSim, profitability, sanitize_nonnegative_finite};
 use super::types::subtract_balance;
 
+const MAX_ALT_ROUTE_ROUNDS: usize = 256;
+
 pub(super) fn action_contract_pair(sims: &[PoolSim]) -> (&'static str, &'static str) {
     if sims.is_empty() {
         return ("", "");
@@ -334,6 +336,104 @@ pub(super) fn merge_usable_inventory(
     held_balance(sim_balances, sim.market_name)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MergeRoundLeg {
+    idx: usize,
+    bought: f64,
+    cost: f64,
+    new_price: f64,
+    consumed_from_inventory: f64,
+}
+
+fn preview_merge_round(
+    sims: &[PoolSim],
+    source_idx: usize,
+    amount: f64,
+    sim_balances: &HashMap<&str, f64>,
+    inventory_keep_prof: f64,
+) -> Option<(Vec<MergeRoundLeg>, f64)> {
+    if amount <= DUST {
+        return Some((Vec::new(), 0.0));
+    }
+
+    let mut legs: Vec<MergeRoundLeg> = Vec::with_capacity(sims.len().saturating_sub(1));
+    let mut total_buy_cost = 0.0_f64;
+    for (i, sim) in sims.iter().enumerate() {
+        if i == source_idx {
+            continue;
+        }
+        let held = merge_usable_inventory(Some(sim_balances), sim, inventory_keep_prof);
+        let consumed_from_inventory = amount.min(held);
+        let buy_amount = (amount - consumed_from_inventory).max(0.0);
+        if buy_amount <= DUST {
+            legs.push(MergeRoundLeg {
+                idx: i,
+                bought: 0.0,
+                cost: 0.0,
+                new_price: sim.price(),
+                consumed_from_inventory,
+            });
+            continue;
+        }
+
+        match sim.buy_exact(buy_amount) {
+            Some((bought, cost, new_price))
+                if bought + EPS >= buy_amount && bought > 0.0 && cost.is_finite() =>
+            {
+                legs.push(MergeRoundLeg {
+                    idx: i,
+                    bought,
+                    cost,
+                    new_price,
+                    consumed_from_inventory,
+                });
+                total_buy_cost += cost;
+            }
+            _ => return None,
+        }
+    }
+
+    Some((legs, total_buy_cost))
+}
+
+fn affordable_merge_round_amount(
+    sims: &[PoolSim],
+    source_idx: usize,
+    upper: f64,
+    sim_balances: &HashMap<&str, f64>,
+    inventory_keep_prof: f64,
+    spendable_cash: f64,
+) -> f64 {
+    if upper <= DUST {
+        return 0.0;
+    }
+
+    let affordable = |amount: f64| -> bool {
+        preview_merge_round(sims, source_idx, amount, sim_balances, inventory_keep_prof)
+            .map(|(_, total_buy_cost)| total_buy_cost <= spendable_cash + EPS)
+            .unwrap_or(false)
+    };
+
+    if affordable(upper) {
+        return upper;
+    }
+
+    let mut lo = 0.0_f64;
+    let mut hi = upper;
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        if affordable(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo) <= EPS * (1.0 + hi.abs()) {
+            break;
+        }
+    }
+    lo
+}
+
 /// Execute a merge sell while consuming existing complementary holdings first.
 /// Missing shortfall is bought from pools. Updates `sim_balances`.
 pub(super) fn execute_merge_sell_with_inventory(
@@ -345,79 +445,92 @@ pub(super) fn execute_merge_sell_with_inventory(
     actions: &mut Vec<Action>,
     budget: &mut f64,
 ) -> f64 {
-    let merge_cap =
-        merge_sell_cap_with_inventory(sims, source_idx, Some(sim_balances), inventory_keep_prof);
-    let actual = amount.min(merge_cap);
-    if actual <= 0.0 {
+    let mut remaining = amount;
+    if remaining <= DUST {
         return 0.0;
     }
 
-    // (idx, bought, cost, new_price, consumed_from_inventory)
-    let mut legs: Vec<(usize, f64, f64, f64, f64)> =
-        Vec::with_capacity(sims.len().saturating_sub(1));
-    let mut total_buy_cost = 0.0_f64;
-    for (i, s) in sims.iter().enumerate() {
-        if i == source_idx {
-            continue;
+    let mut merged_total = 0.0_f64;
+    for _ in 0..MAX_ALT_ROUTE_ROUNDS {
+        if remaining <= DUST {
+            break;
         }
-        let held = merge_usable_inventory(Some(sim_balances), s, inventory_keep_prof);
-        let consumed_from_inventory = actual.min(held);
-        let buy_amount = (actual - consumed_from_inventory).max(0.0);
-        if buy_amount <= DUST {
-            legs.push((i, 0.0, 0.0, s.price(), consumed_from_inventory));
-            continue;
+
+        let merge_cap = merge_sell_cap_with_inventory(
+            sims,
+            source_idx,
+            Some(sim_balances),
+            inventory_keep_prof,
+        );
+        if merge_cap <= DUST {
+            break;
         }
-        match s.buy_exact(buy_amount) {
-            Some((bought, cost, new_price))
-                if bought + EPS >= buy_amount && bought > 0.0 && cost.is_finite() =>
-            {
-                legs.push((i, bought, cost, new_price, consumed_from_inventory));
-                total_buy_cost += cost;
+
+        let round_upper = remaining.min(merge_cap);
+        let spendable_cash = (*budget).max(0.0);
+        let round_amount = affordable_merge_round_amount(
+            sims,
+            source_idx,
+            round_upper,
+            sim_balances,
+            inventory_keep_prof,
+            spendable_cash,
+        );
+        if round_amount <= DUST {
+            break;
+        }
+
+        let Some((legs, total_buy_cost)) = preview_merge_round(
+            sims,
+            source_idx,
+            round_amount,
+            sim_balances,
+            inventory_keep_prof,
+        ) else {
+            break;
+        };
+
+        if total_buy_cost > spendable_cash + EPS {
+            break;
+        }
+
+        *budget -= total_buy_cost;
+        for leg in &legs {
+            if leg.bought > DUST {
+                sims[leg.idx].set_price(leg.new_price);
+                actions.push(Action::Buy {
+                    market_name: sims[leg.idx].market_name,
+                    amount: leg.bought,
+                    cost: leg.cost,
+                });
             }
-            _ => return 0.0,
         }
-    }
 
-    if total_buy_cost > DUST {
-        actions.push(Action::FlashLoan {
-            amount: total_buy_cost,
+        let (contract_1, contract_2) = action_contract_pair(sims);
+        actions.push(Action::Merge {
+            contract_1,
+            contract_2,
+            amount: round_amount,
+            source_market: sims[source_idx].market_name,
         });
-    }
+        *budget += round_amount;
 
-    for (i, bought, cost, new_price, _) in &legs {
-        if *bought > DUST {
-            sims[*i].set_price(*new_price);
-            actions.push(Action::Buy {
-                market_name: sims[*i].market_name,
-                amount: *bought,
-                cost: *cost,
-            });
+        for leg in &legs {
+            if leg.consumed_from_inventory > DUST {
+                subtract_balance(
+                    sim_balances,
+                    sims[leg.idx].market_name,
+                    leg.consumed_from_inventory,
+                );
+            }
         }
+        subtract_balance(sim_balances, sims[source_idx].market_name, round_amount);
+
+        merged_total += round_amount;
+        remaining -= round_amount;
     }
 
-    let (contract_1, contract_2) = action_contract_pair(sims);
-    actions.push(Action::Merge {
-        contract_1,
-        contract_2,
-        amount: actual,
-        source_market: sims[source_idx].market_name,
-    });
-
-    if total_buy_cost > DUST {
-        actions.push(Action::RepayFlashLoan {
-            amount: total_buy_cost,
-        });
-    }
-
-    for (i, _, _, _, consumed_from_inventory) in &legs {
-        if *consumed_from_inventory > DUST {
-            subtract_balance(sim_balances, sims[*i].market_name, *consumed_from_inventory);
-        }
-    }
-    subtract_balance(sim_balances, sims[source_idx].market_name, actual);
-
-    *budget += actual - total_buy_cost;
-    actual
+    merged_total
 }
 
 /// Execute a merge sell: buy all other outcomes, merge complete sets, recover sUSD.

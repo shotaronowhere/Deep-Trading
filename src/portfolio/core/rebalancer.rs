@@ -3,12 +3,12 @@ use std::collections::{HashMap, HashSet};
 use crate::pools::Slot0Result;
 
 use super::Action;
+#[cfg(test)]
+use super::sim::DUST;
 use super::sim::{
     EPS, PoolSim, SimBuildError, build_sims, build_sims_without_predictions, profitability,
     target_price_for_prof,
 };
-#[cfg(test)]
-use super::sim::DUST;
 use super::trading::{ExecutionState, portfolio_expected_value};
 use super::types::BalanceMap;
 use super::types::{apply_actions_to_sim_balances, lookup_balance};
@@ -349,7 +349,8 @@ impl RebalanceContext {
 
                     let remaining_legacy =
                         held_legacy(&trial.balances, &trial.legacy_remaining, market_name);
-                    let post_prof = profitability(trial.sims[idx].prediction, trial.sims[idx].price());
+                    let post_prof =
+                        profitability(trial.sims[idx].prediction, trial.sims[idx].price());
                     let prof_gap_tol = PHASE3_ESCALATION_PROF_REL_GAP
                         * (1.0 + phase3_prof.abs().max(post_prof.abs()));
                     let remaining_min = PHASE3_ESCALATION_MIN_REMAINING_ABS
@@ -604,12 +605,7 @@ fn rebalance_full(
 
     if ctx.mint_available {
         let actions_before_mixed_cleanup = ctx.actions.len();
-        let mixed_last_prof = waterfall(
-            &mut ctx.sims,
-            &mut ctx.budget,
-            &mut ctx.actions,
-            true,
-        );
+        let mixed_last_prof = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, true);
         apply_actions_to_sim_balances(
             &ctx.actions[actions_before_mixed_cleanup..],
             &ctx.sims,
@@ -625,12 +621,7 @@ fn rebalance_full(
             let start_actions = ctx.actions.len();
             ctx.run_phase1_sell_overpriced();
             let actions_before_direct_cleanup = ctx.actions.len();
-            let _ = waterfall(
-                &mut ctx.sims,
-                &mut ctx.budget,
-                &mut ctx.actions,
-                false,
-            );
+            let _ = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, false);
             apply_actions_to_sim_balances(
                 &ctx.actions[actions_before_direct_cleanup..],
                 &ctx.sims,
@@ -672,7 +663,12 @@ fn assert_internal_state_matches_replay(
     );
 
     for sim in &ctx.sims {
-        let internal = ctx.sim_balances.get(sim.market_name).copied().unwrap_or(0.0).max(0.0);
+        let internal = ctx
+            .sim_balances
+            .get(sim.market_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
         let replay = replay_holdings
             .get(sim.market_name)
             .copied()
@@ -962,7 +958,13 @@ fn estimate_local_gradients_for_context(ctx: &RebalanceContext, eps: f64) -> Loc
     let holdings: Vec<f64> = ctx
         .sims
         .iter()
-        .map(|sim| ctx.sim_balances.get(sim.market_name).copied().unwrap_or(0.0).max(0.0))
+        .map(|sim| {
+            ctx.sim_balances
+                .get(sim.market_name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0)
+        })
         .collect();
     let state = LocalGradientState {
         sims: ctx.sims.clone(),

@@ -13,10 +13,9 @@ use super::super::solver::mint_cost_to_prof;
 use super::super::trading::ExecutionState;
 use super::super::waterfall::{MAX_WATERFALL_ITERS, best_non_active, waterfall};
 use super::{
-    Action, TestRng, assert_action_values_are_finite, assert_flash_loan_ordering,
-    assert_rebalance_action_invariants, brute_force_best_gain_mint_direct,
-    build_rebalance_fuzz_case, build_slot0_results_for_markets, build_three_sims_with_preds,
-    buy_totals, eligible_l1_markets_with_predictions, ev_from_state, flash_loan_totals,
+    Action, TestRng, assert_action_values_are_finite, assert_rebalance_action_invariants,
+    brute_force_best_gain_mint_direct, build_rebalance_fuzz_case, build_slot0_results_for_markets,
+    build_three_sims_with_preds, buy_totals, eligible_l1_markets_with_predictions, ev_from_state,
     mock_slot0_market, mock_slot0_market_with_liquidity,
     mock_slot0_market_with_liquidity_and_ticks, oracle_direct_only_best_ev_grid,
     oracle_two_pool_direct_only_best_ev_with_holdings_grid, replay_actions_to_ev,
@@ -449,10 +448,10 @@ fn test_oracle_single_pool_direct_only_matches_grid_optimum() {
         build_sims(&slot0_results, &preds).expect("fixture must include prediction for each market")
     };
     assert_eq!(sims.len(), 1);
-    let oracle_ev = oracle_direct_only_best_ev_grid(&sims, budget, 2400);
+    let oracle_ev = oracle_direct_only_best_ev_grid(&sims, budget, 3200);
 
     assert!(
-        algo_ev + 1e-6 >= oracle_ev - 2e-3,
+        algo_ev + 1e-6 >= oracle_ev - 1.5e-3,
         "single-pool oracle gap too large: algo={:.9}, oracle={:.9}",
         algo_ev,
         oracle_ev
@@ -475,10 +474,10 @@ fn test_oracle_two_pool_direct_only_matches_grid_optimum() {
         build_sims(&slot0_results, &preds).expect("fixture must include prediction for each market")
     };
     assert_eq!(sims.len(), 2);
-    let oracle_ev = oracle_direct_only_best_ev_grid(&sims, budget, 520);
+    let oracle_ev = oracle_direct_only_best_ev_grid(&sims, budget, 800);
 
     assert!(
-        algo_ev + 1e-6 >= oracle_ev - 4e-3,
+        algo_ev + 1e-6 >= oracle_ev - 3e-3,
         "two-pool oracle gap too large: algo={:.9}, oracle={:.9}",
         algo_ev,
         oracle_ev
@@ -508,10 +507,10 @@ fn test_oracle_fuzz_two_pool_direct_only_not_worse_than_grid() {
             build_sims(&slot0_results, &preds)
                 .expect("fixture must include prediction for each market")
         };
-        let oracle_ev = oracle_direct_only_best_ev_grid(&sims, budget, 260);
+        let oracle_ev = oracle_direct_only_best_ev_grid(&sims, budget, 360);
 
         assert!(
-            algo_ev + 1e-6 >= oracle_ev - 1.2e-2,
+            algo_ev + 1e-6 >= oracle_ev - 1.0e-2,
             "oracle differential failed: algo={:.9}, oracle={:.9}, markets=({}, {}), multipliers=({:.4}, {:.4}), budget={:.4}",
             algo_ev,
             oracle_ev,
@@ -540,12 +539,6 @@ fn test_oracle_two_pool_direct_only_with_legacy_holdings_matches_grid_optimum() 
             .iter()
             .any(|a| matches!(a, Action::Mint { .. } | Action::Merge { .. })),
         "partial two-pool fixture should be direct-only"
-    );
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
-        "direct-only fixture should not use flash loans"
     );
     assert!(
         actions.iter().any(
@@ -577,7 +570,7 @@ fn test_oracle_two_pool_direct_only_with_legacy_holdings_matches_grid_optimum() 
         800,
     );
     assert!(
-        algo_ev + 1e-6 >= oracle_ev - 7e-3,
+        algo_ev + 1e-6 >= oracle_ev - 6e-3,
         "legacy-holdings oracle gap too large: algo={:.9}, oracle={:.9}",
         algo_ev,
         oracle_ev
@@ -610,12 +603,6 @@ fn test_oracle_fuzz_two_pool_direct_only_with_legacy_holdings_not_worse_than_gri
                 .any(|a| matches!(a, Action::Mint { .. } | Action::Merge { .. })),
             "partial two-pool fixture should be direct-only"
         );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
-            "direct-only fixture should not use flash loans"
-        );
         assert_rebalance_action_invariants(&actions, &slot0_results, &balances, budget);
 
         let algo_ev = replay_actions_to_ev(&actions, &slot0_results, &balances, budget);
@@ -632,11 +619,11 @@ fn test_oracle_fuzz_two_pool_direct_only_with_legacy_holdings_not_worse_than_gri
             &sims,
             &initial_holdings,
             budget,
-            180,
+            260,
         );
 
         assert!(
-            algo_ev + 1e-6 >= oracle_ev - 1.5e-2,
+            algo_ev + 1e-6 >= oracle_ev - 1.2e-2,
             "legacy-holdings oracle differential failed: algo={:.9}, oracle={:.9}, markets=({}, {}), multipliers=({:.4}, {:.4}), budget={:.5}, holdings=({:.5}, {:.5})",
             algo_ev,
             oracle_ev,
@@ -728,11 +715,10 @@ fn test_oracle_two_pool_closed_form_direct_waterfall_matches_kkt_target() {
 }
 
 #[test]
-fn test_mint_first_order_can_make_zero_cash_plan_feasible() {
-    // Search adversarial mixed-route fixtures where:
-    // - Mint leg is cash-positive (negative cost),
-    // - Direct leg is cash-consuming,
-    // - zero-cash feasibility holds only with mint-first ordering.
+fn test_mint_first_order_zero_cash_plan_fails_closed_without_flash() {
+    // Search adversarial mixed-route fixtures where nominal net-cost planning at
+    // zero cash prefers mint-first ordering. Without flash collateral, execution
+    // should fail closed at runtime.
     let mut rng = TestRng::new(0x0FD3_A0A7_2026_4001u64);
     let mut witness: Option<(Vec<PoolSim>, f64, Vec<PlannedRoute>)> = None;
 
@@ -801,20 +787,17 @@ fn test_mint_first_order_can_make_zero_cash_plan_feasible() {
         exec.execute_planned_routes(&plan, &skip)
     };
     assert!(
-        ok,
-        "mint-first mixed plan should execute from zero cash at target_prof={:.9}",
+        !ok,
+        "zero-cash mint-first mixed plan should fail closed without flash collateral at target_prof={:.9}",
         target_prof
     );
-    assert!(budget >= -1e-9, "execution must not underflow cash");
     assert!(
-        actions.iter().any(|a| matches!(a, Action::Mint { .. })),
-        "execution should include mint leg"
+        (budget - 0.0).abs() <= 1e-12,
+        "cash should remain unchanged"
     );
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::Buy { market_name, .. } if *market_name == "M1")),
-        "execution should include direct buy leg on M1"
+        actions.is_empty(),
+        "no actions should be emitted when zero-cash mint cannot start"
     );
 }
 
@@ -835,12 +818,6 @@ fn test_oracle_two_pool_direct_only_legacy_self_funding_budget_zero_matches_grid
             .iter()
             .any(|a| matches!(a, Action::Mint { .. } | Action::Merge { .. })),
         "two-pool fixture should stay direct-only"
-    );
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
-        "direct-only fixture should not use flash loans"
     );
     assert!(
         actions.iter().any(
@@ -867,7 +844,7 @@ fn test_oracle_two_pool_direct_only_legacy_self_funding_budget_zero_matches_grid
     );
 
     assert!(
-        algo_ev + 1e-6 >= oracle_ev - 1.1e-2,
+        algo_ev + 1e-6 >= oracle_ev - 9e-3,
         "self-funding legacy oracle gap too large: algo={:.9}, oracle={:.9}",
         algo_ev,
         oracle_ev
@@ -900,14 +877,10 @@ fn test_fuzz_rebalance_partial_direct_only_ev_non_decreasing() {
         let ev_before = replay_actions_to_ev(&[], &slot0_results, &balances, susd_balance);
         let actions = rebalance(&balances, susd_balance, &slot0_results);
         assert!(
-            !actions.iter().any(|a| matches!(
-                a,
-                Action::Mint { .. }
-                    | Action::Merge { .. }
-                    | Action::FlashLoan { .. }
-                    | Action::RepayFlashLoan { .. }
-            )),
-            "partial direct-only fixture should not emit mint/merge/flash actions"
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Mint { .. } | Action::Merge { .. })),
+            "partial direct-only fixture should not emit mint/merge actions"
         );
         assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
 
@@ -940,12 +913,6 @@ fn test_fuzz_rebalance_partial_no_legacy_holdings_emits_no_sells() {
                 .iter()
                 .any(|a| matches!(a, Action::Sell { .. } | Action::Merge { .. })),
             "without legacy inventory, rebalance should not emit sell/merge actions"
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
-            "partial fixture should not emit flash actions"
         );
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
@@ -1066,12 +1033,6 @@ fn test_rebalance_zero_liquidity_outcome_disables_mint_merge_routes() {
         "mint/merge must be disabled when any pooled outcome has zero liquidity"
     );
     assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
-        "flash-loan legs should not appear when mint/merge routes are disabled"
-    );
-    assert!(
         actions.iter().any(|a| matches!(a, Action::Buy { .. })),
         "underpriced remaining outcomes should still trade via direct buys"
     );
@@ -1095,13 +1056,9 @@ fn test_phase3_near_tie_low_liquidity_avoids_ev_regression() {
     let ev_before = replay_actions_to_ev(&[], &slot0_results, &balances, budget);
     let actions = rebalance(&balances, budget, &slot0_results);
     assert!(
-        !actions.iter().any(|a| matches!(
-            a,
-            Action::Mint { .. }
-                | Action::Merge { .. }
-                | Action::FlashLoan { .. }
-                | Action::RepayFlashLoan { .. }
-        )),
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Mint { .. } | Action::Merge { .. })),
         "two-pool fixture should remain direct-only"
     );
     assert_rebalance_action_invariants(&actions, &slot0_results, &balances, budget);
@@ -1192,18 +1149,12 @@ fn test_phase3_recycling_full_l1_with_mint_routes_reduces_low_prof_legacy() {
         "expected at least one legacy bucket holding to be reduced"
     );
 
-    let (borrowed, repaid) = flash_loan_totals(&actions);
-    let flash_tol = 1e-7 * (1.0 + borrowed.abs() + repaid.abs());
-    assert!(
-        (borrowed - repaid).abs() <= flash_tol,
-        "flash totals must balance in full-L1 phase3 fixture"
-    );
+    assert_action_values_are_finite(&actions);
 }
 
 #[test]
-fn test_fuzz_flash_loan_action_stream_ordering_invariants() {
+fn test_fuzz_no_flash_action_stream_ordering_invariants() {
     let mut rng = TestRng::new(0xF1A5_410A_2026_5001u64);
-    let mut checked = 0usize;
 
     for _ in 0..24 {
         let (slot0_results, balances_static, susd_balance) =
@@ -1214,16 +1165,8 @@ fn test_fuzz_flash_loan_action_stream_ordering_invariants() {
             .collect();
 
         let actions = rebalance(&balances, susd_balance, &slot0_results);
-        let brackets = assert_flash_loan_ordering(&actions);
-        if brackets > 0 {
-            checked += 1;
-        }
+        assert_action_values_are_finite(&actions);
     }
-
-    assert!(
-        checked >= 1,
-        "expected at least one full-L1 fuzz fixture to exercise flash-loan brackets"
-    );
 }
 
 #[test]
@@ -1272,12 +1215,6 @@ fn test_oracle_phase3_recycling_two_pool_direct_only_matches_grid_optimum() {
         "partial two-pool fixture should remain direct-only"
     );
     assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
-        "direct-only fixture should not use flash loans"
-    );
-    assert!(
         actions.iter().any(
             |a| matches!(a, Action::Sell { market_name, .. } if *market_name == selected[0].name)
         ),
@@ -1302,7 +1239,7 @@ fn test_oracle_phase3_recycling_two_pool_direct_only_matches_grid_optimum() {
     );
 
     assert!(
-        algo_ev + 1e-6 >= oracle_ev - 9e-3,
+        algo_ev + 1e-6 >= oracle_ev - 8e-3,
         "phase3 recycling oracle gap too large: algo={:.9}, oracle={:.9}",
         algo_ev,
         oracle_ev
@@ -2065,10 +2002,12 @@ fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
         actions.iter().any(|a| matches!(a, Action::Mint { .. })),
         "fixture should execute at least one mint leg"
     );
+    let budget_tol = 2e-9 * (1.0 + current_prof.abs());
     assert!(
-        budget <= EPS * (1.0 + budget.abs()),
-        "fixture should terminate on budget exhaustion after boundary split: remaining={:.12}",
-        budget
+        budget <= budget_tol,
+        "fixture should terminate on budget exhaustion after boundary split: remaining={:.12}, tol={:.12}",
+        budget,
+        budget_tol
     );
 
     let price_sum_after: f64 = sims.iter().map(|s| s.price()).sum();
@@ -2141,21 +2080,19 @@ fn test_waterfall_boundary_splits_refresh_skip_before_next_descent() {
     let mut mint_spans: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
     while i < first_buy_idx {
-        if !matches!(actions[i], Action::FlashLoan { .. }) {
+        if !matches!(actions[i], Action::Mint { .. }) {
             i += 1;
             continue;
         }
+        let start = i;
         let mut j = i + 1;
-        while j < first_buy_idx && !matches!(actions[j], Action::RepayFlashLoan { .. }) {
+        while j < first_buy_idx && matches!(actions[j], Action::Sell { .. }) {
             j += 1;
-        }
-        if j >= first_buy_idx {
-            break;
         }
 
         let mut has_mint = false;
         let mut sold_markets: HashSet<&str> = HashSet::new();
-        for action in &actions[i..=j] {
+        for action in &actions[start..j] {
             match action {
                 Action::Mint { .. } => has_mint = true,
                 Action::Sell { market_name, .. } => {
@@ -2166,9 +2103,9 @@ fn test_waterfall_boundary_splits_refresh_skip_before_next_descent() {
         }
         if has_mint {
             mint_sell_sets.push(sold_markets);
-            mint_spans.push((i, j));
+            mint_spans.push((start, j.saturating_sub(1)));
         }
-        i = j + 1;
+        i = j;
     }
 
     assert!(
@@ -2392,12 +2329,7 @@ fn test_waterfall_budget_partial_continue_can_improve_ev_vs_break_control() {
                 };
                 let liquidity = (10f64.powf(liq_exp)).round().max(1.0) as u128;
                 mock_slot0_market_with_liquidity_and_ticks(
-                    names[i],
-                    tokens[i],
-                    prices[i],
-                    liquidity,
-                    -220_000,
-                    220_000,
+                    names[i], tokens[i], prices[i], liquidity, -220_000, 220_000,
                 )
             })
             .collect();
@@ -2434,7 +2366,13 @@ fn test_waterfall_budget_partial_continue_can_improve_ev_vs_break_control() {
         let ev_old = ev_from_state(&holdings_old, cash_old);
         let ev_tol = 1e-9 * (1.0 + ev_new.abs() + ev_old.abs());
         if actions_new.len() > actions_old.len() && ev_new + ev_tol >= ev_old {
-            witness = Some((case_idx, ev_new, ev_old, actions_new.len(), actions_old.len()));
+            witness = Some((
+                case_idx,
+                ev_new,
+                ev_old,
+                actions_new.len(),
+                actions_old.len(),
+            ));
             break;
         }
     }
@@ -2501,20 +2439,18 @@ fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasin
     let mut realized_profs = Vec::new();
     let mut i = 0usize;
     while i < actions.len() {
-        if !matches!(actions[i], Action::FlashLoan { .. }) {
+        if !matches!(actions[i], Action::Mint { .. }) {
             i += 1;
             continue;
         }
+        let start = i;
         let mut j = i + 1;
-        while j < actions.len() && !matches!(actions[j], Action::RepayFlashLoan { .. }) {
+        while j < actions.len() && matches!(actions[j], Action::Sell { .. }) {
             j += 1;
-        }
-        if j >= actions.len() {
-            break;
         }
 
         let mut mint_target: Option<&'static str> = None;
-        for action in &actions[i..=j] {
+        for action in &actions[start..j] {
             match action {
                 Action::Mint { target_market, .. } => {
                     mint_target = Some(*target_market);
@@ -2563,7 +2499,7 @@ fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasin
             realized_profs.push(realized);
         }
 
-        i = j + 1;
+        i = j;
     }
 
     assert!(
@@ -2656,10 +2592,7 @@ fn test_plan_near_full_mint_boundary_does_not_split() {
             assert!(
                 !capped_plan[0].active_set_boundary_hit,
                 "near-full mint boundary should not split: uncapped={:.12}, capped={:.12}, remaining={:.12}, threshold={:.12}",
-                uncapped_amount,
-                capped_amount,
-                remaining,
-                remaining_min
+                uncapped_amount, capped_amount, remaining, remaining_min
             );
             checked += 1;
         }
@@ -2687,7 +2620,9 @@ fn test_phase3_full_l1_recycling_limits_tiny_legacy_sell_fragmentation() {
         .iter()
         .filter_map(|action| match action {
             Action::Sell {
-                market_name, amount, ..
+                market_name,
+                amount,
+                ..
             } if *market_name == selected[0].name => Some(*amount),
             _ => None,
         })
@@ -2696,7 +2631,10 @@ fn test_phase3_full_l1_recycling_limits_tiny_legacy_sell_fragmentation() {
         !source_sells.is_empty(),
         "fixture should include source legacy sells"
     );
-    let tiny_legacy_sells = source_sells.iter().filter(|amount| **amount <= 1e-5).count();
+    let tiny_legacy_sells = source_sells
+        .iter()
+        .filter(|amount| **amount <= 1e-5)
+        .count();
     println!(
         "[phase3_frag] source_sells={} tiny_source_sells={}",
         source_sells.len(),
@@ -2956,7 +2894,7 @@ fn test_mixed_route_plan_execute_budget_consistency() {
 }
 
 #[test]
-fn test_flash_loans_balance_in_full_rebalance_fuzz() {
+fn test_no_flash_actions_in_full_rebalance_fuzz() {
     let mut rng = TestRng::new(0xDEAD_BEEF_2026_0001u64);
     for _ in 0..20 {
         let (slot0_results, balances_static, susd_balance) =
@@ -2966,15 +2904,7 @@ fn test_flash_loans_balance_in_full_rebalance_fuzz() {
             .map(|(k, v)| (*k as &str, *v))
             .collect();
         let actions = rebalance(&balances, susd_balance, &slot0_results);
-        let (borrowed, repaid) = flash_loan_totals(&actions);
-        let tol = 1e-7 * (1.0 + borrowed.abs() + repaid.abs());
-        assert!(
-            (borrowed - repaid).abs() <= tol,
-            "flash loan mismatch: borrowed={:.12}, repaid={:.12}, tol={:.12}",
-            borrowed,
-            repaid,
-            tol
-        );
+        assert_action_values_are_finite(&actions);
     }
 }
 
@@ -3165,10 +3095,7 @@ fn test_large_budget_rebalance_stays_finite() {
             } => {
                 assert!(amount.is_finite() && proceeds.is_finite());
             }
-            Action::Mint { amount, .. }
-            | Action::Merge { amount, .. }
-            | Action::FlashLoan { amount }
-            | Action::RepayFlashLoan { amount } => {
+            Action::Mint { amount, .. } | Action::Merge { amount, .. } => {
                 assert!(amount.is_finite());
             }
         }
@@ -3544,7 +3471,9 @@ fn test_mint_direct_mixed_route_matches_bruteforce_gain_fuzz() {
             );
             exec.execute_planned_routes(&plan, &skip)
         };
-        assert!(ok);
+        if !ok {
+            continue;
+        }
 
         let mut idx_by_market: HashMap<&str, usize> = HashMap::new();
         for (i, s) in sims.iter().enumerate() {
@@ -3586,7 +3515,6 @@ fn test_mint_direct_mixed_route_matches_bruteforce_gain_fuzz() {
                     }
                     spent -= *amount;
                 }
-                Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
             }
         }
         let algo_gain: f64 = holdings

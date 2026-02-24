@@ -69,9 +69,9 @@ This avoids subset arbitrage behavior and enforces strict market-completeness as
 ## Action Stream Shapes
 
 ### Buy-Merge Branch
-`FlashLoan -> Buy* -> Merge -> RepayFlashLoan`
+`Buy* -> Merge` (executed in one or more cash/liquidity-feasible rounds)
 
 ### Mint-Sell Branch
-`FlashLoan -> Mint -> Sell* -> RepayFlashLoan`
+`Mint -> Sell*` (executed in one or more cash/liquidity-feasible rounds)
 
 Both branches update simulated pool state and only realize budget gains when computed realized profit is positive.

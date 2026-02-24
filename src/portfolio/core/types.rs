@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use super::sim::{EPS, PoolSim, sanitize_nonnegative_finite};
+use super::sim::{PoolSim, sanitize_nonnegative_finite};
 
 /// Shared simulated holdings map keyed by market name.
 pub(super) type BalanceMap = HashMap<&'static str, f64>;
 
 /// A rebalancing action to execute.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Mint complete sets across both L1 contracts.
     /// Contract 1 mint produces "other repos" token used as collateral for contract 2 mint.
@@ -36,10 +36,6 @@ pub enum Action {
         amount: f64,
         source_market: &'static str,
     },
-    /// Borrow sUSD via flash loan to fund minting.
-    FlashLoan { amount: f64 },
-    /// Repay flash loan after selling minted tokens.
-    RepayFlashLoan { amount: f64 },
 }
 
 pub(super) fn lookup_balance(balances: &HashMap<&str, f64>, market_name: &str) -> f64 {
@@ -56,7 +52,7 @@ pub(super) fn subtract_balance(
     }
     let bal = sim_balances.entry(market_name).or_insert(0.0);
     *bal -= amount;
-    if *bal > -EPS && *bal < 0.0 {
+    if *bal < 0.0 {
         *bal = 0.0;
     }
 }
@@ -85,14 +81,13 @@ pub(super) fn apply_actions_to_sim_balances(
                 amount,
                 ..
             } => {
-                *sim_balances.entry(market_name).or_insert(0.0) -= amount;
+                subtract_balance(sim_balances, *market_name, *amount);
             }
             Action::Merge { amount, .. } => {
                 for sim in sims {
-                    *sim_balances.entry(sim.market_name).or_insert(0.0) -= amount;
+                    subtract_balance(sim_balances, sim.market_name, *amount);
                 }
             }
-            Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
         }
     }
 }

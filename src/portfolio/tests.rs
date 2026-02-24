@@ -219,7 +219,10 @@ fn test_mint_route_actions() {
         assert!(*name == "M2" || *name == "M3");
         assert!(*amt > 0.0);
     }
-    assert!(proceeds > 0.0, "selling non-targets should yield proceeds");
+    assert!(
+        proceeds.unwrap_or(0.0) > 0.0,
+        "selling non-targets should yield proceeds"
+    );
 
     // Test execute_buy with Route::Mint updates budget correctly
     let mut sims2: Vec<_> = slot0_results
@@ -261,7 +264,6 @@ fn test_mint_route_actions() {
                     *sim_balances.entry(sim.market_name).or_insert(0.0) -= amount;
                 }
             }
-            Action::FlashLoan { .. } | Action::RepayFlashLoan { .. } => {}
         }
     }
     // Target M1 should hold the full mint amount
@@ -279,6 +281,59 @@ fn test_mint_route_actions() {
             "{} balance should be >= 0 (residual), got {}",
             name,
             bal
+        );
+    }
+}
+
+#[test]
+fn test_execute_buy_mint_route_failure_rolls_back_state() {
+    let tokens = [
+        "0x1111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222",
+        "0x3333333333333333333333333333333333333333",
+    ];
+    let names = ["M1", "M2", "M3"];
+
+    let slot0_results: Vec<_> = tokens
+        .iter()
+        .zip(names.iter())
+        .map(|(tok, name)| mock_slot0_market(name, tok, 0.05))
+        .collect();
+    let mut sims: Vec<_> = slot0_results
+        .iter()
+        .map(|(s, m)| PoolSim::from_slot0(s, m, 0.3).unwrap())
+        .collect();
+    let sims_before = sims.clone();
+
+    let mut budget = 1.0;
+    let budget_before = budget;
+    let mut actions = Vec::new();
+    let mut sim_balances: HashMap<&str, f64> = HashMap::from([("M1", 0.5), ("M2", 1.5)]);
+    let balances_before = sim_balances.clone();
+
+    let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
+    let ok = execute_buy(&mut exec, 0, 0.0, 10.0, Route::Mint, None, &HashSet::new());
+    assert!(
+        !ok,
+        "mint route should fail when planned amount cannot be fully completed"
+    );
+
+    assert!(
+        (budget - budget_before).abs() <= 1e-12,
+        "budget should roll back on failed mint execution"
+    );
+    assert!(
+        actions.is_empty(),
+        "actions should roll back on failed mint execution"
+    );
+    assert_eq!(
+        sim_balances, balances_before,
+        "sim balances should roll back on failed mint execution"
+    );
+    for (before, after) in sims_before.iter().zip(sims.iter()) {
+        assert!(
+            (before.price() - after.price()).abs() <= 1e-12,
+            "pool prices should roll back on failed mint execution"
         );
     }
 }
@@ -318,7 +373,8 @@ fn test_complete_set_arb_executes_when_profitable() {
     // Sum prices = 0.6 < 1.0 (before fees/slippage), so complete-set buy+merge should be profitable.
     let mut sims = build_three_sims_with_preds([0.2, 0.2, 0.2], [0.3, 0.3, 0.3]);
     let mut actions = Vec::new();
-    let mut budget = 0.0;
+    let initial_budget = 100.0;
+    let mut budget = initial_budget;
 
     let profit = {
         let mut unused_bal: HashMap<&str, f64> = HashMap::new();
@@ -327,7 +383,7 @@ fn test_complete_set_arb_executes_when_profitable() {
     };
     assert!(profit > 0.0, "arb should produce positive profit");
     assert!(
-        (budget - profit).abs() < 1e-9,
+        (budget - (initial_budget + profit)).abs() < 1e-9,
         "budget increase should match realized arb profit"
     );
 
@@ -335,9 +391,9 @@ fn test_complete_set_arb_executes_when_profitable() {
         .iter()
         .filter(|a| matches!(a, Action::Buy { .. }))
         .count();
-    assert_eq!(
-        buy_count, 3,
-        "complete-set arb should buy every pooled outcome"
+    assert!(
+        buy_count >= 3,
+        "complete-set arb should buy every pooled outcome at least once"
     );
     assert!(
         actions.iter().any(|a| matches!(
@@ -350,16 +406,8 @@ fn test_complete_set_arb_executes_when_profitable() {
         "arb should emit merge action tagged as complete_set_arb"
     );
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::FlashLoan { .. })),
-        "arb legs should be funded with a flash loan"
-    );
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::RepayFlashLoan { .. })),
-        "arb legs should repay the flash loan"
+        !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+        "buy-merge arb should not emit mint actions"
     );
 }
 
@@ -391,7 +439,8 @@ fn test_complete_set_mint_sell_arb_executes_when_profitable() {
     // Sum prices = 1.5 > 1.0, so mint-all-and-sell should be profitable.
     let mut sims = build_three_sims_with_preds([0.5, 0.5, 0.5], [0.3, 0.3, 0.3]);
     let mut actions = Vec::new();
-    let mut budget = 0.0;
+    let initial_budget = 100.0;
+    let mut budget = initial_budget;
 
     let profit = {
         let mut unused_bal: HashMap<&str, f64> = HashMap::new();
@@ -400,35 +449,32 @@ fn test_complete_set_mint_sell_arb_executes_when_profitable() {
     };
     assert!(profit > 0.0, "mint-sell arb should produce positive profit");
     assert!(
-        (budget - profit).abs() < 1e-9,
+        (budget - (initial_budget + profit)).abs() < 1e-9,
         "budget increase should match realized mint-sell arb profit"
     );
 
     assert!(
-        matches!(actions.first(), Some(Action::FlashLoan { .. })),
-        "first action should be flash-loan borrow"
-    );
-    assert!(
         matches!(
-            actions.get(1),
+            actions.first(),
             Some(Action::Mint {
                 target_market: "complete_set_arb",
                 ..
             })
         ),
-        "second action should be mint tagged as complete_set_arb"
-    );
-    assert!(
-        matches!(actions.last(), Some(Action::RepayFlashLoan { .. })),
-        "last action should be flash-loan repay"
+        "first action should be mint tagged as complete_set_arb"
     );
     let sell_count = actions
         .iter()
         .filter(|a| matches!(a, Action::Sell { .. }))
         .count();
     assert_eq!(
-        sell_count, 3,
-        "mint-sell arb should sell every pooled outcome"
+        sell_count % 3,
+        0,
+        "mint-sell arb should emit full sell baskets across rounds"
+    );
+    assert!(
+        sell_count >= 3,
+        "mint-sell arb should sell every pooled outcome at least once"
     );
     assert!(
         !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
@@ -470,7 +516,8 @@ fn test_complete_set_mint_sell_arb_skips_when_unprofitable() {
 fn test_two_sided_complete_set_arb_selects_buy_merge_when_sum_below_one() {
     let mut sims = build_three_sims_with_preds([0.2, 0.2, 0.2], [0.3, 0.3, 0.3]);
     let mut actions = Vec::new();
-    let mut budget = 0.0;
+    // No-flash execution requires a positive cash seed for buy+merge rounds.
+    let mut budget = 50.0;
 
     let profit = {
         let mut unused_bal: HashMap<&str, f64> = HashMap::new();
@@ -499,7 +546,8 @@ fn test_two_sided_complete_set_arb_selects_buy_merge_when_sum_below_one() {
 fn test_two_sided_complete_set_arb_selects_mint_sell_when_sum_above_one() {
     let mut sims = build_three_sims_with_preds([0.5, 0.5, 0.5], [0.3, 0.3, 0.3]);
     let mut actions = Vec::new();
-    let mut budget = 0.0;
+    // No-flash execution requires collateral cash for mint rounds.
+    let mut budget = 50.0;
 
     let profit = {
         let mut unused_bal: HashMap<&str, f64> = HashMap::new();
@@ -605,7 +653,12 @@ fn test_rebalance_with_mode_arb_only_mint_sell_shape_only() {
         })
         .collect();
 
-    let actions = rebalance_with_mode(&HashMap::new(), 0.0, &slot0_results, RebalanceMode::ArbOnly);
+    let actions = rebalance_with_mode(
+        &HashMap::new(),
+        100.0,
+        &slot0_results,
+        RebalanceMode::ArbOnly,
+    );
     assert!(!actions.is_empty(), "arb-only mode should emit arb actions");
     assert!(
         actions.iter().any(|a| matches!(a, Action::Mint { .. })),
@@ -614,11 +667,6 @@ fn test_rebalance_with_mode_arb_only_mint_sell_shape_only() {
     assert!(
         actions.iter().any(|a| matches!(a, Action::Sell { .. })),
         "arb-only mode should include sell legs in sum(prices)>1 case"
-    );
-    assert!(
-        matches!(actions.first(), Some(Action::FlashLoan { .. }))
-            && matches!(actions.last(), Some(Action::RepayFlashLoan { .. })),
-        "arb-only action stream should be a single flash bracket"
     );
     assert!(
         !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
@@ -862,7 +910,6 @@ fn assert_rebalance_action_invariants(
     }
 
     let mut cash = initial_susd;
-    let mut flash_outstanding = 0.0_f64;
 
     for action in actions {
         match action {
@@ -923,21 +970,6 @@ fn assert_rebalance_action_invariants(
                 }
                 cash += *amount;
             }
-            Action::FlashLoan { amount } => {
-                assert!(amount.is_finite() && *amount >= 0.0);
-                flash_outstanding += *amount;
-                cash += *amount;
-            }
-            Action::RepayFlashLoan { amount } => {
-                assert!(amount.is_finite() && *amount >= 0.0);
-                flash_outstanding -= *amount;
-                assert!(
-                    flash_outstanding >= -1e-6,
-                    "repaid more flash loan than borrowed: {}",
-                    flash_outstanding
-                );
-                cash -= *amount;
-            }
         }
         assert!(
             cash.is_finite(),
@@ -945,11 +977,6 @@ fn assert_rebalance_action_invariants(
         );
     }
 
-    assert!(
-        flash_outstanding.abs() <= 1e-6,
-        "flash loan should net to zero, got {}",
-        flash_outstanding
-    );
     assert!(cash >= -1e-6, "final cash should not be negative: {}", cash);
     for (name, bal) in holdings {
         assert!(
@@ -1403,19 +1430,6 @@ fn oracle_two_pool_direct_only_best_ev_with_holdings_grid(
     }
 }
 
-fn flash_loan_totals(actions: &[Action]) -> (f64, f64) {
-    let mut borrowed = 0.0_f64;
-    let mut repaid = 0.0_f64;
-    for a in actions {
-        match a {
-            Action::FlashLoan { amount } => borrowed += *amount,
-            Action::RepayFlashLoan { amount } => repaid += *amount,
-            _ => {}
-        }
-    }
-    (borrowed, repaid)
-}
-
 fn buy_totals(actions: &[Action]) -> HashMap<&'static str, f64> {
     let mut out: HashMap<&'static str, f64> = HashMap::new();
     for a in actions {
@@ -1444,62 +1458,11 @@ fn assert_action_values_are_finite(actions: &[Action]) {
                 assert!(amount.is_finite() && *amount >= 0.0);
                 assert!(proceeds.is_finite() && *proceeds >= 0.0);
             }
-            Action::Mint { amount, .. }
-            | Action::Merge { amount, .. }
-            | Action::FlashLoan { amount }
-            | Action::RepayFlashLoan { amount } => {
+            Action::Mint { amount, .. } | Action::Merge { amount, .. } => {
                 assert!(amount.is_finite() && *amount >= 0.0);
             }
         }
     }
-}
-
-fn assert_flash_loan_ordering(actions: &[Action]) -> usize {
-    let mut open_loan: Option<f64> = None;
-    let mut steps_inside = 0usize;
-    let mut brackets = 0usize;
-
-    for action in actions {
-        match action {
-            Action::FlashLoan { amount } => {
-                assert!(
-                    open_loan.is_none(),
-                    "nested FlashLoan bracket is not allowed"
-                );
-                open_loan = Some(*amount);
-                steps_inside = 0;
-                brackets += 1;
-            }
-            Action::RepayFlashLoan { amount } => {
-                let borrowed = open_loan
-                    .take()
-                    .expect("RepayFlashLoan must close an open FlashLoan bracket");
-                assert!(
-                    steps_inside > 0,
-                    "flash bracket should contain at least one operation"
-                );
-                let tol = 1e-8 * (1.0 + borrowed.abs() + amount.abs());
-                assert!(
-                    (borrowed - *amount).abs() <= tol,
-                    "flash bracket amount mismatch: borrowed={:.12}, repaid={:.12}, tol={:.12}",
-                    borrowed,
-                    amount,
-                    tol
-                );
-            }
-            Action::Buy { .. }
-            | Action::Sell { .. }
-            | Action::Mint { .. }
-            | Action::Merge { .. } => {
-                if open_loan.is_some() {
-                    steps_inside += 1;
-                }
-            }
-        }
-    }
-
-    assert!(open_loan.is_none(), "unterminated FlashLoan bracket");
-    brackets
 }
 
 #[derive(Clone)]

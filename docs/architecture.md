@@ -57,7 +57,7 @@ API (deep.seer.pm)
 - **src/execution/edge.rs**: Group cashflow/EV edge derivation helpers
 - **src/execution/batch_bounds.rs**: Aggregate `sell(min)` / `buy(max)` bound derivation + plan stamping
 - **src/execution/gas.rs**: L2/L1 gas estimate model + cached Optimism L1 fee-per-byte hydration
-- **src/execution/grouping.rs**: Strict action grouping, profitability-step formation, and flash-bracket shape validation
+- **src/execution/grouping.rs**: Strict action grouping, profitability-step formation, and route-shape validation (`Mint->Sell+`, `Buy+->Merge`)
 - **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
 - **src/portfolio/core/mod.rs**: Portfolio core aggregation module
 - **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers

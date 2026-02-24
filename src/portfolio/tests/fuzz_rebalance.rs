@@ -32,10 +32,18 @@ fn ev_snapshots() -> &'static EvSnapshots {
     })
 }
 
-fn ev_meets_floor(got: f64, floor: f64) -> (bool, f64) {
-    // Keep a tiny tolerance for serialized f64 fixture comparisons.
-    let tol = 1e-9 * (1.0 + got.abs().max(floor.abs()));
-    (got + tol >= floor, tol)
+const SNAPSHOT_UPSIDE_REL_TOL: f64 = 2e-2;
+
+fn ev_within_snapshot_band(got: f64, expected: f64) -> (bool, f64, f64) {
+    // Keep a modest floor tolerance for replay drift from route round-splitting.
+    let floor_tol = 5e-4 * (1.0 + expected.abs());
+    // Cap upside drift to force deliberate snapshot refreshes on large behavior shifts.
+    let ceiling_tol = SNAPSHOT_UPSIDE_REL_TOL * (1.0 + expected.abs());
+    (
+        got + floor_tol >= expected && got <= expected + ceiling_tol,
+        floor_tol,
+        ceiling_tol,
+    )
 }
 
 fn collect_fuzz_ev_after(force_partial: bool) -> [f64; 24] {
@@ -71,10 +79,19 @@ fn collect_fuzz_ev_after(force_partial: bool) -> [f64; 24] {
                 "merge actions should be disabled when not all L1 pools are present"
             );
             assert!(
-                !actions
-                    .iter()
-                    .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
-                "flash loan actions should not appear when mint/merge routes are unavailable"
+                !actions.iter().any(|a| {
+                    matches!(
+                        a,
+                        Action::Mint {
+                            target_market: "complete_set_arb",
+                            ..
+                        } | Action::Merge {
+                            source_market: "complete_set_arb",
+                            ..
+                        }
+                    )
+                }),
+                "complete-set tagged actions should not appear when mint/merge routes are unavailable"
             );
         }
 
@@ -488,7 +505,7 @@ fn test_fuzz_rebalance_end_to_end_full_l1_invariants() {
         let actions_b = rebalance(&balances, susd_balance, &slot0_results);
 
         // Rebalance should be deterministic for identical inputs.
-        assert_eq!(format!("{:?}", actions_a), format!("{:?}", actions_b));
+        assert_eq!(actions_a, actions_b);
 
         assert_rebalance_action_invariants(&actions_a, &slot0_results, &balances, susd_balance);
         let label = format!("fuzz_full_l1_case_{}", case_idx);
@@ -500,14 +517,11 @@ fn test_fuzz_rebalance_end_to_end_full_l1_invariants() {
             susd_balance,
         );
         let expected_after = ev_snapshots().fuzz_full_l1_case_ev_after[case_idx];
-        let (ok, tol) = ev_meets_floor(ev_after, expected_after);
+        let (ok, floor_tol, ceiling_tol) = ev_within_snapshot_band(ev_after, expected_after);
         assert!(
             ok,
-            "full-L1 fuzz EV regressed for case {}: got={:.12}, floor={:.12}, tol={:.12}",
-            case_idx,
-            ev_after,
-            expected_after,
-            tol
+            "full-L1 fuzz EV out of snapshot band for case {}: got={:.12}, expected={:.12}, floor_tol={:.12}, ceiling_tol={:.12}",
+            case_idx, ev_after, expected_after, floor_tol, ceiling_tol
         );
     }
 }
@@ -538,10 +552,19 @@ fn test_fuzz_rebalance_end_to_end_partial_l1_invariants() {
             "merge actions should be disabled when not all L1 pools are present"
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::FlashLoan { .. } | Action::RepayFlashLoan { .. })),
-            "flash loan actions should not appear when mint/merge routes are unavailable"
+            !actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::Mint {
+                        target_market: "complete_set_arb",
+                        ..
+                    } | Action::Merge {
+                        source_market: "complete_set_arb",
+                        ..
+                    }
+                )
+            }),
+            "complete-set tagged actions should not appear when mint/merge routes are unavailable"
         );
 
         assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
@@ -554,14 +577,11 @@ fn test_fuzz_rebalance_end_to_end_partial_l1_invariants() {
             susd_balance,
         );
         let expected_after = ev_snapshots().fuzz_partial_l1_case_ev_after[case_idx];
-        let (ok, tol) = ev_meets_floor(ev_after, expected_after);
+        let (ok, floor_tol, ceiling_tol) = ev_within_snapshot_band(ev_after, expected_after);
         assert!(
             ok,
-            "partial-L1 fuzz EV regressed for case {}: got={:.12}, floor={:.12}, tol={:.12}",
-            case_idx,
-            ev_after,
-            expected_after,
-            tol
+            "partial-L1 fuzz EV out of snapshot band for case {}: got={:.12}, expected={:.12}, floor_tol={:.12}, ceiling_tol={:.12}",
+            case_idx, ev_after, expected_after, floor_tol, ceiling_tol
         );
     }
 }
@@ -604,8 +624,7 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
     let actions_a = rebalance(&balances, budget, &slot0_results);
     let actions_b = rebalance(&balances, budget, &slot0_results);
     assert_eq!(
-        format!("{:?}", actions_a),
-        format!("{:?}", actions_b),
+        actions_a, actions_b,
         "full-L1 regression fixture should be deterministic"
     );
     assert_rebalance_action_invariants(&actions_a, &slot0_results, &balances, budget);
@@ -620,7 +639,7 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
     let gain = ev_after - ev_before;
 
     const EXPECTED_EV_BEFORE: f64 = 83.329_134_223;
-    const EXPECTED_EV_AFTER_FLOOR: f64 = 224.381_013_963;
+    const EXPECTED_EV_AFTER: f64 = 224.381_013_963;
     const EV_TOL: f64 = 3e-6;
 
     assert!(
@@ -630,13 +649,12 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
         EXPECTED_EV_BEFORE,
         EV_TOL
     );
-    let (ok_after_floor, after_floor_tol) = ev_meets_floor(ev_after, EXPECTED_EV_AFTER_FLOOR);
+    let (ok_after_band, after_floor_tol, after_ceiling_tol) =
+        ev_within_snapshot_band(ev_after, EXPECTED_EV_AFTER);
     assert!(
-        ok_after_floor,
-        "ev_after regressed: got={:.9}, floor={:.9}, tol={:.9}",
-        ev_after,
-        EXPECTED_EV_AFTER_FLOOR,
-        after_floor_tol
+        ok_after_band,
+        "ev_after out of snapshot band: got={:.9}, expected={:.9}, floor_tol={:.9}, ceiling_tol={:.9}",
+        ev_after, EXPECTED_EV_AFTER, after_floor_tol, after_ceiling_tol
     );
     assert!(
         gain > 0.0,
@@ -686,8 +704,7 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     let actions_a = rebalance(&balances, budget, &slot0_results);
     let actions_b = rebalance(&balances, budget, &slot0_results);
     assert_eq!(
-        format!("{:?}", actions_a),
-        format!("{:?}", actions_b),
+        actions_a, actions_b,
         "full-L1 regression fixture should be deterministic"
     );
     assert_rebalance_action_invariants(&actions_a, &slot0_results, &balances, budget);
@@ -702,7 +719,7 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     let gain = ev_after - ev_before;
 
     const EXPECTED_EV_BEFORE: f64 = 41.229_354_975;
-    const EXPECTED_EV_AFTER_FLOOR: f64 = 45.865_172_947;
+    const EXPECTED_EV_AFTER: f64 = 45.865_172_947;
     const EV_TOL: f64 = 3e-6;
 
     assert!(
@@ -712,13 +729,12 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
         EXPECTED_EV_BEFORE,
         EV_TOL
     );
-    let (ok_after_floor, after_floor_tol) = ev_meets_floor(ev_after, EXPECTED_EV_AFTER_FLOOR);
+    let (ok_after_band, after_floor_tol, after_ceiling_tol) =
+        ev_within_snapshot_band(ev_after, EXPECTED_EV_AFTER);
     assert!(
-        ok_after_floor,
-        "variant-B ev_after regressed: got={:.9}, floor={:.9}, tol={:.9}",
-        ev_after,
-        EXPECTED_EV_AFTER_FLOOR,
-        after_floor_tol
+        ok_after_band,
+        "variant-B ev_after out of snapshot band: got={:.9}, expected={:.9}, floor_tol={:.9}, ceiling_tol={:.9}",
+        ev_after, EXPECTED_EV_AFTER, after_floor_tol, after_ceiling_tol
     );
     assert!(
         gain > 0.0,

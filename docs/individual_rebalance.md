@@ -150,10 +150,10 @@ The mint route returns two cost metrics:
 
 ```
 cash_cost(m)  = m − Σⱼ≠ᵢ Pⱼ × mⱼ × (1−f) / (1 + mⱼ × κⱼ)
-value_cost(m) = cash_cost(m) − Σⱼ∈capped predⱼ × (m − mⱼ)
+value_cost(m) = cash_cost(m)    // under full-route executable cap
 ```
 
-where mⱼ = min(m, M_cap_j). `cash_cost` is the actual sUSD spent (used for budget feasibility). `value_cost` subtracts the expected value of unsold tokens from saturated pools, reflecting the true economic cost of the position.
+where mⱼ = min(m, M_cap_j). In the current no-flash execution model, mint sizing is capped by the minimum required-leg sell cap, so minted rounds stay fully executable as `Mint -> Sell*` without unsold-leg dependence.
 
 The derivative d(cash_cost)/dm = 1 − (1−f) × Σⱼ∈uncapped Pⱼ(m). Both costs and the cash derivative with respect to π* (via the implicit function theorem, dm/dπ = P_target / ((1 + π*) × g'(m))) are computed in a single pass. The budget solver uses cash_cost to ensure feasibility.
 
