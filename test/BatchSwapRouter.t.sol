@@ -37,10 +37,11 @@ contract BatchSwapRouterTest is Test {
         address[] memory tokens = new address[](1);
         tokens[0] = address(tokenIn);
 
-        uint256 out = batch.exactInput(tokenOut, 10, 0, 500, 77, tokens);
+        uint256 out = batch.exactInput(tokens, address(tokenOut), 10, 0, 500, 77);
 
         assertEq(out, 15);
         assertEq(tokenOut.balanceOf(address(this)), 15);
+        assertEq(tokenIn.balanceOf(address(batch)), 0);
         assertEq(router.exactInputCalls(), 1);
         (address lastTokenIn, address lastTokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) =
             router.lastExactInput();
@@ -60,10 +61,12 @@ contract BatchSwapRouterTest is Test {
         tokens[0] = address(tokenIn);
         tokens[1] = address(tokenIn);
 
-        uint256 out = batch.exactInput(tokenOut, 10, 12, 500, 0, tokens);
+        uint256 out = batch.exactInput(tokens, address(tokenOut), 10, 12, 500, 0);
 
         assertEq(out, 12);
         assertEq(tokenOut.balanceOf(address(this)), 12);
+        assertEq(tokenIn.balanceOf(address(this)), 1_000_000 - 20);
+        assertEq(tokenIn.balanceOf(address(batch)), 0);
         assertEq(router.exactInputCalls(), 2);
     }
 
@@ -74,20 +77,20 @@ contract BatchSwapRouterTest is Test {
         tokens[0] = address(tokenIn);
         tokens[1] = address(tokenInAlt);
 
-        uint256 out = batch.exactInput(tokenOut, 10, 10, 500, 0, tokens);
+        uint256 out = batch.exactInput(tokens, address(tokenOut), 10, 10, 500, 0);
 
         assertEq(out, 10);
         assertEq(tokenOut.balanceOf(address(this)), 10);
         assertEq(tokenIn.balanceOf(address(this)), 1_000_000 - 10);
         assertEq(tokenInAlt.balanceOf(address(this)), 1_000_000 - 10);
-        assertEq(tokenIn.allowance(address(batch), address(router)), 10);
-        assertEq(tokenInAlt.allowance(address(batch), address(router)), 10);
+        assertEq(tokenIn.allowance(address(batch), address(router)), 0);
+        assertEq(tokenInAlt.allowance(address(batch), address(router)), 0);
     }
 
     function testExactInputEmptyArrayReturnsZeroAtMinZero() public {
         address[] memory tokens = new address[](0);
 
-        uint256 out = batch.exactInput(tokenOut, 10, 0, 500, 0, tokens);
+        uint256 out = batch.exactInput(tokens, address(tokenOut), 10, 0, 500, 0);
 
         assertEq(out, 0);
         assertEq(router.exactInputCalls(), 0);
@@ -99,7 +102,7 @@ contract BatchSwapRouterTest is Test {
         address[] memory tokens = new address[](1);
         tokens[0] = address(tokenOut);
 
-        uint256 inSpent = batch.exactOutput(tokenIn, 4, 10, 500, 123, tokens);
+        uint256 inSpent = batch.exactOutput(tokens, address(tokenIn), 4, 10, 500, 123);
 
         assertEq(inSpent, 7);
         assertEq(tokenOut.balanceOf(address(this)), 4);
@@ -123,7 +126,7 @@ contract BatchSwapRouterTest is Test {
         tokens[0] = address(tokenOut);
         tokens[1] = address(tokenOutAlt);
 
-        uint256 inSpent = batch.exactOutput(tokenIn, 5, 10, 500, 0, tokens);
+        uint256 inSpent = batch.exactOutput(tokens, address(tokenIn), 5, 10, 500, 0);
 
         assertEq(inSpent, 6);
         assertEq(tokenOut.balanceOf(address(this)), 5);
@@ -141,7 +144,7 @@ contract BatchSwapRouterTest is Test {
         tokens[1] = address(tokenOutAlt);
         tokens[2] = address(tokenOut);
 
-        uint256 inSpent = batch.exactOutput(tokenIn, 1, 9, 500, 0, tokens);
+        uint256 inSpent = batch.exactOutput(tokens, address(tokenIn), 1, 9, 500, 0);
 
         assertEq(inSpent, 9);
         assertEq(router.exactOutputCalls(), 3);
@@ -159,7 +162,7 @@ contract BatchSwapRouterTest is Test {
         tokens[0] = address(tokenOut);
         tokens[1] = address(tokenOutAlt);
 
-        uint256 inSpent = batch.exactOutput(tokenIn, 2, 10, 500, 0, tokens);
+        uint256 inSpent = batch.exactOutput(tokens, address(tokenIn), 2, 10, 500, 0);
 
         assertEq(inSpent, 10);
         assertEq(tokenIn.balanceOf(address(batch)), 0);
@@ -175,7 +178,7 @@ contract BatchSwapRouterTest is Test {
         tokens[0] = address(tokenOut);
 
         uint256 before = tokenIn.balanceOf(address(this));
-        uint256 inSpent = batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
+        uint256 inSpent = batch.exactOutput(tokens, address(tokenIn), 1, 10, 500, 0);
 
         assertEq(inSpent, 10);
         assertEq(tokenIn.balanceOf(address(this)), before - 10);

@@ -47,7 +47,7 @@ contract BatchSwapRouterFuzzTest is Test {
         uint256 tokenInBefore = tokenIn.balanceOf(address(this));
         uint256 tokenInAltBefore = tokenInAlt.balanceOf(address(this));
 
-        uint256 amountOut = batch.exactInput(tokenOut, amountInPerSwap, expectedOut, 500, 0, tokens);
+        uint256 amountOut = batch.exactInput(tokens, address(tokenOut), amountInPerSwap, expectedOut, 500, 0);
 
         uint256 tokenInSwapCount = (count + 1) / 2;
         uint256 tokenInAltSwapCount = count - tokenInSwapCount;
@@ -55,6 +55,7 @@ contract BatchSwapRouterFuzzTest is Test {
         assertEq(tokenOut.balanceOf(address(this)), expectedOut);
         assertEq(tokenInBefore - tokenIn.balanceOf(address(this)), amountInPerSwap * tokenInSwapCount);
         assertEq(tokenInAltBefore - tokenInAlt.balanceOf(address(this)), amountInPerSwap * tokenInAltSwapCount);
+        assertEq(router.exactInputCalls(), count);
     }
 
     function testFuzzExactInputRevertsWhenMinimumTooHigh(
@@ -77,7 +78,7 @@ contract BatchSwapRouterFuzzTest is Test {
         }
 
         vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
-        batch.exactInput(tokenOut, amountInPerSwap, minimumTooHigh, 500, 0, tokens);
+        batch.exactInput(tokens, address(tokenOut), amountInPerSwap, minimumTooHigh, 500, 0);
     }
 
     function testFuzzExactOutputTracksRemainingBudgetAndRefunds(
@@ -105,7 +106,7 @@ contract BatchSwapRouterFuzzTest is Test {
         uint256 tokenOutBefore = tokenOut.balanceOf(address(this));
         uint256 tokenOutAltBefore = tokenOutAlt.balanceOf(address(this));
 
-        uint256 amountIn = batch.exactOutput(tokenIn, amountOutPerSwap, amountInTotalMax, 500, 0, tokens);
+        uint256 amountIn = batch.exactOutput(tokens, address(tokenIn), amountOutPerSwap, amountInTotalMax, 500, 0);
 
         uint256 tokenOutSwapCount = (count + 1) / 2;
         uint256 tokenOutAltSwapCount = count - tokenOutSwapCount;
@@ -141,6 +142,6 @@ contract BatchSwapRouterFuzzTest is Test {
         }
 
         vm.expectRevert(MockV3SwapRouter.AmountInMaximumExceeded.selector);
-        batch.exactOutput(tokenIn, 1, amountInTotalMax, 500, 0, tokens);
+        batch.exactOutput(tokens, address(tokenIn), 1, amountInTotalMax, 500, 0);
     }
 }

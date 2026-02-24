@@ -28,7 +28,7 @@ contract BatchSwapRouterBranchTest is Test {
         tokens[0] = address(tokenIn);
 
         vm.expectRevert(BatchSwapRouter.TransferFailed.selector);
-        batch.exactInput(tokenOut, 1, 0, 500, 0, tokens);
+        batch.exactInput(tokens, address(tokenOut), 1, 0, 500, 0);
     }
 
     function testExactInputRevertsOnApprovalFailed() public {
@@ -38,7 +38,7 @@ contract BatchSwapRouterBranchTest is Test {
         tokens[0] = address(tokenIn);
 
         vm.expectRevert(BatchSwapRouter.ApprovalFailed.selector);
-        batch.exactInput(tokenOut, 1, 0, 500, 0, tokens);
+        batch.exactInput(tokens, address(tokenOut), 1, 0, 500, 0);
     }
 
     function testExactInputRevertsOnAggregateSlippage() public {
@@ -48,26 +48,26 @@ contract BatchSwapRouterBranchTest is Test {
         tokens[0] = address(tokenIn);
 
         vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
-        batch.exactInput(tokenOut, 1, 4, 500, 0, tokens);
+        batch.exactInput(tokens, address(tokenOut), 1, 4, 500, 0);
     }
 
-    function testExactInputIgnoresTokenOutTransferFlag() public {
+    function testExactInputBatchRouterDoesNotDeliverTokenOut() public {
         router.setExactInputSingleReturn(2);
-        tokenOut.setTransferResult(false);
+        router.setMintTokenOutOnExactInput(false);
 
         address[] memory tokens = new address[](1);
         tokens[0] = address(tokenIn);
 
-        uint256 amountOut = batch.exactInput(tokenOut, 1, 0, 500, 0, tokens);
+        uint256 amountOut = batch.exactInput(tokens, address(tokenOut), 1, 0, 500, 0);
         assertEq(amountOut, 2);
-        assertEq(tokenOut.balanceOf(address(this)), 2);
+        assertEq(tokenOut.balanceOf(address(this)), 0); // delivery is the router's responsibility
     }
 
     function testExactInputEmptyArrayRevertsForPositiveMin() public {
         address[] memory tokens = new address[](0);
 
         vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
-        batch.exactInput(tokenOut, 1, 1, 500, 0, tokens);
+        batch.exactInput(tokens, address(tokenOut), 1, 1, 500, 0);
     }
 
     function testExactOutputRevertsOnInitialTransferFromFailed() public {
@@ -77,7 +77,7 @@ contract BatchSwapRouterBranchTest is Test {
         tokens[0] = address(tokenOut);
 
         vm.expectRevert(BatchSwapRouter.TransferFailed.selector);
-        batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
+        batch.exactOutput(tokens, address(tokenIn), 1, 10, 500, 0);
     }
 
     function testExactOutputRevertsOnApprovalFailed() public {
@@ -87,19 +87,19 @@ contract BatchSwapRouterBranchTest is Test {
         tokens[0] = address(tokenOut);
 
         vm.expectRevert(BatchSwapRouter.ApprovalFailed.selector);
-        batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
+        batch.exactOutput(tokens, address(tokenIn), 1, 10, 500, 0);
     }
 
-    function testExactOutputIgnoresTokenOutTransferFlag() public {
+    function testExactOutputBatchRouterDoesNotDeliverTokenOut() public {
         router.setExactOutputSingleReturn(2);
-        tokenOut.setTransferResult(false);
+        router.setMintTokenOutOnExactOutput(false);
 
         address[] memory tokens = new address[](1);
         tokens[0] = address(tokenOut);
 
-        uint256 amountIn = batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
+        uint256 amountIn = batch.exactOutput(tokens, address(tokenIn), 1, 10, 500, 0);
         assertEq(amountIn, 2);
-        assertEq(tokenOut.balanceOf(address(this)), 1);
+        assertEq(tokenOut.balanceOf(address(this)), 0); // delivery is the router's responsibility
     }
 
     function testExactOutputRevertsWhenAggregateSpentExceedsMax() public {
@@ -110,7 +110,7 @@ contract BatchSwapRouterBranchTest is Test {
         tokens[1] = address(tokenOut);
 
         vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
-        batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
+        batch.exactOutput(tokens, address(tokenIn), 1, 10, 500, 0);
     }
 
     function testExactOutputRevertsWhenPerSwapRemainingMaximumExceeded() public {
@@ -122,7 +122,7 @@ contract BatchSwapRouterBranchTest is Test {
         tokens[1] = address(tokenOut);
 
         vm.expectRevert(MockV3SwapRouter.AmountInMaximumExceeded.selector);
-        batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
+        batch.exactOutput(tokens, address(tokenIn), 1, 10, 500, 0);
     }
 
     function testExactOutputRevertsWhenRefundTransferFails() public {
@@ -133,16 +133,18 @@ contract BatchSwapRouterBranchTest is Test {
         tokens[0] = address(tokenOut);
 
         vm.expectRevert(BatchSwapRouter.TransferFailed.selector);
-        batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
+        batch.exactOutput(tokens, address(tokenIn), 1, 10, 500, 0);
     }
 
     function testExactOutputEmptyArrayRefundsAllInput() public {
         address[] memory tokens = new address[](0);
 
         uint256 before = tokenIn.balanceOf(address(this));
-        uint256 spent = batch.exactOutput(tokenIn, 1, 10, 500, 0, tokens);
+        uint256 spent = batch.exactOutput(tokens, address(tokenIn), 1, 10, 500, 0);
 
         assertEq(spent, 0);
         assertEq(tokenIn.balanceOf(address(this)), before);
+        assertEq(tokenIn.balanceOf(address(batch)), 0);
+        assertEq(router.exactOutputCalls(), 0);
     }
 }

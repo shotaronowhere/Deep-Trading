@@ -72,6 +72,7 @@ contract MockV3SwapRouter is IV3SwapRouter {
 
     bool public mintTokenOutOnExactInput = true;
     bool public mintTokenOutOnExactOutput = true;
+    bool public pullTokenInOnExactInput = true;
     bool public pullTokenInOnExactOutput = true;
     bool public enforceAmountInMaximumOnExactOutput;
 
@@ -98,6 +99,10 @@ contract MockV3SwapRouter is IV3SwapRouter {
         mintTokenOutOnExactOutput = value;
     }
 
+    function setPullTokenInOnExactInput(bool value) external {
+        pullTokenInOnExactInput = value;
+    }
+
     function setPullTokenInOnExactOutput(bool value) external {
         pullTokenInOnExactOutput = value;
     }
@@ -110,6 +115,10 @@ contract MockV3SwapRouter is IV3SwapRouter {
         exactInputCalls += 1;
         lastExactInput = params;
         amountOut = exactInputSingleReturn;
+
+        if (pullTokenInOnExactInput && params.amountIn > 0) {
+            IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);
+        }
 
         if (mintTokenOutOnExactInput && amountOut > 0) {
             IMintableToken(params.tokenOut).mint(params.recipient, amountOut);
