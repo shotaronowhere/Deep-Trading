@@ -10,24 +10,37 @@ use super::trading::ExecutionState;
 
 /// Find the highest-profitability (outcome, route) pair not already in the active set.
 /// Scans current pool state each call, so mint perturbations are reflected immediately.
+///
+/// `remaining_budget`, `gas_direct_susd`, `gas_mint_susd`: gas-aware minimum-trade filter.
+/// An outcome is only admitted if `remaining_budget × prof >= gas_cost`, i.e. the maximum
+/// possible profit from the remaining budget covers the gas cost. Pass `0.0` to disable.
 pub(super) fn best_non_active(
     sims: &[PoolSim],
     active_set: &HashSet<(usize, Route)>,
     mint_available: bool,
     price_sum: f64,
+    remaining_budget: f64,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
 ) -> Option<(usize, Route, f64)> {
     let mut best: Option<(usize, Route, f64)> = None;
     for (i, sim) in sims.iter().enumerate() {
         if !active_set.contains(&(i, Route::Direct)) {
             let prof = profitability(sim.prediction, sim.price());
-            if prof > 0.0 && best.is_none_or(|b| prof > b.2) {
+            if prof > 0.0
+                && remaining_budget * prof >= gas_direct_susd
+                && best.is_none_or(|b| prof > b.2)
+            {
                 best = Some((i, Route::Direct, prof));
             }
         }
         if mint_available && !active_set.contains(&(i, Route::Mint)) {
             let mp = alt_price(sims, i, price_sum);
             let prof = profitability(sim.prediction, mp);
-            if prof > 0.0 && best.is_none_or(|b| prof > b.2) {
+            if prof > 0.0
+                && remaining_budget * prof >= gas_mint_susd
+                && best.is_none_or(|b| prof > b.2)
+            {
                 best = Some((i, Route::Mint, prof));
             }
         }
@@ -78,6 +91,8 @@ pub(super) fn waterfall(
     budget: &mut f64,
     actions: &mut Vec<Action>,
     mint_available: bool,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
 ) -> f64 {
     if *budget <= 0.0 {
         return 0.0;
@@ -88,7 +103,7 @@ pub(super) fn waterfall(
     let mut active_set: HashSet<(usize, Route)> = HashSet::new();
 
     // Seed active set with the highest-profitability entry.
-    let first = match best_non_active(sims, &active_set, mint_available, price_sum) {
+    let first = match best_non_active(sims, &active_set, mint_available, price_sum, *budget, gas_direct_susd, gas_mint_susd) {
         Some(entry) if entry.2 > 0.0 => entry,
         _ => return 0.0,
     };
@@ -112,7 +127,7 @@ pub(super) fn waterfall(
         // If a mint perturbed prices and pushed an entry above current_prof,
         // absorb it into active immediately (no cost step needed).
         loop {
-            match best_non_active(sims, &active_set, mint_available, price_sum) {
+            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, gas_direct_susd, gas_mint_susd) {
                 Some((idx, route, prof)) if prof > current_prof => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -121,7 +136,7 @@ pub(super) fn waterfall(
             }
         }
 
-        let next = best_non_active(sims, &active_set, mint_available, price_sum);
+        let next = best_non_active(sims, &active_set, mint_available, price_sum, *budget, gas_direct_susd, gas_mint_susd);
         let target_prof = match next {
             Some((_, _, p)) if p > 0.0 => p,
             _ => 0.0,
@@ -207,7 +222,7 @@ pub(super) fn waterfall(
             stalled_continues = 0;
 
             // Re-query best entry from post-execution state
-            match best_non_active(sims, &active_set, mint_available, price_sum) {
+            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, gas_direct_susd, gas_mint_susd) {
                 Some((idx, route, prof)) if prof > 0.0 => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -327,4 +342,111 @@ pub(super) fn waterfall(
     }
 
     last_prof
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markets::{MarketData, Pool, Tick, MARKETS_L1};
+    use crate::pools::{Slot0Result, prediction_to_sqrt_price_x96};
+    use alloy::primitives::{Address, U256};
+
+    /// Minimal PoolSim for waterfall tests: price ~= price_frac, prediction = pred.
+    /// Uses Box::leak to produce 'static references (test process memory, not freed).
+    fn make_sim(name: &'static str, token: &'static str, price_frac: f64, pred: f64) -> PoolSim {
+        let liq_str: &'static str =
+            Box::leak("1000000000000000000000".to_string().into_boxed_str());
+        let ticks: &'static [Tick] = Box::leak(Box::new([
+            Tick { tick_idx: 1, liquidity_net: 1_000_000_000_000_000_000_000 },
+            Tick { tick_idx: 92108, liquidity_net: -1_000_000_000_000_000_000_000 },
+        ]));
+        let pool: &'static Pool = Box::leak(Box::new(Pool {
+            token0: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
+            token1: token,
+            pool_id: "0x0000000000000000000000000000000000000001",
+            liquidity: liq_str,
+            ticks,
+        }));
+        let sqrt = prediction_to_sqrt_price_x96(price_frac, true)
+            .unwrap_or(U256::from(1u128 << 96));
+        let market: &'static MarketData = Box::leak(Box::new(MarketData {
+            name,
+            market_id: MARKETS_L1[0].market_id,
+            outcome_token: token,
+            pool: Some(*pool),
+            quote_token: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
+        }));
+        let slot0 = Slot0Result {
+            pool_id: Address::ZERO,
+            sqrt_price_x96: sqrt,
+            tick: 0,
+            observation_index: 0,
+            observation_cardinality: 0,
+            observation_cardinality_next: 0,
+            fee_protocol: 0,
+            unlocked: true,
+        };
+        PoolSim::from_slot0(&slot0, market, pred).unwrap()
+    }
+
+    #[test]
+    fn waterfall_skips_outcome_when_budget_below_break_even() {
+        // profitability ≈ (0.0101 - 0.01) / 0.01 = 1% = 0.01
+        // gas_direct = $0.50, break-even min budget = 0.50 / 0.01 = $50
+        // budget = $1 < $50 → outcome must be skipped → zero actions
+        let mut sims =
+            vec![make_sim("m1", "0x1111111111111111111111111111111111111111", 0.01, 0.0101)];
+        let mut budget = 1.0_f64;
+        let mut actions = vec![];
+
+        let last_prof = waterfall(
+            &mut sims,
+            &mut budget,
+            &mut actions,
+            false,
+            0.50, // gas_direct_susd: $0.50
+            2.00, // gas_mint_susd: $2.00
+        );
+        assert!(
+            actions.is_empty(),
+            "budget $1 at 1% profitability cannot cover $0.50 gas; got {} actions, last_prof={last_prof}",
+            actions.len()
+        );
+        assert!(
+            (budget - 1.0).abs() < 1e-9,
+            "budget must be unchanged when all trades skipped; got {budget}"
+        );
+    }
+
+    #[test]
+    fn waterfall_executes_when_budget_above_break_even() {
+        // Same outcome, budget = $100; break-even = $50; $100 > $50 → should trade
+        let mut sims =
+            vec![make_sim("m2", "0x2222222222222222222222222222222222222222", 0.01, 0.0101)];
+        let mut budget = 100.0_f64;
+        let mut actions = vec![];
+
+        let _last_prof =
+            waterfall(&mut sims, &mut budget, &mut actions, false, 0.50, 2.00);
+        assert!(
+            !actions.is_empty(),
+            "budget $100 at 1% profitability must exceed $0.50 gas break-even; got 0 actions"
+        );
+    }
+
+    #[test]
+    fn waterfall_with_zero_gas_thresholds_behaves_as_before() {
+        // gas_direct=0, gas_mint=0 → no filtering, same as old signature
+        let mut sims =
+            vec![make_sim("m3", "0x3333333333333333333333333333333333333333", 0.01, 0.0101)];
+        let mut budget = 1.0_f64;
+        let mut actions = vec![];
+
+        let _last_prof =
+            waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
+        assert!(
+            !actions.is_empty(),
+            "with zero gas thresholds, any positive profitability should produce actions"
+        );
+    }
 }

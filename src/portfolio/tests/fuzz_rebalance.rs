@@ -362,7 +362,7 @@ fn test_fuzz_waterfall_direct_equalizes_uncapped_profitability() {
         let mut budget = initial_budget;
         let mut actions = Vec::new();
 
-        let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false);
+        let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
 
         assert!(last_prof.is_finite());
         assert!(budget.is_finite());

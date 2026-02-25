@@ -8,7 +8,7 @@ mod trading;
 mod types;
 mod waterfall;
 
-pub use rebalancer::{RebalanceMode, rebalance, rebalance_with_mode};
+pub use rebalancer::{RebalanceMode, rebalance, rebalance_with_gas, rebalance_with_mode};
 pub use types::Action;
 
 #[cfg(test)]

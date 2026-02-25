@@ -254,6 +254,35 @@ pub fn estimate_total_gas_susd(
     gas_l2_susd + gas_l1_susd
 }
 
+/// Estimated total gas cost in sUSD for a single trade group of the given kind.
+///
+/// Uses the L1 data fee floor when no L1 fee-per-byte is set.
+/// `sell_legs` / `buy_legs` are the number of swap legs in the group.
+pub fn estimate_min_gas_susd_for_group(
+    assumptions: &GasAssumptions,
+    kind: GroupKind,
+    buy_legs: usize,
+    sell_legs: usize,
+    gas_price_eth: f64,
+    eth_usd: f64,
+) -> f64 {
+    let l2_units = estimate_group_l2_gas_units(assumptions, kind, buy_legs, sell_legs);
+    let gas_l2 = estimate_l2_gas_susd(l2_units, gas_price_eth, eth_usd);
+    if !gas_l2.is_finite() || gas_l2 < 0.0 {
+        return f64::INFINITY;
+    }
+
+    let gas_l1 = if assumptions.l1_fee_per_byte_wei > 0.0 {
+        estimate_group_l1_data_fee_susd(assumptions, kind, buy_legs, sell_legs, eth_usd)
+    } else {
+        assumptions.l1_data_fee_floor_susd
+    };
+    if !gas_l1.is_finite() || gas_l1 < 0.0 {
+        return f64::INFINITY;
+    }
+    gas_l2 + gas_l1
+}
+
 pub async fn cached_optimism_l1_fee_per_byte_wei(rpc_url: &str) -> Result<f64, L1FeeOracleError> {
     if let Some(cached) = fresh_cached_l1_fee_per_byte_wei(rpc_url) {
         return Ok(cached);
@@ -669,6 +698,34 @@ mod tests {
     }
 
     #[test]
+    fn min_gas_susd_direct_buy_at_floor() {
+        let gas = GasAssumptions {
+            l1_data_fee_floor_susd: 0.10,
+            l1_fee_per_byte_wei: 0.0, // unknown — fall back to floor
+            ..GasAssumptions::default()
+        };
+        // L2: 220_000 gas × 5e-10 ETH/gas × 3000 $/ETH = 0.33 sUSD
+        // L1: floor = 0.10 sUSD
+        // Total: 0.43 sUSD
+        let cost = estimate_min_gas_susd_for_group(&gas, GroupKind::DirectBuy, 0, 0, 5e-10, 3000.0);
+        assert!((cost - 0.43).abs() < 1e-9, "expected ~0.43, got {cost}");
+    }
+
+    #[test]
+    fn min_gas_susd_is_finite_for_97_leg_mint_sell() {
+        let gas = GasAssumptions {
+            l1_data_fee_floor_susd: 0.10,
+            l1_fee_per_byte_wei: 0.0,
+            ..GasAssumptions::default()
+        };
+        let cost =
+            estimate_min_gas_susd_for_group(&gas, GroupKind::MintSell, 0, 97, 5e-10, 3000.0);
+        assert!(cost.is_finite(), "97-leg MintSell gas estimate must be finite");
+        assert!(cost > 0.0, "97-leg MintSell gas must be positive");
+        assert!(cost > 1.0, "97-leg MintSell at 5e-10 gas price should be > $1: {cost}");
+    }
+
+    #[test]
     fn exact_input_single_payload_without_selector_is_224_bytes() {
         // Verify that 7 EVM word fields = 7 × 32 = 224 bytes.
         // SWAP_BYTES = 224 excludes the 4-byte selector (which lives in BATCH_CALL_BASE_BYTES).
@@ -692,11 +749,11 @@ mod tests {
             params: ExactInputSingleParams {
                 tokenIn: alloy::primitives::Address::ZERO,
                 tokenOut: alloy::primitives::Address::ZERO,
-                fee: 100,
+                fee: alloy::primitives::Uint::from(100u32),
                 recipient: alloy::primitives::Address::ZERO,
                 amountIn: alloy::primitives::U256::ZERO,
                 amountOutMinimum: alloy::primitives::U256::ZERO,
-                sqrtPriceLimitX96: alloy::primitives::U256::ZERO.into(),
+                sqrtPriceLimitX96: alloy::primitives::U160::ZERO,
             },
         };
         let encoded = call.abi_encode();

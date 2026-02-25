@@ -39,7 +39,7 @@ fn waterfall_without_intra_step_boundary_split(
     let mut price_sum: f64 = sims.iter().map(|s| s.price()).sum();
     let mut active_set: HashSet<(usize, Route)> = HashSet::new();
 
-    let first = match best_non_active(sims, &active_set, mint_available, price_sum) {
+    let first = match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
         Some(entry) if entry.2 > 0.0 => entry,
         _ => return 0.0,
     };
@@ -57,7 +57,7 @@ fn waterfall_without_intra_step_boundary_split(
         }
 
         loop {
-            match best_non_active(sims, &active_set, mint_available, price_sum) {
+            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
                 Some((idx, route, prof)) if prof > current_prof => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -66,7 +66,7 @@ fn waterfall_without_intra_step_boundary_split(
             }
         }
 
-        let next = best_non_active(sims, &active_set, mint_available, price_sum);
+        let next = best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0);
         let target_prof = match next {
             Some((_, _, p)) if p > 0.0 => p,
             _ => 0.0,
@@ -118,7 +118,7 @@ fn waterfall_without_intra_step_boundary_split(
             current_prof = target_prof;
             last_prof = target_prof;
 
-            match best_non_active(sims, &active_set, mint_available, price_sum) {
+            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
                 Some((idx, route, prof)) if prof > 0.0 => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -212,7 +212,7 @@ fn waterfall_break_after_budget_partial(
     let mut price_sum: f64 = sims.iter().map(|s| s.price()).sum();
     let mut active_set: HashSet<(usize, Route)> = HashSet::new();
 
-    let first = match best_non_active(sims, &active_set, mint_available, price_sum) {
+    let first = match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
         Some(entry) if entry.2 > 0.0 => entry,
         _ => return 0.0,
     };
@@ -230,7 +230,7 @@ fn waterfall_break_after_budget_partial(
         }
 
         loop {
-            match best_non_active(sims, &active_set, mint_available, price_sum) {
+            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
                 Some((idx, route, prof)) if prof > current_prof => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -239,7 +239,7 @@ fn waterfall_break_after_budget_partial(
             }
         }
 
-        let next = best_non_active(sims, &active_set, mint_available, price_sum);
+        let next = best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0);
         let target_prof = match next {
             Some((_, _, p)) if p > 0.0 => p,
             _ => 0.0,
@@ -311,7 +311,7 @@ fn waterfall_break_after_budget_partial(
             current_prof = target_prof;
             last_prof = target_prof;
 
-            match best_non_active(sims, &active_set, mint_available, price_sum) {
+            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
                 Some((idx, route, prof)) if prof > 0.0 => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -654,7 +654,7 @@ fn test_oracle_two_pool_closed_form_direct_waterfall_matches_kkt_target() {
     let initial_budget = 80.0;
     let mut budget = initial_budget;
     let mut actions = Vec::new();
-    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false);
+    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
 
     assert!(
         actions.iter().all(|a| matches!(a, Action::Buy { .. })),
@@ -1185,7 +1185,7 @@ fn test_waterfall_misnormalized_prediction_sums_remain_finite() {
         let mut budget = start_budget;
         let mut actions = Vec::new();
 
-        let prof = waterfall(&mut sims, &mut budget, &mut actions, mint_available);
+        let prof = waterfall(&mut sims, &mut budget, &mut actions, mint_available, 0.0, 0.0);
         assert!(prof.is_finite());
         assert!(budget.is_finite() && budget >= -1e-7);
         assert_action_values_are_finite(&actions);
@@ -1916,7 +1916,7 @@ fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
         let price_sum: f64 = sims.iter().map(|s| s.price()).sum();
         let empty_active_set: HashSet<(usize, Route)> = HashSet::new();
         let Some((seed_idx, seed_route, current_prof)) =
-            best_non_active(&sims, &empty_active_set, true, price_sum)
+            best_non_active(&sims, &empty_active_set, true, price_sum, f64::MAX, 0.0, 0.0)
         else {
             continue;
         };
@@ -1926,7 +1926,7 @@ fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
 
         let active = vec![(seed_idx, seed_route)];
         let active_set: HashSet<(usize, Route)> = active.iter().copied().collect();
-        let target_prof = match best_non_active(&sims, &active_set, true, price_sum) {
+        let target_prof = match best_non_active(&sims, &active_set, true, price_sum, f64::MAX, 0.0, 0.0) {
             Some((_, _, p)) if p > 0.0 => p,
             _ => 0.0,
         };
@@ -1996,7 +1996,7 @@ fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
         "expected a fixture where first waterfall step is a boundary split below current_prof",
     );
     let mut actions = Vec::new();
-    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, true);
+    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, true, 0.0, 0.0);
 
     assert!(
         actions.iter().any(|a| matches!(a, Action::Mint { .. })),
@@ -2069,7 +2069,7 @@ fn test_waterfall_boundary_splits_refresh_skip_before_next_descent() {
         .collect();
     let mut budget = initial_budget;
     let mut actions = Vec::new();
-    let _last_prof = waterfall(&mut sims, &mut budget, &mut actions, true);
+    let _last_prof = waterfall(&mut sims, &mut budget, &mut actions, true, 0.0, 0.0);
 
     let first_buy_idx = actions
         .iter()
@@ -2221,7 +2221,7 @@ fn test_intra_step_boundary_rerank_improves_ev_vs_no_split_control() {
         let mut split_actions = Vec::new();
         let mut no_split_actions = Vec::new();
 
-        let _ = waterfall(&mut sims_split, &mut split_budget, &mut split_actions, true);
+        let _ = waterfall(&mut sims_split, &mut split_budget, &mut split_actions, true, 0.0, 0.0);
         let _ = waterfall_without_intra_step_boundary_split(
             &mut sims_no_split,
             &mut no_split_budget,
@@ -2346,7 +2346,7 @@ fn test_waterfall_budget_partial_continue_can_improve_ev_vs_break_control() {
         let mut budget_old = initial_budget;
         let mut actions_new = Vec::new();
         let mut actions_old = Vec::new();
-        let _ = waterfall(&mut sims_new, &mut budget_new, &mut actions_new, true);
+        let _ = waterfall(&mut sims_new, &mut budget_new, &mut actions_new, true, 0.0, 0.0);
         let _ = waterfall_break_after_budget_partial(
             &mut sims_old,
             &mut budget_old,
@@ -2429,7 +2429,7 @@ fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasin
         .collect();
     let mut budget = 17.358789;
     let mut actions = Vec::new();
-    let _ = waterfall(&mut sims, &mut budget, &mut actions, true);
+    let _ = waterfall(&mut sims, &mut budget, &mut actions, true, 0.0, 0.0);
 
     let mut replay_sims: Vec<PoolSim> = slot0_results
         .iter()
@@ -2785,7 +2785,7 @@ fn test_waterfall_tiny_liquidity_no_nan_no_overspend() {
     let mut budget = 10.0;
     let mut actions = Vec::new();
 
-    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false);
+    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
     assert!(last_prof.is_finite());
     assert!(budget.is_finite());
     assert!(budget >= -1e-6, "budget should not go negative");
@@ -2944,7 +2944,7 @@ fn test_dust_budget_produces_no_actions() {
     let mut sims = vec![PoolSim::from_slot0(&slot0, market, 0.9).unwrap()];
     let mut budget = 1e-15;
     let mut actions = Vec::new();
-    let prof = waterfall(&mut sims, &mut budget, &mut actions, false);
+    let prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
     assert_eq!(prof, 0.0);
     assert!(actions.is_empty());
     assert!((budget - 1e-15).abs() <= 1e-24);
@@ -3024,8 +3024,10 @@ fn test_waterfall_scale_invariance_direct_only() {
         &mut budget_small,
         &mut actions_small,
         false,
+        0.0,
+        0.0,
     );
-    let prof_big = waterfall(&mut sims_big, &mut budget_big, &mut actions_big, false);
+    let prof_big = waterfall(&mut sims_big, &mut budget_big, &mut actions_big, false, 0.0, 0.0);
 
     let prof_tol = 5e-5 * (1.0 + prof_small.abs() + prof_big.abs());
     assert!(
@@ -3071,7 +3073,7 @@ fn test_zero_prediction_market_is_not_bought() {
     let mut budget = 100.0;
     let mut actions = Vec::new();
 
-    let prof = waterfall(&mut sims, &mut budget, &mut actions, false);
+    let prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
     assert_eq!(prof, 0.0);
     assert!(actions.is_empty(), "zero prediction should never be bought");
     assert!((budget - 100.0).abs() < 1e-12);
@@ -3594,12 +3596,12 @@ fn test_waterfall_idempotent_after_equilibrium() {
     let mut sims = build_three_sims_with_preds([0.03, 0.04, 0.05], [0.90, 0.85, 0.80]);
     let mut budget = 10_000.0;
     let mut actions_first = Vec::new();
-    let _prof_first = waterfall(&mut sims, &mut budget, &mut actions_first, false);
+    let _prof_first = waterfall(&mut sims, &mut budget, &mut actions_first, false, 0.0, 0.0);
     assert!(!actions_first.is_empty(), "first pass should trade");
 
     let budget_before_second = budget;
     let mut actions_second = Vec::new();
-    let prof_second = waterfall(&mut sims, &mut budget, &mut actions_second, false);
+    let prof_second = waterfall(&mut sims, &mut budget, &mut actions_second, false, 0.0, 0.0);
     assert!(
         actions_second.is_empty(),
         "second pass at equilibrium should not emit new buy actions"
@@ -3642,7 +3644,7 @@ fn test_waterfall_hard_caps_converges() {
     ];
     let mut budget = 1_000_000.0;
     let mut actions = Vec::new();
-    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false);
+    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
 
     assert!(last_prof.is_finite());
     assert!(budget.is_finite());
@@ -3660,7 +3662,7 @@ fn test_waterfall_hard_caps_converges() {
     );
 
     let mut second_actions = Vec::new();
-    let second_prof = waterfall(&mut sims, &mut budget, &mut second_actions, false);
+    let second_prof = waterfall(&mut sims, &mut budget, &mut second_actions, false, 0.0, 0.0);
     assert!(
         second_actions.is_empty(),
         "after cap convergence, subsequent pass should not trade"

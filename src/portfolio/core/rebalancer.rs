@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::execution::gas::{GasAssumptions, estimate_min_gas_susd_for_group};
+use crate::execution::GroupKind;
 use crate::pools::Slot0Result;
 
 use super::Action;
@@ -109,6 +111,8 @@ struct RebalanceContext {
     mint_available: bool,
     sim_balances: BalanceMap,
     legacy_remaining: BalanceMap,
+    gas_direct: f64,
+    gas_mint: f64,
 }
 
 struct Phase3Trial {
@@ -188,6 +192,8 @@ impl RebalanceContext {
             mint_available,
             sim_balances,
             legacy_remaining,
+            gas_direct: 0.0,
+            gas_mint: 0.0,
         })
     }
 
@@ -382,6 +388,8 @@ impl RebalanceContext {
                 &mut trial.budget,
                 &mut trial.actions,
                 self.mint_available,
+                self.gas_direct,
+                self.gas_mint,
             );
             apply_actions_to_sim_balances(
                 &trial.actions[actions_before_realloc..],
@@ -441,6 +449,8 @@ impl RebalanceContext {
                 sim_balances: self.sim_balances.clone(),
                 // In polish mode, recycle across current inventory (not only initial legacy).
                 legacy_remaining: self.sim_balances.clone(),
+                gas_direct: self.gas_direct,
+                gas_mint: self.gas_mint,
             };
 
             if trial.mint_available {
@@ -463,6 +473,8 @@ impl RebalanceContext {
                 &mut trial.budget,
                 &mut trial.actions,
                 trial.mint_available,
+                trial.gas_direct,
+                trial.gas_mint,
             );
             apply_actions_to_sim_balances(
                 &trial.actions[actions_before..],
@@ -497,6 +509,8 @@ fn rebalance_full(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    gas_direct: f64,
+    gas_mint: f64,
 ) -> Vec<Action> {
     let preds = crate::pools::prediction_map();
     let expected_count = crate::predictions::PREDICTIONS_L1.len();
@@ -513,6 +527,8 @@ fn rebalance_full(
             return Vec::new();
         }
     };
+    ctx.gas_direct = gas_direct;
+    ctx.gas_mint = gas_mint;
 
     // ── Phase 0: Complete-set arbitrage (buy-merge only) ──
     // Execute before any discretionary rebalancing so free budget is harvested first.
@@ -541,6 +557,8 @@ fn rebalance_full(
         &mut ctx.budget,
         &mut ctx.actions,
         ctx.mint_available,
+        ctx.gas_direct,
+        ctx.gas_mint,
     );
 
     // Update simulated holdings from the initial waterfall pass.
@@ -570,6 +588,8 @@ fn rebalance_full(
         &mut ctx.budget,
         &mut ctx.actions,
         ctx.mint_available,
+        ctx.gas_direct,
+        ctx.gas_mint,
     );
     apply_actions_to_sim_balances(
         &ctx.actions[actions_before_cleanup..],
@@ -592,6 +612,8 @@ fn rebalance_full(
             &mut ctx.budget,
             &mut ctx.actions,
             false, // direct-only terminal sweep for residual direct alpha
+            ctx.gas_direct,
+            ctx.gas_mint,
         );
         apply_actions_to_sim_balances(
             &ctx.actions[actions_before_direct_cleanup..],
@@ -605,7 +627,7 @@ fn rebalance_full(
 
     if ctx.mint_available {
         let actions_before_mixed_cleanup = ctx.actions.len();
-        let mixed_last_prof = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, true);
+        let mixed_last_prof = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, true, ctx.gas_direct, ctx.gas_mint);
         apply_actions_to_sim_balances(
             &ctx.actions[actions_before_mixed_cleanup..],
             &ctx.sims,
@@ -621,7 +643,7 @@ fn rebalance_full(
             let start_actions = ctx.actions.len();
             ctx.run_phase1_sell_overpriced();
             let actions_before_direct_cleanup = ctx.actions.len();
-            let _ = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, false);
+            let _ = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, false, ctx.gas_direct, ctx.gas_mint);
             apply_actions_to_sim_balances(
                 &ctx.actions[actions_before_direct_cleanup..],
                 &ctx.sims,
@@ -1026,16 +1048,76 @@ fn rebalance_arb_only(
 }
 
 /// Computes optimal trades for L1 markets using the requested mode.
+/// Gas thresholds default to 0.0 (no filtering). Use `rebalance_with_gas` for gas-aware scheduling.
 pub fn rebalance_with_mode(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     mode: RebalanceMode,
 ) -> Vec<Action> {
+    rebalance_with_mode_and_thresholds(balances, susds_balance, slot0_results, mode, 0.0, 0.0)
+}
+
+fn rebalance_with_mode_and_thresholds(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    gas_direct: f64,
+    gas_mint: f64,
+) -> Vec<Action> {
     match mode {
-        RebalanceMode::Full => rebalance_full(balances, susds_balance, slot0_results),
+        RebalanceMode::Full => {
+            rebalance_full(balances, susds_balance, slot0_results, gas_direct, gas_mint)
+        }
         RebalanceMode::ArbOnly => rebalance_arb_only(balances, susds_balance, slot0_results),
     }
+}
+
+/// Default gas price assumptions for minimum-trade-threshold computation.
+/// Conservative: 1 gwei L2, $3000/ETH.
+const THRESHOLD_GAS_PRICE_ETH: f64 = 1e-9;
+const THRESHOLD_ETH_USD: f64 = 3000.0;
+
+fn compute_gas_thresholds(
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+    mint_sell_legs: usize,
+) -> (f64, f64) {
+    let direct = estimate_min_gas_susd_for_group(gas, GroupKind::DirectBuy, 0, 0, gas_price_eth, eth_usd);
+    let mint_sell = estimate_min_gas_susd_for_group(
+        gas,
+        GroupKind::MintSell,
+        0,
+        mint_sell_legs,
+        gas_price_eth,
+        eth_usd,
+    );
+    (
+        if direct.is_finite() { direct } else { f64::INFINITY },
+        if mint_sell.is_finite() { mint_sell } else { f64::INFINITY },
+    )
+}
+
+/// Gas-aware entry point for `main.rs`.
+/// Computes per-route thresholds from `GasAssumptions` and threads them through `waterfall`.
+/// The existing `rebalance_with_mode` keeps its current signature (used by all tests unchanged).
+pub fn rebalance_with_gas(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    gas: &GasAssumptions,
+) -> Vec<Action> {
+    let n_sims = slot0_results.len();
+    let (gas_direct, gas_mint) = compute_gas_thresholds(
+        gas,
+        THRESHOLD_GAS_PRICE_ETH,
+        THRESHOLD_ETH_USD,
+        n_sims.saturating_sub(1),
+    );
+    rebalance_with_mode_and_thresholds(balances, susds_balance, slot0_results, mode, gas_direct, gas_mint)
 }
 
 /// Computes optimal rebalancing trades for L1 markets.

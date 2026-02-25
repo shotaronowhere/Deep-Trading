@@ -3,6 +3,7 @@ use std::error::Error;
 use std::str::FromStr;
 
 use alloy::primitives::Address;
+use deep_trading_bot::execution::gas::default_gas_assumptions_with_optimism_l1_fee;
 use deep_trading_bot::pools;
 use deep_trading_bot::portfolio::{self, RebalanceMode, TraceConfig};
 
@@ -48,6 +49,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    let mode = parse_rebalance_mode();
+
+    let gas_assumptions = if mode == RebalanceMode::Full {
+        match default_gas_assumptions_with_optimism_l1_fee(&rpc_url).await {
+            Ok(ga) => ga,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to fetch L1 fee oracle; using default GasAssumptions");
+                deep_trading_bot::execution::gas::GasAssumptions::default()
+            }
+        }
+    } else {
+        deep_trading_bot::execution::gas::GasAssumptions::default()
+    };
+
     let (initial_susd, balances_owned): (f64, HashMap<&'static str, f64>) =
         if let Ok(wallet_raw) = std::env::var("WALLET") {
             let wallet = Address::from_str(wallet_raw.trim())?;
@@ -67,9 +82,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|(market, units)| (*market as &str, *units))
         .collect();
 
-    let mode = parse_rebalance_mode();
-    let actions =
-        portfolio::rebalance_with_mode(&balances_view, initial_susd, &slot0_results, mode);
+    let actions = portfolio::rebalance_with_gas(
+        &balances_view,
+        initial_susd,
+        &slot0_results,
+        mode,
+        &gas_assumptions,
+    );
     let (final_holdings, final_susd) = portfolio::replay_actions_to_portfolio_state(
         &actions,
         &slot0_results,

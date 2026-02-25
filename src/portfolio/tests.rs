@@ -106,7 +106,7 @@ fn test_waterfall_equalizes() {
     let mut budget = 1000.0;
     let mut actions = Vec::new();
 
-    waterfall(&mut sims, &mut budget, &mut actions, false);
+    waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
 
     // Should have buy actions
     let buys: Vec<_> = actions
@@ -133,7 +133,7 @@ fn test_no_action_when_all_overpriced_no_holdings() {
     let mut budget = 100.0;
     let mut actions = Vec::new();
 
-    waterfall(&mut sims, &mut budget, &mut actions, false);
+    waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
 
     assert!(actions.is_empty(), "no actions when everything overpriced");
     assert!((budget - 100.0).abs() < 1e-6, "budget should be unchanged");
@@ -148,7 +148,7 @@ fn test_budget_exhaustion() {
     let mut budget = 0.001; // tiny budget
     let mut actions = Vec::new();
 
-    waterfall(&mut sims, &mut budget, &mut actions, false);
+    waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
 
     // Should have a buy but budget should be nearly exhausted
     let buys: Vec<_> = actions
@@ -359,7 +359,7 @@ fn test_waterfall_can_activate_mint_with_negative_alt_price() {
     let mut budget = 1.0;
     let mut actions = Vec::new();
 
-    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, true);
+    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, true, 0.0, 0.0);
 
     assert!(last_prof.is_finite() && last_prof >= 0.0);
     assert!(
@@ -1509,3 +1509,34 @@ mod fuzz_rebalance;
 mod monte_carlo;
 #[path = "tests/oracle.rs"]
 mod oracle;
+
+#[test]
+fn other_repos_outcome_has_no_pool() {
+    // "Other repos" is intentionally present in MARKETS_L1 as the synthetic connector
+    // between market1 and market2 (it appears with pool: None at markets.rs:1303).
+    // The invariant is that it must NEVER have a pool — it must never be tradeable.
+    const OTHER_REPOS: &str = "0x63a4f76ef5846f68d069054c271465b7118e8ed9";
+    let tradeable = crate::markets::MARKETS_L1
+        .iter()
+        .any(|m| m.pool.is_some() && m.outcome_token.eq_ignore_ascii_case(OTHER_REPOS));
+    assert!(
+        !tradeable,
+        "Other repos token {} must never have a pool (must not be tradeable)",
+        OTHER_REPOS
+    );
+}
+
+#[test]
+fn l1_tradeable_outcome_count_matches_predictions() {
+    // 66 from market1 (67 - Other repos connector) + 32 from market2 (33 - invalid has no pool)
+    // Use PREDICTIONS_L1.len() as the source-of-truth count — not a hardcoded literal.
+    let count = crate::markets::MARKETS_L1
+        .iter()
+        .filter(|m| m.pool.is_some())
+        .count();
+    assert_eq!(
+        count,
+        crate::predictions::PREDICTIONS_L1.len(),
+        "MARKETS_L1 pools-present count must equal PREDICTIONS_L1 len; got {count}"
+    );
+}

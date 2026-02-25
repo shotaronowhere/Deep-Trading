@@ -27,6 +27,9 @@ pub fn rebalance_with_mode(
 `RebalanceMode::Full` keeps the existing phase-0 behavior (buy-all then merge only). Two-sided
 complete-set arb is isolated to `RebalanceMode::ArbOnly`.
 
+In `main.rs`, the Optimism L1 fee oracle is fetched only for `Full` mode. `ArbOnly` skips that
+network call entirely and uses `GasAssumptions::default()` — the arb path ignores gas thresholds.
+
 ## Two-Sided Complete-Set Arb Rule
 
 `ArbOnly` ignores prediction-driven phases and executes only complete-set arbitrage on current pool prices.
