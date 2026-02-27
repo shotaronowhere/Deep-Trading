@@ -22,16 +22,32 @@ contract BatchSwapRouter is IBatchSwapRouter {
     // see IBatchSwapRouter for function docs
     function exactInput(
         address[] memory _tokenIns,
-        address _tokenOut,
         uint256 _amountIn,
+        address _tokenOut,
         uint256 _amountOutTotalMinimum,
         uint24 _fee,
         uint160 _sqrtPriceLimitX96
     ) external returns (uint256 amountOut) {
+        uint256[] memory amountsIn = new uint256[](_tokenIns.length);
         for (uint i = 0; i < _tokenIns.length; i++) {
-            bool success = IERC20(_tokenIns[i]).transferFrom(msg.sender, address(this), _amountIn);
+            amountsIn[i] = _amountIn;
+        }
+        return exactInput(_tokenIns, amountsIn, _tokenOut, _amountOutTotalMinimum, _fee, _sqrtPriceLimitX96);
+    }
+
+    // see IBatchSwapRouter for function docs
+    function exactInput(
+        address[] memory _tokenIns,
+        uint256[] memory _amountIn,
+        address _tokenOut,
+        uint256 _amountOutTotalMinimum,
+        uint24 _fee,
+        uint160 _sqrtPriceLimitX96
+    ) public returns (uint256 amountOut) {
+        for (uint i = 0; i < _tokenIns.length; i++) {
+            bool success = IERC20(_tokenIns[i]).transferFrom(msg.sender, address(this), _amountIn[i]);
             require(success, TransferFailed());
-            success = IERC20(_tokenIns[i]).approve(address(router), _amountIn);
+            success = IERC20(_tokenIns[i]).approve(address(router), _amountIn[i]);
             require(success, ApprovalFailed());
             amountOut += router.exactInputSingle(
                 IV3SwapRouter.ExactInputSingleParams({
@@ -39,7 +55,7 @@ contract BatchSwapRouter is IBatchSwapRouter {
                     tokenOut: address(_tokenOut), // same tokenOut for all swaps
                     fee: _fee,
                     recipient: msg.sender,
-                    amountIn: _amountIn, // same amountIn for all swaps
+                    amountIn: _amountIn[i],
                     amountOutMinimum: 0,
                     sqrtPriceLimitX96: _sqrtPriceLimitX96
                 })
@@ -51,12 +67,28 @@ contract BatchSwapRouter is IBatchSwapRouter {
     // see IBatchSwapRouter for function docs
     function exactOutput(
         address[] memory _tokenOuts,
-        address _tokenIn,
         uint256 _amountOut,
+        address _tokenIn,
         uint256 _amountInTotalMax,
         uint24 _fee,
         uint160 _sqrtPriceLimitX96
     ) external returns (uint256 amountIn) {
+        uint256[] memory amountsOut = new uint256[](_tokenOuts.length);
+        for (uint i = 0; i < _tokenOuts.length; i++) {
+            amountsOut[i] = _amountOut;
+        }
+        return exactOutput(_tokenOuts, amountsOut, _tokenIn, _amountInTotalMax, _fee, _sqrtPriceLimitX96);
+    }
+
+    // see IBatchSwapRouter for function docs
+    function exactOutput(
+        address[] memory _tokenOuts,
+        uint256[] memory _amountOut,
+        address _tokenIn,
+        uint256 _amountInTotalMax,
+        uint24 _fee,
+        uint160 _sqrtPriceLimitX96
+    ) public returns (uint256 amountIn) {
         bool success = IERC20(_tokenIn).transferFrom(msg.sender, address(this), _amountInTotalMax);
         require(success, TransferFailed());
 
@@ -73,7 +105,7 @@ contract BatchSwapRouter is IBatchSwapRouter {
                     tokenOut: _tokenOuts[i], // same tokenOut for all swaps
                     fee: _fee,
                     recipient: msg.sender,
-                    amountOut: _amountOut, // same amountOut for all swaps
+                    amountOut: _amountOut[i], // same amountOut for all swaps
                     amountInMaximum: amountInRemaining, // per-swap ceiling uses remaining max; aggregate checked at the end
                     sqrtPriceLimitX96: _sqrtPriceLimitX96
                 })
