@@ -1,10 +1,10 @@
 # Deep Trading Bot
 
-A Rust-based trading bot that rebalances portfolio according to predictions across a set of markets, specifically targeting deep funding markets. The bot connects to Ethereum via WebSocket and interacts with market contracts to execute trades.
+A Rust-based trading bot that rebalances portfolio according to predictions across a set of markets, specifically targeting deep funding markets. The bot connects to Ethereum via HTTP JSON-RPC and interacts with market contracts to execute trades.
 
 ## Features
 
-- Connects to Ethereum nodes via WebSocket (Optimism RPC supported)
+- Connects to Ethereum nodes via HTTP JSON-RPC (Optimism RPC supported)
 - Interfaces with market contracts to fetch outcome data
 - Portfolio rebalancing based on ML predictions
 - Uniswap V3 integration for efficient token swaps
@@ -72,6 +72,7 @@ Optional environment:
 ## Documentation
 
 See the [docs](./docs/) directory for detailed documentation:
+- [Waterfall Algorithm (Canonical Spec)](./docs/waterfall.md) - Definitive waterfall/rebalance implementation behavior
 - [Architecture](./docs/architecture.md) - System architecture overview
 - [Model](./docs/model.md) - ML prediction model details
 - [Portfolio](./docs/portfolio.md) - Portfolio management

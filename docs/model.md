@@ -1,5 +1,7 @@
 # Mathematical Model
 
+Canonical implementation spec: see `docs/waterfall.md`. This document focuses on derivations.
+
 ## Optimization Problem
 
 Maximize expected portfolio value subject to a budget constraint:
@@ -121,8 +123,10 @@ To find m such that alt(m) = P_target, solve g(m) = rhs where:
 
 ```
 g(m) = Σⱼ Pⱼ / (1 + min(m, Mⱼ)×κⱼ)²
-rhs  = 1 - P_target
+rhs  = (1 - P_target) - Σ_{j∈skip, j≠target} P⁰_j
 ```
+
+When `skip` is empty, this reduces to `rhs = 1 - P_target`.
 
 Newton step: m ← m - (g(m) - rhs) / g'(m), with:
 
@@ -131,8 +135,6 @@ g'(m) = Σⱼ { -2×Pⱼ×κⱼ/(1+m×κⱼ)³  if m < Mⱼ,  0  if m ≥ Mⱼ }
 ```
 
 Each pool's price contribution freezes at P_limit once m exceeds that pool's sell cap Mⱼ (derivative = 0). Warm-started with the linearized first Newton step: m₀ = (P_target - alt(0)) / (2 × Σ Pⱼκⱼ). Converges reliably in 2-3 iterations.
-
-**Fixed**: `rhs = (1 - P_target) - Σ_{j∈skip, j≠target} P⁰_j` correctly accounts for skip pool prices frozen at their spot values.
 
 ### Mixed-Route Budget Solver
 

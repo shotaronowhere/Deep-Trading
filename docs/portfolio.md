@@ -1,5 +1,7 @@
 # Portfolio Rebalancing
 
+Canonical algorithm spec: see `docs/waterfall.md`.
+
 ## Overview
 
 `src/portfolio/core/mod.rs` (with `sim.rs`, `planning.rs`, `solver.rs`, `trading.rs`, `waterfall.rs`, `rebalancer.rs`) computes optimal rebalancing trades for L1 prediction markets using an analytical single-tick `PoolSim` model (`f64`, with explicit tick-boundary caps). Implements the waterfall allocation algorithm: deploy capital to the most profitable outcome, equalize profitability progressively with the next-best outcomes, then recycle lower-profitability inventory.
@@ -80,6 +82,8 @@ The waterfall treats each (outcome, route) pair as a separate entry. The same ou
 
 **Dynamic entry selection:** Instead of pre-sorting entries by profitability, the waterfall calls `best_non_active()` each iteration to find the highest-profitability non-active entry from **current** pool state. This handles mint-route coupling: when a mint sell perturbs other pools' prices, the next entry selection reflects the updated state automatically.
 
+**Gas-aware admission filter (runtime path):** `best_non_active()` only admits an entry if `remaining_budget × profitability >= gas_threshold_for_route`. In production (`rebalance_with_gas`, used by `main.rs`), route thresholds come from `GasAssumptions`; in tests (`rebalance_with_mode`) thresholds are `0.0` so this filter is disabled.
+
 **Monotonicity guard:** If a mint pushes a non-active entry's profitability *above* `current_prof`, it is absorbed into the active set immediately (no cost step) before the next descent. This prevents the water level from moving upward, which would break `solve_prof`'s assumptions.
 
 **Intra-step active-set boundary:** Planning applies boundary step-splitting to **mint** legs only. The split point is the earliest of: (1) a non-active route reaching `current_prof`, or (2) a non-active direct profitability crossing the active mint route's in-step profitability (`prof_non_active >= prof_active_mint`) before `current_prof` is reached. Direct legs are not intra-step truncated. This route-asymmetric policy preserves mint-side coupling control while avoiding EV leakage from fragmented direct execution. A boundary hit is a **step split within the same profitability group**, not a new level and not a terminal stop: after that partial mint leg, the loop promotes all outcomes that now meet `current_prof`, recomputes `skip`, re-ranks non-active outcomes from current pool state (next-highest only), and keeps building the current step until the next lower profitability level is reached.
@@ -124,7 +128,7 @@ The solver searches the interval `[target_prof, current_prof]` with bisection (u
 
 #### Execution safeguards
 
-- Each outcome's cost is recomputed right before execution (not from stale precomputed values), since mint actions mutate other pools' state.
+- Planning and execution share the same mint-first/direct ordering and pricing model. Direct legs execute using planned `(cost, new_price)` from the scratch simulation. Mint legs execute in cash/liquidity-feasible rounds and fail closed with step-level rollback if the planned amount cannot be fully satisfied.
 - Waterfall route planning reuses a scratch simulation buffer across iterations to avoid repeated `Vec<PoolSim>` allocation/cloning in the hot loop.
 - Per-step budget feasibility is enforced with a running-budget check over the planned mint-first/direct sequence. If execution cannot proceed, the waterfall stops at the current achieved level.
 - **Prune loop:** when entries fail cost computation, the active set is pruned in a loop that re-derives the skip set after each removal, so remaining entries always see a consistent skip set. Mint routes do not get pruned solely because the requested target is unreachable under caps; they clamp to saturated executable size.
@@ -145,7 +149,11 @@ After the waterfall:
 A bounded loop (`MAX_POLISH_PASSES`) reruns arb pre-pass (if mint-available), Phase 1, waterfall, and Phase 3 on a trial state and commits only EV-improving trials.
 
 ### Phase 5: Terminal Cleanup
-A final bounded cleanup sequence runs additional sell-overpriced + waterfall sweeps (including direct-only terminal sweeps) to reduce residual local profitable directions before returning actions.
+A bounded cleanup sequence runs additional sell-overpriced + waterfall sweeps to reduce residual local profitable directions before returning actions:
+1. one mixed-availability pass (`mint_available` as initialized),
+2. optional full-inventory phase-3 recycle on that pass (when mint is available and actions were emitted),
+3. up to four direct-only sweeps,
+4. if mint is available: one extra mixed pass + optional recycle + up to two more direct-only sweeps.
 
 ## Two Market Contracts
 

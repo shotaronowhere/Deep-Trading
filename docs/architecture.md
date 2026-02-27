@@ -44,7 +44,7 @@ API (deep.seer.pm)
 - **src/bin/regenerate/markets.rs**: JSON parsing, multicall address resolution, and `markets.rs` generation
 - **src/bin/regenerate/common.rs**: Shared codegen helper(s) (e.g., formatting generated outputs)
 - **src/lib.rs**: API client, fetches market data from Seer PM endpoints
-- **src/main.rs**: WebSocket connection to Optimism RPC
+- **src/main.rs**: Runtime planning entrypoint using HTTP JSON-RPC provider wiring, mode selection (`full`/`arb_only`), gas-assumption hydration, and diagnostics output
 - **src/markets.rs**: Generated static market data arrays
 - **src/predictions.rs**: Generated prediction weights from CSVs
 - **src/pools.rs**: Facade/re-exports for pool utilities

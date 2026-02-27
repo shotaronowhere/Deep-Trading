@@ -2,6 +2,8 @@
 
 *How to allocate a budget across 98 prediction market outcomes when every purchase moves the price against you.*
 
+Canonical implementation spec: see `docs/waterfall.md`. This document is explanatory.
+
 ## The Setup
 
 You hold beliefs — probability estimates — over 98 mutually exclusive outcomes. Each outcome trades on a Uniswap V3 pool against a stablecoin (sUSD). You have a budget B in sUSD, possibly some existing outcome token holdings, and you want to maximize the expected value of your portfolio.
@@ -104,6 +106,8 @@ The waterfall treats (outcome, route) pairs as separate entries. The same outcom
 
 **Route interaction.** Direct buys move the target pool's price. Mint sells move non-target pools' prices. These are independent price channels draining profitability from different directions.
 
+**Runtime gas gate.** In production mode (`rebalance_with_gas`, used by `main.rs`), route admission in `best_non_active()` is gated by `remaining_budget × profitability >= gas_threshold_for_route`. In test mode (`rebalance_with_mode`), thresholds are `0.0` so this gate is disabled.
+
 ## Closed-Form Budget Solver (All-Direct Case)
 
 When every active outcome uses direct buy, Step 5 has an exact solution. The budget constraint is:
@@ -132,6 +136,12 @@ The mint route is harder. To find the mint amount m that achieves a target alt p
 
 ```
 g(m) = Σⱼ Pⱼ / (1 + min(m, M_cap_j) × κⱼ)² = 1 − P_target
+```
+
+With an active-set skip, the implemented RHS is adjusted to keep skipped pools fixed at spot:
+
+```
+rhs = (1 - P_target) - Σ_{j ∈ skip, j ≠ target} P⁰_j
 ```
 
 This is a sum of decreasing functions (each pool's price drops as you sell into it), so g is monotone decreasing, and Newton converges reliably.
@@ -205,7 +215,7 @@ The merge route is only available when all pools are present (no partial-pool ha
 
 **Phase 4: EV-positive polish loop.** Run bounded trial passes (arb pre-pass if mint-available, Phase 1, waterfall, Phase 3) and commit only EV-improving trials.
 
-**Phase 5: Terminal cleanup sweeps.** Run additional bounded sell-overpriced + waterfall cleanup passes (including direct-only sweeps) to reduce residual local profitable directions.
+**Phase 5: Terminal cleanup sweeps.** Run additional bounded sell-overpriced + waterfall cleanup passes to reduce residual local profitable directions: one mixed pass, optional recycle over current inventory, up to four direct-only sweeps, and (when mint is available) one extra mixed pass plus up to two more direct-only sweeps.
 
 This implemented flow ensures: (1) free arb budget is harvested first, (2) overpriced exposure is reduced, (3) discretionary budget is allocated by waterfall, (4) legacy laggards are recycled with EV guardrails, and (5) terminal local cleanup is attempted without unbounded loops.
 
