@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use super::sim::{DUST, EPS, PoolSim, Route, alt_price, profitability, target_price_for_prof};
 use super::solver::mint_cost_to_prof;
@@ -358,6 +359,148 @@ pub(super) fn plan_is_budget_feasible(plan: &[PlannedRoute], budget: f64) -> boo
     true
 }
 
+fn experimental_exact_mixed_solver_enabled() -> bool {
+    // Cache once per process: tests should set env before first solver call.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("REBALANCE_EXACT_MIXED_SOLVER")
+            .ok()
+            .map(|raw| {
+                matches!(
+                    raw.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "y" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn solve_prof_mixed_bisection(
+    sims: &[PoolSim],
+    active: &[(usize, Route)],
+    prof_hi: f64,
+    prof_lo: f64,
+    budget: f64,
+    skip: &HashSet<usize>,
+) -> f64 {
+    let mut sim_state: Vec<PoolSim> = Vec::with_capacity(sims.len());
+    let mut affordable = |prof: f64| -> bool {
+        plan_active_routes_with_scratch(sims, active, prof, skip, &mut sim_state, None)
+            .map(|plan| plan_is_budget_feasible(&plan, budget))
+            .unwrap_or(false)
+    };
+
+    if affordable(prof_lo) {
+        return prof_lo;
+    }
+    if !affordable(prof_hi) {
+        return prof_hi;
+    }
+
+    let mut lo = prof_lo;
+    let mut hi = prof_hi;
+    for _ in 0..SOLVE_PROF_ITERS {
+        let mid = 0.5 * (lo + hi);
+        if affordable(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+        if (hi - lo).abs() <= EPS * (1.0 + hi.abs()) {
+            break;
+        }
+    }
+
+    hi.clamp(prof_lo, prof_hi)
+}
+
+fn mixed_plan_cost_for_prof(
+    sims: &[PoolSim],
+    active: &[(usize, Route)],
+    prof: f64,
+    skip: &HashSet<usize>,
+    sim_state: &mut Vec<PoolSim>,
+) -> Option<f64> {
+    let plan = plan_active_routes_with_scratch(sims, active, prof, skip, sim_state, None)?;
+    let mut total = 0.0_f64;
+    for step in &plan {
+        if !step.cost.is_finite() {
+            return None;
+        }
+        total += step.cost;
+    }
+    total.is_finite().then_some(total)
+}
+
+fn solve_prof_mixed_coupled_experimental(
+    sims: &[PoolSim],
+    active: &[(usize, Route)],
+    prof_hi: f64,
+    prof_lo: f64,
+    budget: f64,
+    skip: &HashSet<usize>,
+) -> Option<f64> {
+    if prof_hi <= prof_lo {
+        return Some(prof_hi.clamp(prof_lo, prof_hi));
+    }
+
+    let mut sim_state: Vec<PoolSim> = Vec::with_capacity(sims.len());
+    let cost_lo = mixed_plan_cost_for_prof(sims, active, prof_lo, skip, &mut sim_state)?;
+    if cost_lo <= budget {
+        return Some(prof_lo);
+    }
+    let cost_hi = mixed_plan_cost_for_prof(sims, active, prof_hi, skip, &mut sim_state)?;
+    if cost_hi > budget {
+        return Some(prof_hi);
+    }
+
+    // Safeguarded Newton on f(prof) = cost(prof) - budget, with bracket fallback.
+    let mut lo = prof_lo;
+    let mut hi = prof_hi;
+    let mut current = prof_hi;
+    for _ in 0..15 {
+        let cost = mixed_plan_cost_for_prof(sims, active, current, skip, &mut sim_state)?;
+        let f = cost - budget;
+        let f_tol = EPS * (1.0 + cost.abs() + budget.abs());
+        if f.abs() <= f_tol {
+            return Some(current.clamp(prof_lo, prof_hi));
+        }
+
+        if f > 0.0 {
+            lo = lo.max(current);
+        } else {
+            hi = hi.min(current);
+        }
+
+        let h = (1e-6 * (1.0 + current.abs())).max(1e-9);
+        let plus = (current + h).min(hi);
+        let minus = (current - h).max(lo);
+        if plus <= minus + EPS {
+            break;
+        }
+
+        let cost_plus = mixed_plan_cost_for_prof(sims, active, plus, skip, &mut sim_state)?;
+        let cost_minus = mixed_plan_cost_for_prof(sims, active, minus, skip, &mut sim_state)?;
+        let deriv = (cost_plus - cost_minus) / (plus - minus);
+        if !deriv.is_finite() || deriv.abs() <= 1e-12 {
+            break;
+        }
+
+        let mut next = current - f / deriv;
+        if !next.is_finite() || next <= lo || next >= hi {
+            next = 0.5 * (lo + hi);
+        }
+
+        let step_tol = EPS * (1.0 + current.abs().max(next.abs()));
+        current = next;
+        if (hi - lo).abs() <= step_tol {
+            return Some(current.clamp(prof_lo, prof_hi));
+        }
+    }
+
+    None
+}
+
 /// Find the lowest profitability level affordable with the available budget.
 /// Uses closed-form for all-direct, and simulation-backed bisection for mixed routes.
 pub(super) fn solve_prof(
@@ -389,33 +532,11 @@ pub(super) fn solve_prof(
         return prof.clamp(prof_lo, prof_hi);
     }
 
-    let mut sim_state: Vec<PoolSim> = Vec::with_capacity(sims.len());
-    let mut affordable = |prof: f64| -> bool {
-        plan_active_routes_with_scratch(sims, active, prof, skip, &mut sim_state, None)
-            .map(|plan| plan_is_budget_feasible(&plan, budget))
-            .unwrap_or(false)
-    };
-
-    if affordable(prof_lo) {
-        return prof_lo;
+    if experimental_exact_mixed_solver_enabled()
+        && let Some(experimental) =
+            solve_prof_mixed_coupled_experimental(sims, active, prof_hi, prof_lo, budget, skip)
+    {
+        return experimental;
     }
-    if !affordable(prof_hi) {
-        return prof_hi;
-    }
-
-    let mut lo = prof_lo;
-    let mut hi = prof_hi;
-    for _ in 0..SOLVE_PROF_ITERS {
-        let mid = 0.5 * (lo + hi);
-        if affordable(mid) {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-        if (hi - lo).abs() <= EPS * (1.0 + hi.abs()) {
-            break;
-        }
-    }
-
-    hi.clamp(prof_lo, prof_hi)
+    solve_prof_mixed_bisection(sims, active, prof_hi, prof_lo, budget, skip)
 }

@@ -5,7 +5,7 @@ use super::super::planning::{
     PlannedRoute, active_skip_indices, cost_for_route, plan_active_routes,
     plan_active_routes_with_scratch, plan_is_budget_feasible, solve_prof,
 };
-use super::super::rebalancer::rebalance;
+use super::super::rebalancer::{RebalanceMode, rebalance, rebalance_with_gas_pricing};
 use super::super::sim::{
     EPS, PoolSim, Route, alt_price, build_sims, profitability, target_price_for_prof,
 };
@@ -22,6 +22,10 @@ use super::{
     replay_actions_to_market_state, replay_actions_to_state,
     slot0_for_market_with_multiplier_and_pool_liquidity,
 };
+use crate::execution::gas::GasAssumptions;
+use crate::markets::MARKETS_L1;
+use crate::pools::{Slot0Result, normalize_market_name, prediction_to_sqrt_price_x96};
+use alloy::primitives::{Address, U256};
 use proptest::prelude::*;
 use proptest::proptest;
 
@@ -39,7 +43,15 @@ fn waterfall_without_intra_step_boundary_split(
     let mut price_sum: f64 = sims.iter().map(|s| s.price()).sum();
     let mut active_set: HashSet<(usize, Route)> = HashSet::new();
 
-    let first = match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
+    let first = match best_non_active(
+        sims,
+        &active_set,
+        mint_available,
+        price_sum,
+        *budget,
+        0.0,
+        0.0,
+    ) {
         Some(entry) if entry.2 > 0.0 => entry,
         _ => return 0.0,
     };
@@ -57,7 +69,15 @@ fn waterfall_without_intra_step_boundary_split(
         }
 
         loop {
-            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
+            match best_non_active(
+                sims,
+                &active_set,
+                mint_available,
+                price_sum,
+                *budget,
+                0.0,
+                0.0,
+            ) {
                 Some((idx, route, prof)) if prof > current_prof => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -66,7 +86,15 @@ fn waterfall_without_intra_step_boundary_split(
             }
         }
 
-        let next = best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0);
+        let next = best_non_active(
+            sims,
+            &active_set,
+            mint_available,
+            price_sum,
+            *budget,
+            0.0,
+            0.0,
+        );
         let target_prof = match next {
             Some((_, _, p)) if p > 0.0 => p,
             _ => 0.0,
@@ -118,7 +146,15 @@ fn waterfall_without_intra_step_boundary_split(
             current_prof = target_prof;
             last_prof = target_prof;
 
-            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
+            match best_non_active(
+                sims,
+                &active_set,
+                mint_available,
+                price_sum,
+                *budget,
+                0.0,
+                0.0,
+            ) {
                 Some((idx, route, prof)) if prof > 0.0 => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -212,7 +248,15 @@ fn waterfall_break_after_budget_partial(
     let mut price_sum: f64 = sims.iter().map(|s| s.price()).sum();
     let mut active_set: HashSet<(usize, Route)> = HashSet::new();
 
-    let first = match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
+    let first = match best_non_active(
+        sims,
+        &active_set,
+        mint_available,
+        price_sum,
+        *budget,
+        0.0,
+        0.0,
+    ) {
         Some(entry) if entry.2 > 0.0 => entry,
         _ => return 0.0,
     };
@@ -230,7 +274,15 @@ fn waterfall_break_after_budget_partial(
         }
 
         loop {
-            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
+            match best_non_active(
+                sims,
+                &active_set,
+                mint_available,
+                price_sum,
+                *budget,
+                0.0,
+                0.0,
+            ) {
                 Some((idx, route, prof)) if prof > current_prof => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -239,7 +291,15 @@ fn waterfall_break_after_budget_partial(
             }
         }
 
-        let next = best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0);
+        let next = best_non_active(
+            sims,
+            &active_set,
+            mint_available,
+            price_sum,
+            *budget,
+            0.0,
+            0.0,
+        );
         let target_prof = match next {
             Some((_, _, p)) if p > 0.0 => p,
             _ => 0.0,
@@ -311,7 +371,15 @@ fn waterfall_break_after_budget_partial(
             current_prof = target_prof;
             last_prof = target_prof;
 
-            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, 0.0, 0.0) {
+            match best_non_active(
+                sims,
+                &active_set,
+                mint_available,
+                price_sum,
+                *budget,
+                0.0,
+                0.0,
+            ) {
                 Some((idx, route, prof)) if prof > 0.0 => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -412,6 +480,81 @@ fn waterfall_break_after_budget_partial(
     }
 
     last_prof
+}
+
+fn full_pooled_slot0_results_with_prediction_multiplier(
+    multiplier: f64,
+) -> Vec<(Slot0Result, &'static crate::markets::MarketData)> {
+    let preds = crate::pools::prediction_map();
+    MARKETS_L1
+        .iter()
+        .filter(|m| m.pool.is_some())
+        .filter(|m| preds.contains_key(&normalize_market_name(m.name)))
+        .map(|market| {
+            let pool = market.pool.as_ref().expect("pooled market required");
+            let pred = preds[&normalize_market_name(market.name)];
+            let is_token1_outcome =
+                pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+            let price = (pred * multiplier).max(1e-9);
+            let sqrt_price = prediction_to_sqrt_price_x96(price, is_token1_outcome)
+                .unwrap_or(U256::from(1u128 << 96));
+            (
+                Slot0Result {
+                    pool_id: Address::ZERO,
+                    sqrt_price_x96: sqrt_price,
+                    tick: 0,
+                    observation_index: 0,
+                    observation_cardinality: 0,
+                    observation_cardinality_next: 0,
+                    fee_protocol: 0,
+                    unlocked: true,
+                },
+                market,
+            )
+        })
+        .collect()
+}
+
+fn direct_sell_blocking_gas_assumptions() -> GasAssumptions {
+    GasAssumptions {
+        direct_buy_l2_units: 0,
+        direct_sell_l2_units: 5_000_000_000,
+        direct_merge_l2_units: 5_000_000_000,
+        mint_sell_base_l2_units: 5_000_000_000,
+        mint_sell_per_sell_leg_l2_units: 1_000_000_000,
+        buy_merge_base_l2_units: 5_000_000_000,
+        buy_merge_per_buy_leg_l2_units: 1_000_000_000,
+        l1_data_fee_floor_susd: 0.0,
+        l1_fee_per_byte_wei: 0.0,
+    }
+}
+
+fn permissive_runtime_gas_assumptions() -> GasAssumptions {
+    GasAssumptions {
+        direct_buy_l2_units: 1,
+        direct_sell_l2_units: 1,
+        direct_merge_l2_units: 1,
+        mint_sell_base_l2_units: 1,
+        mint_sell_per_sell_leg_l2_units: 0,
+        buy_merge_base_l2_units: 1,
+        buy_merge_per_buy_leg_l2_units: 0,
+        l1_data_fee_floor_susd: 1e-9,
+        l1_fee_per_byte_wei: 1.0,
+    }
+}
+
+fn mint_sell_blocking_runtime_gas_assumptions() -> GasAssumptions {
+    GasAssumptions {
+        direct_buy_l2_units: 1,
+        direct_sell_l2_units: 1,
+        direct_merge_l2_units: 1,
+        mint_sell_base_l2_units: 5_000_000_000,
+        mint_sell_per_sell_leg_l2_units: 1_000_000_000,
+        buy_merge_base_l2_units: 1,
+        buy_merge_per_buy_leg_l2_units: 0,
+        l1_data_fee_floor_susd: 1e-9,
+        l1_fee_per_byte_wei: 1.0,
+    }
 }
 
 #[test]
@@ -1185,7 +1328,14 @@ fn test_waterfall_misnormalized_prediction_sums_remain_finite() {
         let mut budget = start_budget;
         let mut actions = Vec::new();
 
-        let prof = waterfall(&mut sims, &mut budget, &mut actions, mint_available, 0.0, 0.0);
+        let prof = waterfall(
+            &mut sims,
+            &mut budget,
+            &mut actions,
+            mint_available,
+            0.0,
+            0.0,
+        );
         assert!(prof.is_finite());
         assert!(budget.is_finite() && budget >= -1e-7);
         assert_action_values_are_finite(&actions);
@@ -1915,9 +2065,15 @@ fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
 
         let price_sum: f64 = sims.iter().map(|s| s.price()).sum();
         let empty_active_set: HashSet<(usize, Route)> = HashSet::new();
-        let Some((seed_idx, seed_route, current_prof)) =
-            best_non_active(&sims, &empty_active_set, true, price_sum, f64::MAX, 0.0, 0.0)
-        else {
+        let Some((seed_idx, seed_route, current_prof)) = best_non_active(
+            &sims,
+            &empty_active_set,
+            true,
+            price_sum,
+            f64::MAX,
+            0.0,
+            0.0,
+        ) else {
             continue;
         };
         if seed_route != Route::Mint || !current_prof.is_finite() || current_prof <= 1e-8 {
@@ -1926,10 +2082,11 @@ fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
 
         let active = vec![(seed_idx, seed_route)];
         let active_set: HashSet<(usize, Route)> = active.iter().copied().collect();
-        let target_prof = match best_non_active(&sims, &active_set, true, price_sum, f64::MAX, 0.0, 0.0) {
-            Some((_, _, p)) if p > 0.0 => p,
-            _ => 0.0,
-        };
+        let target_prof =
+            match best_non_active(&sims, &active_set, true, price_sum, f64::MAX, 0.0, 0.0) {
+                Some((_, _, p)) if p > 0.0 => p,
+                _ => 0.0,
+            };
         if !(target_prof.is_finite() && target_prof >= 0.0 && target_prof < current_prof) {
             continue;
         }
@@ -2221,7 +2378,14 @@ fn test_intra_step_boundary_rerank_improves_ev_vs_no_split_control() {
         let mut split_actions = Vec::new();
         let mut no_split_actions = Vec::new();
 
-        let _ = waterfall(&mut sims_split, &mut split_budget, &mut split_actions, true, 0.0, 0.0);
+        let _ = waterfall(
+            &mut sims_split,
+            &mut split_budget,
+            &mut split_actions,
+            true,
+            0.0,
+            0.0,
+        );
         let _ = waterfall_without_intra_step_boundary_split(
             &mut sims_no_split,
             &mut no_split_budget,
@@ -2346,7 +2510,14 @@ fn test_waterfall_budget_partial_continue_can_improve_ev_vs_break_control() {
         let mut budget_old = initial_budget;
         let mut actions_new = Vec::new();
         let mut actions_old = Vec::new();
-        let _ = waterfall(&mut sims_new, &mut budget_new, &mut actions_new, true, 0.0, 0.0);
+        let _ = waterfall(
+            &mut sims_new,
+            &mut budget_new,
+            &mut actions_new,
+            true,
+            0.0,
+            0.0,
+        );
         let _ = waterfall_break_after_budget_partial(
             &mut sims_old,
             &mut budget_old,
@@ -3027,7 +3198,14 @@ fn test_waterfall_scale_invariance_direct_only() {
         0.0,
         0.0,
     );
-    let prof_big = waterfall(&mut sims_big, &mut budget_big, &mut actions_big, false, 0.0, 0.0);
+    let prof_big = waterfall(
+        &mut sims_big,
+        &mut budget_big,
+        &mut actions_big,
+        false,
+        0.0,
+        0.0,
+    );
 
     let prof_tol = 5e-5 * (1.0 + prof_small.abs() + prof_big.abs());
     assert!(
@@ -3668,6 +3846,154 @@ fn test_waterfall_hard_caps_converges() {
         "after cap convergence, subsequent pass should not trade"
     );
     assert!(second_prof <= 1e-9);
+}
+
+#[test]
+fn phase1_skips_subgas_liquidation_runtime_thresholds() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected = [markets[0], markets[1]];
+    let slot0_results = build_slot0_results_for_markets(&selected, &[1.0000005, 0.55]);
+
+    let mut balances: HashMap<&str, f64> = HashMap::new();
+    balances.insert(selected[0].name, 40.0);
+    let budget = 0.0;
+
+    let baseline_actions = rebalance(&balances, budget, &slot0_results);
+    assert!(
+        baseline_actions.iter().any(
+            |a| matches!(a, Action::Sell { market_name, .. } if *market_name == selected[0].name)
+        ),
+        "baseline fixture should liquidate overpriced legacy inventory"
+    );
+
+    let gas = direct_sell_blocking_gas_assumptions();
+    let gated_actions = rebalance_with_gas_pricing(
+        &balances,
+        budget,
+        &slot0_results,
+        RebalanceMode::Full,
+        &gas,
+        1e-9,
+        3000.0,
+    );
+
+    assert_action_values_are_finite(&gated_actions);
+    assert!(
+        !gated_actions.iter().any(
+            |a| matches!(a, Action::Sell { market_name, .. } if *market_name == selected[0].name)
+        ),
+        "runtime gas thresholds should skip sub-gas phase-1 liquidation legs"
+    );
+}
+
+#[test]
+fn phase3_skips_subgas_recycling_runtime_thresholds() {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected = [markets[0], markets[1]];
+    let slot0_results = build_slot0_results_for_markets(&selected, &[0.98, 0.40]);
+
+    let mut balances: HashMap<&str, f64> = HashMap::new();
+    balances.insert(selected[0].name, 30.0);
+    let budget = 1.0;
+
+    let baseline_actions = rebalance(&balances, budget, &slot0_results);
+    assert!(
+        baseline_actions.iter().any(
+            |a| matches!(a, Action::Sell { market_name, .. } if *market_name == selected[0].name)
+        ),
+        "baseline fixture should recycle low-profitability legacy inventory in phase 3"
+    );
+
+    let gas = direct_sell_blocking_gas_assumptions();
+    let gated_actions = rebalance_with_gas_pricing(
+        &balances,
+        budget,
+        &slot0_results,
+        RebalanceMode::Full,
+        &gas,
+        1e-9,
+        3000.0,
+    );
+
+    assert_action_values_are_finite(&gated_actions);
+    assert!(
+        !gated_actions.iter().any(
+            |a| matches!(a, Action::Sell { market_name, .. } if *market_name == selected[0].name)
+        ),
+        "runtime gas thresholds should block sub-gas phase-3 recycling sells"
+    );
+}
+
+#[test]
+fn full_mode_two_sided_arb_executes_when_price_sum_above_one() {
+    let slot0_results = full_pooled_slot0_results_with_prediction_multiplier(1.15);
+    let preds = crate::pools::prediction_map();
+    let sims = build_sims(&slot0_results, &preds).expect("full fixture should build sims");
+    let price_sum: f64 = sims.iter().map(|s| s.price()).sum();
+    assert!(
+        price_sum > 1.0 + EPS,
+        "fixture must satisfy sum(prices) > 1, got {price_sum:.9}"
+    );
+
+    let gas = permissive_runtime_gas_assumptions();
+    let actions = rebalance_with_gas_pricing(
+        &HashMap::new(),
+        100.0,
+        &slot0_results,
+        RebalanceMode::Full,
+        &gas,
+        1e-9,
+        3000.0,
+    );
+    assert_action_values_are_finite(&actions);
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+        "two-sided overpricing arb should mint complete sets when sum(prices) > 1"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Sell { .. })),
+        "two-sided overpricing arb should sell minted outcome legs in full mode"
+    );
+}
+
+#[test]
+fn full_mode_two_sided_arb_skips_subgas_phase0_overpricing() {
+    let slot0_results = full_pooled_slot0_results_with_prediction_multiplier(1.15);
+
+    let permissive = permissive_runtime_gas_assumptions();
+    let baseline = rebalance_with_gas_pricing(
+        &HashMap::new(),
+        100.0,
+        &slot0_results,
+        RebalanceMode::Full,
+        &permissive,
+        1e-9,
+        3000.0,
+    );
+    assert!(
+        baseline.iter().any(
+            |a| matches!(a, Action::Mint { target_market, .. } if *target_market == "complete_set_arb")
+        ),
+        "fixture should emit overpricing mint/sell arb under permissive gas"
+    );
+
+    let blocking = mint_sell_blocking_runtime_gas_assumptions();
+    let gated = rebalance_with_gas_pricing(
+        &HashMap::new(),
+        100.0,
+        &slot0_results,
+        RebalanceMode::Full,
+        &blocking,
+        1e-9,
+        3000.0,
+    );
+    assert_action_values_are_finite(&gated);
+    assert!(
+        !gated.iter().any(
+            |a| matches!(a, Action::Mint { target_market, .. } if *target_market == "complete_set_arb")
+        ),
+        "sub-gas phase-0 overpricing arb should be filtered before action emission"
+    );
 }
 
 proptest! {

@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use super::super::merge::{
     execute_merge_sell, merge_sell_cap, merge_sell_proceeds, optimal_sell_split,
 };
-use super::super::rebalancer::{RebalanceMode, rebalance, rebalance_with_mode};
+use super::super::rebalancer::{
+    RebalanceMode, rebalance, rebalance_with_gas_pricing, rebalance_with_mode,
+};
 use super::super::sim::PoolSim;
 use super::super::trading::{ExecutionState, solve_complete_set_arb_amount};
 use super::{
@@ -269,6 +271,39 @@ fn test_execute_optimal_sell_buys_only_shortfall() {
     assert!((*sim_balances.get("M1").unwrap() - 0.0).abs() < 1e-9);
     assert!((*sim_balances.get("M2").unwrap() - 0.0).abs() < 1e-9);
     assert!((*sim_balances.get("M3").unwrap() - 2.0).abs() < 1e-9);
+}
+
+#[test]
+fn test_execute_optimal_sell_allows_direct_merge_when_buy_merge_is_blocked() {
+    let mut sims = build_three_sims_with_preds([0.8, 0.05, 0.05], [0.3, 0.01, 0.01]);
+    let mut sim_balances: HashMap<&'static str, f64> = HashMap::new();
+    sim_balances.insert("M1", 5.0);
+    sim_balances.insert("M2", 5.0);
+    sim_balances.insert("M3", 5.0);
+
+    let mut budget = 0.0;
+    let mut actions = Vec::new();
+    let sold = {
+        let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
+        exec.execute_optimal_sell_with_merge_gates(
+            0,
+            5.0,
+            0.0,
+            true,
+            false, // buy-merge blocked
+            true,  // direct-merge allowed
+        )
+    };
+
+    assert!((sold - 5.0).abs() < 1e-9, "should sell full source amount");
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+        "direct-merge route should still execute when buy-merge is blocked"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "no buy legs should be emitted for direct-merge-only liquidation"
+    );
 }
 
 #[test]
@@ -627,6 +662,122 @@ fn test_rebalance_perf_full_l1() {
 
     // Budget accounting: remaining should be non-negative.
     // It may exceed initial budget if complete-set arbitrage is executed.
+    assert!(
+        remaining_budget >= -1e-9,
+        "remaining budget should be non-negative: {:.6}",
+        remaining_budget
+    );
+}
+
+#[test]
+fn test_rebalance_perf_full_l1_with_gas_pricing() {
+    use crate::markets::MARKETS_L1;
+    use std::time::Instant;
+
+    let preds = crate::pools::prediction_map();
+    let slot0_results: Vec<(Slot0Result, &'static crate::markets::MarketData)> = MARKETS_L1
+        .iter()
+        .filter(|m| m.pool.is_some())
+        .filter(|m| preds.contains_key(&normalize_market_name(m.name)))
+        .map(|market| {
+            let pool = market.pool.as_ref().unwrap();
+            let is_token1_outcome =
+                pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+            let key = normalize_market_name(market.name);
+            let pred = preds[&key];
+            let price = pred * 0.5;
+            let sqrt_price = prediction_to_sqrt_price_x96(price, is_token1_outcome)
+                .unwrap_or(U256::from(1u128 << 96));
+            (
+                Slot0Result {
+                    pool_id: Address::ZERO,
+                    sqrt_price_x96: sqrt_price,
+                    tick: 0,
+                    observation_index: 0,
+                    observation_cardinality: 0,
+                    observation_cardinality_next: 0,
+                    fee_protocol: 0,
+                    unlocked: true,
+                },
+                market,
+            )
+        })
+        .collect();
+
+    let gas = test_gas_assumptions();
+    println!("Markets: {}", slot0_results.len());
+
+    let _ = rebalance_with_gas_pricing(
+        &HashMap::new(),
+        100.0,
+        &slot0_results,
+        RebalanceMode::Full,
+        &gas,
+        1e-9,
+        3000.0,
+    );
+
+    let iters = 10;
+    let start = Instant::now();
+    let mut actions = Vec::new();
+    for _ in 0..iters {
+        actions = rebalance_with_gas_pricing(
+            &HashMap::new(),
+            100.0,
+            &slot0_results,
+            RebalanceMode::Full,
+            &gas,
+            1e-9,
+            3000.0,
+        );
+    }
+    let elapsed = start.elapsed();
+
+    let buys = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Buy { .. }))
+        .count();
+    let sells = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Sell { .. }))
+        .count();
+    let mints = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Mint { .. }))
+        .count();
+    let merges = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Merge { .. }))
+        .count();
+
+    println!(
+        "=== Rebalance Performance (full L1 + gas pricing, {} outcomes) ===",
+        slot0_results.len()
+    );
+    println!("  Total: {:?} for {} iterations", elapsed, iters);
+    println!("  Per call: {:?}", elapsed / iters as u32);
+    println!(
+        "  Actions: {} total ({} buys, {} sells, {} mints, {} merges)",
+        actions.len(),
+        buys,
+        sells,
+        mints,
+        merges
+    );
+
+    assert!(
+        !actions.is_empty(),
+        "gas-aware full-L1 fixture should produce actions"
+    );
+
+    let initial_balances: HashMap<&str, f64> = HashMap::new();
+    let (_, _, remaining_budget) = assert_strict_ev_gain_with_portfolio_trace(
+        "rebalance_perf_full_l1_with_gas_pricing",
+        &actions,
+        &slot0_results,
+        &initial_balances,
+        100.0,
+    );
     assert!(
         remaining_budget >= -1e-9,
         "remaining budget should be non-negative: {:.6}",

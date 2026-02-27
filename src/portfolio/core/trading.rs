@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::Action;
 use super::merge::{
-    action_contract_pair, execute_merge_sell_with_inventory, optimal_sell_split_with_inventory,
+    action_contract_pair, execute_merge_sell_with_inventory, merge_usable_inventory,
+    optimal_sell_split_with_inventory,
 };
 use super::planning::PlannedRoute;
 use super::sim::{DUST, EPS, FEE_FACTOR, PoolSim, Route, sanitize_nonnegative_finite};
@@ -416,12 +417,32 @@ impl<'a> ExecutionState<'a> {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn execute_optimal_sell(
         &mut self,
         source_idx: usize,
         sell_amount: f64,
         inventory_keep_prof: f64,
         mint_available: bool,
+    ) -> f64 {
+        self.execute_optimal_sell_with_merge_gates(
+            source_idx,
+            sell_amount,
+            inventory_keep_prof,
+            mint_available,
+            true,
+            true,
+        )
+    }
+
+    pub(super) fn execute_optimal_sell_with_merge_gates(
+        &mut self,
+        source_idx: usize,
+        sell_amount: f64,
+        inventory_keep_prof: f64,
+        mint_available: bool,
+        allow_buy_merge: bool,
+        allow_direct_merge: bool,
     ) -> f64 {
         if sell_amount <= 0.0 {
             return 0.0;
@@ -436,7 +457,29 @@ impl<'a> ExecutionState<'a> {
                 Some(sim_balances),
                 inventory_keep_prof,
             );
-            m_opt
+            if m_opt > DUST {
+                let needs_buy_legs = self
+                    .sims
+                    .iter()
+                    .enumerate()
+                    .any(|(i, sim)| {
+                        i != source_idx
+                            && m_opt
+                                > merge_usable_inventory(
+                                    Some(sim_balances),
+                                    sim,
+                                    inventory_keep_prof,
+                                ) + DUST
+                    });
+                let route_allowed = if needs_buy_legs {
+                    allow_buy_merge
+                } else {
+                    allow_direct_merge
+                };
+                if route_allowed { m_opt } else { 0.0 }
+            } else {
+                0.0
+            }
         } else {
             0.0
         };

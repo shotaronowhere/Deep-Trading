@@ -36,23 +36,62 @@ Estimated by probing the `GasPriceOracle.getL1Fee()` on-chain contract with two 
 
 The second call uses the "Other repos" token (outcome `0x63a4...`) as collateral, not sUSDS. This token is excluded from trading and sim construction — it has `pool: None` in `MARKETS_L1` and must never appear as a swap leg.
 
-## Minimum Trade Threshold (Waterfall)
+## Runtime Thresholds and Gates
 
-Before admitting an outcome to the active set, `best_non_active()` checks:
+Thresholds are computed per route group kind:
+
+- `DirectBuy`
+- `MintSell`
+- `DirectSell`
+- `BuyMerge`
+- `DirectMerge`
+
+### Waterfall candidate admission
+
+Before admitting a non-active entry to the waterfall active set:
 
 ```
-remaining_budget × profitability >= gas_cost
+remaining_budget × profitability >= gas_cost_for_route
 ```
 
-Equivalently: `remaining_budget >= gas_cost / profitability`.
+Direct entries use `direct_buy`; mint entries use `mint_sell`.
 
-This ensures the maximum possible profit from the remaining budget (if all of it went to this outcome) at least covers the gas cost. The threshold uses worst-case gas (`MintSell` with `sims.len() - 1` sell legs) for the mint route.
+### Execution-aligned edge gate
 
-Gas thresholds are computed once per rebalance call from `GasAssumptions` using conservative defaults (1 gwei L2, $3000/ETH). The `rebalance_with_mode` function (used by all tests) passes `0.0, 0.0` thresholds (no filtering). The `rebalance_with_gas` entry point (used by `main.rs`) passes real thresholds.
+Phase-1 liquidation, phase-3 recycling, and waterfall step execution all use the same gate shape:
 
-`main.rs` only fetches the L1 fee oracle when `REBALANCE_MODE=full` (the default). In `ArbOnly` mode the fetch is skipped entirely and `GasAssumptions::default()` is used — which is harmless since `ArbOnly` ignores gas thresholds regardless.
+```
+edge_susd > gas_susd + max(buffer_min_susd, buffer_frac * edge_susd) + EPS
+```
 
-**Fail-closed:** If `estimate_min_gas_susd_for_group` returns non-finite (e.g. due to missing L1 fee data), the threshold is set to `f64::INFINITY`, blocking all trades rather than silently allowing them.
+Default runtime buffer settings:
+
+- `buffer_frac = 0.20`
+- `buffer_min_susd = 0.25`
+
+Fail-closed semantics:
+
+- non-finite/negative edge: reject
+- non-finite/negative gas estimate: reject
+- non-finite thresholds from estimator are sanitized to `f64::INFINITY`
+
+### API and pricing assumptions
+
+Gas-aware APIs:
+
+- `rebalance_with_gas(...)` (compatibility wrapper)
+- `rebalance_with_gas_pricing(..., gas_price_eth, eth_usd)` (explicit pricing)
+
+Defaults for the wrapper:
+
+- `gas_price_eth = 1e-9`
+- `eth_usd = 3000.0`
+
+Runtime override:
+
+- `ETH_USD` env var in `main` and `execute` binaries (default `3000`)
+
+`main.rs` fetches L1 fee oracle data only in `RebalanceMode::Full`; `ArbOnly` uses defaults and ignores waterfall gas thresholds.
 
 ## Preconditions
 

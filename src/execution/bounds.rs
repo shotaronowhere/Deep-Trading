@@ -416,6 +416,10 @@ mod tests {
     use crate::execution::BatchQuoteBounds;
     use crate::execution::GroupKind;
     use crate::execution::grouping::{GroupingError, group_execution_actions};
+    use crate::markets::MARKETS_L1;
+    use crate::pools::{Slot0Result, normalize_market_name, prediction_to_sqrt_price_x96};
+    use crate::portfolio::{self, RebalanceMode};
+    use alloy::primitives::{Address, U256};
 
     fn buy(name: &'static str, amount: f64, cost: f64) -> Action {
         Action::Buy {
@@ -447,6 +451,75 @@ mod tests {
             l1_fee_per_byte_wei: 1.0e11,
             ..GasAssumptions::default()
         }
+    }
+
+    fn full_slot0_results_with_prediction_multiplier(
+        multiplier: f64,
+    ) -> Vec<(Slot0Result, &'static crate::markets::MarketData)> {
+        let preds = crate::pools::prediction_map();
+        MARKETS_L1
+            .iter()
+            .filter(|m| m.pool.is_some())
+            .filter(|m| preds.contains_key(&normalize_market_name(m.name)))
+            .map(|market| {
+                let pool = market.pool.as_ref().expect("pooled market required");
+                let key = normalize_market_name(market.name);
+                let pred = preds[&key];
+                let is_token1_outcome =
+                    pool.token1.to_lowercase() == market.outcome_token.to_lowercase();
+                let price = (pred * multiplier).max(1e-9);
+                let sqrt_price = prediction_to_sqrt_price_x96(price, is_token1_outcome)
+                    .unwrap_or(U256::from(1u128 << 96));
+                (
+                    Slot0Result {
+                        pool_id: Address::ZERO,
+                        sqrt_price_x96: sqrt_price,
+                        tick: 0,
+                        observation_index: 0,
+                        observation_cardinality: 0,
+                        observation_cardinality_next: 0,
+                        fee_protocol: 0,
+                        unlocked: true,
+                    },
+                    market,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn runtime_actions_produce_nonempty_plan_prefix_under_realistic_gas() {
+        let slot0_results = full_slot0_results_with_prediction_multiplier(0.35);
+        let gas = GasAssumptions {
+            l1_fee_per_byte_wei: 1.0e8,
+            ..GasAssumptions::default()
+        };
+        let actions = portfolio::rebalance_with_gas_pricing(
+            &HashMap::new(),
+            200.0,
+            &slot0_results,
+            RebalanceMode::Full,
+            &gas,
+            1e-9,
+            3000.0,
+        );
+        assert!(
+            !actions.is_empty(),
+            "runtime rebalance fixture should emit actions"
+        );
+
+        let plans = build_group_plans_with_default_edges(
+            &actions,
+            &gas,
+            1e-9,
+            3000.0,
+            BufferConfig::default(),
+        )
+        .expect("planning should succeed for runtime action stream");
+        assert!(
+            !plans.is_empty(),
+            "runtime action stream should produce non-empty strict execution prefix"
+        );
     }
 
     #[test]

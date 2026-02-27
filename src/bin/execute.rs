@@ -33,6 +33,14 @@ fn parse_rebalance_mode() -> RebalanceMode {
     }
 }
 
+fn parse_eth_usd() -> f64 {
+    std::env::var("ETH_USD")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(3000.0)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
@@ -42,6 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = ExecutionRuntimeConfig::from_env()?;
     let mode = parse_rebalance_mode();
+    let eth_usd = parse_eth_usd();
 
     let signer: PrivateKeySigner = config.private_key.parse()?;
     let signer_address = signer.address();
@@ -126,12 +135,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map(|(market, units)| (*market as &str, *units))
             .collect();
 
-        let actions = portfolio::rebalance_with_gas(
+        let actions = portfolio::rebalance_with_gas_pricing(
             &balances_view,
             susds_balance,
             &slot0_results,
             mode,
             &gas_assumptions,
+            1e-9,
+            eth_usd,
         );
         if actions.is_empty() {
             tracing::info!(step = steps, "no actions generated; stopping execute loop");
@@ -142,14 +153,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &actions,
             &gas_assumptions,
             1e-9,
-            3000.0,
+            eth_usd,
             BufferConfig::default(),
         )?;
         if plans.is_empty() {
+            use deep_trading_bot::execution::bounds::planned_edge_from_prediction_map_susd;
+            use deep_trading_bot::execution::grouping::group_execution_actions;
             tracing::info!(
                 step = steps,
+                action_count = actions.len(),
+                eth_usd,
                 "no executable groups planned; stopping execute loop"
             );
+            if let Ok(groups) = group_execution_actions(&actions) {
+                let preds = deep_trading_bot::pools::prediction_map();
+                for (idx, group) in groups.iter().take(3).enumerate() {
+                    let edge = planned_edge_from_prediction_map_susd(group, &preds).unwrap_or(0.0);
+                    let gas_est = deep_trading_bot::execution::gas::estimate_min_gas_susd_for_group(
+                        &gas_assumptions,
+                        group.kind,
+                        group.buy_legs,
+                        group.sell_legs,
+                        1e-9,
+                        eth_usd,
+                    );
+                    tracing::info!(
+                        step = steps,
+                        group_index = idx,
+                        group_kind = ?group.kind,
+                        buy_legs = group.buy_legs,
+                        sell_legs = group.sell_legs,
+                        edge_plan_susd = edge,
+                        gas_estimate_susd = gas_est,
+                        "empty-plan diagnostics"
+                    );
+                }
+            }
             break;
         }
 

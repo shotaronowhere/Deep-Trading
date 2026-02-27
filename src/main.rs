@@ -26,6 +26,14 @@ fn parse_starting_susd() -> f64 {
         .unwrap_or(100.0)
 }
 
+fn parse_eth_usd() -> f64 {
+    std::env::var("ETH_USD")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(3000.0)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
@@ -51,6 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mode = parse_rebalance_mode();
+    let eth_usd = parse_eth_usd();
 
     let gas_assumptions = if mode == RebalanceMode::Full {
         match default_gas_assumptions_with_optimism_l1_fee(&rpc_url).await {
@@ -83,12 +92,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|(market, units)| (*market as &str, *units))
         .collect();
 
-    let actions = portfolio::rebalance_with_gas(
+    let actions = portfolio::rebalance_with_gas_pricing(
         &balances_view,
         initial_susd,
         &slot0_results,
         mode,
         &gas_assumptions,
+        1e-9,
+        eth_usd,
     );
     let (final_holdings, final_susd) = portfolio::replay_actions_to_portfolio_state(
         &actions,
@@ -100,6 +111,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tracing::info!(
         mode = ?mode,
+        eth_usd,
         markets = slot0_results.len(),
         actions = actions.len(),
         "completed rebalance planning"

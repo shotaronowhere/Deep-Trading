@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::execution::gas::{GasAssumptions, estimate_min_gas_susd_for_group};
 use crate::execution::GroupKind;
+use crate::execution::gas::{GasAssumptions, estimate_min_gas_susd_for_group};
 use crate::pools::Slot0Result;
 
 use super::Action;
@@ -14,7 +14,7 @@ use super::sim::{
 use super::trading::{ExecutionState, portfolio_expected_value};
 use super::types::BalanceMap;
 use super::types::{apply_actions_to_sim_balances, lookup_balance};
-use super::waterfall::waterfall;
+use super::waterfall::{WaterfallGateStats, waterfall_with_execution_gate};
 
 const MAX_PHASE1_ITERS: usize = 128;
 const MAX_PHASE3_ITERS: usize = 8;
@@ -25,11 +25,109 @@ const PHASE3_ESCALATION_MIN_REMAINING_FRAC: f64 = 0.20;
 const PHASE3_ESCALATION_MIN_REMAINING_ABS: f64 = 1e-6;
 const MAX_POLISH_PASSES: usize = 64;
 const POLISH_EV_REL_TOL: f64 = 1e-10;
+const DEFAULT_GATE_BUFFER_FRAC: f64 = 0.20;
+const DEFAULT_GATE_BUFFER_MIN_SUSD: f64 = 0.25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebalanceMode {
     Full,
     ArbOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RouteGateThresholds {
+    direct_buy: f64,
+    mint_sell: f64,
+    direct_sell: f64,
+    buy_merge: f64,
+    direct_merge: f64,
+    buffer_frac: f64,
+    buffer_min_susd: f64,
+}
+
+impl RouteGateThresholds {
+    fn disabled() -> Self {
+        Self {
+            direct_buy: 0.0,
+            mint_sell: 0.0,
+            direct_sell: 0.0,
+            buy_merge: 0.0,
+            direct_merge: 0.0,
+            buffer_frac: 0.0,
+            buffer_min_susd: 0.0,
+        }
+    }
+
+    fn is_legacy_compat_mode(&self) -> bool {
+        gate_is_disabled(self.direct_buy, self.buffer_frac, self.buffer_min_susd)
+            && gate_is_disabled(self.mint_sell, self.buffer_frac, self.buffer_min_susd)
+            && gate_is_disabled(self.direct_sell, self.buffer_frac, self.buffer_min_susd)
+            && gate_is_disabled(self.buy_merge, self.buffer_frac, self.buffer_min_susd)
+            && gate_is_disabled(self.direct_merge, self.buffer_frac, self.buffer_min_susd)
+    }
+
+    fn two_sided_complete_set_arb_enabled(&self) -> bool {
+        !self.is_legacy_compat_mode()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RebalanceGateCounters {
+    skipped_by_gate_direct_buy: u64,
+    skipped_by_gate_mint_sell: u64,
+    skipped_by_gate_direct_sell: u64,
+    skipped_by_gate_buy_merge: u64,
+    skipped_by_gate_direct_merge: u64,
+    waterfall_steps_pruned_subgas: u64,
+    phase1_candidates_skipped_subgas: u64,
+    phase3_candidates_skipped_subgas: u64,
+}
+
+fn sanitize_gate_threshold(value: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn gate_is_disabled(gas_susd: f64, buffer_frac: f64, buffer_min_susd: f64) -> bool {
+    gas_susd.is_finite()
+        && gas_susd <= 0.0
+        && buffer_frac.is_finite()
+        && buffer_frac <= 0.0
+        && buffer_min_susd.is_finite()
+        && buffer_min_susd <= 0.0
+}
+
+pub(super) fn passes_execution_gate(
+    edge_susd: f64,
+    gas_susd: f64,
+    buffer_frac: f64,
+    buffer_min_susd: f64,
+) -> bool {
+    if gate_is_disabled(gas_susd, buffer_frac, buffer_min_susd) {
+        // Preserve legacy behavior when route thresholds and buffers are disabled.
+        return true;
+    }
+    if !edge_susd.is_finite() || edge_susd <= 0.0 {
+        return false;
+    }
+    if !gas_susd.is_finite() || gas_susd < 0.0 {
+        return false;
+    }
+    let effective_frac = if buffer_frac.is_finite() {
+        buffer_frac.max(0.0)
+    } else {
+        0.0
+    };
+    let effective_min = if buffer_min_susd.is_finite() {
+        buffer_min_susd.max(0.0)
+    } else {
+        0.0
+    };
+    let profit_buffer = effective_min.max(effective_frac * edge_susd);
+    edge_susd > gas_susd + profit_buffer + EPS
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,8 +209,8 @@ struct RebalanceContext {
     mint_available: bool,
     sim_balances: BalanceMap,
     legacy_remaining: BalanceMap,
-    gas_direct: f64,
-    gas_mint: f64,
+    route_gates: RouteGateThresholds,
+    gate_counters: RebalanceGateCounters,
 }
 
 struct Phase3Trial {
@@ -140,6 +238,8 @@ impl Phase3Trial {
         sell_amount: f64,
         inventory_keep_prof: f64,
         mint_available: bool,
+        allow_buy_merge: bool,
+        allow_direct_merge: bool,
     ) -> f64 {
         let mut exec = ExecutionState::new(
             &mut self.sims,
@@ -147,7 +247,14 @@ impl Phase3Trial {
             &mut self.actions,
             &mut self.balances,
         );
-        exec.execute_optimal_sell(source_idx, sell_amount, inventory_keep_prof, mint_available)
+        exec.execute_optimal_sell_with_merge_gates(
+            source_idx,
+            sell_amount,
+            inventory_keep_prof,
+            mint_available,
+            allow_buy_merge,
+            allow_direct_merge,
+        )
     }
 }
 
@@ -192,8 +299,8 @@ impl RebalanceContext {
             mint_available,
             sim_balances,
             legacy_remaining,
-            gas_direct: 0.0,
-            gas_mint: 0.0,
+            route_gates: RouteGateThresholds::disabled(),
+            gate_counters: RebalanceGateCounters::default(),
         })
     }
 
@@ -236,11 +343,140 @@ impl RebalanceContext {
         self.budget = trial.budget;
     }
 
+    fn merge_waterfall_gate_stats(&mut self, stats: WaterfallGateStats) {
+        self.gate_counters.skipped_by_gate_direct_buy += stats.skipped_direct as u64;
+        self.gate_counters.skipped_by_gate_mint_sell += stats.skipped_mint as u64;
+        self.gate_counters.waterfall_steps_pruned_subgas += stats.steps_pruned_subgas as u64;
+    }
+
+    fn log_gate_summary(&self) {
+        tracing::info!(
+            skipped_by_gate_direct_buy = self.gate_counters.skipped_by_gate_direct_buy,
+            skipped_by_gate_mint_sell = self.gate_counters.skipped_by_gate_mint_sell,
+            skipped_by_gate_direct_sell = self.gate_counters.skipped_by_gate_direct_sell,
+            skipped_by_gate_buy_merge = self.gate_counters.skipped_by_gate_buy_merge,
+            skipped_by_gate_direct_merge = self.gate_counters.skipped_by_gate_direct_merge,
+            waterfall_steps_pruned_subgas = self.gate_counters.waterfall_steps_pruned_subgas,
+            phase1_candidates_skipped_subgas = self.gate_counters.phase1_candidates_skipped_subgas,
+            phase3_candidates_skipped_subgas = self.gate_counters.phase3_candidates_skipped_subgas,
+            "rebalance gate summary"
+        );
+    }
+
+    fn phase0_route_kind(&self, two_sided: bool) -> Option<GroupKind> {
+        let price_sum: f64 = self.sims.iter().map(|s| s.price()).sum();
+        if !price_sum.is_finite() {
+            return None;
+        }
+        if price_sum < 1.0 - EPS {
+            Some(GroupKind::BuyMerge)
+        } else if two_sided && price_sum > 1.0 + EPS {
+            Some(GroupKind::MintSell)
+        } else {
+            None
+        }
+    }
+
+    fn estimate_phase0_edge_susd(&self, two_sided: bool) -> Option<(GroupKind, f64)> {
+        let route_kind = self.phase0_route_kind(two_sided)?;
+        let mut trial_sims = self.sims.clone();
+        let mut trial_budget = self.budget;
+        let mut trial_actions = Vec::new();
+        let mut trial_balances: BalanceMap = HashMap::new();
+        let mut exec = ExecutionState::new(
+            &mut trial_sims,
+            &mut trial_budget,
+            &mut trial_actions,
+            &mut trial_balances,
+        );
+        let edge_susd = if two_sided {
+            exec.execute_two_sided_complete_set_arb()
+        } else {
+            exec.execute_complete_set_arb()
+        };
+        if edge_susd.is_finite() && edge_susd > 0.0 {
+            Some((route_kind, edge_susd))
+        } else {
+            None
+        }
+    }
+
+    fn route_gate_threshold(&self, kind: GroupKind) -> f64 {
+        match kind {
+            GroupKind::DirectBuy => self.route_gates.direct_buy,
+            GroupKind::MintSell => self.route_gates.mint_sell,
+            GroupKind::DirectSell => self.route_gates.direct_sell,
+            GroupKind::BuyMerge => self.route_gates.buy_merge,
+            GroupKind::DirectMerge => self.route_gates.direct_merge,
+        }
+    }
+
+    fn merge_route_gate_flags(&mut self, edge_susd: f64) -> (bool, bool) {
+        let buy_merge_allowed = passes_execution_gate(
+            edge_susd,
+            self.route_gates.buy_merge,
+            self.route_gates.buffer_frac,
+            self.route_gates.buffer_min_susd,
+        );
+        let direct_merge_allowed = passes_execution_gate(
+            edge_susd,
+            self.route_gates.direct_merge,
+            self.route_gates.buffer_frac,
+            self.route_gates.buffer_min_susd,
+        );
+        if self.mint_available && !buy_merge_allowed {
+            self.gate_counters.skipped_by_gate_buy_merge += 1;
+        }
+        if self.mint_available && !direct_merge_allowed {
+            self.gate_counters.skipped_by_gate_direct_merge += 1;
+        }
+        (buy_merge_allowed, direct_merge_allowed)
+    }
+
+    fn run_phase0_complete_set_arb(&mut self) {
+        if !self.mint_available {
+            return;
+        }
+        let two_sided = self.route_gates.two_sided_complete_set_arb_enabled();
+        let Some((route_kind, edge_susd)) = self.estimate_phase0_edge_susd(two_sided) else {
+            return;
+        };
+        let threshold = self.route_gate_threshold(route_kind);
+        if !passes_execution_gate(
+            edge_susd,
+            threshold,
+            self.route_gates.buffer_frac,
+            self.route_gates.buffer_min_susd,
+        ) {
+            match route_kind {
+                GroupKind::MintSell => self.gate_counters.skipped_by_gate_mint_sell += 1,
+                GroupKind::BuyMerge => self.gate_counters.skipped_by_gate_buy_merge += 1,
+                _ => {}
+            }
+            return;
+        }
+        let mut exec = ExecutionState::new(
+            &mut self.sims,
+            &mut self.budget,
+            &mut self.actions,
+            &mut self.sim_balances,
+        );
+        if two_sided {
+            exec.execute_two_sided_complete_set_arb();
+        } else {
+            // Keep zero-threshold paths behavior-compatible with legacy one-sided arb.
+            exec.execute_complete_set_arb();
+        }
+    }
+
     fn execute_optimal_sell(
         &mut self,
         source_idx: usize,
         sell_amount: f64,
         inventory_keep_prof: f64,
+        mint_available: bool,
+        allow_buy_merge: bool,
+        allow_direct_merge: bool,
     ) -> f64 {
         let mut exec = ExecutionState::new(
             &mut self.sims,
@@ -248,11 +484,13 @@ impl RebalanceContext {
             &mut self.actions,
             &mut self.sim_balances,
         );
-        exec.execute_optimal_sell(
+        exec.execute_optimal_sell_with_merge_gates(
             source_idx,
             sell_amount,
             inventory_keep_prof,
-            self.mint_available,
+            mint_available,
+            allow_buy_merge,
+            allow_direct_merge,
         )
     }
 
@@ -284,7 +522,28 @@ impl RebalanceContext {
                     break;
                 }
 
-                let sold_total = self.execute_optimal_sell(i, sell_amount, 0.0);
+                let approx_edge = sell_amount * (price - pred).max(0.0);
+                if !passes_execution_gate(
+                    approx_edge,
+                    self.route_gates.direct_sell,
+                    self.route_gates.buffer_frac,
+                    self.route_gates.buffer_min_susd,
+                ) {
+                    self.gate_counters.skipped_by_gate_direct_sell += 1;
+                    self.gate_counters.phase1_candidates_skipped_subgas += 1;
+                    break;
+                }
+
+                let (buy_merge_allowed, direct_merge_allowed) =
+                    self.merge_route_gate_flags(approx_edge);
+                let sold_total = self.execute_optimal_sell(
+                    i,
+                    sell_amount,
+                    0.0,
+                    self.mint_available,
+                    buy_merge_allowed,
+                    direct_merge_allowed,
+                );
                 if sold_total <= EPS {
                     break;
                 }
@@ -299,7 +558,27 @@ impl RebalanceContext {
                     && new_held + EPS < held
                     && new_held > EPS
                 {
-                    let sold_remaining = self.execute_optimal_sell(i, new_held, 0.0);
+                    let remaining_edge = new_held * (new_price - pred).max(0.0);
+                    if !passes_execution_gate(
+                        remaining_edge,
+                        self.route_gates.direct_sell,
+                        self.route_gates.buffer_frac,
+                        self.route_gates.buffer_min_susd,
+                    ) {
+                        self.gate_counters.skipped_by_gate_direct_sell += 1;
+                        self.gate_counters.phase1_candidates_skipped_subgas += 1;
+                        break;
+                    }
+                    let (buy_merge_allowed, direct_merge_allowed) =
+                        self.merge_route_gate_flags(remaining_edge);
+                    let sold_remaining = self.execute_optimal_sell(
+                        i,
+                        new_held,
+                        0.0,
+                        self.mint_available,
+                        buy_merge_allowed,
+                        direct_merge_allowed,
+                    );
                     if sold_remaining <= EPS {
                         break;
                     }
@@ -347,8 +626,32 @@ impl RebalanceContext {
                     continue;
                 }
 
-                let sold_total =
-                    trial.execute_optimal_sell(idx, sell_target, phase3_prof, self.mint_available);
+                let current_prof =
+                    profitability(trial.sims[idx].prediction, trial.sims[idx].price());
+                // Conservative first-order edge estimate for gating; ignores slippage by design.
+                let approx_edge =
+                    sell_target * trial.sims[idx].price() * (phase3_prof - current_prof).max(0.0);
+                if !passes_execution_gate(
+                    approx_edge,
+                    self.route_gates.direct_sell,
+                    self.route_gates.buffer_frac,
+                    self.route_gates.buffer_min_susd,
+                ) {
+                    self.gate_counters.skipped_by_gate_direct_sell += 1;
+                    self.gate_counters.phase3_candidates_skipped_subgas += 1;
+                    continue;
+                }
+
+                let (buy_merge_allowed, direct_merge_allowed) =
+                    self.merge_route_gate_flags(approx_edge);
+                let sold_total = trial.execute_optimal_sell(
+                    idx,
+                    sell_target,
+                    phase3_prof,
+                    self.mint_available,
+                    buy_merge_allowed,
+                    direct_merge_allowed,
+                );
                 if sold_total > EPS {
                     let legacy = trial.legacy_remaining.entry(market_name).or_insert(0.0);
                     *legacy = (*legacy - sold_total).max(0.0);
@@ -362,11 +665,31 @@ impl RebalanceContext {
                     let remaining_min = PHASE3_ESCALATION_MIN_REMAINING_ABS
                         .max(PHASE3_ESCALATION_MIN_REMAINING_FRAC * legacy_amount);
                     if remaining_legacy > remaining_min && post_prof + prof_gap_tol < phase3_prof {
+                        let extra_prof =
+                            profitability(trial.sims[idx].prediction, trial.sims[idx].price());
+                        // Conservative first-order edge estimate for gating; ignores slippage by design.
+                        let extra_edge = remaining_legacy
+                            * trial.sims[idx].price()
+                            * (phase3_prof - extra_prof).max(0.0);
+                        if !passes_execution_gate(
+                            extra_edge,
+                            self.route_gates.direct_sell,
+                            self.route_gates.buffer_frac,
+                            self.route_gates.buffer_min_susd,
+                        ) {
+                            self.gate_counters.skipped_by_gate_direct_sell += 1;
+                            self.gate_counters.phase3_candidates_skipped_subgas += 1;
+                            continue;
+                        }
+                        let (buy_merge_allowed, direct_merge_allowed) =
+                            self.merge_route_gate_flags(extra_edge);
                         let sold_extra = trial.execute_optimal_sell(
                             idx,
                             remaining_legacy,
                             phase3_prof,
                             self.mint_available,
+                            buy_merge_allowed,
+                            direct_merge_allowed,
                         );
                         if sold_extra > EPS {
                             let legacy = trial.legacy_remaining.entry(market_name).or_insert(0.0);
@@ -383,14 +706,19 @@ impl RebalanceContext {
 
             // Reallocate recovered capital and fold the acquired positions into simulated balances.
             let actions_before_realloc = trial.actions.len();
-            let new_prof = waterfall(
+            let mut wf_stats = WaterfallGateStats::default();
+            let new_prof = waterfall_with_execution_gate(
                 &mut trial.sims,
                 &mut trial.budget,
                 &mut trial.actions,
                 self.mint_available,
-                self.gas_direct,
-                self.gas_mint,
+                self.route_gates.direct_buy,
+                self.route_gates.mint_sell,
+                self.route_gates.buffer_frac,
+                self.route_gates.buffer_min_susd,
+                Some(&mut wf_stats),
             );
+            self.merge_waterfall_gate_stats(wf_stats);
             apply_actions_to_sim_balances(
                 &trial.actions[actions_before_realloc..],
                 &trial.sims,
@@ -427,6 +755,22 @@ impl RebalanceContext {
         self.sim_balances = trial.sim_balances;
         self.legacy_remaining = trial.legacy_remaining;
         self.budget = trial.budget;
+        self.gate_counters.skipped_by_gate_direct_buy +=
+            trial.gate_counters.skipped_by_gate_direct_buy;
+        self.gate_counters.skipped_by_gate_mint_sell +=
+            trial.gate_counters.skipped_by_gate_mint_sell;
+        self.gate_counters.skipped_by_gate_direct_sell +=
+            trial.gate_counters.skipped_by_gate_direct_sell;
+        self.gate_counters.skipped_by_gate_buy_merge +=
+            trial.gate_counters.skipped_by_gate_buy_merge;
+        self.gate_counters.skipped_by_gate_direct_merge +=
+            trial.gate_counters.skipped_by_gate_direct_merge;
+        self.gate_counters.waterfall_steps_pruned_subgas +=
+            trial.gate_counters.waterfall_steps_pruned_subgas;
+        self.gate_counters.phase1_candidates_skipped_subgas +=
+            trial.gate_counters.phase1_candidates_skipped_subgas;
+        self.gate_counters.phase3_candidates_skipped_subgas +=
+            trial.gate_counters.phase3_candidates_skipped_subgas;
     }
 
     fn run_polish_reoptimization(&mut self) {
@@ -449,33 +793,28 @@ impl RebalanceContext {
                 sim_balances: self.sim_balances.clone(),
                 // In polish mode, recycle across current inventory (not only initial legacy).
                 legacy_remaining: self.sim_balances.clone(),
-                gas_direct: self.gas_direct,
-                gas_mint: self.gas_mint,
+                route_gates: self.route_gates,
+                gate_counters: RebalanceGateCounters::default(),
             };
 
-            if trial.mint_available {
-                let _arb_profit = {
-                    let mut exec = ExecutionState::new(
-                        &mut trial.sims,
-                        &mut trial.budget,
-                        &mut trial.actions,
-                        &mut trial.sim_balances,
-                    );
-                    exec.execute_complete_set_arb()
-                };
-            }
+            trial.run_phase0_complete_set_arb();
 
             trial.run_phase1_sell_overpriced();
 
             let actions_before = trial.actions.len();
-            let last_bought_prof = waterfall(
+            let mut wf_stats = WaterfallGateStats::default();
+            let last_bought_prof = waterfall_with_execution_gate(
                 &mut trial.sims,
                 &mut trial.budget,
                 &mut trial.actions,
                 trial.mint_available,
-                trial.gas_direct,
-                trial.gas_mint,
+                trial.route_gates.direct_buy,
+                trial.route_gates.mint_sell,
+                trial.route_gates.buffer_frac,
+                trial.route_gates.buffer_min_susd,
+                Some(&mut wf_stats),
             );
+            trial.merge_waterfall_gate_stats(wf_stats);
             apply_actions_to_sim_balances(
                 &trial.actions[actions_before..],
                 &trial.sims,
@@ -509,8 +848,7 @@ fn rebalance_full(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
-    gas_direct: f64,
-    gas_mint: f64,
+    route_gates: RouteGateThresholds,
 ) -> Vec<Action> {
     let preds = crate::pools::prediction_map();
     let expected_count = crate::predictions::PREDICTIONS_L1.len();
@@ -527,22 +865,11 @@ fn rebalance_full(
             return Vec::new();
         }
     };
-    ctx.gas_direct = gas_direct;
-    ctx.gas_mint = gas_mint;
+    ctx.route_gates = route_gates;
 
-    // ── Phase 0: Complete-set arbitrage (buy-merge only) ──
+    // ── Phase 0: Complete-set arbitrage (two-sided) ──
     // Execute before any discretionary rebalancing so free budget is harvested first.
-    if ctx.mint_available {
-        let _arb_profit = {
-            let mut exec = ExecutionState::new(
-                &mut ctx.sims,
-                &mut ctx.budget,
-                &mut ctx.actions,
-                &mut ctx.sim_balances,
-            );
-            exec.execute_complete_set_arb()
-        };
-    }
+    ctx.run_phase0_complete_set_arb();
 
     // ── Phase 1: Sell overpriced holdings ──
     ctx.run_phase1_sell_overpriced();
@@ -552,14 +879,19 @@ fn rebalance_full(
 
     // ── Phase 2: Waterfall allocation ──
     let actions_before = ctx.actions.len();
-    let last_bought_prof = waterfall(
+    let mut wf_stats = WaterfallGateStats::default();
+    let last_bought_prof = waterfall_with_execution_gate(
         &mut ctx.sims,
         &mut ctx.budget,
         &mut ctx.actions,
         ctx.mint_available,
-        ctx.gas_direct,
-        ctx.gas_mint,
+        ctx.route_gates.direct_buy,
+        ctx.route_gates.mint_sell,
+        ctx.route_gates.buffer_frac,
+        ctx.route_gates.buffer_min_susd,
+        Some(&mut wf_stats),
     );
+    ctx.merge_waterfall_gate_stats(wf_stats);
 
     // Update simulated holdings from the initial waterfall pass.
     apply_actions_to_sim_balances(
@@ -583,14 +915,19 @@ fn rebalance_full(
     // better aligns with first-order local optimality checks used in tests.
     ctx.run_phase1_sell_overpriced();
     let actions_before_cleanup = ctx.actions.len();
-    let cleanup_last_prof = waterfall(
+    let mut cleanup_wf_stats = WaterfallGateStats::default();
+    let cleanup_last_prof = waterfall_with_execution_gate(
         &mut ctx.sims,
         &mut ctx.budget,
         &mut ctx.actions,
         ctx.mint_available,
-        ctx.gas_direct,
-        ctx.gas_mint,
+        ctx.route_gates.direct_buy,
+        ctx.route_gates.mint_sell,
+        ctx.route_gates.buffer_frac,
+        ctx.route_gates.buffer_min_susd,
+        Some(&mut cleanup_wf_stats),
     );
+    ctx.merge_waterfall_gate_stats(cleanup_wf_stats);
     apply_actions_to_sim_balances(
         &ctx.actions[actions_before_cleanup..],
         &ctx.sims,
@@ -607,14 +944,19 @@ fn rebalance_full(
         let start_actions = ctx.actions.len();
         ctx.run_phase1_sell_overpriced();
         let actions_before_direct_cleanup = ctx.actions.len();
-        let _ = waterfall(
+        let mut direct_cleanup_wf_stats = WaterfallGateStats::default();
+        let _ = waterfall_with_execution_gate(
             &mut ctx.sims,
             &mut ctx.budget,
             &mut ctx.actions,
             false, // direct-only terminal sweep for residual direct alpha
-            ctx.gas_direct,
-            ctx.gas_mint,
+            ctx.route_gates.direct_buy,
+            ctx.route_gates.mint_sell,
+            ctx.route_gates.buffer_frac,
+            ctx.route_gates.buffer_min_susd,
+            Some(&mut direct_cleanup_wf_stats),
         );
+        ctx.merge_waterfall_gate_stats(direct_cleanup_wf_stats);
         apply_actions_to_sim_balances(
             &ctx.actions[actions_before_direct_cleanup..],
             &ctx.sims,
@@ -627,7 +969,19 @@ fn rebalance_full(
 
     if ctx.mint_available {
         let actions_before_mixed_cleanup = ctx.actions.len();
-        let mixed_last_prof = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, true, ctx.gas_direct, ctx.gas_mint);
+        let mut mixed_wf_stats = WaterfallGateStats::default();
+        let mixed_last_prof = waterfall_with_execution_gate(
+            &mut ctx.sims,
+            &mut ctx.budget,
+            &mut ctx.actions,
+            true,
+            ctx.route_gates.direct_buy,
+            ctx.route_gates.mint_sell,
+            ctx.route_gates.buffer_frac,
+            ctx.route_gates.buffer_min_susd,
+            Some(&mut mixed_wf_stats),
+        );
+        ctx.merge_waterfall_gate_stats(mixed_wf_stats);
         apply_actions_to_sim_balances(
             &ctx.actions[actions_before_mixed_cleanup..],
             &ctx.sims,
@@ -643,7 +997,19 @@ fn rebalance_full(
             let start_actions = ctx.actions.len();
             ctx.run_phase1_sell_overpriced();
             let actions_before_direct_cleanup = ctx.actions.len();
-            let _ = waterfall(&mut ctx.sims, &mut ctx.budget, &mut ctx.actions, false, ctx.gas_direct, ctx.gas_mint);
+            let mut final_direct_wf_stats = WaterfallGateStats::default();
+            let _ = waterfall_with_execution_gate(
+                &mut ctx.sims,
+                &mut ctx.budget,
+                &mut ctx.actions,
+                false,
+                ctx.route_gates.direct_buy,
+                ctx.route_gates.mint_sell,
+                ctx.route_gates.buffer_frac,
+                ctx.route_gates.buffer_min_susd,
+                Some(&mut final_direct_wf_stats),
+            );
+            ctx.merge_waterfall_gate_stats(final_direct_wf_stats);
             apply_actions_to_sim_balances(
                 &ctx.actions[actions_before_direct_cleanup..],
                 &ctx.sims,
@@ -658,6 +1024,7 @@ fn rebalance_full(
     #[cfg(test)]
     assert_internal_state_matches_replay(&ctx, slot0_results, balances, susds_balance);
 
+    ctx.log_gate_summary();
     ctx.actions
 }
 
@@ -705,6 +1072,11 @@ fn assert_internal_state_matches_replay(
             replay,
             tol
         );
+    }
+
+    let gates_disabled = ctx.route_gates.is_legacy_compat_mode();
+    if !gates_disabled {
+        return;
     }
 
     const LOCAL_GRAD_EPS: f64 = 1e-6;
@@ -1055,7 +1427,13 @@ pub fn rebalance_with_mode(
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     mode: RebalanceMode,
 ) -> Vec<Action> {
-    rebalance_with_mode_and_thresholds(balances, susds_balance, slot0_results, mode, 0.0, 0.0)
+    rebalance_with_mode_and_thresholds(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        RouteGateThresholds::disabled(),
+    )
 }
 
 fn rebalance_with_mode_and_thresholds(
@@ -1063,13 +1441,10 @@ fn rebalance_with_mode_and_thresholds(
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     mode: RebalanceMode,
-    gas_direct: f64,
-    gas_mint: f64,
+    route_gates: RouteGateThresholds,
 ) -> Vec<Action> {
     match mode {
-        RebalanceMode::Full => {
-            rebalance_full(balances, susds_balance, slot0_results, gas_direct, gas_mint)
-        }
+        RebalanceMode::Full => rebalance_full(balances, susds_balance, slot0_results, route_gates),
         RebalanceMode::ArbOnly => rebalance_arb_only(balances, susds_balance, slot0_results),
     }
 }
@@ -1083,21 +1458,39 @@ fn compute_gas_thresholds(
     gas: &GasAssumptions,
     gas_price_eth: f64,
     eth_usd: f64,
-    mint_sell_legs: usize,
-) -> (f64, f64) {
-    let direct = estimate_min_gas_susd_for_group(gas, GroupKind::DirectBuy, 0, 0, gas_price_eth, eth_usd);
+    cross_route_legs: usize,
+) -> RouteGateThresholds {
+    let direct_buy =
+        estimate_min_gas_susd_for_group(gas, GroupKind::DirectBuy, 0, 0, gas_price_eth, eth_usd);
     let mint_sell = estimate_min_gas_susd_for_group(
         gas,
         GroupKind::MintSell,
         0,
-        mint_sell_legs,
+        cross_route_legs,
         gas_price_eth,
         eth_usd,
     );
-    (
-        if direct.is_finite() { direct } else { f64::INFINITY },
-        if mint_sell.is_finite() { mint_sell } else { f64::INFINITY },
-    )
+    let direct_sell =
+        estimate_min_gas_susd_for_group(gas, GroupKind::DirectSell, 0, 0, gas_price_eth, eth_usd);
+    let buy_merge = estimate_min_gas_susd_for_group(
+        gas,
+        GroupKind::BuyMerge,
+        cross_route_legs,
+        0,
+        gas_price_eth,
+        eth_usd,
+    );
+    let direct_merge =
+        estimate_min_gas_susd_for_group(gas, GroupKind::DirectMerge, 0, 0, gas_price_eth, eth_usd);
+    RouteGateThresholds {
+        direct_buy: sanitize_gate_threshold(direct_buy),
+        mint_sell: sanitize_gate_threshold(mint_sell),
+        direct_sell: sanitize_gate_threshold(direct_sell),
+        buy_merge: sanitize_gate_threshold(buy_merge),
+        direct_merge: sanitize_gate_threshold(direct_merge),
+        buffer_frac: DEFAULT_GATE_BUFFER_FRAC,
+        buffer_min_susd: DEFAULT_GATE_BUFFER_MIN_SUSD,
+    }
 }
 
 /// Gas-aware entry point for `main.rs`.
@@ -1110,20 +1503,36 @@ pub fn rebalance_with_gas(
     mode: RebalanceMode,
     gas: &GasAssumptions,
 ) -> Vec<Action> {
-    let n_sims = slot0_results.len();
-    let (gas_direct, gas_mint) = compute_gas_thresholds(
+    rebalance_with_gas_pricing(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
         gas,
         THRESHOLD_GAS_PRICE_ETH,
         THRESHOLD_ETH_USD,
-        n_sims.saturating_sub(1),
-    );
-    rebalance_with_mode_and_thresholds(balances, susds_balance, slot0_results, mode, gas_direct, gas_mint)
+    )
+}
+
+/// Gas-aware entry point with explicit gas price and ETH/USD assumptions.
+pub fn rebalance_with_gas_pricing(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+) -> Vec<Action> {
+    let n_sims = slot0_results.len();
+    let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
+    rebalance_with_mode_and_thresholds(balances, susds_balance, slot0_results, mode, route_gates)
 }
 
 /// Computes optimal rebalancing trades for L1 markets.
 ///
 /// Implemented full-mode flow:
-/// 0. Complete-set arbitrage pre-pass (`buy-all -> merge`) when mint routes are available
+/// 0. Complete-set arbitrage pre-pass (two-sided) when mint routes are available
 /// 1. Iterative sell-overpriced liquidation
 /// 2. Waterfall allocation to equalize marginal profitability
 /// 3. Legacy-inventory recycling with EV-guarded trial commits

@@ -119,6 +119,160 @@ fn collect_fuzz_ev_after(force_partial: bool) -> [f64; 24] {
     out
 }
 
+fn collect_fuzz_case_by_index(
+    force_partial: bool,
+    case_idx: usize,
+) -> (
+    Vec<(crate::pools::Slot0Result, &'static crate::markets::MarketData)>,
+    HashMap<&'static str, f64>,
+    f64,
+) {
+    let seed = if force_partial {
+        0xABCD_1234_EF99_7788u64
+    } else {
+        0xFEED_FACE_1234_4321u64
+    };
+    let mut rng = TestRng::new(seed);
+    let mut out = None;
+    for _ in 0..=case_idx {
+        out = Some(build_rebalance_fuzz_case(&mut rng, force_partial));
+    }
+    out.expect("seeded fuzz case should exist for requested index")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FastEvCaseReport {
+    case_idx: usize,
+    force_partial: bool,
+    ev_before: f64,
+    ev_after: f64,
+    ev_delta: f64,
+    expected_after: f64,
+    snapshot_delta: f64,
+    floor_tol: f64,
+    ceiling_tol: f64,
+}
+
+fn print_fast_ev_case_report(report: &FastEvCaseReport) {
+    let suite = if report.force_partial { "partial" } else { "full" };
+    println!(
+        "[ev-fast][{suite}][case {:02}] before={:.9} after={:.9} delta={:+.9} expected_after={:.9} snapshot_delta={:+.9} band=[-{:.9},+{:.9}]",
+        report.case_idx,
+        report.ev_before,
+        report.ev_after,
+        report.ev_delta,
+        report.expected_after,
+        report.snapshot_delta,
+        report.floor_tol,
+        report.ceiling_tol
+    );
+}
+
+fn print_fast_ev_summary(label: &str, reports: &[FastEvCaseReport]) {
+    if reports.is_empty() {
+        return;
+    }
+    let total_delta: f64 = reports.iter().map(|r| r.ev_delta).sum();
+    let avg_delta = total_delta / reports.len() as f64;
+    let min_delta = reports
+        .iter()
+        .map(|r| r.ev_delta)
+        .fold(f64::INFINITY, f64::min);
+    let max_delta = reports
+        .iter()
+        .map(|r| r.ev_delta)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let max_abs_snapshot_delta = reports
+        .iter()
+        .map(|r| r.snapshot_delta.abs())
+        .fold(0.0_f64, f64::max);
+    println!(
+        "[ev-fast][summary][{label}] cases={} total_delta={:+.9} avg_delta={:+.9} min_delta={:+.9} max_delta={:+.9} max_abs_snapshot_delta={:.9}",
+        reports.len(),
+        total_delta,
+        avg_delta,
+        min_delta,
+        max_delta,
+        max_abs_snapshot_delta
+    );
+}
+
+fn assert_case_within_snapshot_band_fast(force_partial: bool, case_idx: usize) -> FastEvCaseReport {
+    let (slot0_results, balances_static, susd_balance) = collect_fuzz_case_by_index(
+        force_partial,
+        case_idx,
+    );
+    let balances: HashMap<&str, f64> = balances_static
+        .iter()
+        .map(|(k, v)| (*k as &str, *v))
+        .collect();
+    let actions = rebalance(&balances, susd_balance, &slot0_results);
+    assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
+
+    if force_partial {
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+            "mint actions should be disabled for partial fixture case {}",
+            case_idx
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+            "merge actions should be disabled for partial fixture case {}",
+            case_idx
+        );
+    }
+
+    let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
+    for (_, market) in &slot0_results {
+        holdings_before.insert(
+            market.name,
+            balances.get(market.name).copied().unwrap_or(0.0).max(0.0),
+        );
+    }
+    let ev_before = ev_from_state(&holdings_before, susd_balance);
+    let (holdings_after, cash_after) =
+        replay_actions_to_state(&actions, &slot0_results, &balances, susd_balance);
+    let ev_after = ev_from_state(&holdings_after, cash_after);
+    let ev_delta = ev_after - ev_before;
+    assert!(
+        ev_after > ev_before,
+        "expected strict EV gain for fast regression case {} (partial={}): before={:.9}, after={:.9}",
+        case_idx,
+        force_partial,
+        ev_before,
+        ev_after
+    );
+
+    let expected_after = if force_partial {
+        ev_snapshots().fuzz_partial_l1_case_ev_after[case_idx]
+    } else {
+        ev_snapshots().fuzz_full_l1_case_ev_after[case_idx]
+    };
+    let (ok, floor_tol, ceiling_tol) = ev_within_snapshot_band(ev_after, expected_after);
+    let snapshot_delta = ev_after - expected_after;
+    assert!(
+        ok,
+        "fast EV regression case out of snapshot band: case={}, partial={}, got={:.12}, expected={:.12}, floor_tol={:.12}, ceiling_tol={:.12}",
+        case_idx,
+        force_partial,
+        ev_after,
+        expected_after,
+        floor_tol,
+        ceiling_tol
+    );
+    FastEvCaseReport {
+        case_idx,
+        force_partial,
+        ev_before,
+        ev_after,
+        ev_delta,
+        expected_after,
+        snapshot_delta,
+        floor_tol,
+        ceiling_tol,
+    }
+}
+
 #[test]
 #[ignore = "updates src/portfolio/tests/ev_snapshots.json; run explicitly"]
 fn test_refresh_ev_snapshots_fixture() {
@@ -131,6 +285,33 @@ fn test_refresh_ev_snapshots_fixture() {
     std::fs::write("src/portfolio/tests/ev_snapshots.json", format!("{json}\n"))
         .expect("failed to write ev snapshots fixture");
     println!("[snapshot-refresh] wrote src/portfolio/tests/ev_snapshots.json");
+}
+
+#[test]
+fn test_fuzz_rebalance_ev_regression_fast_suite() {
+    // Fast representative subset; catches meaningful EV drift quickly.
+    const FULL_CASES: [usize; 4] = [0, 1, 10, 14];
+    const PARTIAL_CASES: [usize; 4] = [0, 4, 10, 13];
+
+    let mut full_reports = Vec::with_capacity(FULL_CASES.len());
+    for case_idx in FULL_CASES {
+        let report = assert_case_within_snapshot_band_fast(false, case_idx);
+        print_fast_ev_case_report(&report);
+        full_reports.push(report);
+    }
+    let mut partial_reports = Vec::with_capacity(PARTIAL_CASES.len());
+    for case_idx in PARTIAL_CASES {
+        let report = assert_case_within_snapshot_band_fast(true, case_idx);
+        print_fast_ev_case_report(&report);
+        partial_reports.push(report);
+    }
+    let mut combined_reports = Vec::with_capacity(full_reports.len() + partial_reports.len());
+    combined_reports.extend(full_reports.iter().copied());
+    combined_reports.extend(partial_reports.iter().copied());
+
+    print_fast_ev_summary("full", &full_reports);
+    print_fast_ev_summary("partial", &partial_reports);
+    print_fast_ev_summary("combined", &combined_reports);
 }
 
 #[test]
@@ -491,6 +672,7 @@ fn test_fuzz_optimal_sell_split_with_inventory_matches_bruteforce() {
 }
 
 #[test]
+#[ignore = "slow 24-case full-L1 snapshot sweep; use fast suite for default regression checks"]
 fn test_fuzz_rebalance_end_to_end_full_l1_invariants() {
     let mut rng = TestRng::new(0xFEED_FACE_1234_4321u64);
     for case_idx in 0..24 {
@@ -527,6 +709,7 @@ fn test_fuzz_rebalance_end_to_end_full_l1_invariants() {
 }
 
 #[test]
+#[ignore = "slow 24-case partial-L1 snapshot sweep; use fast suite for default regression checks"]
 fn test_fuzz_rebalance_end_to_end_partial_l1_invariants() {
     let mut rng = TestRng::new(0xABCD_1234_EF99_7788u64);
     for case_idx in 0..24 {

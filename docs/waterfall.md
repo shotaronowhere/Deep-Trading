@@ -18,11 +18,20 @@ Source-of-truth code paths:
 pub fn rebalance(...) -> Vec<Action>
 pub fn rebalance_with_mode(..., mode: RebalanceMode) -> Vec<Action>
 pub fn rebalance_with_gas(..., mode: RebalanceMode, gas: &GasAssumptions) -> Vec<Action>
+pub fn rebalance_with_gas_pricing(
+    ...,
+    mode: RebalanceMode,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+) -> Vec<Action>
 ```
 
 - `rebalance(...)` is equivalent to `rebalance_with_mode(..., RebalanceMode::Full)`.
 - `rebalance_with_mode(...)` uses zero gas thresholds (`0.0, 0.0`) for route admission.
-- `rebalance_with_gas(...)` computes route thresholds from `GasAssumptions` and threads them into waterfall admission.
+- In zero-threshold compatibility mode, full-mode phase-0 uses legacy one-sided complete-set arb (`buy-all -> merge` only when `sum(prices) < 1`).
+- `rebalance_with_gas_pricing(...)` computes per-route thresholds from runtime gas assumptions and threads them into the full rebalance flow.
+- `rebalance_with_gas(...)` is a compatibility wrapper over `rebalance_with_gas_pricing(...)` using conservative defaults (`gas_price_eth = 1e-9`, `eth_usd = 3000.0`).
 
 ## Action Model
 
@@ -46,7 +55,10 @@ No flash-loan actions are emitted.
 
 `RebalanceMode::Full` executes six phases:
 
-1. `Phase 0`: complete-set arbitrage pre-pass (`buy-all -> merge`) when mint routes are available.
+1. `Phase 0`: complete-set arbitrage pre-pass when mint routes are available.
+   - runtime gas-gated path: two-sided (`sum(prices) < 1` buy-merge, `sum(prices) > 1` mint-sell)
+   - zero-threshold compatibility path: legacy one-sided (`sum(prices) < 1` buy-merge only)
+   - runtime path estimates phase-0 edge from a dry-run and applies the same execution gate before emitting actions, so sub-gas phase-0 steps are skipped up front.
 2. `Phase 1`: iterative sell-overpriced liquidation.
 3. `Phase 2`: waterfall allocation.
 4. `Phase 3`: legacy-only recycling with EV-guarded trial commit.
@@ -59,6 +71,7 @@ For each outcome, while price is above prediction and holdings remain:
 
 - size a sell target toward prediction price,
 - execute optimal direct/merge split via `execute_optimal_sell`,
+- when merge is considered, gate by the merge subtype actually used (`DirectMerge` vs `BuyMerge`) instead of requiring both gates to pass,
 - if merge-heavy execution reduced holdings without moving source price enough, force one full remainder attempt.
 
 Bound: `MAX_PHASE1_ITERS = 128` per outcome.
@@ -78,6 +91,19 @@ Admission/ranking:
   - direct: `remaining_budget * prof >= gas_direct_susd`
   - mint: `remaining_budget * prof >= gas_mint_susd`
 - outcomes can appear twice (direct and mint), with independent profitability ranking.
+
+Execution-meaningful step gating:
+
+- Before executing each planned step, approximate edge is `step.cost * max(current_prof, 0.0)`.
+- Route-specific gate applies:
+  - direct step uses `direct_buy` threshold,
+  - mint step uses `mint_sell` threshold.
+- The gate requires:
+  - finite positive edge,
+  - finite non-negative gas estimate,
+  - `edge > gas + max(buffer_min_susd, buffer_frac * edge) + EPS`.
+- If a step fails, its `(idx, route)` is pruned from the active set for that descent and planning retries with remaining entries.
+- If no active entries remain after pruning, waterfall ends.
 
 Iteration structure:
 
@@ -107,8 +133,10 @@ All-direct active set:
 
 Mixed active set:
 
-- simulation-backed bisection (up to 64 iterations),
+- simulation-backed bisection (up to 64 iterations) by default,
+- optional experimental coupled mixed-route solver behind `REBALANCE_EXACT_MIXED_SOLVER=1`,
 - affordability predicate uses planned mint-first/direct execution with running budget feasibility.
+- hard fallback to bisection on non-convergence or non-finite intermediates.
 
 ### Mint Route Cost Solve
 

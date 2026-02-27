@@ -25,6 +25,28 @@ The portfolio module now supports mode-based execution:
 
 See [Arb-Only Mode](./arb_mode.md) for API details, sizing equations, and fail-closed behavior.
 
+## Gas-Aware APIs
+
+Public gas-aware entry points:
+
+- `rebalance_with_gas(...)`: compatibility wrapper with conservative defaults (`1e-9` ETH gas price and `$3000` ETH/USD).
+- `rebalance_with_gas_pricing(..., gas_price_eth, eth_usd)`: explicit runtime pricing inputs.
+
+Runtime binaries support optional `ETH_USD` override (default: `3000`):
+
+- `src/main.rs`
+- `src/bin/execute.rs`
+
+## EV Regression Reporting
+
+`test_fuzz_rebalance_ev_regression_fast_suite` now prints a per-case EV report for its full/partial fixtures:
+
+- `ev_before`, `ev_after`, and `delta`
+- snapshot target `expected_after` and realized `snapshot_delta`
+- tolerated snapshot band (`floor_tol`, `ceiling_tol`)
+
+It also prints compact summary lines for `full`, `partial`, and `combined` groups.
+
 ## Action Types
 
 ```rust
@@ -44,7 +66,9 @@ Indirect routes are self-funded and execute in bounded rounds:
 ## Algorithm
 
 Implemented full-mode flow:
-1. Phase 0: complete-set arbitrage pre-pass (`buy-all -> merge` only in `RebalanceMode::Full`).
+1. Phase 0: complete-set arbitrage pre-pass.
+   - Runtime gas-gated path (`rebalance_with_gas*`): two-sided (`buy-all -> merge` when `sum(prices) < 1`, `mint -> sell-all` when `sum(prices) > 1`).
+   - Zero-threshold compatibility path (`rebalance` / `rebalance_with_mode`): legacy one-sided (`buy-all -> merge` only when `sum(prices) < 1`).
 2. Phase 1: iterative sell-overpriced liquidation.
 3. Phase 2: waterfall allocation.
 4. Phase 3: legacy-inventory recycling (EV-guarded trial commits).
@@ -83,6 +107,12 @@ The waterfall treats each (outcome, route) pair as a separate entry. The same ou
 **Dynamic entry selection:** Instead of pre-sorting entries by profitability, the waterfall calls `best_non_active()` each iteration to find the highest-profitability non-active entry from **current** pool state. This handles mint-route coupling: when a mint sell perturbs other pools' prices, the next entry selection reflects the updated state automatically.
 
 **Gas-aware admission filter (runtime path):** `best_non_active()` only admits an entry if `remaining_budget × profitability >= gas_threshold_for_route`. In production (`rebalance_with_gas`, used by `main.rs`), route thresholds come from `GasAssumptions`; in tests (`rebalance_with_mode`) thresholds are `0.0` so this filter is disabled.
+
+**Execution-aligned route gates (runtime path):**
+- Route thresholds now include `DirectSell`, `BuyMerge`, and `DirectMerge` in addition to `DirectBuy` and `MintSell`.
+- Phase-1 and phase-3 liquidation candidates are filtered by the same execution gate predicate used for planning semantics (`edge > gas + profit_buffer`).
+- Waterfall tail steps are pruned when their approximate execution edge is sub-gas for their route.
+- Non-finite gas estimates fail closed for the affected route.
 
 **Monotonicity guard:** If a mint pushes a non-active entry's profitability *above* `current_prof`, it is absorbed into the active set immediately (no cost step) before the next descent. This prevents the water level from moving upward, which would break `solve_prof`'s assumptions.
 

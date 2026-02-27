@@ -5,6 +5,7 @@ use super::planning::{
     PlannedRoute, active_skip_indices, cost_for_route, plan_active_routes_with_scratch,
     plan_is_budget_feasible, solve_prof,
 };
+use super::rebalancer::passes_execution_gate;
 use super::sim::{EPS, PoolSim, Route, alt_price, profitability};
 use super::trading::ExecutionState;
 
@@ -81,11 +82,38 @@ fn realized_step_profitability(
     prof.is_finite().then_some(prof)
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct WaterfallGateStats {
+    pub(super) skipped_direct: usize,
+    pub(super) skipped_mint: usize,
+    pub(super) steps_pruned_subgas: usize,
+}
+
+fn passes_step_execution_gate(
+    step: &PlannedRoute,
+    current_prof: f64,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
+    buffer_frac: f64,
+    buffer_min_susd: f64,
+) -> bool {
+    if step.cost <= 0.0 {
+        return true;
+    }
+    let edge_susd = step.cost * current_prof.max(0.0);
+    let gas_susd = match step.route {
+        Route::Direct => gas_direct_susd,
+        Route::Mint => gas_mint_susd,
+    };
+    passes_execution_gate(edge_susd, gas_susd, buffer_frac, buffer_min_susd)
+}
+
 /// Waterfall allocation: deploy capital to the highest profitability outcome.
 /// As capital is deployed, profitability drops until it matches the next outcome.
 /// Then deploy to both, then three, etc.
 ///
 /// Returns the profitability level of the last bought outcome (for post-liquidation).
+#[allow(dead_code)]
 pub(super) fn waterfall(
     sims: &mut [PoolSim],
     budget: &mut f64,
@@ -93,6 +121,30 @@ pub(super) fn waterfall(
     mint_available: bool,
     gas_direct_susd: f64,
     gas_mint_susd: f64,
+) -> f64 {
+    waterfall_with_execution_gate(
+        sims,
+        budget,
+        actions,
+        mint_available,
+        gas_direct_susd,
+        gas_mint_susd,
+        0.0,
+        0.0,
+        None,
+    )
+}
+
+pub(super) fn waterfall_with_execution_gate(
+    sims: &mut [PoolSim],
+    budget: &mut f64,
+    actions: &mut Vec<Action>,
+    mint_available: bool,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
+    buffer_frac: f64,
+    buffer_min_susd: f64,
+    mut gate_stats: Option<&mut WaterfallGateStats>,
 ) -> f64 {
     if *budget <= 0.0 {
         return 0.0;
@@ -103,7 +155,15 @@ pub(super) fn waterfall(
     let mut active_set: HashSet<(usize, Route)> = HashSet::new();
 
     // Seed active set with the highest-profitability entry.
-    let first = match best_non_active(sims, &active_set, mint_available, price_sum, *budget, gas_direct_susd, gas_mint_susd) {
+    let first = match best_non_active(
+        sims,
+        &active_set,
+        mint_available,
+        price_sum,
+        *budget,
+        gas_direct_susd,
+        gas_mint_susd,
+    ) {
         Some(entry) if entry.2 > 0.0 => entry,
         _ => return 0.0,
     };
@@ -127,7 +187,15 @@ pub(super) fn waterfall(
         // If a mint perturbed prices and pushed an entry above current_prof,
         // absorb it into active immediately (no cost step needed).
         loop {
-            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, gas_direct_susd, gas_mint_susd) {
+            match best_non_active(
+                sims,
+                &active_set,
+                mint_available,
+                price_sum,
+                *budget,
+                gas_direct_susd,
+                gas_mint_susd,
+            ) {
                 Some((idx, route, prof)) if prof > current_prof => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -136,7 +204,15 @@ pub(super) fn waterfall(
             }
         }
 
-        let next = best_non_active(sims, &active_set, mint_available, price_sum, *budget, gas_direct_susd, gas_mint_susd);
+        let next = best_non_active(
+            sims,
+            &active_set,
+            mint_available,
+            price_sum,
+            *budget,
+            gas_direct_susd,
+            gas_mint_susd,
+        );
         let target_prof = match next {
             Some((_, _, p)) if p > 0.0 => p,
             _ => 0.0,
@@ -177,6 +253,36 @@ pub(super) fn waterfall(
         let full_plan_hits_active_boundary = full_plan
             .last()
             .is_some_and(|step| step.active_set_boundary_hit);
+        if let Some((pruned_idx, pruned_route)) = full_plan
+            .iter()
+            .find(|step| {
+                !passes_step_execution_gate(
+                    step,
+                    current_prof,
+                    gas_direct_susd,
+                    gas_mint_susd,
+                    buffer_frac,
+                    buffer_min_susd,
+                )
+            })
+            .map(|step| (step.idx, step.route))
+        {
+            active.retain(|&(idx, route)| !(idx == pruned_idx && route == pruned_route));
+            // Keep pruned entries tombstoned in active_set so they are not immediately
+            // re-selected by best_non_active at the same profitability frontier.
+            if let Some(stats) = gate_stats.as_deref_mut() {
+                match pruned_route {
+                    Route::Direct => stats.skipped_direct += 1,
+                    Route::Mint => stats.skipped_mint += 1,
+                }
+                stats.steps_pruned_subgas += 1;
+            }
+            last_prof = current_prof;
+            if active.is_empty() {
+                break;
+            }
+            continue;
+        }
 
         if plan_is_budget_feasible(&full_plan, *budget) {
             let executed = {
@@ -222,7 +328,15 @@ pub(super) fn waterfall(
             stalled_continues = 0;
 
             // Re-query best entry from post-execution state
-            match best_non_active(sims, &active_set, mint_available, price_sum, *budget, gas_direct_susd, gas_mint_susd) {
+            match best_non_active(
+                sims,
+                &active_set,
+                mint_available,
+                price_sum,
+                *budget,
+                gas_direct_susd,
+                gas_mint_susd,
+            ) {
                 Some((idx, route, prof)) if prof > 0.0 => {
                     active.push((idx, route));
                     active_set.insert((idx, route));
@@ -284,6 +398,36 @@ pub(super) fn waterfall(
                 last_prof = current_prof;
                 break;
             };
+            if let Some((pruned_idx, pruned_route)) = execution_plan
+                .iter()
+                .find(|step| {
+                    !passes_step_execution_gate(
+                        step,
+                        current_prof,
+                        gas_direct_susd,
+                        gas_mint_susd,
+                        buffer_frac,
+                        buffer_min_susd,
+                    )
+                })
+                .map(|step| (step.idx, step.route))
+            {
+                active.retain(|&(idx, route)| !(idx == pruned_idx && route == pruned_route));
+                // Keep pruned entries tombstoned in active_set so they are not immediately
+                // re-selected by best_non_active at the same profitability frontier.
+                if let Some(stats) = gate_stats.as_deref_mut() {
+                    match pruned_route {
+                        Route::Direct => stats.skipped_direct += 1,
+                        Route::Mint => stats.skipped_mint += 1,
+                    }
+                    stats.steps_pruned_subgas += 1;
+                }
+                last_prof = current_prof;
+                if active.is_empty() {
+                    break;
+                }
+                continue;
+            }
             if !plan_is_budget_feasible(&execution_plan, *budget) {
                 last_prof = current_prof;
                 break;
@@ -347,7 +491,7 @@ pub(super) fn waterfall(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markets::{MarketData, Pool, Tick, MARKETS_L1};
+    use crate::markets::{MARKETS_L1, MarketData, Pool, Tick};
     use crate::pools::{Slot0Result, prediction_to_sqrt_price_x96};
     use alloy::primitives::{Address, U256};
 
@@ -357,8 +501,14 @@ mod tests {
         let liq_str: &'static str =
             Box::leak("1000000000000000000000".to_string().into_boxed_str());
         let ticks: &'static [Tick] = Box::leak(Box::new([
-            Tick { tick_idx: 1, liquidity_net: 1_000_000_000_000_000_000_000 },
-            Tick { tick_idx: 92108, liquidity_net: -1_000_000_000_000_000_000_000 },
+            Tick {
+                tick_idx: 1,
+                liquidity_net: 1_000_000_000_000_000_000_000,
+            },
+            Tick {
+                tick_idx: 92108,
+                liquidity_net: -1_000_000_000_000_000_000_000,
+            },
         ]));
         let pool: &'static Pool = Box::leak(Box::new(Pool {
             token0: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
@@ -367,8 +517,8 @@ mod tests {
             liquidity: liq_str,
             ticks,
         }));
-        let sqrt = prediction_to_sqrt_price_x96(price_frac, true)
-            .unwrap_or(U256::from(1u128 << 96));
+        let sqrt =
+            prediction_to_sqrt_price_x96(price_frac, true).unwrap_or(U256::from(1u128 << 96));
         let market: &'static MarketData = Box::leak(Box::new(MarketData {
             name,
             market_id: MARKETS_L1[0].market_id,
@@ -394,8 +544,12 @@ mod tests {
         // profitability ≈ (0.0101 - 0.01) / 0.01 = 1% = 0.01
         // gas_direct = $0.50, break-even min budget = 0.50 / 0.01 = $50
         // budget = $1 < $50 → outcome must be skipped → zero actions
-        let mut sims =
-            vec![make_sim("m1", "0x1111111111111111111111111111111111111111", 0.01, 0.0101)];
+        let mut sims = vec![make_sim(
+            "m1",
+            "0x1111111111111111111111111111111111111111",
+            0.01,
+            0.0101,
+        )];
         let mut budget = 1.0_f64;
         let mut actions = vec![];
 
@@ -421,13 +575,16 @@ mod tests {
     #[test]
     fn waterfall_executes_when_budget_above_break_even() {
         // Same outcome, budget = $100; break-even = $50; $100 > $50 → should trade
-        let mut sims =
-            vec![make_sim("m2", "0x2222222222222222222222222222222222222222", 0.01, 0.0101)];
+        let mut sims = vec![make_sim(
+            "m2",
+            "0x2222222222222222222222222222222222222222",
+            0.01,
+            0.0101,
+        )];
         let mut budget = 100.0_f64;
         let mut actions = vec![];
 
-        let _last_prof =
-            waterfall(&mut sims, &mut budget, &mut actions, false, 0.50, 2.00);
+        let _last_prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.50, 2.00);
         assert!(
             !actions.is_empty(),
             "budget $100 at 1% profitability must exceed $0.50 gas break-even; got 0 actions"
@@ -437,16 +594,119 @@ mod tests {
     #[test]
     fn waterfall_with_zero_gas_thresholds_behaves_as_before() {
         // gas_direct=0, gas_mint=0 → no filtering, same as old signature
-        let mut sims =
-            vec![make_sim("m3", "0x3333333333333333333333333333333333333333", 0.01, 0.0101)];
+        let mut sims = vec![make_sim(
+            "m3",
+            "0x3333333333333333333333333333333333333333",
+            0.01,
+            0.0101,
+        )];
         let mut budget = 1.0_f64;
         let mut actions = vec![];
 
-        let _last_prof =
-            waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
+        let _last_prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
         assert!(
             !actions.is_empty(),
             "with zero gas thresholds, any positive profitability should produce actions"
+        );
+    }
+
+    #[test]
+    fn waterfall_prunes_subgas_steps() {
+        let mut sims = vec![make_sim(
+            "m4",
+            "0x4444444444444444444444444444444444444444",
+            0.01,
+            0.0101,
+        )];
+        let mut budget = 1.0_f64;
+        let mut actions = vec![];
+        let mut gate_stats = WaterfallGateStats::default();
+
+        let last_prof = waterfall_with_execution_gate(
+            &mut sims,
+            &mut budget,
+            &mut actions,
+            false,
+            0.0,
+            0.0,
+            0.20,
+            0.05,
+            Some(&mut gate_stats),
+        );
+        assert!(
+            last_prof.is_finite() && last_prof >= 0.0,
+            "last profitability should remain finite after pruning"
+        );
+        assert!(actions.is_empty(), "sub-gas step should be pruned");
+        assert!(
+            (budget - 1.0).abs() <= 1e-9,
+            "budget should remain unchanged after prune"
+        );
+        assert!(
+            gate_stats.steps_pruned_subgas >= 1 && gate_stats.skipped_direct >= 1,
+            "expected direct step to be pruned by gate: {:?}",
+            gate_stats
+        );
+    }
+
+    #[test]
+    fn waterfall_subgas_prune_does_not_emit_nonfinite_or_overspend() {
+        let mut sims = vec![
+            make_sim(
+                "m5",
+                "0x5555555555555555555555555555555555555555",
+                0.01,
+                0.0101,
+            ),
+            make_sim(
+                "m6",
+                "0x6666666666666666666666666666666666666666",
+                0.02,
+                0.0202,
+            ),
+        ];
+        let start_budget = 10.0_f64;
+        let mut budget = start_budget;
+        let mut actions = vec![];
+        let mut gate_stats = WaterfallGateStats::default();
+
+        let _last_prof = waterfall_with_execution_gate(
+            &mut sims,
+            &mut budget,
+            &mut actions,
+            false,
+            0.0,
+            0.0,
+            0.20,
+            0.25,
+            Some(&mut gate_stats),
+        );
+
+        assert!(budget.is_finite(), "budget must remain finite");
+        assert!(
+            budget <= start_budget + 1e-9,
+            "direct-only execution cannot overspend"
+        );
+        for action in &actions {
+            match action {
+                Action::Buy { amount, cost, .. } => {
+                    assert!(amount.is_finite() && *amount >= 0.0);
+                    assert!(cost.is_finite() && *cost >= 0.0);
+                }
+                Action::Sell {
+                    amount, proceeds, ..
+                } => {
+                    assert!(amount.is_finite() && *amount >= 0.0);
+                    assert!(proceeds.is_finite() && *proceeds >= 0.0);
+                }
+                Action::Mint { amount, .. } | Action::Merge { amount, .. } => {
+                    assert!(amount.is_finite() && *amount >= 0.0);
+                }
+            }
+        }
+        assert!(
+            gate_stats.steps_pruned_subgas >= 1,
+            "expected at least one step pruning event"
         );
     }
 }
