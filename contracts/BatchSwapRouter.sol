@@ -12,6 +12,7 @@ contract BatchSwapRouter is IBatchSwapRouter {
     error SlippageExceeded();
     error ApprovalFailed();
     error TransferFailed();
+    error InvalidArrayLength();
 
     IV3SwapRouter public immutable router;
 
@@ -44,11 +45,18 @@ contract BatchSwapRouter is IBatchSwapRouter {
         uint24 _fee,
         uint160 _sqrtPriceLimitX96
     ) public returns (uint256 amountOut) {
+        if (_tokenIns.length != _amountIn.length) {
+            revert InvalidArrayLength();
+        }
         for (uint i = 0; i < _tokenIns.length; i++) {
             bool success = IERC20(_tokenIns[i]).transferFrom(msg.sender, address(this), _amountIn[i]);
-            require(success, TransferFailed());
+            if (!success) {
+                revert TransferFailed();
+            }
             success = IERC20(_tokenIns[i]).approve(address(router), _amountIn[i]);
-            require(success, ApprovalFailed());
+            if (!success) {
+                revert ApprovalFailed();
+            }
             amountOut += router.exactInputSingle(
                 IV3SwapRouter.ExactInputSingleParams({
                     tokenIn: _tokenIns[i],
@@ -61,7 +69,9 @@ contract BatchSwapRouter is IBatchSwapRouter {
                 })
             );
         }
-        require(amountOut >= _amountOutTotalMinimum, SlippageExceeded());
+        if (amountOut < _amountOutTotalMinimum) {
+            revert SlippageExceeded();
+        }
     }
 
     // see IBatchSwapRouter for function docs
@@ -89,12 +99,19 @@ contract BatchSwapRouter is IBatchSwapRouter {
         uint24 _fee,
         uint160 _sqrtPriceLimitX96
     ) public returns (uint256 amountIn) {
+        if (_tokenOuts.length != _amountOut.length) {
+            revert InvalidArrayLength();
+        }
         bool success = IERC20(_tokenIn).transferFrom(msg.sender, address(this), _amountInTotalMax);
-        require(success, TransferFailed());
+        if (!success) {
+            revert TransferFailed();
+        }
 
         // tokenIn is same for all swaps, so approve once
         success = IERC20(_tokenIn).approve(address(router), _amountInTotalMax);
-        require(success, ApprovalFailed());
+        if (!success) {
+            revert ApprovalFailed();
+        }
 
 
         for (uint i = 0; i < _tokenOuts.length; i++) {
@@ -111,12 +128,16 @@ contract BatchSwapRouter is IBatchSwapRouter {
                 })
             );
         }
-        require(amountIn <= _amountInTotalMax, SlippageExceeded());
+        if (amountIn > _amountInTotalMax) {
+            revert SlippageExceeded();
+        }
         // Refund unused tokenIn to caller
         uint256 remaining = IERC20(_tokenIn).balanceOf(address(this));
         if (remaining > 0) {
             success = IERC20(_tokenIn).transfer(msg.sender, remaining);
-            require(success, TransferFailed());
+            if (!success) {
+                revert TransferFailed();
+            }
         }
     }
 }

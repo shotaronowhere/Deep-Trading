@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {IERC20} from "./IERC20.sol";
+
 // https://github.com/seer-pm/demo/blob/ed0a98c70ce13a0764ec5405126a90ebb7f6c94d/contracts/src/Market.sol
 interface IMarket {
     function wrappedOutcome(uint256 index) external view returns (IERC20 wrapped1155, bytes memory data);

@@ -1,0 +1,28 @@
+Loaded cached credentials.
+VERDICT: The execution wiring and bounds rounding logic are excellent, but the transaction flow will consistently revert on-chain due to missing outcome token approvals for the CTF Router during merge operations.
+
+### FINDINGS
+
+[severity: critical] Missing approvals for outcome tokens to CTF_ROUTER_ADDRESS
+- file: `src/execution/approvals.rs`:112-124
+- why it matters: The `mergePositions` function in the CTF Router requires pulling the complete set of wrapped ERC20 outcome tokens from the caller (`TradeExecutor`) to unwrap and burn them. `approvals.rs` only approves `SWAP_ROUTER_ADDRESS` and `BATCH_SWAP_ROUTER_ADDRESS`. Furthermore, the loop filters by `market.pool.is_some()`, meaning un-pooled outcome tokens are never approved. Consequently, `BuyMerge` and `DirectMerge` executor calls will predictably revert when the CTF Router attempts to execute `transferFrom` on the outcomes.
+- concrete fix: Remove the `.filter(|market| market.pool.is_some())` filter. Inside the loop, unconditionally approve every `outcome_token` to `CTF_ROUTER_ADDRESS` (since complete sets are needed for merges), and conditionally approve to the swap routers only if `market.pool.is_some()`.
+- worth_fixing_now: yes
+
+[severity: low] Incompatible custom error syntax in require() for Solidity <0.8.26
+- file: `contracts/BatchSwapRouter.sol`:58,60 (and multiple others)
+- why it matters: The code uses `require(success, TransferFailed());`, combining `require` with a custom error instance. This syntax is not supported in Solidity until `0.8.26`. Because `pragma solidity ^0.8.24;` allows compiling with newer Foundry setups, it currently builds, but anyone pinning to strictly `0.8.24` or `0.8.25` will encounter a compiler error (`TypeError: Invalid type for argument 2 in require`).
+- concrete fix: Either bump the pragma to `pragma solidity ^0.8.26;` to correctly indicate the minimum required compiler version, or refactor to standard custom error branches: `if (!success) revert TransferFailed();`.
+- worth_fixing_now: yes
+
+### INTENTIONAL_OR_NOT_A_BUG
+
+- **BatchSwapRouter leftover allowance**: In `exactOutput`, the contract approves the Uniswap V3 router for `_amountInTotalMax` but may spend less, leaving residual allowance on `BatchSwapRouter`. This is acceptable given the router is trusted and no standing balances are held, but would revert on second calls if a token requiring zero-first approvals (like legacy USDT) were used as collateral. Assuming `sUSDS` is standard, this is safe.
+- **Directional float rounding absorbs f64 precision loss**: `amount_to_wei_ceil` is used for `Buy` (ask for exactly/slightly more) while `amount_to_wei_floor` is used for `Merge`/`Mint` (consume exactly/slightly less). This directional rounding elegantly ensures that tiny fractional float differences at the `1e18` scale will never cause the executor to attempt a merge requiring more wei than was bought.
+- **Missing on-chain deadline parameter**: `BatchSwapRouter` does not enforce `block.timestamp` deadlines. While `execute.rs` implements a rigorous client-side deadline gate before submission, transactions delayed in the mempool are only protected by aggregate slippage bounds.
+- **Aggressive subgroup execution structure**: `MintSell` splits Market 2 unconditionally, and `BuyMerge` merges Market 2 unconditionally. Given the "cross-contract complete-set" comment in `tx_builder.rs`, this strict waterfall handling of the conditional tree is assumed to be an intentional portfolio architectural decision.
+
+### TEST_GAPS
+
+- **End-to-end executor integration**: No Foundry tests simulate the `TradeExecutor` proxying calls to the `CTFRouter`. A test validating a `DirectMerge` or `MintSell` sequence from the TradeExecutor's perspective would have caught the missing approvals for wrapped ERC20 outcomes.
+- **Approval payload matrix verification**: `approvals.rs` lacks unit tests to verify that the correct subset of spenders (CTF, SwapRouter, BatchRouter) is mapped to the correct subset of pooled vs non-pooled token addresses.

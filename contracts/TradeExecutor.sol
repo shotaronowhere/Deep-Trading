@@ -20,6 +20,8 @@ contract TradeExecutor {
     
     address public permitted; /// @dev wallet address which is temporary allowed to call functions.
 	uint public expire; /// @dev wallet address which is temporary allowed to call functions.
+
+    error CallFailed();
     
     /// @dev Modifier to restrict access to owner only
     modifier onlyOwner() {
@@ -53,8 +55,8 @@ contract TradeExecutor {
     /// @param calls Array of calls to execute
     function batchExecute(Call[] calldata calls) external onlyAuthorized {
         for (uint i = 0; i < calls.length; i++) {
-            (bool success,) = calls[i].to.call(calls[i].data);
-            require(success, "Call failed");
+            (bool success, bytes memory returndata) = calls[i].to.call(calls[i].data);
+            _revertIfFailed(success, returndata);
         }
     }
 
@@ -62,11 +64,23 @@ contract TradeExecutor {
     /// @param calls Array of calls to execute
     function batchValueExecute(ValueCall[] calldata calls) external payable onlyAuthorized {
         for (uint i = 0; i < calls.length; i++) {
-            (bool success,) = calls[i].to.call{value: calls[i].value}(calls[i].data);
-            require(success, "Call failed");
+            (bool success, bytes memory returndata) = calls[i].to.call{value: calls[i].value}(calls[i].data);
+            _revertIfFailed(success, returndata);
         }
     }
 
     /// @dev Receive ETH.
     receive() external payable { }
+
+    function _revertIfFailed(bool success, bytes memory returndata) private pure {
+        if (success) {
+            return;
+        }
+        if (returndata.length > 0) {
+            assembly {
+                revert(add(returndata, 0x20), mload(returndata))
+            }
+        }
+        revert CallFailed();
+    }
 }

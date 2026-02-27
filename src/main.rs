@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let rpc_url = std::env::var("RPC").unwrap_or_else(|_| "https://optimism.drpc.org".to_string());
+
     let provider =
         alloy::providers::ProviderBuilder::new().with_reqwest(rpc_url.parse()?, |builder| {
             builder

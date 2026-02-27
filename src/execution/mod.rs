@@ -1,10 +1,138 @@
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256, address};
+use alloy::sol;
 
+pub mod approvals;
 mod batch_bounds;
 pub mod bounds;
 mod edge;
 pub mod gas;
 pub mod grouping;
+pub mod runtime;
+pub mod tx_builder;
+
+// https://github.com/seer-pm/demo/blob/ed0a98c70ce13a0764ec5405126a90ebb7f6c94d/contracts/src/Router.sol
+sol! {
+    #[sol(rpc)]
+    interface ICTFRouter {
+        function splitPosition(address collateralToken, address market, uint256 amount) external;
+        function mergePositions(address collateralToken, address market, uint256 amount) external;
+    }
+}
+
+pub const CTF_ROUTER_ADDRESS: Address = address!("179d8F8c811B8C759c33809dbc6c5ceDc62D05DD");
+
+// https://github.com/Uniswap/swap-router-contracts/blob/70bc2e40dfca294c1cea9bf67a4036732ee54303/contracts/interfaces/IV3SwapRouter.sol
+sol! {
+    #[sol(rpc)]
+    interface IV3SwapRouter {
+        struct ExactInputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint24 fee;
+            address recipient;
+            uint256 amountIn;
+            uint256 amountOutMinimum;
+            uint160 sqrtPriceLimitX96;
+        }
+
+        // Sell: spend exact tokenIn, receive at least amountOutMinimum of tokenOut.
+        // Action::Sell → exactInputSingle(outcome_token → sUSDS, min_proceeds_wei)
+        function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+        struct ExactOutputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint24 fee;
+            address recipient;
+            uint256 amountOut;
+            uint256 amountInMaximum;
+            uint160 sqrtPriceLimitX96;
+        }
+
+        // Buy: receive exact amountOut of tokenOut, spend at most amountInMaximum of tokenIn.
+        // Action::Buy → exactOutputSingle(sUSDS → outcome_token, max_cost_wei)
+        function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
+    }
+}
+
+/// sUSDS — base collateral for splitPosition/mergePositions on market 1.
+pub const BASE_COLLATERAL: Address = address!("b5B2dc7fd34C249F4be7fB1fCea07950784229e0");
+
+/// SwapRouter02 — direct Buy/Sell (exactOutputSingle / exactInputSingle).
+pub const SWAP_ROUTER_ADDRESS: Address = address!("68b3465833fb72A70ecDF485E0e4C7bD8665Fc45");
+
+/// Seer batch swap router — multi-leg MintSell / BuyMerge groups.
+pub const BATCH_SWAP_ROUTER_ADDRESS: Address = address!("4081136d23FEeCD324a420A54635e007F51fd94a");
+
+/// Market 1 (67 outcomes) — split with BASE_COLLATERAL (sUSDS).
+pub const MARKET_1_ADDRESS: Address = address!("3220a208aaf4d2ceecde5a2e21ec0c9145f40ba6");
+/// Market 2 (33 outcomes) — conditional on MARKET_2_COLLATERAL.
+pub const MARKET_2_ADDRESS: Address = address!("fea47428981f70110c64dd678889826c3627245b");
+/// "Other repos" ERC1155 outcome token from market 1 — collateral for market 2 splits.
+pub const MARKET_2_COLLATERAL: Address = address!("63a4f76ef5846f68d069054c271465b7118e8ed9");
+
+// https://github.com/seer-pm/demo/blob/ed0a98c70ce13a0764ec5405126a90ebb7f6c94d/contracts/src/Router.sol
+sol! {
+    #[sol(rpc)]
+    interface IBatchSwapRouter {
+        // MintSell / DirectSell: sell one or more outcome tokens for sUSDS.
+        function exactInput(
+            address[] memory tokenIns,
+            uint256[] memory amountIn,
+            address tokenOut,
+            uint256 amountOutTotalMinimum,
+            uint24 fee,
+            uint160 sqrtPriceLimitX96
+        ) external returns (uint256 amountOut);
+
+        // BuyMerge / DirectBuy: buy one or more outcome tokens with sUSDS.
+        function exactOutput(
+            address[] memory tokenOuts,
+            uint256[] memory amountOut,
+            address tokenIn,
+            uint256 amountInTotalMax,
+            uint24 fee,
+            uint160 sqrtPriceLimitX96
+        ) external returns (uint256 amountIn);
+    }
+}
+
+sol! {
+    #[sol(rpc)]
+    interface IERC20 {
+        function approve(address spender, uint256 amount) external returns (bool);
+        function allowance(address owner, address spender) external view returns (uint256);
+    }
+}
+
+sol! {
+    #[sol(rpc)]
+    interface ITradeExecutor {
+        struct Call {
+            address to;
+            bytes data;
+        }
+
+        function batchExecute(Call[] calldata calls) external;
+        function setTemporaryPermission(address _permitted, uint256 _expire) external;
+        function owner() external view returns (address);
+        function permitted() external view returns (address);
+        function expire() external view returns (uint256);
+    }
+}
+
+// https://github.com/seer-pm/demo/blob/ed0a98c70ce13a0764ec5405126a90ebb7f6c94d/contracts/src/Market.sol
+sol! {
+    #[sol(rpc)]
+    interface IMarket {
+        // Returns the ERC1155 wrapper address for a given outcome index.
+        // Used to resolve the intermediate collateral token for market 2 splits.
+        function wrappedOutcome(uint256 index) external view returns (address wrapped1155, bytes memory data);
+        // Returns (_, _, parentOutcome, parentMarket, _) for conditional markets.
+        // parentOutcome is the index in parentMarket whose wrapped token is this market's collateral.
+        function conditionalTokensParams() external view returns (bytes32, bytes32, uint256 parentOutcome, address parentMarket, bytes32);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
@@ -96,6 +224,18 @@ pub enum QuoteAmountConversionError {
     Negative,
     Overflow,
 }
+
+impl std::fmt::Display for QuoteAmountConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite => write!(f, "amount is not finite"),
+            Self::Negative => write!(f, "amount is negative"),
+            Self::Overflow => write!(f, "amount overflow during conversion"),
+        }
+    }
+}
+
+impl std::error::Error for QuoteAmountConversionError {}
 
 pub const SUSD_DECIMALS: u8 = 18;
 

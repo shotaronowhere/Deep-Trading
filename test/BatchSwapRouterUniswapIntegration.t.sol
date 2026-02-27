@@ -104,7 +104,7 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
         uint256 tokenABefore = tokenA.balanceOf(address(this));
         uint256 tokenBBefore = tokenB.balanceOf(address(this));
 
-        uint256 amountOut = batch.exactInput(tokens, address(stable), amountInPerSwap, 1, FEE, 0);
+        uint256 amountOut = batch.exactInput(tokens, amountInPerSwap, address(stable), 1, FEE, 0);
 
         assertGt(amountOut, 0);
         assertEq(stable.balanceOf(address(this)) - stableBefore, amountOut);
@@ -126,7 +126,7 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
         uint256 tokenABefore = tokenA.balanceOf(address(this));
         uint256 tokenBBefore = tokenB.balanceOf(address(this));
 
-        uint256 amountIn = batch.exactOutput(tokens, address(stable), amountOutPerSwap, amountInMax, FEE, 0);
+        uint256 amountIn = batch.exactOutput(tokens, amountOutPerSwap, address(stable), amountInMax, FEE, 0);
 
         assertGt(amountIn, 0);
         assertLe(amountIn, amountInMax);

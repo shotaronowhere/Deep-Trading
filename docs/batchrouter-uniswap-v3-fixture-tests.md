@@ -4,9 +4,11 @@
 Keep `contracts/BatchSwapRouter.sol` fully covered after the API update to `exactInput` and `exactOutput`.
 
 ## API under test
-- `exactInput(IERC20 _tokenOut, uint256 _amountIn, uint256 _amountOutTotalMinimum, uint24 _fee, uint160 _sqrtPriceLimitX96, address[] _tokens)`
-- `exactOutput(IERC20 _tokenIn, uint256 _amountOut, uint256 _amountInTotalMax, uint24 _fee, uint160 _sqrtPriceLimitX96, address[] _tokens)`
-- `address[] _tokens` selects per-swap token addresses; `_fee` and `_sqrtPriceLimitX96` are shared across the batch.
+- `exactInput(address[] tokenIns, uint256 amountIn, address tokenOut, uint256 amountOutTotalMinimum, uint24 fee, uint160 sqrtPriceLimitX96)`
+- `exactInput(address[] tokenIns, uint256[] amountIn, address tokenOut, uint256 amountOutTotalMinimum, uint24 fee, uint160 sqrtPriceLimitX96)`
+- `exactOutput(address[] tokenOuts, uint256 amountOut, address tokenIn, uint256 amountInTotalMax, uint24 fee, uint160 sqrtPriceLimitX96)`
+- `exactOutput(address[] tokenOuts, uint256[] amountOut, address tokenIn, uint256 amountInTotalMax, uint24 fee, uint160 sqrtPriceLimitX96)`
+- `address[]` selects per-swap tokens, and `uint256[]` overloads preserve unequal per-leg amounts.
 
 ## Test strategy
 The suite now has two layers:
@@ -39,9 +41,11 @@ For `UniswapV3Factory` and `NonfungiblePositionManager`, tests first try root `n
 - multi swap aggregate output
 - multi swap with distinct input tokens and per-token router approvals
 - empty swaps with `_amountOutTotalMinimum == 0`
+- unequal per-swap input amount array success
 - revert on `tokenIn.transferFrom` failure
 - revert on `tokenIn.approve` failure
 - revert on aggregate slippage (`amountOut < _amountOutTotalMinimum`)
+- revert on token/amount array length mismatch
 - success path remains valid even when output token `transfer` is disabled in mock (router sends directly to recipient)
 - empty swaps with positive `_amountOutTotalMinimum` revert
 - fuzzed aggregation invariants over bounded swap counts, amounts, and slippage thresholds
@@ -52,11 +56,13 @@ For `UniswapV3Factory` and `NonfungiblePositionManager`, tests first try root `n
 - three-swap tight-budget regression that validates remaining per-swap maxima (`totalMax`, `totalMax-spent1`, `totalMax-spent1-spent2`)
 - boundary case where aggregate spend equals `amountInTotalMax`
 - zero-remaining path (no refund transfer)
+- unequal per-swap output amount array success
 - revert on initial `tokenIn.transferFrom` failure
 - revert on `tokenIn.approve` failure
 - success path remains valid even when output token `transfer` is disabled in mock (no output transfer by `BatchSwapRouter`)
 - revert on aggregate slippage (`amountIn > _amountInTotalMax`)
 - revert when strict per-swap remaining maximum is exceeded
+- revert on token/amount array length mismatch
 - revert on refund transfer failure
 - empty swaps path returning full refund and `amountIn == 0`
 - fuzzed per-swap budget progression checks (`amountInMaximum` history), exact-spend/refund invariants, and bounded over-budget revert cases
