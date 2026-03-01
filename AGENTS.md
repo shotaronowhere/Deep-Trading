@@ -9,6 +9,7 @@ See https://docs.uniswap.org/assets/files/llms-0535f49abd170e69dc72fdc37b81dff2.
 **Rules:**
 - Run all commands in the user's local terminal — no sandboxed environments.
 - Do not ask for API keys.
+- DO NOT MODIFY CONTRACTS
 
 ---
 
