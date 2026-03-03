@@ -20,8 +20,6 @@ contract BatchSwapRouter is IBatchSwapRouter {
         router = IV3SwapRouter(_router);
     }
 
-    receive() external payable {}
-
     function _callOptionalBool(address token, bytes memory data) private returns (bool) {
         (bool success, bytes memory returndata) = token.call(data);
         if (!success) {
@@ -37,8 +35,7 @@ contract BatchSwapRouter is IBatchSwapRouter {
     }
 
     function _safeTransferFrom(address token, address from, address to, uint256 amount) private {
-        bool success =
-            _callOptionalBool(token, abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
+        bool success = _callOptionalBool(token, abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
         if (!success) {
             revert TransferFailed();
         }
@@ -67,120 +64,137 @@ contract BatchSwapRouter is IBatchSwapRouter {
         }
     }
 
+    // batch sell outcome for collateral
     // see IBatchSwapRouter for function docs
     function exactInput(
         address[] memory _tokenIns,
-        uint256 _amountIn,
+        uint256[] memory _amountIns,
+        uint160[] memory _sqrtPriceLimitsX96,
         address _tokenOut,
         uint256 _amountOutTotalMinimum,
-        uint24 _fee,
-        uint160 _sqrtPriceLimitX96
+        uint24 _fee
     ) external returns (uint256 amountOut) {
-        uint256[] memory amountsIn = new uint256[](_tokenIns.length);
-        for (uint i = 0; i < _tokenIns.length; i++) {
-            amountsIn[i] = _amountIn;
+        if (_tokenIns.length != _amountIns.length || _tokenIns.length != _sqrtPriceLimitsX96.length) {
+            revert InvalidArrayLength();
         }
-        amountOut = _exactInput(_tokenIns, amountsIn, _tokenOut, _fee, _sqrtPriceLimitX96);
+        amountOut = _exactInput(_tokenIns, _amountIns, _sqrtPriceLimitsX96, _tokenOut, _fee);
         if (amountOut < _amountOutTotalMinimum) {
             revert SlippageExceeded();
         }
     }
 
-    // see IBatchSwapRouter for function docs
-    function exactInput(
-        address[] memory _tokenIns,
-        uint256[] memory _amountIn,
-        address _tokenOut,
-        uint256 _amountOutTotalMinimum,
-        uint24 _fee,
-        uint160 _sqrtPriceLimitX96
-    ) external returns (uint256 amountOut) {
-        amountOut = _exactInput(_tokenIns, _amountIn, _tokenOut, _fee, _sqrtPriceLimitX96);
-        if (amountOut < _amountOutTotalMinimum) {
-            revert SlippageExceeded();
-        }
-    }
-
+    // batch sell with per-token price limits, refund unexecuted input
     // see IBatchSwapRouter for function docs
     function _exactInput(
         address[] memory _tokenIns,
-        uint256[] memory _amountIn,
+        uint256[] memory _amountIns,
+        uint160[] memory _sqrtPriceLimitsX96,
         address _tokenOut,
-        uint24 _fee,
-        uint160 _sqrtPriceLimitX96
+        uint24 _fee
     ) internal returns (uint256 amountOut) {
-        if (_tokenIns.length != _amountIn.length) {
-            revert InvalidArrayLength();
-        }
-        for (uint i = 0; i < _tokenIns.length; i++) {
-            _safeTransferFrom(_tokenIns[i], msg.sender, address(this), _amountIn[i]);
-            _forceApprove(_tokenIns[i], address(router), _amountIn[i]);
+        for (uint256 i = 0; i < _tokenIns.length; i++) {
+            uint256 balanceBefore = IERC20(_tokenIns[i]).balanceOf(address(this));
+            _safeTransferFrom(_tokenIns[i], msg.sender, address(this), _amountIns[i]);
+            _forceApprove(_tokenIns[i], address(router), _amountIns[i]);
             amountOut += router.exactInputSingle(
                 IV3SwapRouter.ExactInputSingleParams({
                     tokenIn: _tokenIns[i],
-                    tokenOut: address(_tokenOut), // same tokenOut for all swaps
+                    tokenOut: _tokenOut,
                     fee: _fee,
                     recipient: msg.sender,
-                    amountIn: _amountIn[i],
+                    amountIn: _amountIns[i],
                     amountOutMinimum: 0,
-                    sqrtPriceLimitX96: _sqrtPriceLimitX96
+                    sqrtPriceLimitX96: _sqrtPriceLimitsX96[i]
+                })
+            );
+            // Refund unspent input (partial fill from price limit)
+            uint256 balanceAfter = IERC20(_tokenIns[i]).balanceOf(address(this));
+            if (balanceAfter > balanceBefore) {
+                _safeTransfer(_tokenIns[i], msg.sender, balanceAfter - balanceBefore);
+            }
+        }
+    }
+
+    // batch buy outcome with collateral
+    // see IBatchSwapRouter for function docs
+    function exactOutput(
+        address[] memory _tokenOuts,
+        uint256[] memory _amountOuts,
+        uint160[] memory _sqrtPriceLimitsX96,
+        address _tokenIn,
+        uint256 _amountInTotalMax,
+        uint24 _fee
+    ) external returns (uint256 amountIn) {
+        if (_tokenOuts.length != _amountOuts.length || _tokenOuts.length != _sqrtPriceLimitsX96.length) {
+            revert InvalidArrayLength();
+        }
+        amountIn = _exactOutput(_tokenOuts, _amountOuts, _sqrtPriceLimitsX96, _tokenIn, _amountInTotalMax, _fee);
+        if (amountIn > _amountInTotalMax) {
+            revert SlippageExceeded();
+        }
+    }
+
+    // waterfall buy: spend tokenIn budget across tokenOuts, each up to its price limit
+    // see IBatchSwapRouter for function docs
+    function waterfallBuy(
+        address[] memory _tokenOuts,
+        uint160[] memory _sqrtPriceLimitsX96,
+        address _tokenIn,
+        uint256 _amountIn,
+        uint24 _fee
+    ) external returns (uint256 amountInSpent) {
+        if (_tokenOuts.length != _sqrtPriceLimitsX96.length) {
+            revert InvalidArrayLength();
+        }
+        uint256 balanceBefore = IERC20(_tokenIn).balanceOf(address(this));
+        _safeTransferFrom(_tokenIn, msg.sender, address(this), _amountIn);
+        _forceApprove(_tokenIn, address(router), _amountIn);
+
+        for (uint256 i = 0; i < _tokenOuts.length; i++) {
+            uint256 remaining = IERC20(_tokenIn).balanceOf(address(this));
+            if (remaining == 0) break;
+
+            router.exactInputSingle(
+                IV3SwapRouter.ExactInputSingleParams({
+                    tokenIn: _tokenIn,
+                    tokenOut: _tokenOuts[i],
+                    fee: _fee,
+                    recipient: msg.sender,
+                    amountIn: remaining,
+                    amountOutMinimum: 0,
+                    sqrtPriceLimitX96: _sqrtPriceLimitsX96[i]
                 })
             );
         }
-    }
 
-    // see IBatchSwapRouter for function docs
-    function exactOutput(
-        address[] memory _tokenOuts,
-        uint256 _amountOut,
-        address _tokenIn,
-        uint256 _amountInTotalMax,
-        uint24 _fee,
-        uint160 _sqrtPriceLimitX96
-    ) external returns (uint256 amountIn) {
-        uint256[] memory amountsOut = new uint256[](_tokenOuts.length);
-        for (uint i = 0; i < _tokenOuts.length; i++) {
-            amountsOut[i] = _amountOut;
+        // Refund unspent budget
+        uint256 refund = IERC20(_tokenIn).balanceOf(address(this));
+        uint256 callerUnspent = refund > balanceBefore ? refund - balanceBefore : 0;
+        if (callerUnspent > 0) {
+            _safeTransfer(_tokenIn, msg.sender, callerUnspent);
         }
-        amountIn = _exactOutput(_tokenOuts, amountsOut, _tokenIn, _amountInTotalMax, _fee, _sqrtPriceLimitX96);
-        if (amountIn > _amountInTotalMax) {
-            revert SlippageExceeded();
+        if (callerUnspent > _amountIn) {
+            callerUnspent = _amountIn;
         }
-    }
-
-    // see IBatchSwapRouter for function docs
-    function exactOutput(
-        address[] memory _tokenOuts,
-        uint256[] memory _amountOut,
-        address _tokenIn,
-        uint256 _amountInTotalMax,
-        uint24 _fee,
-        uint160 _sqrtPriceLimitX96
-    ) external returns (uint256 amountIn) {
-        amountIn = _exactOutput(_tokenOuts, _amountOut, _tokenIn, _amountInTotalMax, _fee, _sqrtPriceLimitX96);
-        if (amountIn > _amountInTotalMax) {
-            revert SlippageExceeded();
-        }
+        amountInSpent = _amountIn - callerUnspent;
     }
 
     // see IBatchSwapRouter for function docs
     function _exactOutput(
         address[] memory _tokenOuts,
-        uint256[] memory _amountOut,
+        uint256[] memory _amountOuts,
+        uint160[] memory _sqrtPriceLimitsX96,
         address _tokenIn,
         uint256 _amountInTotalMax,
-        uint24 _fee,
-        uint160 _sqrtPriceLimitX96
+        uint24 _fee
     ) internal returns (uint256 amountIn) {
-        if (_tokenOuts.length != _amountOut.length) {
-            revert InvalidArrayLength();
-        }
+        uint256 balanceBefore = IERC20(_tokenIn).balanceOf(address(this));
         _safeTransferFrom(_tokenIn, msg.sender, address(this), _amountInTotalMax);
 
         // tokenIn is same for all swaps, so approve once
         _forceApprove(_tokenIn, address(router), _amountInTotalMax);
 
-        for (uint i = 0; i < _tokenOuts.length; i++) {
+        for (uint256 i = 0; i < _tokenOuts.length; i++) {
             uint256 amountInRemaining = _amountInTotalMax - amountIn; // remaining max for this swap
             amountIn += router.exactOutputSingle(
                 IV3SwapRouter.ExactOutputSingleParams({
@@ -188,16 +202,17 @@ contract BatchSwapRouter is IBatchSwapRouter {
                     tokenOut: _tokenOuts[i], // same tokenOut for all swaps
                     fee: _fee,
                     recipient: msg.sender,
-                    amountOut: _amountOut[i], // same amountOut for all swaps
+                    amountOut: _amountOuts[i], // same amountOut for all swaps
                     amountInMaximum: amountInRemaining, // per-swap ceiling uses remaining max; aggregate checked at the end
-                    sqrtPriceLimitX96: _sqrtPriceLimitX96
+                    sqrtPriceLimitX96: _sqrtPriceLimitsX96[i]
                 })
             );
         }
         // Refund unused tokenIn to caller
         uint256 remaining = IERC20(_tokenIn).balanceOf(address(this));
-        if (remaining > 0) {
-            _safeTransfer(_tokenIn, msg.sender, remaining);
+        uint256 callerRefund = remaining > balanceBefore ? remaining - balanceBefore : 0;
+        if (callerRefund > 0) {
+            _safeTransfer(_tokenIn, msg.sender, callerRefund);
         }
     }
 }

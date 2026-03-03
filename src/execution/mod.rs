@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256, address};
+use alloy::primitives::{Address, U160, U256, address};
 use alloy::sol;
 
 pub mod approvals;
@@ -7,6 +7,7 @@ pub mod bounds;
 mod edge;
 pub mod gas;
 pub mod grouping;
+pub mod preview;
 pub mod runtime;
 pub mod tx_builder;
 
@@ -61,7 +62,9 @@ pub const BASE_COLLATERAL: Address = address!("b5B2dc7fd34C249F4be7fB1fCea079507
 /// SwapRouter02 — direct Buy/Sell (exactOutputSingle / exactInputSingle).
 pub const SWAP_ROUTER_ADDRESS: Address = address!("68b3465833fb72A70ecDF485E0e4C7bD8665Fc45");
 
-/// Seer batch swap router — multi-leg MintSell / BuyMerge groups.
+/// Legacy deployed Seer batch swap router (v1 ABI).
+/// Retained for approvals and compatibility with the live deployment; the current executor
+/// emits direct `SwapRouter02` calls instead of these batch selectors.
 pub const BATCH_SWAP_ROUTER_ADDRESS: Address = address!("4081136d23FEeCD324a420A54635e007F51fd94a");
 
 /// Market 1 (67 outcomes) — split with BASE_COLLATERAL (sUSDS).
@@ -71,6 +74,9 @@ pub const MARKET_2_ADDRESS: Address = address!("fea47428981f70110c64dd678889826c
 /// "Other repos" ERC1155 outcome token from market 1 — collateral for market 2 splits.
 pub const MARKET_2_COLLATERAL: Address = address!("63a4f76ef5846f68d069054c271465b7118e8ed9");
 
+// Compatibility view of the currently deployed batch router at `BATCH_SWAP_ROUTER_ADDRESS`.
+// Do not sync this to `contracts/interfaces/IBatchSwapRouter.sol` until a new router with the
+// newer array-based ABI is actually deployed and the executor is switched over to it.
 // https://github.com/seer-pm/demo/blob/ed0a98c70ce13a0764ec5405126a90ebb7f6c94d/contracts/src/Router.sol
 sol! {
     #[sol(rpc)]
@@ -170,10 +176,12 @@ pub struct ExecutionLegPlan {
     pub market_name: Option<&'static str>,
     pub kind: LegKind,
     pub planned_quote_susd: f64,
+    pub conservative_quote_susd: f64,
     pub adverse_notional_susd: f64,
     pub allocated_slippage_susd: f64,
     pub max_cost_susd: Option<f64>,
     pub min_proceeds_susd: Option<f64>,
+    pub sqrt_price_limit_x96: Option<U160>,
 }
 
 #[derive(Debug, Clone)]
@@ -411,10 +419,12 @@ mod tests {
                 market_name: Some("x"),
                 kind: LegKind::Buy,
                 planned_quote_susd: 1.0,
+                conservative_quote_susd: 1.0,
                 adverse_notional_susd: 1.0,
                 allocated_slippage_susd: 0.1,
                 max_cost_susd: Some(1.1),
                 min_proceeds_susd: None,
+                sqrt_price_limit_x96: Some(U160::from(1u8)),
             }],
             planned_at_block: None,
             edge_plan_susd: 1.0,
@@ -444,10 +454,12 @@ mod tests {
                 market_name: Some("x"),
                 kind: LegKind::Sell,
                 planned_quote_susd: 1.0,
+                conservative_quote_susd: 1.0,
                 adverse_notional_susd: 1.0,
                 allocated_slippage_susd: 0.1,
                 max_cost_susd: None,
                 min_proceeds_susd: Some(0.9),
+                sqrt_price_limit_x96: Some(U160::from(1u8)),
             }],
             planned_at_block: Some(100),
             edge_plan_susd: 1.0,

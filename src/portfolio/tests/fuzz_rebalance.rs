@@ -123,7 +123,10 @@ fn collect_fuzz_case_by_index(
     force_partial: bool,
     case_idx: usize,
 ) -> (
-    Vec<(crate::pools::Slot0Result, &'static crate::markets::MarketData)>,
+    Vec<(
+        crate::pools::Slot0Result,
+        &'static crate::markets::MarketData,
+    )>,
     HashMap<&'static str, f64>,
     f64,
 ) {
@@ -154,7 +157,11 @@ struct FastEvCaseReport {
 }
 
 fn print_fast_ev_case_report(report: &FastEvCaseReport) {
-    let suite = if report.force_partial { "partial" } else { "full" };
+    let suite = if report.force_partial {
+        "partial"
+    } else {
+        "full"
+    };
     println!(
         "[ev-fast][{suite}][case {:02}] before={:.9} after={:.9} delta={:+.9} expected_after={:.9} snapshot_delta={:+.9} band=[-{:.9},+{:.9}]",
         report.case_idx,
@@ -198,10 +205,8 @@ fn print_fast_ev_summary(label: &str, reports: &[FastEvCaseReport]) {
 }
 
 fn assert_case_within_snapshot_band_fast(force_partial: bool, case_idx: usize) -> FastEvCaseReport {
-    let (slot0_results, balances_static, susd_balance) = collect_fuzz_case_by_index(
-        force_partial,
-        case_idx,
-    );
+    let (slot0_results, balances_static, susd_balance) =
+        collect_fuzz_case_by_index(force_partial, case_idx);
     let balances: HashMap<&str, f64> = balances_static
         .iter()
         .map(|(k, v)| (*k as &str, *v))
@@ -253,12 +258,7 @@ fn assert_case_within_snapshot_band_fast(force_partial: bool, case_idx: usize) -
     assert!(
         ok,
         "fast EV regression case out of snapshot band: case={}, partial={}, got={:.12}, expected={:.12}, floor_tol={:.12}, ceiling_tol={:.12}",
-        case_idx,
-        force_partial,
-        ev_after,
-        expected_after,
-        floor_tol,
-        ceiling_tol
+        case_idx, force_partial, ev_after, expected_after, floor_tol, ceiling_tol
     );
     FastEvCaseReport {
         case_idx,

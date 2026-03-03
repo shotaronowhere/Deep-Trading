@@ -27,11 +27,9 @@ contract BatchSwapRouterFuzzTest is Test {
         tokenInAlt.approve(address(batch), type(uint256).max);
     }
 
-    function testFuzzExactInputAggregatesAcrossSwaps(
-        uint8 rawCount,
-        uint96 rawAmountInPerSwap,
-        uint96 rawOutPerSwap
-    ) public {
+    function testFuzzExactInputAggregatesAcrossSwaps(uint8 rawCount, uint96 rawAmountInPerSwap, uint96 rawOutPerSwap)
+        public
+    {
         uint256 count = bound(uint256(rawCount), 1, 8);
         uint256 amountInPerSwap = bound(uint256(rawAmountInPerSwap), 1, 10_000);
         uint256 outPerSwap = bound(uint256(rawOutPerSwap), 0, 20_000);
@@ -47,7 +45,14 @@ contract BatchSwapRouterFuzzTest is Test {
         uint256 tokenInBefore = tokenIn.balanceOf(address(this));
         uint256 tokenInAltBefore = tokenInAlt.balanceOf(address(this));
 
-        uint256 amountOut = batch.exactInput(tokens, amountInPerSwap, address(tokenOut), expectedOut, 500, 0);
+        uint256 amountOut = batch.exactInput(
+            tokens,
+            _filledUint256Array(count, amountInPerSwap),
+            _filledUint160Array(count, 0),
+            address(tokenOut),
+            expectedOut,
+            500
+        );
 
         uint256 tokenInSwapCount = (count + 1) / 2;
         uint256 tokenInAltSwapCount = count - tokenInSwapCount;
@@ -78,7 +83,14 @@ contract BatchSwapRouterFuzzTest is Test {
         }
 
         vm.expectRevert(BatchSwapRouter.SlippageExceeded.selector);
-        batch.exactInput(tokens, amountInPerSwap, address(tokenOut), minimumTooHigh, 500, 0);
+        batch.exactInput(
+            tokens,
+            _filledUint256Array(count, amountInPerSwap),
+            _filledUint160Array(count, 0),
+            address(tokenOut),
+            minimumTooHigh,
+            500
+        );
     }
 
     function testFuzzExactOutputTracksRemainingBudgetAndRefunds(
@@ -106,7 +118,14 @@ contract BatchSwapRouterFuzzTest is Test {
         uint256 tokenOutBefore = tokenOut.balanceOf(address(this));
         uint256 tokenOutAltBefore = tokenOutAlt.balanceOf(address(this));
 
-        uint256 amountIn = batch.exactOutput(tokens, amountOutPerSwap, address(tokenIn), amountInTotalMax, 500, 0);
+        uint256 amountIn = batch.exactOutput(
+            tokens,
+            _filledUint256Array(count, amountOutPerSwap),
+            _filledUint160Array(count, 0),
+            address(tokenIn),
+            amountInTotalMax,
+            500
+        );
 
         uint256 tokenOutSwapCount = (count + 1) / 2;
         uint256 tokenOutAltSwapCount = count - tokenOutSwapCount;
@@ -142,14 +161,19 @@ contract BatchSwapRouterFuzzTest is Test {
         }
 
         vm.expectRevert(MockV3SwapRouter.AmountInMaximumExceeded.selector);
-        batch.exactOutput(tokens, 1, address(tokenIn), amountInTotalMax, 500, 0);
+        batch.exactOutput(
+            tokens,
+            _filledUint256Array(count, 1),
+            _filledUint160Array(count, 0),
+            address(tokenIn),
+            amountInTotalMax,
+            500
+        );
     }
 
-    function testFuzzExactInputUnequalArrayAmounts(
-        uint96 rawAmountInA,
-        uint96 rawAmountInB,
-        uint96 rawOutPerSwap
-    ) public {
+    function testFuzzExactInputUnequalArrayAmounts(uint96 rawAmountInA, uint96 rawAmountInB, uint96 rawOutPerSwap)
+        public
+    {
         uint256 amountInA = bound(uint256(rawAmountInA), 1, 10_000);
         uint256 amountInB = bound(uint256(rawAmountInB), 1, 10_000);
         uint256 outPerSwap = bound(uint256(rawOutPerSwap), 0, 20_000);
@@ -164,18 +188,17 @@ contract BatchSwapRouterFuzzTest is Test {
         amountsIn[0] = amountInA;
         amountsIn[1] = amountInB;
 
-        uint256 amountOut = batch.exactInput(tokens, amountsIn, address(tokenOut), outPerSwap * 2, 500, 0);
+        uint256 amountOut =
+            batch.exactInput(tokens, amountsIn, _filledUint160Array(2, 0), address(tokenOut), outPerSwap * 2, 500);
 
         assertEq(amountOut, outPerSwap * 2);
         assertEq(tokenIn.balanceOf(address(this)), 1_000_000 - amountInA);
         assertEq(tokenInAlt.balanceOf(address(this)), 1_000_000 - amountInB);
     }
 
-    function testFuzzExactOutputUnequalArrayAmounts(
-        uint96 rawAmountOutA,
-        uint96 rawAmountOutB,
-        uint96 rawCostPerSwap
-    ) public {
+    function testFuzzExactOutputUnequalArrayAmounts(uint96 rawAmountOutA, uint96 rawAmountOutB, uint96 rawCostPerSwap)
+        public
+    {
         uint256 amountOutA = bound(uint256(rawAmountOutA), 1, 10_000);
         uint256 amountOutB = bound(uint256(rawAmountOutB), 1, 10_000);
         uint256 costPerSwap = bound(uint256(rawCostPerSwap), 0, 2_000);
@@ -190,10 +213,25 @@ contract BatchSwapRouterFuzzTest is Test {
         amountsOut[0] = amountOutA;
         amountsOut[1] = amountOutB;
 
-        uint256 amountIn = batch.exactOutput(tokens, amountsOut, address(tokenIn), costPerSwap * 2, 500, 0);
+        uint256 amountIn =
+            batch.exactOutput(tokens, amountsOut, _filledUint160Array(2, 0), address(tokenIn), costPerSwap * 2, 500);
 
         assertEq(amountIn, costPerSwap * 2);
         assertEq(tokenOut.balanceOf(address(this)), amountOutA);
         assertEq(tokenOutAlt.balanceOf(address(this)), amountOutB);
+    }
+
+    function _filledUint256Array(uint256 length, uint256 value) internal pure returns (uint256[] memory values) {
+        values = new uint256[](length);
+        for (uint256 i = 0; i < length; i++) {
+            values[i] = value;
+        }
+    }
+
+    function _filledUint160Array(uint256 length, uint160 value) internal pure returns (uint160[] memory values) {
+        values = new uint160[](length);
+        for (uint256 i = 0; i < length; i++) {
+            values[i] = value;
+        }
     }
 }

@@ -6,19 +6,17 @@ use alloy::sol_types::SolCall;
 use alloy_primitives::aliases::U24;
 
 use super::{
-    BASE_COLLATERAL, BATCH_SWAP_ROUTER_ADDRESS as BATCH_ROUTER, BatchTokenBounds,
-    CTF_ROUTER_ADDRESS, IBatchSwapRouter, ICTFRouter, ITradeExecutor, MARKET_1_ADDRESS,
-    MARKET_2_ADDRESS, MARKET_2_COLLATERAL, QuoteAmountConversionError, quote_to_u256_ceil,
+    BASE_COLLATERAL, BatchTokenBounds, CTF_ROUTER_ADDRESS, ICTFRouter, ITradeExecutor,
+    IV3SwapRouter, MARKET_1_ADDRESS, MARKET_2_ADDRESS, MARKET_2_COLLATERAL,
+    QuoteAmountConversionError, SWAP_ROUTER_ADDRESS as SWAP_ROUTER, quote_to_u256_ceil,
     quote_to_u256_floor,
 };
 use crate::markets::MARKETS_L1;
 use crate::portfolio::Action;
-use crate::{execution::ExecutionGroupPlan, execution::GroupKind};
+use crate::{execution::ExecutionGroupPlan, execution::GroupKind, execution::LegKind};
 
 const TOKEN_DECIMALS: u8 = 18;
 const SWAP_FEE_TIER: u16 = 500;
-const SQRT_PRICE_LIMIT_X96: U160 = U160::ZERO;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxBuildError {
     ActionIndexOutOfBounds {
@@ -44,6 +42,10 @@ pub enum TxBuildError {
     InvalidMarketTokenAddress {
         market_name: &'static str,
         raw: String,
+    },
+    MissingPriceLimit {
+        kind: GroupKind,
+        action_index: usize,
     },
     AmountConversion(QuoteAmountConversionError),
 }
@@ -73,6 +75,12 @@ impl fmt::Display for TxBuildError {
                     "invalid outcome token address for market {market_name}: {raw}"
                 )
             }
+            Self::MissingPriceLimit { kind, action_index } => {
+                write!(
+                    f,
+                    "missing sqrtPriceLimitX96 for {kind:?} leg at action index {action_index}"
+                )
+            }
             Self::AmountConversion(err) => write!(f, "amount conversion error: {err:?}"),
         }
     }
@@ -87,25 +95,122 @@ impl From<QuoteAmountConversionError> for TxBuildError {
 }
 
 pub fn build_trade_executor_calls(
+    executor: Address,
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
     match plan.kind {
-        GroupKind::DirectBuy => build_direct_buy_calls(actions, plan, batch_bounds),
-        GroupKind::DirectSell => build_direct_sell_calls(actions, plan, batch_bounds),
-        GroupKind::MintSell => build_mint_sell_calls(actions, plan, batch_bounds),
-        GroupKind::BuyMerge => build_buy_merge_calls(actions, plan, batch_bounds),
+        GroupKind::DirectBuy => build_direct_buy_calls(executor, actions, plan, batch_bounds),
+        GroupKind::DirectSell => build_direct_sell_calls(executor, actions, plan, batch_bounds),
+        GroupKind::MintSell => build_mint_sell_calls(executor, actions, plan, batch_bounds),
+        GroupKind::BuyMerge => build_buy_merge_calls(executor, actions, plan, batch_bounds),
         GroupKind::DirectMerge => build_direct_merge_calls(actions, plan, batch_bounds),
     }
 }
 
+fn leg_for_action(
+    plan: &ExecutionGroupPlan,
+    expected_kind: LegKind,
+    action_index: usize,
+) -> Result<&super::ExecutionLegPlan, TxBuildError> {
+    plan.legs
+        .iter()
+        .find(|leg| leg.action_index == action_index && leg.kind == expected_kind)
+        .ok_or(TxBuildError::UnsupportedGroupShape {
+            kind: plan.kind,
+            reason: "group is missing the execution leg for an action",
+        })
+}
+
+fn price_limit_for_leg(
+    plan: &ExecutionGroupPlan,
+    leg: &super::ExecutionLegPlan,
+) -> Result<U160, TxBuildError> {
+    leg.sqrt_price_limit_x96
+        .ok_or(TxBuildError::MissingPriceLimit {
+            kind: plan.kind,
+            action_index: leg.action_index,
+        })
+}
+
+fn max_cost_for_leg(
+    plan: &ExecutionGroupPlan,
+    leg: &super::ExecutionLegPlan,
+) -> Result<U256, TxBuildError> {
+    let Some(max_cost) = leg.max_cost_susd else {
+        return Err(TxBuildError::UnsupportedGroupShape {
+            kind: plan.kind,
+            reason: "buy leg is missing a max cost bound",
+        });
+    };
+    amount_to_wei_ceil(max_cost)
+}
+
+fn min_proceeds_for_leg(
+    plan: &ExecutionGroupPlan,
+    leg: &super::ExecutionLegPlan,
+) -> Result<U256, TxBuildError> {
+    let Some(min_proceeds) = leg.min_proceeds_susd else {
+        return Err(TxBuildError::UnsupportedGroupShape {
+            kind: plan.kind,
+            reason: "sell leg is missing a min proceeds bound",
+        });
+    };
+    amount_to_wei_floor(min_proceeds)
+}
+
+fn build_exact_output_single_call(
+    recipient: Address,
+    token_out: Address,
+    amount_out: U256,
+    amount_in_max: U256,
+    sqrt_price_limit_x96: U160,
+) -> ITradeExecutor::Call {
+    let calldata = IV3SwapRouter::exactOutputSingleCall {
+        params: IV3SwapRouter::ExactOutputSingleParams {
+            tokenIn: BASE_COLLATERAL,
+            tokenOut: token_out,
+            fee: U24::from(SWAP_FEE_TIER),
+            recipient,
+            amountOut: amount_out,
+            amountInMaximum: amount_in_max,
+            sqrtPriceLimitX96: sqrt_price_limit_x96,
+        },
+    }
+    .abi_encode();
+    executor_call(SWAP_ROUTER, calldata)
+}
+
+fn build_exact_input_single_call(
+    recipient: Address,
+    token_in: Address,
+    amount_in: U256,
+    amount_out_min: U256,
+    sqrt_price_limit_x96: U160,
+) -> ITradeExecutor::Call {
+    let calldata = IV3SwapRouter::exactInputSingleCall {
+        params: IV3SwapRouter::ExactInputSingleParams {
+            tokenIn: token_in,
+            tokenOut: BASE_COLLATERAL,
+            fee: U24::from(SWAP_FEE_TIER),
+            recipient,
+            amountIn: amount_in,
+            amountOutMinimum: amount_out_min,
+            sqrtPriceLimitX96: sqrt_price_limit_x96,
+        },
+    }
+    .abi_encode();
+    executor_call(SWAP_ROUTER, calldata)
+}
+
 fn build_direct_buy_calls(
+    executor: Address,
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
-    let max_total_in_wei = expect_buy_bounds(plan.kind, batch_bounds)?;
+    let _ = expect_buy_bounds(plan.kind, batch_bounds)?;
     if plan.action_indices.len() != 1 {
         return Err(TxBuildError::UnsupportedGroupShape {
             kind: plan.kind,
@@ -128,25 +233,26 @@ fn build_direct_buy_calls(
 
     let token_out = outcome_token_for_market(*market_name)?;
     let amount_out_wei = amount_to_wei_ceil(*amount)?;
-    let calldata = IBatchSwapRouter::exactOutputCall {
-        tokenOuts: vec![token_out],
-        amountOut: vec![amount_out_wei],
-        tokenIn: BASE_COLLATERAL,
-        amountInTotalMax: max_total_in_wei,
-        fee: U24::from(SWAP_FEE_TIER),
-        sqrtPriceLimitX96: SQRT_PRICE_LIMIT_X96,
-    }
-    .abi_encode();
+    let leg = leg_for_action(plan, super::LegKind::Buy, plan.action_indices[0])?;
+    let max_cost_wei = max_cost_for_leg(plan, leg)?;
+    let sqrt_price_limit_x96 = price_limit_for_leg(plan, leg)?;
 
-    Ok(vec![executor_call(BATCH_ROUTER, calldata)])
+    Ok(vec![build_exact_output_single_call(
+        executor,
+        token_out,
+        amount_out_wei,
+        max_cost_wei,
+        sqrt_price_limit_x96,
+    )])
 }
 
 fn build_direct_sell_calls(
+    executor: Address,
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
-    let min_total_out_wei = expect_sell_bounds(plan.kind, batch_bounds)?;
+    let _ = expect_sell_bounds(plan.kind, batch_bounds)?;
     if plan.action_indices.len() != 1 {
         return Err(TxBuildError::UnsupportedGroupShape {
             kind: plan.kind,
@@ -169,25 +275,26 @@ fn build_direct_sell_calls(
 
     let token_in = outcome_token_for_market(*market_name)?;
     let amount_in_wei = amount_to_wei_floor(*amount)?;
-    let calldata = IBatchSwapRouter::exactInputCall {
-        tokenIns: vec![token_in],
-        amountIn: vec![amount_in_wei],
-        tokenOut: BASE_COLLATERAL,
-        amountOutTotalMinimum: min_total_out_wei,
-        fee: U24::from(SWAP_FEE_TIER),
-        sqrtPriceLimitX96: SQRT_PRICE_LIMIT_X96,
-    }
-    .abi_encode();
+    let leg = leg_for_action(plan, super::LegKind::Sell, plan.action_indices[0])?;
+    let min_proceeds_wei = min_proceeds_for_leg(plan, leg)?;
+    let sqrt_price_limit_x96 = price_limit_for_leg(plan, leg)?;
 
-    Ok(vec![executor_call(BATCH_ROUTER, calldata)])
+    Ok(vec![build_exact_input_single_call(
+        executor,
+        token_in,
+        amount_in_wei,
+        min_proceeds_wei,
+        sqrt_price_limit_x96,
+    )])
 }
 
 fn build_mint_sell_calls(
+    executor: Address,
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
-    let min_total_out_wei = expect_sell_bounds(plan.kind, batch_bounds)?;
+    let _ = expect_sell_bounds(plan.kind, batch_bounds)?;
     if plan.action_indices.len() < 2 {
         return Err(TxBuildError::UnsupportedGroupShape {
             kind: plan.kind,
@@ -204,8 +311,7 @@ fn build_mint_sell_calls(
     };
     let mint_amount_wei = amount_to_wei_floor(*amount)?;
 
-    let mut token_ins = Vec::new();
-    let mut amount_ins = Vec::new();
+    let mut swap_calls = Vec::new();
     for action_index in plan.action_indices.iter().skip(1) {
         let action = action_at(actions, *action_index)?;
         let Action::Sell {
@@ -219,10 +325,20 @@ fn build_mint_sell_calls(
                 reason: "MintSell tail must contain only Sell actions",
             });
         };
-        token_ins.push(outcome_token_for_market(*market_name)?);
-        amount_ins.push(amount_to_wei_floor(*amount)?);
+        let leg = leg_for_action(plan, super::LegKind::Sell, *action_index)?;
+        let token_in = outcome_token_for_market(*market_name)?;
+        let amount_in_wei = amount_to_wei_floor(*amount)?;
+        let min_proceeds_wei = min_proceeds_for_leg(plan, leg)?;
+        let sqrt_price_limit_x96 = price_limit_for_leg(plan, leg)?;
+        swap_calls.push(build_exact_input_single_call(
+            executor,
+            token_in,
+            amount_in_wei,
+            min_proceeds_wei,
+            sqrt_price_limit_x96,
+        ));
     }
-    if token_ins.is_empty() {
+    if swap_calls.is_empty() {
         return Err(TxBuildError::UnsupportedGroupShape {
             kind: plan.kind,
             reason: "MintSell requires at least one sell leg",
@@ -243,29 +359,21 @@ fn build_mint_sell_calls(
         amount: mint_amount_wei,
     }
     .abi_encode();
-    let batch_sell = IBatchSwapRouter::exactInputCall {
-        tokenIns: token_ins,
-        amountIn: amount_ins,
-        tokenOut: BASE_COLLATERAL,
-        amountOutTotalMinimum: min_total_out_wei,
-        fee: U24::from(SWAP_FEE_TIER),
-        sqrtPriceLimitX96: SQRT_PRICE_LIMIT_X96,
-    }
-    .abi_encode();
-
-    Ok(vec![
+    let mut calls = vec![
         executor_call(CTF_ROUTER_ADDRESS, split_market_1),
         executor_call(CTF_ROUTER_ADDRESS, split_market_2),
-        executor_call(BATCH_ROUTER, batch_sell),
-    ])
+    ];
+    calls.extend(swap_calls);
+    Ok(calls)
 }
 
 fn build_buy_merge_calls(
+    executor: Address,
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
-    let max_total_in_wei = expect_buy_bounds(plan.kind, batch_bounds)?;
+    let _ = expect_buy_bounds(plan.kind, batch_bounds)?;
     if plan.action_indices.len() < 2 {
         return Err(TxBuildError::UnsupportedGroupShape {
             kind: plan.kind,
@@ -283,8 +391,7 @@ fn build_buy_merge_calls(
     };
     let merge_amount_wei = amount_to_wei_floor(*amount)?;
 
-    let mut token_outs = Vec::new();
-    let mut amount_outs = Vec::new();
+    let mut swap_calls = Vec::new();
     for action_index in plan
         .action_indices
         .iter()
@@ -302,25 +409,25 @@ fn build_buy_merge_calls(
                 reason: "BuyMerge prefix must contain only Buy actions",
             });
         };
-        token_outs.push(outcome_token_for_market(*market_name)?);
-        amount_outs.push(amount_to_wei_ceil(*amount)?);
+        let leg = leg_for_action(plan, super::LegKind::Buy, *action_index)?;
+        let token_out = outcome_token_for_market(*market_name)?;
+        let amount_out_wei = amount_to_wei_ceil(*amount)?;
+        let max_cost_wei = max_cost_for_leg(plan, leg)?;
+        let sqrt_price_limit_x96 = price_limit_for_leg(plan, leg)?;
+        swap_calls.push(build_exact_output_single_call(
+            executor,
+            token_out,
+            amount_out_wei,
+            max_cost_wei,
+            sqrt_price_limit_x96,
+        ));
     }
-    if token_outs.is_empty() {
+    if swap_calls.is_empty() {
         return Err(TxBuildError::UnsupportedGroupShape {
             kind: plan.kind,
             reason: "BuyMerge requires at least one buy leg",
         });
     }
-
-    let batch_buy = IBatchSwapRouter::exactOutputCall {
-        tokenOuts: token_outs,
-        amountOut: amount_outs,
-        tokenIn: BASE_COLLATERAL,
-        amountInTotalMax: max_total_in_wei,
-        fee: U24::from(SWAP_FEE_TIER),
-        sqrtPriceLimitX96: SQRT_PRICE_LIMIT_X96,
-    }
-    .abi_encode();
     // Action::Merge semantics are cross-contract complete-set merge/burn.
     let merge_market_2 = ICTFRouter::mergePositionsCall {
         collateralToken: MARKET_2_COLLATERAL,
@@ -335,11 +442,12 @@ fn build_buy_merge_calls(
     }
     .abi_encode();
 
-    Ok(vec![
-        executor_call(BATCH_ROUTER, batch_buy),
+    let mut calls = swap_calls;
+    calls.extend([
         executor_call(CTF_ROUTER_ADDRESS, merge_market_2),
         executor_call(CTF_ROUTER_ADDRESS, merge_market_1),
-    ])
+    ]);
+    Ok(calls)
 }
 
 fn build_direct_merge_calls(
@@ -462,6 +570,10 @@ mod tests {
     use crate::execution::{BatchTokenBounds, ExecutionGroupPlan, ExecutionLegPlan, LegKind};
 
     fn plan(kind: GroupKind, action_indices: Vec<usize>) -> ExecutionGroupPlan {
+        let leg_kind = match kind {
+            GroupKind::DirectSell | GroupKind::MintSell => LegKind::Sell,
+            _ => LegKind::Buy,
+        };
         ExecutionGroupPlan {
             kind,
             action_indices,
@@ -471,12 +583,14 @@ mod tests {
             legs: vec![ExecutionLegPlan {
                 action_index: 0,
                 market_name: Some("m"),
-                kind: LegKind::Buy,
+                kind: leg_kind,
                 planned_quote_susd: 1.0,
+                conservative_quote_susd: 1.01,
                 adverse_notional_susd: 1.0,
                 allocated_slippage_susd: 0.01,
-                max_cost_susd: Some(1.01),
-                min_proceeds_susd: None,
+                max_cost_susd: (leg_kind == LegKind::Buy).then_some(1.01),
+                min_proceeds_susd: (leg_kind == LegKind::Sell).then_some(0.99),
+                sqrt_price_limit_x96: Some(U160::from(123u64)),
             }],
             planned_at_block: Some(100),
             edge_plan_susd: 1.0,
@@ -499,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn buy_merge_uses_heterogeneous_array_amounts() {
+    fn buy_merge_preserves_per_leg_buy_amounts() {
         let (m0, m1) = first_two_markets();
         let actions = vec![
             Action::Buy {
@@ -519,25 +633,48 @@ mod tests {
                 source_market: m0,
             },
         ];
-        let plan = plan(GroupKind::BuyMerge, vec![0, 1, 2]);
+        let mut plan = plan(GroupKind::BuyMerge, vec![0, 1, 2]);
+        plan.legs.push(ExecutionLegPlan {
+            action_index: 1,
+            market_name: Some("m"),
+            kind: LegKind::Buy,
+            planned_quote_susd: 1.0,
+            conservative_quote_susd: 1.01,
+            adverse_notional_susd: 1.0,
+            allocated_slippage_susd: 0.01,
+            max_cost_susd: Some(1.01),
+            min_proceeds_susd: None,
+            sqrt_price_limit_x96: Some(U160::from(123u64)),
+        });
         let bounds = Some(BatchTokenBounds::Buy {
             planned_total_in_wei: U256::from(2u64),
             max_total_in_wei: U256::from(3u64),
         });
 
-        let calls =
-            build_trade_executor_calls(&actions, &plan, bounds).expect("build should succeed");
-        assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0].to, BATCH_ROUTER);
-        let decoded = IBatchSwapRouter::exactOutputCall::abi_decode(&calls[0].data)
+        let calls = build_trade_executor_calls(Address::ZERO, &actions, &plan, bounds)
+            .expect("build should succeed");
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].to, SWAP_ROUTER);
+        let decoded = IV3SwapRouter::exactOutputSingleCall::abi_decode(&calls[0].data)
             .expect("decode should succeed");
-        assert_eq!(decoded.amountOut.len(), 2);
-        assert_ne!(
-            decoded.amountOut[0], decoded.amountOut[1],
-            "heterogeneous buy amounts must be preserved in calldata arrays"
+        assert_eq!(
+            decoded.params.amountOut,
+            U256::from(1_250_000_000_000_000_000u128)
         );
-        assert_eq!(decoded.tokenIn, BASE_COLLATERAL);
-        assert_eq!(decoded.amountInTotalMax, U256::from(3u64));
+        assert_eq!(
+            decoded.params.amountInMaximum,
+            U256::from(1_010_000_000_000_000_000u128)
+        );
+        assert_eq!(decoded.params.sqrtPriceLimitX96, U160::from(123u64));
+        assert_eq!(decoded.params.recipient, Address::ZERO);
+        let decoded_second = IV3SwapRouter::exactOutputSingleCall::abi_decode(&calls[1].data)
+            .expect("decode should succeed");
+        assert_ne!(
+            decoded.params.amountOut, decoded_second.params.amountOut,
+            "heterogeneous buy amounts must be preserved across per-leg swap calls"
+        );
+        assert_eq!(calls[2].to, CTF_ROUTER_ADDRESS);
+        assert_eq!(calls[3].to, CTF_ROUTER_ADDRESS);
     }
 
     #[test]
@@ -550,6 +687,7 @@ mod tests {
         }];
         let plan = plan(GroupKind::DirectMerge, vec![0]);
         let err = match build_trade_executor_calls(
+            Address::ZERO,
             &actions,
             &plan,
             Some(BatchTokenBounds::Sell {
@@ -577,7 +715,7 @@ mod tests {
             cost: 0.5,
         }];
         let plan = plan(GroupKind::DirectBuy, vec![0]);
-        let err = match build_trade_executor_calls(&actions, &plan, None) {
+        let err = match build_trade_executor_calls(Address::ZERO, &actions, &plan, None) {
             Ok(_) => panic!("missing bounds must fail closed"),
             Err(err) => err,
         };
@@ -590,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_sell_emits_single_batch_router_call() {
+    fn direct_sell_emits_single_swap_router_call() {
         let (market, _) = first_two_markets();
         let actions = vec![Action::Sell {
             market_name: market,
@@ -602,14 +740,50 @@ mod tests {
             planned_total_out_wei: U256::from(4u64),
             min_total_out_wei: U256::from(3u64),
         });
-        let calls =
-            build_trade_executor_calls(&actions, &plan, bounds).expect("build should succeed");
+        let calls = build_trade_executor_calls(Address::ZERO, &actions, &plan, bounds)
+            .expect("build should succeed");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].to, BATCH_ROUTER);
-        let decoded = IBatchSwapRouter::exactInputCall::abi_decode(&calls[0].data)
+        assert_eq!(calls[0].to, SWAP_ROUTER);
+        let decoded = IV3SwapRouter::exactInputSingleCall::abi_decode(&calls[0].data)
             .expect("decode should succeed");
-        assert_eq!(decoded.amountOutTotalMinimum, U256::from(3u64));
-        assert_eq!(decoded.tokenOut, BASE_COLLATERAL);
+        assert_eq!(
+            decoded.params.amountIn,
+            U256::from(1_000_000_000_000_000_000u128)
+        );
+        assert_eq!(decoded.params.sqrtPriceLimitX96, U160::from(123u64));
+        assert_eq!(
+            decoded.params.amountOutMinimum,
+            U256::from(990_000_000_000_000_000u128)
+        );
+        assert_eq!(decoded.params.tokenOut, BASE_COLLATERAL);
+        assert_eq!(decoded.params.recipient, Address::ZERO);
+    }
+
+    #[test]
+    fn direct_buy_fails_closed_when_price_limit_missing() {
+        let (market, _) = first_two_markets();
+        let actions = vec![Action::Buy {
+            market_name: market,
+            amount: 1.0,
+            cost: 0.5,
+        }];
+        let mut plan = plan(GroupKind::DirectBuy, vec![0]);
+        plan.legs[0].sqrt_price_limit_x96 = None;
+        let bounds = Some(BatchTokenBounds::Buy {
+            planned_total_in_wei: U256::from(1u64),
+            max_total_in_wei: U256::from(2u64),
+        });
+        let err = match build_trade_executor_calls(Address::ZERO, &actions, &plan, bounds) {
+            Ok(_) => panic!("missing price limit must fail closed"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            TxBuildError::MissingPriceLimit {
+                kind: GroupKind::DirectBuy,
+                action_index: 0
+            }
+        ));
     }
 
     #[test]

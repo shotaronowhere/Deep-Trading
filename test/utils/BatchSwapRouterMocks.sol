@@ -69,6 +69,7 @@ contract MockV3SwapRouter is IV3SwapRouter {
 
     uint256 public exactInputSingleReturn;
     uint256 public exactOutputSingleReturn;
+    uint256 public exactInputSingleSpend;
 
     bool public mintTokenOutOnExactInput = true;
     bool public mintTokenOutOnExactOutput = true;
@@ -78,6 +79,7 @@ contract MockV3SwapRouter is IV3SwapRouter {
 
     uint256 public exactInputCalls;
     uint256 public exactOutputCalls;
+    uint256[] public exactInputAmountInHistory;
     uint256[] public exactOutputAmountInMaximumHistory;
 
     ExactInputSingleParams public lastExactInput;
@@ -89,6 +91,10 @@ contract MockV3SwapRouter is IV3SwapRouter {
 
     function setExactOutputSingleReturn(uint256 value) external {
         exactOutputSingleReturn = value;
+    }
+
+    function setExactInputSingleSpend(uint256 value) external {
+        exactInputSingleSpend = value;
     }
 
     function setMintTokenOutOnExactInput(bool value) external {
@@ -111,13 +117,24 @@ contract MockV3SwapRouter is IV3SwapRouter {
         enforceAmountInMaximumOnExactOutput = value;
     }
 
-    function exactInputSingle(ExactInputSingleParams calldata params) external payable override returns (uint256 amountOut) {
+    function exactInputSingle(ExactInputSingleParams calldata params)
+        external
+        payable
+        override
+        returns (uint256 amountOut)
+    {
         exactInputCalls += 1;
         lastExactInput = params;
         amountOut = exactInputSingleReturn;
+        exactInputAmountInHistory.push(params.amountIn);
 
-        if (pullTokenInOnExactInput && params.amountIn > 0) {
-            IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);
+        uint256 spend = exactInputSingleSpend;
+        if (spend == 0 || spend > params.amountIn) {
+            spend = params.amountIn;
+        }
+
+        if (pullTokenInOnExactInput && spend > 0) {
+            IERC20(params.tokenIn).transferFrom(msg.sender, address(this), spend);
         }
 
         if (mintTokenOutOnExactInput && amountOut > 0) {

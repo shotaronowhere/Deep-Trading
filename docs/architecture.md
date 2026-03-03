@@ -54,6 +54,7 @@ API (deep.seer.pm)
 - **src/pools/rpc.rs**: On-chain pool + balance multicall queries
 - **src/pools/cache.rs**: Local balance cache serialization and staleness checks
 - **src/execution/bounds.rs**: Profitability-step-aware strict-subgroup planning, strict gating, and prefix-safe execution-plan orchestration
+- **src/execution/tx_builder.rs**: Encodes per-leg `SwapRouter02` calls for runtime execution; the batch-router ABI in Rust remains compatibility-only until a new batch router is deployed
 - **src/execution/edge.rs**: Group cashflow/EV edge derivation helpers
 - **src/execution/batch_bounds.rs**: Aggregate `sell(min)` / `buy(max)` bound derivation + plan stamping
 - **src/execution/gas.rs**: L2/L1 gas estimate model + cached Optimism L1 fee-per-byte hydration
@@ -61,11 +62,11 @@ API (deep.seer.pm)
 - **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
 - **src/portfolio/core/mod.rs**: Portfolio core aggregation module
 - **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers
-- **src/portfolio/core/planning.rs**: Route planning/cost modeling helpers plus budget-exhaustion profitability solve (closed-form direct, simulation-backed bisection mixed)
-- **src/portfolio/core/solver.rs**: Numerical mint-route solve helpers (`mint_cost_to_prof` and supporting Newton machinery)
+- **src/portfolio/core/planning.rs**: Bundle-step planning for the live waterfall path; legacy route-level planning helpers are retained under `#[cfg(test)]` for oracle parity tests
+- **src/portfolio/core/solver.rs**: Bundle mint-route cost helpers for production planning; the older per-route Newton solver is retained under `#[cfg(test)]` for regression tests
 - **src/portfolio/core/trading.rs**: Trade/plan execution, merge/mint helpers, and inventory accounting (`ExecutionState` centralizes mutable execution state and execution methods)
-- **src/portfolio/core/waterfall.rs**: Waterfall allocation strategy and active-set profitability equalization loop
-- **src/portfolio/core/rebalancer.rs**: Rebalance phase orchestration (`Phase 0-5` flow), EV-guarded trial commits, and phase-specific inventory/budget flows (`RebalanceContext` handles setup/validation)
+- **src/portfolio/core/waterfall.rs**: Bundle-frontier waterfall allocation for runtime execution, with the historical route-level frontier search kept under `#[cfg(test)]` for oracle checks
+- **src/portfolio/core/rebalancer.rs**: Rebalance phase orchestration (`Phase 0-5` flow), EV-guarded trial commits, and phase-specific inventory/budget flows (`RebalanceContext` handles setup/validation); phase 3 liquidation intentionally only permits direct-merge exits
 - **src/portfolio/tests.rs**: Portfolio test root (shared fixtures + early deterministic tests)
 - **src/portfolio/tests/fuzz_rebalance.rs**: Fuzz and full/partial rebalance regression tests
 - **src/portfolio/tests/oracle.rs**: Oracle parity, phase behavior, and invariants tests
@@ -90,6 +91,13 @@ Converts Uniswap V3 `sqrtPriceX96` to outcome token prices (18-decimal fixed poi
 
 ### Alternative Pricing
 `price_long_simple_alt` computes the implied long price for an outcome by summing prices of all other outcomes: `1 - sum(others)`.
+
+## On-Chain Contracts
+
+- **contracts/Rebalancer.sol**: Fully on-chain rebalancer that reads pool state, computes closed-form waterfall allocation (ψ), and executes sell/buy swaps atomically. Replaces the off-chain hybrid approach (see [docs/slippage.md](slippage.md) §0). Also includes complete-set arbitrage (`arb()`).
+- **contracts/BatchSwapRouter.sol**: Batch router contract/API for explicit basket execution and tests. The current Rust runtime executor does not target it directly; it emits per-leg `SwapRouter02` calls while the deployed batch-router ABI is kept in Rust for compatibility.
+- **contracts/interfaces/**: `IV3SwapRouter`, `ICTFRouter`, `IUniswapV3Pool`, `IERC20`, `IBatchSwapRouter`
+- **contracts/libraries/FullMath.sol**: 512-bit `mulDiv` from Uniswap V3 core
 
 ## External Dependencies
 

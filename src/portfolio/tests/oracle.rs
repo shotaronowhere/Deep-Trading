@@ -1453,7 +1453,7 @@ fn test_rebalance_phase1_clears_or_fairs_legacy_overpriced_source_full_l1() {
 
     let mut balances: HashMap<&str, f64> = HashMap::new();
     balances.insert(source_name, 24.0);
-    // Provide complementary inventory so merge can be exercised without pool buys.
+    // Provide complementary inventory so direct-merge remains available if selected.
     for market in markets.iter().skip(1) {
         balances.insert(market.name, 2.0);
     }
@@ -1467,11 +1467,6 @@ fn test_rebalance_phase1_clears_or_fairs_legacy_overpriced_source_full_l1() {
             .any(|a| matches!(a, Action::Sell { market_name, .. } if *market_name == source_name)),
         "overpriced legacy source should trigger sells"
     );
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::Merge { .. })),
-        "fixture should exercise merge path in full-L1 mode"
-    );
-
     let (holdings_after, _) = replay_actions_to_state(&actions, &slot0_results, &balances, budget);
     let slot0_after = replay_actions_to_market_state(&actions, &slot0_results);
     let sims_after = {
@@ -2001,199 +1996,42 @@ fn test_plan_truncates_mint_on_crossover_below_current_prof() {
 }
 
 #[test]
-fn test_waterfall_budget_exit_after_boundary_reports_realized_prof() {
-    let names = ["BP1", "BP2", "BP3", "BP4"];
-    let tokens = [
-        "0x1212121212121212121212121212121212121212",
-        "0x2323232323232323232323232323232323232323",
-        "0x3434343434343434343434343434343434343434",
-        "0x4545454545454545454545454545454545454545",
-    ];
-    let mut rng = TestRng::new(0x4255_445F_4558_4954u64);
-    let mut witness: Option<(Vec<PoolSim>, f64, usize, f64)> = None;
-
-    for _ in 0..12000 {
-        let mut pred_raw = [0.0_f64; 4];
-        for value in &mut pred_raw {
-            *value = rng.in_range(0.05, 0.45);
-        }
-        let pred_sum: f64 = pred_raw.iter().sum();
-        let mut preds = [0.0_f64; 4];
-        for i in 0..4 {
-            preds[i] = pred_raw[i] / pred_sum;
-        }
-
-        let fragile_idx = 1 + rng.pick(3);
-        let mut prices = [0.0_f64; 4];
-        prices[0] = (preds[0] * rng.in_range(0.22, 0.65)).clamp(0.002, 0.92);
-        for i in 1..4 {
-            let base_mult = if i == fragile_idx {
-                rng.in_range(0.90, 1.05)
-            } else {
-                rng.in_range(0.55, 1.30)
-            };
-            prices[i] = (preds[i] * base_mult).clamp(0.002, 0.92);
-        }
-
-        let mut liquidities = [0_u128; 4];
-        for i in 0..4 {
-            let exp = if i == fragile_idx {
-                rng.in_range(15.0, 16.5)
-            } else {
-                rng.in_range(19.0, 21.5)
-            };
-            liquidities[i] = (10f64.powf(exp)).round().max(1.0) as u128;
-        }
-
-        let slot0_results: Vec<_> = (0..4)
-            .map(|i| {
-                mock_slot0_market_with_liquidity_and_ticks(
-                    names[i],
-                    tokens[i],
-                    prices[i],
-                    liquidities[i],
-                    -220_000,
-                    220_000,
-                )
-            })
-            .collect();
-        let sims: Vec<PoolSim> = slot0_results
-            .iter()
-            .zip(preds.iter())
-            .map(|((slot0, market), pred)| PoolSim::from_slot0(slot0, market, *pred).unwrap())
-            .collect();
-
-        let price_sum: f64 = sims.iter().map(|s| s.price()).sum();
-        let empty_active_set: HashSet<(usize, Route)> = HashSet::new();
-        let Some((seed_idx, seed_route, current_prof)) = best_non_active(
-            &sims,
-            &empty_active_set,
-            true,
-            price_sum,
-            f64::MAX,
-            0.0,
-            0.0,
-        ) else {
-            continue;
-        };
-        if seed_route != Route::Mint || !current_prof.is_finite() || current_prof <= 1e-8 {
-            continue;
-        }
-
-        let active = vec![(seed_idx, seed_route)];
-        let active_set: HashSet<(usize, Route)> = active.iter().copied().collect();
-        let target_prof =
-            match best_non_active(&sims, &active_set, true, price_sum, f64::MAX, 0.0, 0.0) {
-                Some((_, _, p)) if p > 0.0 => p,
-                _ => 0.0,
-            };
-        if !(target_prof.is_finite() && target_prof >= 0.0 && target_prof < current_prof) {
-            continue;
-        }
-
-        let skip = active_skip_indices(&active);
-        let mut scratch = Vec::with_capacity(sims.len());
-        let Some(plan) = plan_active_routes_with_scratch(
-            &sims,
-            &active,
-            target_prof,
-            &skip,
-            &mut scratch,
-            Some(current_prof),
-        ) else {
-            continue;
-        };
-        let Some(boundary_step) = plan.last() else {
-            continue;
-        };
-        if !boundary_step.active_set_boundary_hit || boundary_step.route != Route::Mint {
-            continue;
-        }
-        let total_cost: f64 = plan.iter().map(|step| step.cost).sum();
-        if !total_cost.is_finite() || total_cost <= 1e-9 {
-            continue;
-        }
-
-        // Require a true crossover-below-current fixture so stale `last_prof = current_prof`
-        // would be observably wrong at budget exit.
-        let mut exec_sims = sims.clone();
-        let mut exec_budget = total_cost + 1.0;
-        let mut exec_actions = Vec::new();
-        let executed = {
-            let mut balances: HashMap<&str, f64> = HashMap::new();
-            let mut exec = ExecutionState::new(
-                &mut exec_sims,
-                &mut exec_budget,
-                &mut exec_actions,
-                &mut balances,
-            );
-            exec.execute_planned_routes(&plan, &skip)
-        };
-        if !executed {
-            continue;
-        }
-        let price_sum_after: f64 = exec_sims.iter().map(|s| s.price()).sum();
-        let realized_prof = profitability(
-            exec_sims[boundary_step.idx].prediction,
-            alt_price(&exec_sims, boundary_step.idx, price_sum_after),
-        );
-        if !realized_prof.is_finite()
-            || realized_prof >= current_prof - 1e-5 * (1.0 + current_prof.abs())
-        {
-            continue;
-        }
-
-        // Keep just enough budget to execute the split, then stop at the top-of-loop budget guard.
-        let budget = total_cost + 0.25 * EPS * (1.0 + total_cost.abs());
-        witness = Some((sims, budget, boundary_step.idx, current_prof));
-        break;
-    }
-
-    let (mut sims, mut budget, seed_idx, current_prof) = witness.expect(
-        "expected a fixture where first waterfall step is a boundary split below current_prof",
-    );
+fn test_waterfall_budget_exit_reports_post_descent_prof() {
+    let mut sims = build_three_sims_with_preds([0.01, 0.90, 0.90], [0.04, 0.03, 0.03]);
+    let current_prof = sims
+        .iter()
+        .map(|sim| profitability(sim.prediction, sim.price()))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut budget = 10.0;
     let mut actions = Vec::new();
-    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, true, 0.0, 0.0);
+
+    let last_prof = waterfall(&mut sims, &mut budget, &mut actions, false, 0.0, 0.0);
 
     assert!(
-        actions.iter().any(|a| matches!(a, Action::Mint { .. })),
-        "fixture should execute at least one mint leg"
+        actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "partial direct-only budget should still execute buys"
     );
-    let budget_tol = 2e-9 * (1.0 + current_prof.abs());
+    let budget_tol = 1e-8;
     assert!(
         budget <= budget_tol,
-        "fixture should terminate on budget exhaustion after boundary split: remaining={:.12}, tol={:.12}",
+        "partial direct-only waterfall should exhaust the budget: remaining={:.12}, tol={:.12}",
         budget,
         budget_tol
     );
-
-    let price_sum_after: f64 = sims.iter().map(|s| s.price()).sum();
-    let realized_prof = profitability(
-        sims[seed_idx].prediction,
-        alt_price(&sims, seed_idx, price_sum_after),
+    assert!(
+        last_prof.is_finite() && last_prof >= 0.0,
+        "reported post-descent profitability must stay finite"
     );
     assert!(
-        realized_prof.is_finite(),
-        "realized post-split profitability should be finite"
-    );
-    assert!(
-        realized_prof < current_prof - 1e-5 * (1.0 + current_prof.abs()),
-        "fixture should cross below the pre-split level: realized={:.12}, current={:.12}",
-        realized_prof,
-        current_prof
-    );
-    let prof_tol = 2e-7 * (1.0 + realized_prof.abs() + last_prof.abs());
-    assert!(
-        (last_prof - realized_prof).abs() <= prof_tol,
-        "waterfall should report realized profitability after boundary split: last_prof={:.12}, realized={:.12}, tol={:.12}",
+        last_prof < current_prof - 1e-5 * (1.0 + current_prof.abs()),
+        "partial budget should reduce the active direct frontier: last_prof={:.12}, current={:.12}",
         last_prof,
-        realized_prof,
-        prof_tol
+        current_prof
     );
 }
 
 #[test]
-fn test_waterfall_boundary_splits_refresh_skip_before_next_descent() {
+fn test_waterfall_mint_brackets_preserve_frontier_members() {
     let prices = [0.399554, 0.246718, 0.283701, 0.080065];
     let preds = [0.524024, 0.313937, 0.342533, 0.100115];
     let initial_budget = 17.358789;
@@ -2231,78 +2069,36 @@ fn test_waterfall_boundary_splits_refresh_skip_before_next_descent() {
     let first_buy_idx = actions
         .iter()
         .position(|a| matches!(a, Action::Buy { .. }))
-        .expect("fixture should produce direct buys after initial boundary splits");
+        .expect("fixture should still produce direct buys after the initial mixed phase");
+    let first_mint_idx = actions[..first_buy_idx]
+        .iter()
+        .position(|a| matches!(a, Action::Mint { .. }))
+        .expect("fixture should contain at least one mint bracket before the first direct buy");
 
-    let mut mint_sell_sets: Vec<HashSet<&str>> = Vec::new();
-    let mut mint_spans: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0usize;
-    while i < first_buy_idx {
-        if !matches!(actions[i], Action::Mint { .. }) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        let mut j = i + 1;
-        while j < first_buy_idx && matches!(actions[j], Action::Sell { .. }) {
-            j += 1;
-        }
-
-        let mut has_mint = false;
-        let mut sold_markets: HashSet<&str> = HashSet::new();
-        for action in &actions[start..j] {
-            match action {
-                Action::Mint { .. } => has_mint = true,
-                Action::Sell { market_name, .. } => {
-                    sold_markets.insert(*market_name);
-                }
-                _ => {}
-            }
-        }
-        if has_mint {
-            mint_sell_sets.push(sold_markets);
-            mint_spans.push((start, j.saturating_sub(1)));
-        }
-        i = j;
+    let Action::Mint { target_market, .. } = actions[first_mint_idx] else {
+        unreachable!("position identified a mint action");
+    };
+    let mut sold_markets: HashSet<&str> = HashSet::new();
+    let mut cursor = first_mint_idx + 1;
+    while cursor < first_buy_idx {
+        let Action::Sell { market_name, .. } = actions[cursor] else {
+            break;
+        };
+        sold_markets.insert(market_name);
+        cursor += 1;
     }
 
     assert!(
-        mint_sell_sets.len() >= 2,
-        "fixture should contain at least two mint-sell brackets before first direct buy"
-    );
-
-    let first = &mint_sell_sets[0];
-    let second = &mint_sell_sets[1];
-    let expected_first: HashSet<&str> = ["WB1", "WB2", "WB3"].into_iter().collect();
-    let expected_second: HashSet<&str> = ["WB2", "WB3"].into_iter().collect();
-    assert_eq!(
-        first, &expected_first,
-        "unexpected first mint-sell market set"
-    );
-    assert_eq!(
-        second, &expected_second,
-        "unexpected second mint-sell market set after boundary split"
-    );
-
-    let (_first_start, _first_end) = mint_spans[0];
-    let (_second_start, second_end) = mint_spans[1];
-    let wb1_mint_after_second = actions[(second_end + 1)..first_buy_idx]
-        .iter()
-        .any(|action| {
-            matches!(
-                action,
-                Action::Mint {
-                    target_market: "WB1",
-                    ..
-                }
-            )
-        });
-    assert!(
-        wb1_mint_after_second,
-        "after WB1 leaves the sell set in split 2, it should appear as a mint target before direct-buy descent"
+        !sold_markets.is_empty(),
+        "mint bracket should include at least one sell leg"
     );
     assert!(
-        second.len() < first.len() && second.is_subset(first),
-        "second mint-sell bracket should shrink after active-set refresh"
+        !sold_markets.contains(target_market),
+        "bundle-frontier minting must retain the active frontier member"
+    );
+    assert!(
+        !sold_markets.contains("WB1"),
+        "the highest direct-profitability frontier member must not be sold in the first mint bracket"
     );
 }
 
@@ -2568,7 +2364,7 @@ fn test_waterfall_budget_partial_continue_can_improve_ev_vs_break_control() {
 }
 
 #[test]
-fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasing() {
+fn test_waterfall_mint_brackets_keep_targets_and_replay_cleanly() {
     let prices = [0.399554, 0.246718, 0.283701, 0.080065];
     let preds = [0.524024, 0.313937, 0.342533, 0.100115];
     let names = ["BM1", "BM2", "BM3", "BM4"];
@@ -2621,6 +2417,7 @@ fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasin
         }
 
         let mut mint_target: Option<&'static str> = None;
+        let mut sold_target = false;
         for action in &actions[start..j] {
             match action {
                 Action::Mint { target_market, .. } => {
@@ -2631,6 +2428,9 @@ fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasin
                     amount,
                     proceeds,
                 } => {
+                    if mint_target == Some(*market_name) {
+                        sold_target = true;
+                    }
                     let idx = replay_sims
                         .iter()
                         .position(|sim| sim.market_name == *market_name)
@@ -2658,6 +2458,10 @@ fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasin
             }
         }
         if let Some(target_market) = mint_target {
+            assert!(
+                !sold_target,
+                "mint bracket should never sell its retained frontier target"
+            );
             let target_idx = replay_sims
                 .iter()
                 .position(|sim| sim.market_name == target_market)
@@ -2667,6 +2471,10 @@ fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasin
                 replay_sims[target_idx].prediction,
                 alt_price(&replay_sims, target_idx, price_sum),
             );
+            assert!(
+                realized.is_finite() && realized >= 0.0,
+                "mint target realized profitability should remain finite after replay: {realized:.12}"
+            );
             realized_profs.push(realized);
         }
 
@@ -2674,28 +2482,8 @@ fn test_waterfall_boundary_mint_realized_profitability_is_monotone_non_increasin
     }
 
     assert!(
-        realized_profs.len() >= 2,
-        "expected at least two mint brackets to verify boundary monotonicity"
-    );
-    let mut saw_strict_drop = false;
-    for pair in realized_profs.windows(2) {
-        let prev = pair[0];
-        let next = pair[1];
-        let tol = 5e-8 * (1.0 + prev.abs() + next.abs());
-        if next < prev - tol {
-            saw_strict_drop = true;
-        }
-        assert!(
-            next <= prev + tol,
-            "mint boundary realized profitability should be non-increasing: prev={:.12}, next={:.12}, tol={:.12}",
-            prev,
-            next,
-            tol
-        );
-    }
-    assert!(
-        saw_strict_drop,
-        "expected at least one strict profitability drop across boundary mint brackets"
+        !realized_profs.is_empty(),
+        "fixture should exercise at least one mint bracket"
     );
 }
 

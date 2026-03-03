@@ -77,14 +77,23 @@ Implemented full-mode flow:
 
 ### Phase 1: Sell overpriced holdings
 For each outcome where market_price > prediction and we hold tokens:
-- Optimize a split between **direct sell** (sell into pool) and **merge sell** (buy all other outcomes + merge complete sets for 1 sUSD each) to maximize total proceeds for the fixed sell amount.
+- Optimize a split between **direct sell** (sell into pool) and **direct merge** (merge only against already-held complementary inventory) to maximize total proceeds for the fixed sell amount.
 - The split is solved as a 1D concave optimization (`f'(m)=0`) over merge amount `m`, with boundary checks (`m=0`, `m=cap`) and bisection on the interior root when needed.
-- Merge consumes existing complementary holdings first, and buys only any shortfall from pools.
-- Merge capacity is limited by complementary inventory plus buy caps (`held_j + max_buy_tokens_j`) across non-source outcomes; direct handles the remainder.
-- Merge route only available when `mint_available` (all pools present).
+- Liquidation never buys missing complements from pools; any merge leg is limited to already-held complementary inventory.
+- Direct-merge capacity is therefore limited by consumable complementary holdings across non-source outcomes; direct sells handle the remainder.
+- Direct-merge route only available when `mint_available` (all pools present).
 - Pool state (`price`) updated after each sell for subsequent calculations.
 
 ### Phase 2: Waterfall allocation
+
+The current buy-side implementation is now **bundle-frontier based** on the Rust path:
+- The active frontier is discovered from **direct** profitability only.
+- All tied top outcomes form one bundle.
+- Mint is treated as an **alternative way to acquire that bundle**, not as a per-target route.
+- Mint segments keep every frontier member and only sell non-frontier legs.
+- The planner can emit a direct segment followed by a mint segment in one waterfall iteration when the direct bundle marginal cost crosses the mint bundle marginal cost before the next direct frontier.
+
+The older route-per-`(outcome, route)` description below is retained for historical context; the on-chain `Rebalancer.sol` remains direct-only.
 
 #### Route pricing
 
@@ -170,7 +179,7 @@ The solver searches the interval `[target_prof, current_prof]` with bisection (u
 ### Phase 3: Post-allocation liquidation
 After the waterfall:
 1. Check remaining **legacy** holdings' profitability against the last profitability level reached. Profitability is computed using the direct pool price (`sims[i].price()`).
-2. For legacy holdings below that level (lowest first), sell only enough to raise profitability toward `last_bought_prof`, using the same direct/merge split optimizer as Phase 1.
+2. For legacy holdings below that level (lowest first), sell only enough to raise profitability toward `last_bought_prof`, using the same direct-sell/direct-merge-only split optimizer as Phase 1.
 3. If a sell leaves meaningful residual legacy and profitability remains clearly below the frontier, run one bounded follow-up sell escalation in the same trial iteration.
 4. Reallocate recovered capital via another waterfall pass.
 5. Commit the trial pass only if expected value is non-decreasing (EV guardrail).
@@ -260,6 +269,10 @@ Portfolio tests are split across `src/portfolio/tests.rs` (shared fixtures + ear
 - `test_phase3_recycling_full_l1_with_mint_routes_reduces_low_prof_legacy`: full-L1 mint-enabled fixture with near-fair legacy bucket; verifies low-marginal legacy holdings are actually reduced while preserving EV.
 - `test_phase3_full_l1_recycling_limits_tiny_legacy_sell_fragmentation`: phase-3 de-fragmentation check that bounded follow-up escalation does not devolve into tiny residual sell churn in a crafted legacy scenario.
 - Full-L1 action-stream invariants include indirect-route shape checks (`Mint->Sell+`, `Buy+->Merge`) alongside accounting consistency.
+- `test_rebalance_optimization_full_l1_live_prices`: live full-L1 snapshot regression using current pool prices from a reachable RPC endpoint; asserts determinism and EV non-regression on the fetched snapshot.
+- `test_rebalance_top_buy_gap_subset_l1_live_prices`: live subset regression selecting the currently most underpriced L1 outcomes by prediction-minus-price gap; exercises the buy-side optimizer on realistic concentrated edge.
+- `test_rebalance_near_fair_subset_l1_live_prices`: live subset regression selecting the current near-fair tail; guards against low-edge churn on realistic almost-balanced prices.
+- `test_rebalance_regression_full_l1_augmented_multitick_liquidity_changes_exact_replay`: deterministic full-L1 regression built from the real embedded 98-market pool metadata and normalized synthetic prices; appends large randomized initialized-tick liquidity bands inside the already-traversed buy ranges, then replays the unchanged action stream with a test-local exact multi-tick swap loop to prove the current planner is blind to those added bands while realized execution changes materially.
 - `test_waterfall_misnormalized_prediction_sums_remain_finite`: robustness test for miscalibrated belief vectors (`sum(pred) > 1` and `< 1`) to ensure waterfall state and actions remain finite.
 - `test_phase1_merge_split_can_leave_source_pool_overpriced`: adversarial Phase-1 fixture showing that when the optimal sell split uses merge legs, the source pool can remain overpriced even when sell sizing is derived from `sell_to_price(prediction)` in direct-price space.
 - `test_fuzz_phase1_sell_order_budget_stability`: sampled order-stability check for Phase-1 liquidation across adversarial 3-outcome fixtures (same holdings/prices, swapped sell order), guarding against unexpected order-sensitive budget recovery drift.

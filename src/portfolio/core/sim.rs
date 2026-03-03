@@ -6,6 +6,7 @@ use crate::pools::{
     FEE_PIPS, Slot0Result, normalize_market_name, sqrt_price_x96_to_price_outcome, u256_to_f64,
 };
 
+#[cfg(test)]
 pub(super) const NEWTON_ITERS: usize = 8;
 pub(super) const FEE_FACTOR: f64 = 1.0 - (FEE_PIPS as f64 / 1_000_000.0);
 pub(super) const EPS: f64 = 1e-12;
@@ -185,6 +186,7 @@ impl PoolSim {
     }
 
     /// Effective liquidity: L_eff = L / (1e18 × (1-fee)).
+    #[cfg(test)]
     pub(super) fn l_eff(&self) -> f64 {
         self.l_eff
     }
@@ -349,6 +351,7 @@ pub(super) fn target_price_for_prof(prediction: f64, target_prof: f64) -> f64 {
 
 /// Which acquisition route is cheaper for an outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg(test)]
 pub(super) enum Route {
     Direct,
     Mint,

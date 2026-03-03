@@ -1,13 +1,28 @@
+#[cfg(test)]
 use std::collections::HashSet;
+#[cfg(test)]
 use std::sync::OnceLock;
 
-use super::sim::{DUST, EPS, PoolSim, Route, alt_price, profitability, target_price_for_prof};
+use super::bundle::{
+    BundleFrontier, BundleRouteKind, BundleSegmentPlan, BundleStepPlan,
+    direct_bundle_marginal_cost_at_prof, mint_bundle_marginal_cost_at_prof,
+};
+use super::sim::{DUST, EPS, PoolSim};
+#[cfg(test)]
+use super::sim::{Route, alt_price, profitability, target_price_for_prof};
+#[cfg(test)]
 use super::solver::mint_cost_to_prof;
+use super::solver::{
+    direct_bundle_cost_to_prof, mint_bundle_cost_for_amount, mint_bundle_cost_to_prof,
+};
 
 const SOLVE_PROF_ITERS: usize = 64;
+#[cfg(test)]
 const MIN_BOUNDARY_SPLIT_REMAINING_FRAC: f64 = 1e-3;
+#[cfg(test)]
 const MIN_BOUNDARY_SPLIT_REMAINING_ABS: f64 = 1e-9;
 
+#[cfg(test)]
 fn boundary_split_is_meaningful(boundary_amount: f64, planned_amount: f64) -> bool {
     if !boundary_amount.is_finite()
         || !planned_amount.is_finite()
@@ -25,11 +40,13 @@ fn boundary_split_is_meaningful(boundary_amount: f64, planned_amount: f64) -> bo
 
 /// For the direct route, compute cost to bring an outcome's profitability to `target_prof`.
 /// Returns (cost, outcome_amount, new_price).
+#[cfg(test)]
 fn direct_cost_to_prof(sim: &PoolSim, target_prof: f64) -> Option<(f64, f64, f64)> {
     let tp = target_price_for_prof(sim.prediction, target_prof);
     sim.cost_to_price(tp)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RouteEstimate {
     pub(super) cash_cost: f64,
@@ -39,6 +56,7 @@ pub(super) struct RouteEstimate {
 
 /// Compute cost to reach target_prof for a given outcome via a specific route.
 /// cash_cost = actual sUSD spent; value_cost = cash_cost minus expected value of unsold tokens.
+#[cfg(test)]
 pub(super) fn cost_for_route(
     sims: &[PoolSim],
     idx: usize,
@@ -68,10 +86,12 @@ pub(super) fn cost_for_route(
 }
 
 /// Extract deduplicated outcome indices from active (outcome, route) pairs.
+#[cfg(test)]
 pub(super) fn active_skip_indices(active: &[(usize, Route)]) -> HashSet<usize> {
     active.iter().map(|(idx, _)| *idx).collect()
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PlannedRoute {
     pub(super) idx: usize,
@@ -82,6 +102,263 @@ pub(super) struct PlannedRoute {
     pub(super) active_set_boundary_hit: bool,
 }
 
+fn direct_bundle_prof_for_budget(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    current_prof: f64,
+    target_prof: f64,
+    budget: f64,
+) -> f64 {
+    if budget <= DUST || current_prof <= target_prof + EPS {
+        return current_prof;
+    }
+
+    let mut lo = target_prof;
+    let mut hi = current_prof;
+    for _ in 0..SOLVE_PROF_ITERS {
+        let mid = 0.5 * (lo + hi);
+        let Some(estimate) = direct_bundle_cost_to_prof(sims, bundle_members, mid) else {
+            lo = mid;
+            continue;
+        };
+        if estimate.cash_cost > budget + EPS {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo).abs() <= EPS * (1.0 + hi.abs()) {
+            break;
+        }
+    }
+
+    hi.clamp(target_prof, current_prof)
+}
+
+fn direct_minus_mint_marginal(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    prof: f64,
+) -> Option<f64> {
+    let mint = mint_bundle_marginal_cost_at_prof(sims, bundle_members, prof)?;
+    Some(direct_bundle_marginal_cost_at_prof(sims, bundle_members, prof) - mint)
+}
+
+fn build_direct_segment(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    current_prof: f64,
+    target_prof: f64,
+    budget: Option<f64>,
+) -> Option<(BundleSegmentPlan, f64, bool)> {
+    let mut capped_target_prof = target_prof;
+    let mut full_estimate = direct_bundle_cost_to_prof(sims, bundle_members, capped_target_prof)?;
+    let mut fully_affordable = true;
+
+    if let Some(available_budget) = budget
+        && full_estimate.cash_cost > available_budget + EPS
+    {
+        capped_target_prof = direct_bundle_prof_for_budget(
+            sims,
+            bundle_members,
+            current_prof,
+            target_prof,
+            available_budget.max(0.0),
+        );
+        full_estimate = direct_bundle_cost_to_prof(sims, bundle_members, capped_target_prof)?;
+        fully_affordable = full_estimate.cash_cost <= available_budget + EPS;
+    }
+
+    Some((
+        BundleSegmentPlan {
+            kind: BundleRouteKind::Direct,
+            target_prof: capped_target_prof,
+            cash_cost: full_estimate.cash_cost,
+            mint_amount: 0.0,
+            direct_member_plans: full_estimate.member_plans,
+            mint_sell_leg_plans: Vec::new(),
+        },
+        capped_target_prof,
+        fully_affordable,
+    ))
+}
+
+fn build_mint_segment(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    frontier_prof: f64,
+    budget: Option<f64>,
+) -> Option<(BundleSegmentPlan, bool)> {
+    let mut estimate = mint_bundle_cost_to_prof(sims, bundle_members, frontier_prof)?;
+    let mut fully_affordable = true;
+
+    if let Some(available_budget) = budget
+        && estimate.cash_cost > available_budget + EPS
+    {
+        if available_budget <= DUST {
+            return None;
+        }
+        let mut lo = 0.0_f64;
+        let mut hi = estimate.mint_amount;
+        let mut best = None;
+        for _ in 0..SOLVE_PROF_ITERS {
+            let mid = 0.5 * (lo + hi);
+            let Some(candidate) =
+                mint_bundle_cost_for_amount(sims, bundle_members, frontier_prof, mid)
+            else {
+                hi = mid;
+                continue;
+            };
+            if candidate.cash_cost <= available_budget + EPS {
+                best = Some(candidate);
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+            if (hi - lo).abs() <= EPS * (1.0 + hi.abs()) {
+                break;
+            }
+        }
+        estimate = best?;
+        fully_affordable = false;
+    }
+
+    Some((
+        BundleSegmentPlan {
+            kind: BundleRouteKind::Mint,
+            target_prof: frontier_prof,
+            cash_cost: estimate.cash_cost,
+            mint_amount: estimate.mint_amount,
+            direct_member_plans: Vec::new(),
+            mint_sell_leg_plans: estimate.sell_leg_plans,
+        },
+        fully_affordable,
+    ))
+}
+
+fn maybe_route_switch_prof(sims: &[PoolSim], frontier: &BundleFrontier) -> Option<f64> {
+    if frontier.next_prof <= 0.0 || frontier.next_prof + EPS >= frontier.current_prof {
+        return None;
+    }
+    let start_gap = direct_minus_mint_marginal(sims, &frontier.members, frontier.current_prof)?;
+    let end_gap = direct_minus_mint_marginal(sims, &frontier.members, frontier.next_prof)?;
+    if start_gap >= 0.0 || end_gap <= 0.0 {
+        return None;
+    }
+
+    let mut lo = frontier.next_prof;
+    let mut hi = frontier.current_prof;
+    for _ in 0..SOLVE_PROF_ITERS {
+        let mid = 0.5 * (lo + hi);
+        let Some(gap_mid) = direct_minus_mint_marginal(sims, &frontier.members, mid) else {
+            return None;
+        };
+        if gap_mid > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo).abs() <= EPS * (1.0 + hi.abs()) {
+            break;
+        }
+    }
+    Some(hi.clamp(frontier.next_prof, frontier.current_prof))
+}
+
+pub(super) fn plan_bundle_step_with_scratch(
+    sims: &[PoolSim],
+    frontier: &BundleFrontier,
+    mint_available: bool,
+    budget: Option<f64>,
+    sim_state: &mut Vec<PoolSim>,
+) -> Option<BundleStepPlan> {
+    if frontier.members.is_empty() || frontier.current_prof <= 0.0 {
+        return None;
+    }
+
+    let direct_feasible_at_frontier =
+        direct_bundle_cost_to_prof(sims, &frontier.members, frontier.current_prof).is_some();
+    let direct_start = direct_feasible_at_frontier.then(|| {
+        direct_bundle_marginal_cost_at_prof(sims, &frontier.members, frontier.current_prof)
+    });
+    let mint_start = if mint_available {
+        mint_bundle_marginal_cost_at_prof(sims, &frontier.members, frontier.current_prof)
+    } else {
+        None
+    };
+
+    if let Some(mint_cost) = mint_start
+        && mint_cost + EPS < direct_start.unwrap_or(f64::INFINITY)
+    {
+        let (segment, _) =
+            build_mint_segment(sims, &frontier.members, frontier.current_prof, budget)?;
+        return Some(BundleStepPlan {
+            segments: vec![segment],
+            final_prof: frontier.current_prof,
+        });
+    }
+
+    if !direct_feasible_at_frontier {
+        if mint_available {
+            let (segment, _) =
+                build_mint_segment(sims, &frontier.members, frontier.current_prof, budget)?;
+            return Some(BundleStepPlan {
+                segments: vec![segment],
+                final_prof: frontier.current_prof,
+            });
+        }
+        return None;
+    }
+
+    let route_switch_prof = if mint_available {
+        maybe_route_switch_prof(sims, frontier)
+    } else {
+        None
+    };
+    let direct_target_prof = route_switch_prof.unwrap_or(frontier.next_prof);
+    let (direct_segment, direct_final_prof, direct_fully_affordable) = build_direct_segment(
+        sims,
+        &frontier.members,
+        frontier.current_prof,
+        direct_target_prof,
+        budget,
+    )?;
+
+    let mut segments = vec![direct_segment];
+    let mut remaining_budget = budget.map(|value| value - segments[0].cash_cost);
+    if let Some(value) = remaining_budget.as_mut() {
+        *value = (*value).max(0.0);
+    }
+
+    if direct_fully_affordable && route_switch_prof.is_some() {
+        if sim_state.len() != sims.len() {
+            sim_state.clear();
+            sim_state.extend_from_slice(sims);
+        } else {
+            sim_state.clone_from_slice(sims);
+        }
+        for &(idx, _, _, new_price) in &segments[0].direct_member_plans {
+            sim_state[idx].set_price(new_price);
+        }
+
+        if let Some((mint_segment, _)) = build_mint_segment(
+            sim_state,
+            &frontier.members,
+            direct_final_prof,
+            remaining_budget,
+        ) {
+            if mint_segment.cash_cost > DUST {
+                segments.push(mint_segment);
+            }
+        }
+    }
+
+    Some(BundleStepPlan {
+        segments,
+        final_prof: direct_final_prof,
+    })
+}
+
+#[cfg(test)]
 fn execution_order(active: &[(usize, Route)]) -> impl Iterator<Item = (usize, Route)> + '_ {
     active
         .iter()
@@ -95,11 +372,13 @@ fn execution_order(active: &[(usize, Route)]) -> impl Iterator<Item = (usize, Ro
         )
 }
 
+#[cfg(test)]
 fn profitability_level_reached(prof: f64, target_prof: f64) -> bool {
     let tol = EPS * (1.0 + prof.abs() + target_prof.abs());
     prof + tol >= target_prof
 }
 
+#[cfg(test)]
 fn mint_amount_to_reach_profitability(sim: &PoolSim, target_prof: f64) -> Option<f64> {
     let target_price = target_price_for_prof(sim.prediction, target_prof);
     let (amount, _proceeds, new_price) = sim.sell_to_price(target_price)?;
@@ -107,6 +386,7 @@ fn mint_amount_to_reach_profitability(sim: &PoolSim, target_prof: f64) -> Option
     profitability_level_reached(prof_after, target_prof).then_some(amount.max(0.0))
 }
 
+#[cfg(test)]
 fn mint_active_vs_best_non_active_gap(
     sims: &[PoolSim],
     target_idx: usize,
@@ -165,6 +445,7 @@ fn mint_active_vs_best_non_active_gap(
     Some(crossover_gap.min(target_level_gap))
 }
 
+#[cfg(test)]
 fn mint_active_set_boundary_amount(
     sims: &[PoolSim],
     active: &[(usize, Route)],
@@ -259,6 +540,7 @@ pub(super) fn plan_active_routes(
     plan_active_routes_with_scratch(sims, active, target_prof, skip, &mut sim_state, None)
 }
 
+#[cfg(test)]
 pub(super) fn plan_active_routes_with_scratch(
     sims: &[PoolSim],
     active: &[(usize, Route)],
@@ -345,6 +627,7 @@ pub(super) fn plan_active_routes_with_scratch(
     Some(plan)
 }
 
+#[cfg(test)]
 pub(super) fn plan_is_budget_feasible(plan: &[PlannedRoute], budget: f64) -> bool {
     let mut running_budget = budget;
     for step in plan {
@@ -359,6 +642,7 @@ pub(super) fn plan_is_budget_feasible(plan: &[PlannedRoute], budget: f64) -> boo
     true
 }
 
+#[cfg(test)]
 fn experimental_exact_mixed_solver_enabled() -> bool {
     // Cache once per process: tests should set env before first solver call.
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -375,6 +659,7 @@ fn experimental_exact_mixed_solver_enabled() -> bool {
     })
 }
 
+#[cfg(test)]
 fn solve_prof_mixed_bisection(
     sims: &[PoolSim],
     active: &[(usize, Route)],
@@ -414,6 +699,7 @@ fn solve_prof_mixed_bisection(
     hi.clamp(prof_lo, prof_hi)
 }
 
+#[cfg(test)]
 fn mixed_plan_cost_for_prof(
     sims: &[PoolSim],
     active: &[(usize, Route)],
@@ -432,6 +718,7 @@ fn mixed_plan_cost_for_prof(
     total.is_finite().then_some(total)
 }
 
+#[cfg(test)]
 fn solve_prof_mixed_coupled_experimental(
     sims: &[PoolSim],
     active: &[(usize, Route)],
@@ -503,6 +790,7 @@ fn solve_prof_mixed_coupled_experimental(
 
 /// Find the lowest profitability level affordable with the available budget.
 /// Uses closed-form for all-direct, and simulation-backed bisection for mixed routes.
+#[cfg(test)]
 pub(super) fn solve_prof(
     sims: &[PoolSim],
     active: &[(usize, Route)],

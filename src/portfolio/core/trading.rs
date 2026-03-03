@@ -1,13 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::Action;
+use super::bundle::{BundleRouteKind, BundleStepPlan};
 use super::merge::{
     action_contract_pair, execute_merge_sell_with_inventory, merge_usable_inventory,
     optimal_sell_split_with_inventory,
 };
+#[cfg(test)]
 use super::planning::PlannedRoute;
-use super::sim::{DUST, EPS, FEE_FACTOR, PoolSim, Route, sanitize_nonnegative_finite};
+#[cfg(test)]
+use super::sim::Route;
+use super::sim::{DUST, EPS, FEE_FACTOR, PoolSim, sanitize_nonnegative_finite};
 use super::types::{BalanceMap, apply_actions_to_sim_balances, subtract_balance};
+#[cfg(test)]
+use std::collections::HashSet;
 
 const MAX_ALT_ROUTE_ROUNDS: usize = 256;
 
@@ -393,6 +399,7 @@ impl<'a> ExecutionState<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn execute_planned_routes(
         &mut self,
         plan: &[PlannedRoute],
@@ -412,6 +419,59 @@ impl<'a> ExecutionState<'a> {
                 skip,
             ) {
                 return false;
+            }
+        }
+        true
+    }
+
+    pub(super) fn execute_bundle_step(
+        &mut self,
+        step: &BundleStepPlan,
+        bundle_members: &[usize],
+    ) -> bool {
+        for segment in &step.segments {
+            if segment.cash_cost > *self.budget + EPS {
+                return false;
+            }
+            match segment.kind {
+                BundleRouteKind::Direct => {
+                    *self.budget -= segment.cash_cost;
+                    for &(idx, amount, cost, new_price) in &segment.direct_member_plans {
+                        if amount <= DUST {
+                            continue;
+                        }
+                        self.actions.push(Action::Buy {
+                            market_name: self.sims[idx].market_name,
+                            amount,
+                            cost,
+                        });
+                        self.sims[idx].set_price(new_price);
+                        *self
+                            .sim_balances
+                            .entry(self.sims[idx].market_name)
+                            .or_insert(0.0) += amount;
+                    }
+                }
+                BundleRouteKind::Mint => {
+                    let action_start = self.actions.len();
+                    *self.budget -= segment.mint_amount;
+                    let Some(proceeds) = emit_mint_bundle_actions(
+                        self.sims,
+                        bundle_members,
+                        segment.mint_amount,
+                        &segment.mint_sell_leg_plans,
+                        self.actions,
+                    ) else {
+                        *self.budget += segment.mint_amount;
+                        return false;
+                    };
+                    *self.budget += proceeds;
+                    apply_actions_to_sim_balances(
+                        &self.actions[action_start..],
+                        self.sims,
+                        self.sim_balances,
+                    );
+                }
             }
         }
         true
@@ -458,19 +518,12 @@ impl<'a> ExecutionState<'a> {
                 inventory_keep_prof,
             );
             if m_opt > DUST {
-                let needs_buy_legs = self
-                    .sims
-                    .iter()
-                    .enumerate()
-                    .any(|(i, sim)| {
-                        i != source_idx
-                            && m_opt
-                                > merge_usable_inventory(
-                                    Some(sim_balances),
-                                    sim,
-                                    inventory_keep_prof,
-                                ) + DUST
-                    });
+                let needs_buy_legs = self.sims.iter().enumerate().any(|(i, sim)| {
+                    i != source_idx
+                        && m_opt
+                            > merge_usable_inventory(Some(sim_balances), sim, inventory_keep_prof)
+                                + DUST
+                });
                 let route_allowed = if needs_buy_legs {
                     allow_buy_merge
                 } else {
@@ -543,8 +596,48 @@ pub(super) fn portfolio_expected_value(
     }
 }
 
+pub(super) fn emit_mint_bundle_actions(
+    sims: &mut [PoolSim],
+    bundle_members: &[usize],
+    mint_amount: f64,
+    sell_legs: &[(usize, f64, f64, f64)],
+    actions: &mut Vec<Action>,
+) -> Option<f64> {
+    if mint_amount <= DUST || bundle_members.is_empty() {
+        return Some(0.0);
+    }
+    if sell_legs.is_empty() {
+        return None;
+    }
+
+    let (contract_1, contract_2) = action_contract_pair(sims);
+    actions.push(Action::Mint {
+        contract_1,
+        contract_2,
+        amount: mint_amount,
+        target_market: sims[bundle_members[0]].market_name,
+    });
+
+    let mut total_proceeds = 0.0_f64;
+    for &(idx, sold, proceeds, new_price) in sell_legs {
+        if sold <= DUST {
+            continue;
+        }
+        sims[idx].set_price(new_price);
+        total_proceeds += proceeds;
+        actions.push(Action::Sell {
+            market_name: sims[idx].market_name,
+            amount: sold,
+            proceeds,
+        });
+    }
+
+    Some(total_proceeds)
+}
+
 /// Emit mint actions: mint on both contracts, sell all non-target outcomes.
 /// Contract addresses are derived from the distinct market_ids in sims.
+#[cfg(test)]
 pub(super) fn emit_mint_actions(
     sims: &mut [PoolSim],
     target_idx: usize,
@@ -597,6 +690,7 @@ pub(super) fn emit_mint_actions(
     Some(total_proceeds)
 }
 
+#[cfg(test)]
 fn mint_route_round_liquidity_cap(
     sims: &[PoolSim],
     target_idx: usize,
@@ -614,6 +708,7 @@ fn mint_route_round_liquidity_cap(
     if has_leg { cap } else { 0.0 }
 }
 
+#[cfg(test)]
 fn mint_route_round_net_cost(
     sims: &[PoolSim],
     target_idx: usize,
@@ -642,6 +737,7 @@ fn mint_route_round_net_cost(
     Some(amount - proceeds)
 }
 
+#[cfg(test)]
 fn affordable_mint_route_round_amount(
     sims: &[PoolSim],
     target_idx: usize,
@@ -678,6 +774,7 @@ fn affordable_mint_route_round_amount(
     lo
 }
 
+#[cfg(test)]
 fn execute_mint_buy_in_rounds(
     exec: &mut ExecutionState<'_>,
     target_idx: usize,
@@ -730,6 +827,7 @@ fn execute_mint_buy_in_rounds(
 }
 
 /// Execute a buy via the chosen route, updating state.
+#[cfg(test)]
 pub(super) fn execute_buy(
     exec: &mut ExecutionState<'_>,
     idx: usize,

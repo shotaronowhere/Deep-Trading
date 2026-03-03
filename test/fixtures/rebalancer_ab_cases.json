@@ -1,0 +1,85 @@
+{
+  "two_pool_single_tick_direct_only": {
+    "predictions_wad": [520000000000000000, 480000000000000000],
+    "pool_ordering": ["A", "B"],
+    "is_token1": [true, true],
+    "starting_prices_wad": [350000000000000000, 250000000000000000],
+    "liquidity": [1000000000000000000, 1000000000000000000],
+    "ticks": [[1, 92108], [1, 92108]],
+    "initial_holdings_wad": [0, 0],
+    "initial_cash_budget_wad": 100000000000000000000,
+    "uniform_count": 0,
+    "uniform_price_bps": 0,
+    "uniform_liquidity": 0,
+    "uniform_tick_lo": 0,
+    "uniform_tick_hi": 0,
+    "fee_tier": 500,
+    "direct_only_reference": true
+  },
+  "ninety_eight_outcome_multitick_direct_only": {
+    "predictions_wad": [],
+    "pool_ordering": [],
+    "is_token1": [],
+    "starting_prices_wad": [],
+    "liquidity": [],
+    "ticks": [],
+    "initial_holdings_wad": [],
+    "initial_cash_budget_wad": 98000000000000000000,
+    "uniform_count": 98,
+    "uniform_price_bps": 8000,
+    "uniform_liquidity": 1000000000000000000,
+    "uniform_tick_lo": 1,
+    "uniform_tick_hi": 92108,
+    "fee_tier": 500,
+    "direct_only_reference": true
+  },
+  "small_bundle_mixed_case": {
+    "predictions_wad": [
+      300000000000000000,
+      300000000000000000,
+      220000000000000000,
+      180000000000000000
+    ],
+    "pool_ordering": ["A", "B", "C", "D"],
+    "is_token1": [true, true, true, true],
+    "starting_prices_wad": [
+      150000000000000000,
+      150000000000000000,
+      280000000000000000,
+      240000000000000000
+    ],
+    "liquidity": [
+      1000000000000000000,
+      1000000000000000000,
+      1000000000000000000,
+      1000000000000000000
+    ],
+    "ticks": [[1, 92108], [1, 92108], [1, 92108], [1, 92108]],
+    "initial_holdings_wad": [0, 0, 0, 0],
+    "initial_cash_budget_wad": 100000000000000000000,
+    "uniform_count": 0,
+    "uniform_price_bps": 0,
+    "uniform_liquidity": 0,
+    "uniform_tick_lo": 0,
+    "uniform_tick_hi": 0,
+    "fee_tier": 500,
+    "direct_only_reference": false
+  },
+  "legacy_holdings_direct_only_case": {
+    "predictions_wad": [550000000000000000, 450000000000000000],
+    "pool_ordering": ["A", "B"],
+    "is_token1": [true, true],
+    "starting_prices_wad": [600000000000000000, 200000000000000000],
+    "liquidity": [1000000000000000000, 1000000000000000000],
+    "ticks": [[1, 92108], [1, 92108]],
+    "initial_holdings_wad": [25000000000000000000, 0],
+    "initial_cash_budget_wad": 25000000000000000000,
+    "uniform_count": 0,
+    "uniform_price_bps": 0,
+    "uniform_liquidity": 0,
+    "uniform_tick_lo": 0,
+    "uniform_tick_hi": 0,
+    "fee_tier": 500,
+    "direct_only_reference": true
+  }
+}

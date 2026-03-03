@@ -5,7 +5,9 @@ use super::merge::{
     merge_sell_cap, merge_sell_cap_with_inventory, split_sell_total_proceeds,
     split_sell_total_proceeds_with_inventory,
 };
-use super::rebalancer::{RebalanceMode, rebalance, rebalance_with_mode};
+use super::rebalancer::{
+    RebalanceMode, phase1_liquidation_actions_for_test, rebalance, rebalance_with_mode,
+};
 use super::sim::{PoolSim, Route, profitability};
 use super::trading::{ExecutionState, emit_mint_actions, execute_buy};
 use super::waterfall::waterfall;
@@ -15,6 +17,8 @@ use alloy::primitives::{Address, U256};
 
 #[path = "tests/fixtures.rs"]
 mod fixtures;
+#[path = "tests/rebalancer_contract_ab.rs"]
+mod rebalancer_contract_ab;
 use fixtures::*;
 
 #[test]
@@ -286,6 +290,51 @@ fn test_mint_route_actions() {
 }
 
 #[test]
+fn test_phase1_liquidation_does_not_buy_merge_missing_complements() {
+    let tokens = [
+        "0x1111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222",
+        "0x3333333333333333333333333333333333333333",
+    ];
+    let names = ["phase1_src", "phase1_comp_a", "phase1_comp_b"];
+    let prices = [0.8, 0.05, 0.05];
+    let preds = [0.3, 0.01, 0.01];
+
+    let slot0_results: Vec<_> = tokens
+        .iter()
+        .zip(names.iter())
+        .zip(prices.iter())
+        .map(|((tok, name), price)| mock_slot0_market(name, tok, *price))
+        .collect();
+
+    let mut balances = HashMap::new();
+    balances.insert("phase1_src", 5.0);
+
+    let mut predictions = HashMap::new();
+    for (name, pred) in names.iter().zip(preds.iter()) {
+        predictions.insert(normalize_market_name(name), *pred);
+    }
+
+    let actions =
+        phase1_liquidation_actions_for_test(&balances, 0.0, &slot0_results, &predictions, true);
+
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Sell { market_name, .. } if *market_name == "phase1_src")),
+        "overpriced source should still be liquidated via direct sells"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Buy { .. })),
+        "phase-1 liquidation should not buy missing complements for merge"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+        "phase-1 liquidation should not emit buy-merge exits when complements are missing"
+    );
+}
+
+#[test]
 fn test_execute_buy_mint_route_failure_rolls_back_state() {
     let tokens = [
         "0x1111111111111111111111111111111111111111",
@@ -352,9 +401,10 @@ fn test_profitability_handles_nonpositive_prices() {
 }
 
 #[test]
-fn test_waterfall_can_activate_mint_with_negative_alt_price() {
-    // Sum(prices) > 1 => alt price for each target is negative.
-    // Mint route should still be considered and executed.
+fn test_waterfall_does_not_mint_when_only_negative_alt_price_has_no_direct_frontier() {
+    // All direct prices are far above prediction, so there is no positive direct frontier.
+    // A negative synthetic alt-price by itself is not enough to justify minting the full bundle
+    // when there are no non-frontier tokens to sell for credit.
     let mut sims = build_three_sims_with_preds([0.8, 0.8, 0.8], [0.3, 0.3, 0.3]);
     let mut budget = 1.0;
     let mut actions = Vec::new();
@@ -363,8 +413,12 @@ fn test_waterfall_can_activate_mint_with_negative_alt_price() {
 
     assert!(last_prof.is_finite() && last_prof >= 0.0);
     assert!(
-        actions.iter().any(|a| matches!(a, Action::Mint { .. })),
-        "negative alt-price setup should trigger mint route"
+        !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+        "bundle-frontier minting should not activate without a positive direct frontier"
+    );
+    assert!(
+        actions.is_empty(),
+        "no direct frontier means the waterfall should stand down"
     );
 }
 

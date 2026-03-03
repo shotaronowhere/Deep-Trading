@@ -53,8 +53,8 @@ pub fn derive_batch_quote_bounds_unchecked(
     let mut planned_total_out_susd = 0.0_f64;
     for leg in &plan.legs {
         match leg.kind {
-            LegKind::Buy => planned_total_in_susd += leg.planned_quote_susd.max(0.0),
-            LegKind::Sell => planned_total_out_susd += leg.planned_quote_susd.max(0.0),
+            LegKind::Buy => planned_total_in_susd += leg.conservative_quote_susd.max(0.0),
+            LegKind::Sell => planned_total_out_susd += leg.conservative_quote_susd.max(0.0),
         }
     }
 

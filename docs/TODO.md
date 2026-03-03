@@ -4,6 +4,12 @@
 
 - [ ] Integrate gas/MEV-aware net-PnL objective (EV minus execution costs) once live gas-cost estimator wiring is available.
 - [ ] Replace heuristic L1 data-fee model (estimated calldata bytes + cached two-point `getL1Fee(bytes)` marginal fee/byte estimate) with exact transaction-serialization-based `getL1Fee(txData)` now that strict action->transaction calldata wiring is implemented.
+- [ ] Review the current benchmark finding that the experimental off-chain mixed planner underperforms on-chain `Rebalancer.rebalanceExact()` on `small_bundle_mixed_case` (~0.036% lower EV on the committed fixture). Determine whether the issue is in the bundle planner, fixture assumptions, or execution-model mismatch before treating mixed routing as an EV improvement.
+
+## Done (On-Chain)
+
+- [x] **On-chain Rebalancer**: `Rebalancer.sol` with closed-form waterfall allocation (ψ), atomic pool state reads, and per-pool `sqrtPriceLimitX96` slippage protection. Replaces the off-chain hybrid approach whose slippage tolerance problem was intractable.
+- [x] **On-chain complete-set arb**: `arb()` function in `Rebalancer.sol` for mint-sell (sum > 1) and buy-merge (sum < 1) normalization.
 
 ## Deferred
 

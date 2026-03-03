@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::super::merge::{
     execute_merge_sell, merge_sell_cap, merge_sell_proceeds, optimal_sell_split,
@@ -11,8 +11,9 @@ use super::super::trading::{ExecutionState, solve_complete_set_arb_amount};
 use super::{
     Action, assert_rebalance_action_invariants, assert_strict_ev_gain_with_portfolio_trace,
     brute_force_best_split, build_slot0_results_for_markets, build_three_sims,
-    build_three_sims_with_preds, eligible_l1_markets_with_predictions, ev_from_state,
-    mock_slot0_market, print_rebalance_execution_summary, replay_actions_to_state,
+    build_three_sims_with_preds, eligible_l1_markets_with_predictions, ev_from_state, leak_market,
+    leak_pool, mock_slot0_market, print_rebalance_execution_summary,
+    replay_actions_to_market_state, replay_actions_to_state,
 };
 use crate::execution::GroupKind;
 use crate::execution::bounds::{
@@ -21,8 +22,17 @@ use crate::execution::bounds::{
 };
 use crate::execution::gas::GasAssumptions;
 use crate::execution::grouping::{group_actions, group_execution_actions};
-use crate::pools::{Slot0Result, normalize_market_name, prediction_to_sqrt_price_x96};
-use alloy::primitives::{Address, U256};
+use crate::markets::{MarketData, Pool, Tick};
+use crate::pools::{
+    Slot0Result, normalize_market_name, prediction_map, prediction_to_sqrt_price_x96,
+    sqrt_price_x96_to_price_outcome,
+};
+use alloy::primitives::{Address, I256, U256};
+use uniswap_v3_math::{
+    liquidity_math::add_delta,
+    swap_math::compute_swap_step,
+    tick_math::{MAX_TICK, MIN_TICK, get_sqrt_ratio_at_tick, get_tick_at_sqrt_ratio},
+};
 
 fn sample_rebalance_actions() -> Vec<Action> {
     let markets = eligible_l1_markets_with_predictions();
@@ -71,6 +81,614 @@ fn test_gas_assumptions() -> GasAssumptions {
 fn assert_flash_brackets_are_well_formed(actions: &[Action]) {
     group_execution_actions(actions)
         .expect("action stream should satisfy no-flash grouping shapes");
+}
+
+async fn fetch_live_expected_l1_slot0_results(
+    label: &str,
+) -> Option<Vec<(Slot0Result, &'static crate::markets::MarketData)>> {
+    dotenvy::dotenv().ok();
+    let default_rpc = "https://optimism.drpc.org".to_string();
+    let mut rpc_candidates: Vec<String> = Vec::new();
+    if let Ok(rpc) = std::env::var("RPC") {
+        rpc_candidates.push(rpc);
+    }
+    if !rpc_candidates.iter().any(|rpc| rpc == &default_rpc) {
+        rpc_candidates.push(default_rpc.clone());
+    }
+
+    let expected_markets = eligible_l1_markets_with_predictions();
+    let expected_market_names: HashSet<&'static str> =
+        expected_markets.iter().map(|m| m.name).collect();
+
+    let mut slot0_results_all: Option<Vec<(Slot0Result, &'static crate::markets::MarketData)>> =
+        None;
+    let mut last_err = String::new();
+    for rpc_url in &rpc_candidates {
+        let Ok(parsed_url) = rpc_url.parse() else {
+            eprintln!(
+                "[rebalance][{}] skipping invalid RPC URL: {}",
+                label, rpc_url
+            );
+            continue;
+        };
+        let provider =
+            alloy::providers::ProviderBuilder::new().with_reqwest(parsed_url, |builder| {
+                builder
+                    .no_proxy()
+                    .build()
+                    .expect("failed to build reqwest client for tests")
+            });
+        match crate::pools::fetch_all_slot0(provider).await {
+            Ok(results) => {
+                println!("[rebalance][{}] using RPC endpoint: {}", label, rpc_url);
+                slot0_results_all = Some(results);
+                break;
+            }
+            Err(err) => {
+                last_err = err.to_string();
+                eprintln!(
+                    "[rebalance][{}] failed RPC endpoint {}: {}",
+                    label, rpc_url, last_err
+                );
+            }
+        }
+    }
+
+    let Some(slot0_results_all) = slot0_results_all else {
+        eprintln!(
+            "[rebalance][{}] skipping test: no reachable RPC endpoint; last error: {}",
+            label, last_err
+        );
+        return None;
+    };
+
+    let slot0_results: Vec<_> = slot0_results_all
+        .into_iter()
+        .filter(|(_, market)| expected_market_names.contains(market.name))
+        .collect();
+
+    assert_eq!(
+        slot0_results.len(),
+        expected_markets.len(),
+        "live slot0 fetch must include every tradeable L1 market with predictions"
+    );
+
+    Some(slot0_results)
+}
+
+fn live_subset_ranked_by_abs_gap(
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    count: usize,
+    largest_first: bool,
+) -> Vec<(Slot0Result, &'static crate::markets::MarketData)> {
+    let preds = prediction_map();
+    let mut ranked: Vec<_> = slot0_results
+        .iter()
+        .filter_map(|(slot0, market)| {
+            let pool = market.pool.as_ref()?;
+            let pred = *preds.get(&normalize_market_name(market.name))?;
+            let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
+            let current_price =
+                sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)?;
+            let current = current_price.to_string().parse::<f64>().ok()? / 1e18;
+            let gap = (current - pred).abs();
+            Some((gap, current, pred, slot0.clone(), *market))
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if largest_first {
+        ranked.reverse();
+    }
+
+    ranked
+        .into_iter()
+        .take(count)
+        .map(|(gap, current, pred, slot0, market)| {
+            println!(
+                "[rebalance][live_subset] selected {} current={:.6} pred={:.6} abs_gap={:.6}",
+                market.name, current, pred, gap
+            );
+            (slot0, market)
+        })
+        .collect()
+}
+
+fn live_subset_ranked_by_buy_gap(
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    count: usize,
+) -> Vec<(Slot0Result, &'static crate::markets::MarketData)> {
+    let preds = prediction_map();
+    let mut ranked: Vec<_> = slot0_results
+        .iter()
+        .filter_map(|(slot0, market)| {
+            let pool = market.pool.as_ref()?;
+            let pred = *preds.get(&normalize_market_name(market.name))?;
+            let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
+            let current_price =
+                sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)?;
+            let current = current_price.to_string().parse::<f64>().ok()? / 1e18;
+            let buy_gap = pred - current;
+            (buy_gap > 0.0).then_some((buy_gap, current, pred, slot0.clone(), *market))
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    ranked
+        .into_iter()
+        .take(count)
+        .map(|(buy_gap, current, pred, slot0, market)| {
+            println!(
+                "[rebalance][live_subset] selected {} current={:.6} pred={:.6} buy_gap={:.6}",
+                market.name, current, pred, buy_gap
+            );
+            (slot0, market)
+        })
+        .collect()
+}
+
+fn assert_live_subset_rebalance_non_decreasing_ev(
+    label: &str,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    initial_susd: f64,
+) {
+    let initial_balances: HashMap<&str, f64> = HashMap::new();
+    let actions = rebalance(&initial_balances, initial_susd, slot0_results);
+    let actions_repeat = rebalance(&initial_balances, initial_susd, slot0_results);
+
+    assert_eq!(
+        format!("{:?}", actions),
+        format!("{:?}", actions_repeat),
+        "rebalance should be deterministic for a fixed live snapshot"
+    );
+
+    assert_rebalance_action_invariants(&actions, slot0_results, &initial_balances, initial_susd);
+    print_rebalance_execution_summary(label, &actions, slot0_results);
+
+    let (final_holdings, final_cash) =
+        replay_actions_to_state(&actions, slot0_results, &initial_balances, initial_susd);
+    let ev_after = ev_from_state(&final_holdings, final_cash);
+    let ev_gain = ev_after - initial_susd;
+    println!(
+        "[rebalance][{}] expected value: before={:.9}, after={:.9}, gain={:.9}",
+        label, initial_susd, ev_after, ev_gain
+    );
+
+    assert!(
+        ev_after + 1e-6 >= initial_susd,
+        "{} should not reduce expected value on a fixed live snapshot: before={:.9}, after={:.9}",
+        label,
+        initial_susd,
+        ev_after
+    );
+}
+
+#[derive(Clone)]
+struct ExactReplayPoolState {
+    pool: Pool,
+    quote_token: &'static str,
+    outcome_token: &'static str,
+    sqrt_price_x96: U256,
+    liquidity: u128,
+    ticks: Vec<Tick>,
+}
+
+struct ExactReplayResult {
+    holdings: HashMap<&'static str, f64>,
+    cash: f64,
+    crossed_initialized_ticks: usize,
+}
+
+fn amount_to_wei(amount: f64) -> Option<u128> {
+    if !amount.is_finite() || amount <= 0.0 {
+        return Some(0);
+    }
+    let scaled = (amount * 1e18).round();
+    if !scaled.is_finite() || scaled <= 0.0 || scaled > u128::MAX as f64 {
+        return None;
+    }
+    Some(scaled as u128)
+}
+
+fn merge_and_sort_ticks(pool: &Pool) -> Vec<Tick> {
+    let mut merged: BTreeMap<i32, i128> = BTreeMap::new();
+    for tick in pool.ticks {
+        *merged.entry(tick.tick_idx).or_insert(0) += tick.liquidity_net;
+    }
+    merged
+        .into_iter()
+        .filter_map(|(tick_idx, liquidity_net)| {
+            (liquidity_net != 0).then_some(Tick {
+                tick_idx,
+                liquidity_net,
+            })
+        })
+        .collect()
+}
+
+fn next_initialized_tick(
+    ticks: &[Tick],
+    current_tick: i32,
+    zero_for_one: bool,
+    at_boundary: bool,
+) -> Option<Tick> {
+    if zero_for_one {
+        let cutoff = if at_boundary {
+            current_tick.saturating_sub(1)
+        } else {
+            current_tick
+        };
+        ticks
+            .iter()
+            .rev()
+            .copied()
+            .find(|tick| tick.tick_idx <= cutoff)
+    } else {
+        ticks
+            .iter()
+            .copied()
+            .find(|tick| tick.tick_idx > current_tick)
+    }
+}
+
+impl ExactReplayPoolState {
+    fn from_slot0(slot0: &Slot0Result, market: &'static MarketData) -> Option<Self> {
+        let pool = market.pool?;
+        let liquidity = pool.liquidity.parse::<u128>().ok()?;
+        Some(Self {
+            pool,
+            quote_token: market.quote_token,
+            outcome_token: market.outcome_token,
+            sqrt_price_x96: slot0.sqrt_price_x96,
+            liquidity,
+            ticks: merge_and_sort_ticks(&pool),
+        })
+    }
+
+    fn swap_exact_input(
+        &mut self,
+        input_amount: f64,
+        zero_for_one: bool,
+    ) -> Option<(f64, f64, usize)> {
+        let raw_input = amount_to_wei(input_amount)?;
+        if raw_input == 0 || self.liquidity == 0 {
+            return Some((0.0, 0.0, 0));
+        }
+
+        let mut remaining = I256::try_from(raw_input).ok()?;
+        let mut total_in = U256::ZERO;
+        let mut total_out = U256::ZERO;
+        let mut crossed_initialized_ticks = 0usize;
+
+        while remaining > I256::ZERO && self.liquidity > 0 {
+            let current_tick = get_tick_at_sqrt_ratio(self.sqrt_price_x96).ok()?;
+            let at_boundary =
+                get_sqrt_ratio_at_tick(current_tick).ok() == Some(self.sqrt_price_x96);
+            let next_tick =
+                next_initialized_tick(&self.ticks, current_tick, zero_for_one, at_boundary);
+            let target_tick = next_tick
+                .map(|tick| tick.tick_idx)
+                .unwrap_or(if zero_for_one { MIN_TICK } else { MAX_TICK });
+            let target_sqrt = get_sqrt_ratio_at_tick(target_tick).ok()?;
+            let (sqrt_next, amount_in, amount_out, fee_amount) = compute_swap_step(
+                self.sqrt_price_x96,
+                target_sqrt,
+                self.liquidity,
+                remaining,
+                crate::pools::FEE_PIPS,
+            )
+            .ok()?;
+
+            let step_total_in = amount_in + fee_amount;
+            if step_total_in == U256::ZERO && amount_out == U256::ZERO {
+                break;
+            }
+
+            total_in += step_total_in;
+            total_out += amount_out;
+            self.sqrt_price_x96 = sqrt_next;
+
+            let step_in_i256 = I256::try_from(step_total_in.to::<u128>()).ok()?;
+            if step_in_i256 >= remaining {
+                remaining = I256::ZERO;
+            } else {
+                remaining -= step_in_i256;
+            }
+
+            if sqrt_next != target_sqrt {
+                break;
+            }
+
+            let Some(crossed_tick) = next_tick else {
+                break;
+            };
+
+            let liquidity_delta = if zero_for_one {
+                crossed_tick.liquidity_net.checked_neg()?
+            } else {
+                crossed_tick.liquidity_net
+            };
+            self.liquidity = add_delta(self.liquidity, liquidity_delta).ok()?;
+            crossed_initialized_ticks += 1;
+        }
+
+        Some((
+            crate::pools::u256_to_f64(total_in),
+            crate::pools::u256_to_f64(total_out),
+            crossed_initialized_ticks,
+        ))
+    }
+
+    fn buy_exact_input(&mut self, quote_amount: f64) -> Option<(f64, f64, usize)> {
+        let zero_for_one = self.pool.token0.eq_ignore_ascii_case(self.quote_token);
+        self.swap_exact_input(quote_amount, zero_for_one)
+    }
+
+    fn sell_exact_input(&mut self, outcome_amount: f64) -> Option<(f64, f64, usize)> {
+        let zero_for_one = self.pool.token0.eq_ignore_ascii_case(self.outcome_token);
+        self.swap_exact_input(outcome_amount, zero_for_one)
+    }
+}
+
+fn replay_actions_to_state_multitick_exact(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    initial_balances: &HashMap<&str, f64>,
+    initial_susd: f64,
+) -> ExactReplayResult {
+    let mut holdings: HashMap<&'static str, f64> = HashMap::new();
+    let mut pools: HashMap<&'static str, ExactReplayPoolState> = HashMap::new();
+    for (slot0, market) in slot0_results {
+        holdings.insert(
+            market.name,
+            initial_balances
+                .get(market.name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0),
+        );
+        if let Some(state) = ExactReplayPoolState::from_slot0(slot0, *market) {
+            pools.insert(market.name, state);
+        }
+    }
+
+    let mut cash = initial_susd.max(0.0);
+    let mut crossed_initialized_ticks = 0usize;
+
+    for action in actions {
+        match action {
+            Action::Buy {
+                market_name, cost, ..
+            } => {
+                let spend = (*cost).min(cash.max(0.0));
+                if spend <= 0.0 {
+                    continue;
+                }
+                let Some(pool) = pools.get_mut(market_name) else {
+                    continue;
+                };
+                let Some((actual_spend, received, crossed)) = pool.buy_exact_input(spend) else {
+                    continue;
+                };
+                cash -= actual_spend;
+                *holdings.entry(*market_name).or_insert(0.0) += received;
+                crossed_initialized_ticks += crossed;
+            }
+            Action::Sell {
+                market_name,
+                amount,
+                ..
+            } => {
+                let available = holdings.get(market_name).copied().unwrap_or(0.0).max(0.0);
+                let sell_amount = (*amount).min(available);
+                if sell_amount <= 0.0 {
+                    continue;
+                }
+                let Some(pool) = pools.get_mut(market_name) else {
+                    continue;
+                };
+                let Some((sold, proceeds, crossed)) = pool.sell_exact_input(sell_amount) else {
+                    continue;
+                };
+                *holdings.entry(*market_name).or_insert(0.0) -= sold;
+                cash += proceeds;
+                crossed_initialized_ticks += crossed;
+            }
+            Action::Mint { amount, .. } => {
+                let mint_amount = (*amount).min(cash.max(0.0));
+                if mint_amount <= 0.0 {
+                    continue;
+                }
+                for (_, market) in slot0_results {
+                    *holdings.entry(market.name).or_insert(0.0) += mint_amount;
+                }
+                cash -= mint_amount;
+            }
+            Action::Merge { amount, .. } => {
+                let merge_amount = slot0_results
+                    .iter()
+                    .map(|(_, market)| holdings.get(market.name).copied().unwrap_or(0.0).max(0.0))
+                    .fold(f64::INFINITY, f64::min)
+                    .min(*amount);
+                if !merge_amount.is_finite() || merge_amount <= 0.0 {
+                    continue;
+                }
+                for (_, market) in slot0_results {
+                    *holdings.entry(market.name).or_insert(0.0) -= merge_amount;
+                }
+                cash += merge_amount;
+            }
+        }
+    }
+
+    ExactReplayResult {
+        holdings,
+        cash,
+        crossed_initialized_ticks,
+    }
+}
+
+fn normalized_full_l1_price_multipliers(markets: &[&'static MarketData]) -> Vec<f64> {
+    let preds = prediction_map();
+    let mut rng = super::TestRng::new(0x5eed_98_1f);
+    let raw: Vec<f64> = markets.iter().map(|_| rng.in_range(0.72, 1.28)).collect();
+    let weighted_sum: f64 = markets
+        .iter()
+        .zip(raw.iter())
+        .map(|(market, mult)| {
+            let pred = preds
+                .get(&normalize_market_name(market.name))
+                .copied()
+                .expect("eligible L1 market must have prediction");
+            pred * *mult
+        })
+        .sum();
+
+    raw.into_iter().map(|mult| mult / weighted_sum).collect()
+}
+
+fn pick_injected_liquidity_band(
+    current_tick: i32,
+    final_tick: i32,
+    rng: &mut super::TestRng,
+) -> Option<(i32, i32)> {
+    if current_tick == final_tick {
+        return None;
+    }
+
+    let delta = final_tick - current_tick;
+    let distance = delta.unsigned_abs() as i32;
+    if distance < 6 {
+        return None;
+    }
+
+    let start_frac = rng.in_range(0.18, 0.35);
+    let width_frac = rng.in_range(0.08, 0.20);
+    let mut offset = ((distance as f64) * start_frac).round() as i32;
+    let mut width = ((distance as f64) * width_frac).round() as i32;
+    offset = offset.clamp(1, distance.saturating_sub(2));
+    width = width.clamp(2, distance.saturating_sub(offset));
+
+    if delta < 0 {
+        let band_hi = current_tick - offset;
+        let band_lo = band_hi - width;
+        Some((band_lo.min(band_hi), band_lo.max(band_hi)))
+    } else {
+        let band_lo = current_tick + offset;
+        let band_hi = band_lo + width;
+        Some((band_lo.min(band_hi), band_lo.max(band_hi)))
+    }
+}
+
+fn significant_liquidity_delta(base_liquidity: u128, rng: &mut super::TestRng) -> u128 {
+    let scale_bps = 15_000u128 + (rng.next_u64() % 20_001) as u128;
+    let scaled = base_liquidity.saturating_mul(scale_bps) / 10_000;
+    scaled.max(base_liquidity / 2).max(1)
+}
+
+fn build_augmented_multitick_fixture(
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    actions: &[Action],
+) -> Vec<(Slot0Result, &'static MarketData)> {
+    let post_trade_market_state = replay_actions_to_market_state(actions, slot0_results);
+    let final_slot0_by_name: HashMap<&'static str, Slot0Result> = post_trade_market_state
+        .into_iter()
+        .map(|(slot0, market)| (market.name, slot0))
+        .collect();
+    let buy_markets: HashSet<&'static str> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Buy { market_name, .. } => Some(*market_name),
+            Action::Sell { .. } | Action::Mint { .. } | Action::Merge { .. } => None,
+        })
+        .collect();
+
+    let mut rng = super::TestRng::new(0xa11c_e98);
+    let mut injected = 0usize;
+    let mut augmented = Vec::with_capacity(slot0_results.len());
+
+    for (slot0, market) in slot0_results {
+        let Some(pool) = market.pool.as_ref() else {
+            augmented.push((slot0.clone(), *market));
+            continue;
+        };
+        if !buy_markets.contains(market.name) {
+            augmented.push((slot0.clone(), *market));
+            continue;
+        }
+
+        let Some(final_slot0) = final_slot0_by_name.get(market.name) else {
+            augmented.push((slot0.clone(), *market));
+            continue;
+        };
+        let Ok(current_tick) = get_tick_at_sqrt_ratio(slot0.sqrt_price_x96) else {
+            augmented.push((slot0.clone(), *market));
+            continue;
+        };
+        let Ok(final_tick) = get_tick_at_sqrt_ratio(final_slot0.sqrt_price_x96) else {
+            augmented.push((slot0.clone(), *market));
+            continue;
+        };
+        let Some((band_lo, band_hi)) =
+            pick_injected_liquidity_band(current_tick, final_tick, &mut rng)
+        else {
+            augmented.push((slot0.clone(), *market));
+            continue;
+        };
+
+        let Ok(base_liquidity) = pool.liquidity.parse::<u128>() else {
+            augmented.push((slot0.clone(), *market));
+            continue;
+        };
+        let extra_liquidity = significant_liquidity_delta(base_liquidity, &mut rng);
+        let extra_i128 =
+            i128::try_from(extra_liquidity.min(i128::MAX as u128)).expect("extra liquidity fits");
+
+        let delta_lo;
+        let delta_hi;
+        if final_tick < current_tick {
+            // zeroForOne buy path: crossing down enters at upper bound, exits at lower bound.
+            delta_lo = extra_i128;
+            delta_hi = -extra_i128;
+        } else {
+            // oneForZero buy path: crossing up enters at lower bound, exits at upper bound.
+            delta_lo = extra_i128;
+            delta_hi = -extra_i128;
+        }
+
+        let mut augmented_ticks = pool.ticks.to_vec();
+        augmented_ticks.push(Tick {
+            tick_idx: band_lo,
+            liquidity_net: delta_lo,
+        });
+        augmented_ticks.push(Tick {
+            tick_idx: band_hi,
+            liquidity_net: delta_hi,
+        });
+        let leaked_ticks = Box::leak(augmented_ticks.into_boxed_slice());
+
+        let mut augmented_pool = *pool;
+        augmented_pool.ticks = leaked_ticks;
+        let leaked_pool = leak_pool(augmented_pool);
+        let leaked_market = leak_market(MarketData {
+            name: market.name,
+            market_id: market.market_id,
+            outcome_token: market.outcome_token,
+            pool: Some(*leaked_pool),
+            quote_token: market.quote_token,
+        });
+
+        injected += 1;
+        augmented.push((slot0.clone(), leaked_market));
+    }
+
+    assert!(
+        injected >= 1,
+        "expected at least one buy market with a traversable price range for injected liquidity"
+    );
+
+    augmented
 }
 
 #[test]
@@ -286,11 +904,7 @@ fn test_execute_optimal_sell_allows_direct_merge_when_buy_merge_is_blocked() {
     let sold = {
         let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
         exec.execute_optimal_sell_with_merge_gates(
-            0,
-            5.0,
-            0.0,
-            true,
-            false, // buy-merge blocked
+            0, 5.0, 0.0, true, false, // buy-merge blocked
             true,  // direct-merge allowed
         )
     };
@@ -1070,70 +1684,9 @@ fn test_rebalance_never_emits_naked_mint_or_repay() {
 #[tokio::test]
 async fn test_rebalance_optimization_full_l1_live_prices() {
     // Full-L1 optimization test on live pool prices.
-    dotenvy::dotenv().ok();
-    let default_rpc = "https://optimism.drpc.org".to_string();
-    let mut rpc_candidates: Vec<String> = Vec::new();
-    if let Ok(rpc) = std::env::var("RPC") {
-        rpc_candidates.push(rpc);
-    }
-    if !rpc_candidates.iter().any(|rpc| rpc == &default_rpc) {
-        rpc_candidates.push(default_rpc.clone());
-    }
-
-    let expected_markets = eligible_l1_markets_with_predictions();
-    let expected_market_names: HashSet<&'static str> =
-        expected_markets.iter().map(|m| m.name).collect();
-    let mut slot0_results_all: Option<Vec<(Slot0Result, &'static crate::markets::MarketData)>> =
-        None;
-    let mut last_err = String::new();
-    for rpc_url in &rpc_candidates {
-        let Ok(parsed_url) = rpc_url.parse() else {
-            eprintln!(
-                "[rebalance][live_full_l1] skipping invalid RPC URL: {}",
-                rpc_url
-            );
-            continue;
-        };
-        let provider =
-            alloy::providers::ProviderBuilder::new().with_reqwest(parsed_url, |builder| {
-                builder
-                    .no_proxy()
-                    .build()
-                    .expect("failed to build reqwest client for tests")
-            });
-        match crate::pools::fetch_all_slot0(provider).await {
-            Ok(results) => {
-                println!("[rebalance][live_full_l1] using RPC endpoint: {}", rpc_url);
-                slot0_results_all = Some(results);
-                break;
-            }
-            Err(err) => {
-                last_err = err.to_string();
-                eprintln!(
-                    "[rebalance][live_full_l1] failed RPC endpoint {}: {}",
-                    rpc_url, last_err
-                );
-            }
-        }
-    }
-    let Some(slot0_results_all) = slot0_results_all else {
-        eprintln!(
-            "[rebalance][live_full_l1] skipping test: no reachable RPC endpoint; last error: {}",
-            last_err
-        );
+    let Some(slot0_results) = fetch_live_expected_l1_slot0_results("live_full_l1").await else {
         return;
     };
-
-    let slot0_results: Vec<_> = slot0_results_all
-        .into_iter()
-        .filter(|(_, market)| expected_market_names.contains(market.name))
-        .collect();
-
-    assert_eq!(
-        slot0_results.len(),
-        expected_markets.len(),
-        "live slot0 fetch must include every tradeable L1 market with predictions"
-    );
 
     let initial_balances: HashMap<&str, f64> = HashMap::new();
     let initial_susd = 100.0;
@@ -1170,73 +1723,10 @@ async fn test_rebalance_optimization_full_l1_live_prices() {
 #[tokio::test]
 async fn test_rebalance_arb_only_full_l1_live_prices() {
     // Full-L1 arb-only test on live pool prices.
-    dotenvy::dotenv().ok();
-    let default_rpc = "https://optimism.drpc.org".to_string();
-    let mut rpc_candidates: Vec<String> = Vec::new();
-    if let Ok(rpc) = std::env::var("RPC") {
-        rpc_candidates.push(rpc);
-    }
-    if !rpc_candidates.iter().any(|rpc| rpc == &default_rpc) {
-        rpc_candidates.push(default_rpc.clone());
-    }
-
-    let expected_markets = eligible_l1_markets_with_predictions();
-    let expected_market_names: HashSet<&'static str> =
-        expected_markets.iter().map(|m| m.name).collect();
-    let mut slot0_results_all: Option<Vec<(Slot0Result, &'static crate::markets::MarketData)>> =
-        None;
-    let mut last_err = String::new();
-    for rpc_url in &rpc_candidates {
-        let Ok(parsed_url) = rpc_url.parse() else {
-            eprintln!(
-                "[rebalance][live_full_l1_arb_only] skipping invalid RPC URL: {}",
-                rpc_url
-            );
-            continue;
-        };
-        let provider =
-            alloy::providers::ProviderBuilder::new().with_reqwest(parsed_url, |builder| {
-                builder
-                    .no_proxy()
-                    .build()
-                    .expect("failed to build reqwest client for tests")
-            });
-        match crate::pools::fetch_all_slot0(provider).await {
-            Ok(results) => {
-                println!(
-                    "[rebalance][live_full_l1_arb_only] using RPC endpoint: {}",
-                    rpc_url
-                );
-                slot0_results_all = Some(results);
-                break;
-            }
-            Err(err) => {
-                last_err = err.to_string();
-                eprintln!(
-                    "[rebalance][live_full_l1_arb_only] failed RPC endpoint {}: {}",
-                    rpc_url, last_err
-                );
-            }
-        }
-    }
-    let Some(slot0_results_all) = slot0_results_all else {
-        eprintln!(
-            "[rebalance][live_full_l1_arb_only] skipping test: no reachable RPC endpoint; last error: {}",
-            last_err
-        );
+    let Some(slot0_results) = fetch_live_expected_l1_slot0_results("live_full_l1_arb_only").await
+    else {
         return;
     };
-
-    let slot0_results: Vec<_> = slot0_results_all
-        .into_iter()
-        .filter(|(_, market)| expected_market_names.contains(market.name))
-        .collect();
-
-    assert_eq!(
-        slot0_results.len(),
-        expected_markets.len(),
-        "live slot0 fetch must include every tradeable L1 market with predictions"
-    );
 
     let initial_balances: HashMap<&str, f64> = HashMap::new();
     let initial_susd = 100.0;
@@ -1283,5 +1773,119 @@ async fn test_rebalance_arb_only_full_l1_live_prices() {
         "live full-L1 arb-only should not reduce expected value: before={:.9}, after={:.9}",
         ev_before,
         ev_after
+    );
+}
+
+#[tokio::test]
+async fn test_rebalance_top_buy_gap_subset_l1_live_prices() {
+    let Some(full_slot0_results) =
+        fetch_live_expected_l1_slot0_results("live_top_buy_gap_subset").await
+    else {
+        return;
+    };
+
+    let slot0_results = live_subset_ranked_by_buy_gap(&full_slot0_results, 4);
+    assert!(
+        slot0_results.len() >= 4,
+        "expected at least four live underpriced markets with valid price + prediction data"
+    );
+
+    assert_live_subset_rebalance_non_decreasing_ev("live_top_buy_gap_subset", &slot0_results, 25.0);
+}
+
+#[tokio::test]
+async fn test_rebalance_near_fair_subset_l1_live_prices() {
+    let Some(full_slot0_results) =
+        fetch_live_expected_l1_slot0_results("live_near_fair_subset").await
+    else {
+        return;
+    };
+
+    let slot0_results = live_subset_ranked_by_abs_gap(&full_slot0_results, 4, false);
+    assert!(
+        slot0_results.len() >= 4,
+        "expected at least four live markets with valid price + prediction data"
+    );
+
+    assert_live_subset_rebalance_non_decreasing_ev("live_near_fair_subset", &slot0_results, 25.0);
+}
+
+#[test]
+fn test_rebalance_regression_full_l1_augmented_multitick_liquidity_changes_exact_replay() {
+    let markets = eligible_l1_markets_with_predictions();
+    let price_multipliers = normalized_full_l1_price_multipliers(&markets);
+    let slot0_results = build_slot0_results_for_markets(&markets, &price_multipliers);
+    let initial_balances: HashMap<&str, f64> = HashMap::new();
+    let initial_susd = 250.0;
+
+    let actions = rebalance(&initial_balances, initial_susd, &slot0_results);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::Buy { .. })),
+        "expected the realistic full-L1 fixture to include at least one buy"
+    );
+    assert_rebalance_action_invariants(&actions, &slot0_results, &initial_balances, initial_susd);
+
+    let augmented_slot0_results = build_augmented_multitick_fixture(&slot0_results, &actions);
+    let augmented_actions = rebalance(&initial_balances, initial_susd, &augmented_slot0_results);
+
+    assert_eq!(
+        format!("{:?}", actions),
+        format!("{:?}", augmented_actions),
+        "appending extra in-path ticks should not change the current planner because it still only reads the current liquidity band"
+    );
+
+    let base_exact = replay_actions_to_state_multitick_exact(
+        &actions,
+        &slot0_results,
+        &initial_balances,
+        initial_susd,
+    );
+    let augmented_exact = replay_actions_to_state_multitick_exact(
+        &actions,
+        &augmented_slot0_results,
+        &initial_balances,
+        initial_susd,
+    );
+
+    let base_ev = ev_from_state(&base_exact.holdings, base_exact.cash);
+    let augmented_ev = ev_from_state(&augmented_exact.holdings, augmented_exact.cash);
+    let ev_delta = augmented_ev - base_ev;
+    let holdings_changed = markets.iter().any(|market| {
+        let base_units = base_exact.holdings.get(market.name).copied().unwrap_or(0.0);
+        let augmented_units = augmented_exact
+            .holdings
+            .get(market.name)
+            .copied()
+            .unwrap_or(0.0);
+        (augmented_units - base_units).abs() > 1e-9
+    });
+    let cash_changed = (augmented_exact.cash - base_exact.cash).abs() > 1e-9;
+
+    println!(
+        "[rebalance][full_l1_augmented_multitick] actions={} base_crossings={} augmented_crossings={} base_ev={:.9} augmented_ev={:.9} delta={:.9}",
+        actions.len(),
+        base_exact.crossed_initialized_ticks,
+        augmented_exact.crossed_initialized_ticks,
+        base_ev,
+        augmented_ev,
+        ev_delta
+    );
+
+    assert!(
+        augmented_exact.crossed_initialized_ticks > base_exact.crossed_initialized_ticks,
+        "expected injected in-path liquidity to add at least one extra initialized-tick crossing"
+    );
+    assert!(
+        holdings_changed || cash_changed,
+        "expected injected in-path liquidity to change realized fills or cash"
+    );
+    assert!(
+        ev_delta.abs() > 0.1,
+        "expected injected multi-tick liquidity to materially change exact replay EV: base={:.9}, augmented={:.9}, delta={:.9}",
+        base_ev,
+        augmented_ev,
+        ev_delta
     );
 }

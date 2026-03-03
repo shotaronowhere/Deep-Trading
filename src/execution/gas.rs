@@ -718,11 +718,16 @@ mod tests {
             l1_fee_per_byte_wei: 0.0,
             ..GasAssumptions::default()
         };
-        let cost =
-            estimate_min_gas_susd_for_group(&gas, GroupKind::MintSell, 0, 97, 5e-10, 3000.0);
-        assert!(cost.is_finite(), "97-leg MintSell gas estimate must be finite");
+        let cost = estimate_min_gas_susd_for_group(&gas, GroupKind::MintSell, 0, 97, 5e-10, 3000.0);
+        assert!(
+            cost.is_finite(),
+            "97-leg MintSell gas estimate must be finite"
+        );
         assert!(cost > 0.0, "97-leg MintSell gas must be positive");
-        assert!(cost > 1.0, "97-leg MintSell at 5e-10 gas price should be > $1: {cost}");
+        assert!(
+            cost > 1.0,
+            "97-leg MintSell at 5e-10 gas price should be > $1: {cost}"
+        );
     }
 
     #[test]
@@ -784,13 +789,20 @@ mod tests {
             amount: alloy::primitives::U256::ZERO,
         };
         let encoded = call.abi_encode();
-        assert_eq!(encoded.len(), 100, "splitPosition ABI encoding must be 100 bytes");
+        assert_eq!(
+            encoded.len(),
+            100,
+            "splitPosition ABI encoding must be 100 bytes"
+        );
     }
 
     #[test]
     fn direct_buy_calldata_estimate_is_434_bytes() {
         // DirectBuy: TX_ENVELOPE(110) + BATCH_CALL_BASE(100) + SWAP_BYTES(224) = 434
         let estimate = estimate_group_calldata_bytes(GroupKind::DirectBuy, 0, 0);
-        assert_eq!(estimate, 434, "DirectBuy calldata estimate should be 434 bytes");
+        assert_eq!(
+            estimate, 434,
+            "DirectBuy calldata estimate should be 434 bytes"
+        );
     }
 }

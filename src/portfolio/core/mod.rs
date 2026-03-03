@@ -1,3 +1,4 @@
+mod bundle;
 pub mod diagnostics;
 mod merge;
 mod planning;

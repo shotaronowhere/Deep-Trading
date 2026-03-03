@@ -104,7 +104,9 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
         uint256 tokenABefore = tokenA.balanceOf(address(this));
         uint256 tokenBBefore = tokenB.balanceOf(address(this));
 
-        uint256 amountOut = batch.exactInput(tokens, amountInPerSwap, address(stable), 1, FEE, 0);
+        uint256 amountOut = batch.exactInput(
+            tokens, _filledUint256Array(2, amountInPerSwap), _filledUint160Array(2, 0), address(stable), 1, FEE
+        );
 
         assertGt(amountOut, 0);
         assertEq(stable.balanceOf(address(this)) - stableBefore, amountOut);
@@ -126,7 +128,14 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
         uint256 tokenABefore = tokenA.balanceOf(address(this));
         uint256 tokenBBefore = tokenB.balanceOf(address(this));
 
-        uint256 amountIn = batch.exactOutput(tokens, amountOutPerSwap, address(stable), amountInMax, FEE, 0);
+        uint256 amountIn = batch.exactOutput(
+            tokens,
+            _filledUint256Array(2, amountOutPerSwap),
+            _filledUint160Array(2, 0),
+            address(stable),
+            amountInMax,
+            FEE
+        );
 
         assertGt(amountIn, 0);
         assertLe(amountIn, amountInMax);
@@ -136,21 +145,17 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
         assertEq(stable.balanceOf(address(batch)), 0);
     }
 
-    function _createPoolAndSeedLiquidity(
-        MockERC20 tokenX,
-        MockERC20 tokenY,
-        uint256 amountX,
-        uint256 amountY
-    ) internal {
+    function _createPoolAndSeedLiquidity(MockERC20 tokenX, MockERC20 tokenY, uint256 amountX, uint256 amountY)
+        internal
+    {
         (address token0, address token1) = address(tokenX) < address(tokenY)
             ? (address(tokenX), address(tokenY))
             : (address(tokenY), address(tokenX));
 
         positionManager.createAndInitializePoolIfNecessary(token0, token1, FEE, SQRT_PRICE_1_1);
 
-        (uint256 amount0Desired, uint256 amount1Desired) = address(tokenX) < address(tokenY)
-            ? (amountX, amountY)
-            : (amountY, amountX);
+        (uint256 amount0Desired, uint256 amount1Desired) =
+            address(tokenX) < address(tokenY) ? (amountX, amountY) : (amountY, amountX);
 
         positionManager.mint(
             INonfungiblePositionManagerLike.MintParams({
@@ -169,7 +174,11 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
         );
     }
 
-    function _resolveArtifact(string memory primaryPath, string memory fallbackPath) internal view returns (string memory) {
+    function _resolveArtifact(string memory primaryPath, string memory fallbackPath)
+        internal
+        view
+        returns (string memory)
+    {
         if (vm.exists(primaryPath)) {
             return primaryPath;
         }
@@ -177,5 +186,19 @@ contract BatchSwapRouterUniswapIntegrationTest is Test {
             return fallbackPath;
         }
         revert("artifact not found");
+    }
+
+    function _filledUint256Array(uint256 length, uint256 value) internal pure returns (uint256[] memory values) {
+        values = new uint256[](length);
+        for (uint256 i = 0; i < length; i++) {
+            values[i] = value;
+        }
+    }
+
+    function _filledUint160Array(uint256 length, uint160 value) internal pure returns (uint160[] memory values) {
+        values = new uint160[](length);
+        for (uint256 i = 0; i < length; i++) {
+            values[i] = value;
+        }
     }
 }

@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use alloy::primitives::{U160, U256};
+use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
+
+use crate::markets::MarketData;
+use crate::pools::{Slot0Result, sqrt_price_x96_to_price_outcome, u256_to_f64};
 use crate::portfolio::Action;
 
 pub use super::batch_bounds::{
@@ -16,6 +21,12 @@ use super::grouping::{
     ExecutionGroup, GroupingError, group_execution_actions_by_profitability_step,
 };
 use super::{ExecutionGroupPlan, ExecutionLegPlan, GroupKind, LegKind};
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConservativeExecutionConfig {
+    pub quote_latency_blocks: u64,
+    pub adverse_move_bps_per_block: u64,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BufferConfig {
@@ -192,10 +203,12 @@ pub fn build_group_plan_with_reason(
                 market_name: leg.market_name,
                 kind: leg.kind,
                 planned_quote_susd: leg.planned_quote_susd,
+                conservative_quote_susd: leg.planned_quote_susd,
                 adverse_notional_susd: leg.planned_quote_susd,
                 allocated_slippage_susd,
                 max_cost_susd,
                 min_proceeds_susd,
+                sqrt_price_limit_x96: None,
             });
         }
         leg_plans
@@ -225,6 +238,284 @@ pub fn build_group_plan_with_reason(
         slippage_budget_susd,
         guaranteed_profit_floor_susd,
     })
+}
+
+fn conservative_move_frac(config: ConservativeExecutionConfig) -> f64 {
+    ((config.quote_latency_blocks as f64) * (config.adverse_move_bps_per_block as f64) / 10_000.0)
+        .max(0.0)
+}
+
+fn conservative_quote(planned_quote_susd: f64, kind: LegKind, move_frac: f64) -> f64 {
+    match kind {
+        LegKind::Buy => planned_quote_susd * (1.0 + move_frac),
+        LegKind::Sell => (planned_quote_susd * (1.0 - move_frac)).max(0.0),
+    }
+}
+
+fn conservative_quote_delta(planned_quote_susd: f64, kind: LegKind, move_frac: f64) -> f64 {
+    match kind {
+        LegKind::Buy => (planned_quote_susd * move_frac).max(0.0),
+        LegKind::Sell => {
+            (planned_quote_susd - conservative_quote(planned_quote_susd, kind, move_frac)).max(0.0)
+        }
+    }
+}
+
+fn outcome_price_to_sqrt_limit_x96(outcome_price: f64, is_token1_outcome: bool) -> Option<U160> {
+    if !outcome_price.is_finite() || outcome_price <= 0.0 {
+        return None;
+    }
+    let raw_price = if is_token1_outcome {
+        1.0 / outcome_price
+    } else {
+        outcome_price
+    };
+    if !raw_price.is_finite() || raw_price <= 0.0 {
+        return None;
+    }
+
+    let scaled = raw_price.sqrt() * 2f64.powi(96);
+    if !scaled.is_finite() || scaled <= 0.0 || scaled >= 2f64.powi(128) {
+        return None;
+    }
+    Some(U160::from(scaled.round() as u128))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarketPriceState {
+    is_token1_outcome: bool,
+    current_price: f64,
+    buy_limit_price: f64,
+    sell_limit_price: f64,
+    liquidity_raw: f64,
+}
+
+fn market_price_state(
+    slot0: &Slot0Result,
+    market: &'static MarketData,
+) -> Option<MarketPriceState> {
+    let pool = market.pool.as_ref()?;
+    let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
+    let zero_for_one_buy = pool.token0.eq_ignore_ascii_case(market.quote_token);
+    let liquidity: u128 = pool.liquidity.parse().ok()?;
+    if liquidity == 0 {
+        return None;
+    }
+
+    let tick_0 = pool.ticks.first()?.tick_idx;
+    let tick_1 = pool.ticks.get(1)?.tick_idx;
+    let sqrt_lo = U256::from(get_sqrt_ratio_at_tick(tick_0.min(tick_1)).ok()?);
+    let sqrt_hi = U256::from(get_sqrt_ratio_at_tick(tick_0.max(tick_1)).ok()?);
+    let (sqrt_buy_limit, sqrt_sell_limit) = if zero_for_one_buy {
+        (sqrt_lo, sqrt_hi)
+    } else {
+        (sqrt_hi, sqrt_lo)
+    };
+
+    let current_price = u256_to_f64(sqrt_price_x96_to_price_outcome(
+        slot0.sqrt_price_x96,
+        is_token1_outcome,
+    )?);
+    if !current_price.is_finite() || current_price <= 0.0 {
+        return None;
+    }
+
+    let buy_limit_price = u256_to_f64(sqrt_price_x96_to_price_outcome(
+        sqrt_buy_limit,
+        is_token1_outcome,
+    )?);
+    let sell_limit_price = u256_to_f64(sqrt_price_x96_to_price_outcome(
+        sqrt_sell_limit,
+        is_token1_outcome,
+    )?);
+    if !buy_limit_price.is_finite()
+        || !sell_limit_price.is_finite()
+        || buy_limit_price <= 0.0
+        || sell_limit_price <= 0.0
+    {
+        return None;
+    }
+
+    Some(MarketPriceState {
+        is_token1_outcome,
+        current_price,
+        buy_limit_price,
+        sell_limit_price,
+        liquidity_raw: (liquidity as f64) / 1e18,
+    })
+}
+
+fn action_amount_for_leg(actions: &[Action], leg: &ExecutionLegPlan) -> Option<f64> {
+    let action = actions.get(leg.action_index)?;
+    match (leg.kind, action) {
+        (LegKind::Buy, Action::Buy { amount, .. }) => Some(*amount),
+        (LegKind::Sell, Action::Sell { amount, .. }) => Some(*amount),
+        _ => None,
+    }
+}
+
+fn conservative_sqrt_price_limit(
+    actions: &[Action],
+    leg: &ExecutionLegPlan,
+    slot0: &Slot0Result,
+    market: &'static MarketData,
+    move_frac: f64,
+) -> Option<U160> {
+    let state = market_price_state(slot0, market)?;
+    let amount = action_amount_for_leg(actions, leg)?;
+    if !amount.is_finite() || amount <= 0.0 || state.liquidity_raw <= 0.0 {
+        return None;
+    }
+
+    let sqrt_current = state.current_price.sqrt();
+    if !sqrt_current.is_finite() || sqrt_current <= 0.0 {
+        return None;
+    }
+
+    let terminal_price = match leg.kind {
+        LegKind::Buy => {
+            let lambda = sqrt_current / state.liquidity_raw;
+            let denom = 1.0 - amount * lambda;
+            if !denom.is_finite() || denom <= EPSILON {
+                state.buy_limit_price
+            } else {
+                (state.current_price / (denom * denom))
+                    .max(state.current_price)
+                    .min(state.buy_limit_price)
+            }
+        }
+        LegKind::Sell => {
+            const EXECUTION_FEE_FACTOR: f64 = 1.0 - (500.0 / 1_000_000.0);
+            let kappa = EXECUTION_FEE_FACTOR * sqrt_current / state.liquidity_raw;
+            let denom = 1.0 + amount * kappa;
+            if !denom.is_finite() || denom <= 0.0 {
+                return None;
+            }
+            (state.current_price / (denom * denom))
+                .max(state.sell_limit_price)
+                .min(state.current_price)
+        }
+    };
+
+    let adverse_price = match leg.kind {
+        LegKind::Buy => (terminal_price * (1.0 + move_frac)).min(state.buy_limit_price),
+        LegKind::Sell => {
+            (terminal_price * (1.0 - move_frac).max(EPSILON)).max(state.sell_limit_price)
+        }
+    };
+    outcome_price_to_sqrt_limit_x96(adverse_price, state.is_token1_outcome)
+}
+
+const EPSILON: f64 = 1e-9;
+
+fn apply_market_context_to_plan(
+    actions: &[Action],
+    plan: &mut ExecutionGroupPlan,
+    slot0_by_market: &HashMap<&'static str, (&Slot0Result, &'static MarketData)>,
+    move_frac: f64,
+) -> bool {
+    if plan.legs.is_empty() {
+        return true;
+    }
+
+    let mut total_conservative_notional = 0.0_f64;
+    let mut conservative_delta_susd = 0.0_f64;
+
+    for leg in &mut plan.legs {
+        leg.conservative_quote_susd =
+            conservative_quote(leg.planned_quote_susd, leg.kind, move_frac);
+        leg.adverse_notional_susd = leg.conservative_quote_susd;
+        conservative_delta_susd +=
+            conservative_quote_delta(leg.planned_quote_susd, leg.kind, move_frac);
+        total_conservative_notional += leg.conservative_quote_susd.max(0.0);
+        leg.sqrt_price_limit_x96 = leg
+            .market_name
+            .and_then(|market_name| slot0_by_market.get(market_name))
+            .and_then(|(slot0, market)| {
+                conservative_sqrt_price_limit(actions, leg, slot0, *market, move_frac)
+            });
+        if leg.market_name.is_some() && leg.sqrt_price_limit_x96.is_none() {
+            return false;
+        }
+    }
+
+    if !conservative_delta_susd.is_finite()
+        || !total_conservative_notional.is_finite()
+        || total_conservative_notional <= 0.0
+    {
+        return false;
+    }
+
+    let remaining_profit_after_conservative =
+        plan.edge_plan_susd - plan.gas_total_susd - conservative_delta_susd;
+    if !remaining_profit_after_conservative.is_finite()
+        || remaining_profit_after_conservative <= 0.0
+    {
+        return false;
+    }
+
+    plan.slippage_budget_susd = (plan.slippage_budget_susd - conservative_delta_susd).max(0.0);
+    plan.guaranteed_profit_floor_susd =
+        remaining_profit_after_conservative - plan.slippage_budget_susd;
+    if !plan.guaranteed_profit_floor_susd.is_finite() || plan.guaranteed_profit_floor_susd <= 0.0 {
+        return false;
+    }
+    plan.profit_buffer_susd = plan.guaranteed_profit_floor_susd;
+
+    for leg in &mut plan.legs {
+        leg.allocated_slippage_susd =
+            plan.slippage_budget_susd * (leg.conservative_quote_susd / total_conservative_notional);
+        match leg.kind {
+            LegKind::Buy => {
+                leg.max_cost_susd = Some(leg.conservative_quote_susd + leg.allocated_slippage_susd);
+                leg.min_proceeds_susd = None;
+            }
+            LegKind::Sell => {
+                leg.max_cost_susd = None;
+                leg.min_proceeds_susd =
+                    Some((leg.conservative_quote_susd - leg.allocated_slippage_susd).max(0.0));
+            }
+        }
+    }
+
+    true
+}
+
+fn apply_market_context_to_plans(
+    actions: &[Action],
+    plans: &mut Vec<ExecutionGroupPlan>,
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    config: ConservativeExecutionConfig,
+) {
+    let move_frac = conservative_move_frac(config);
+    let slot0_by_market: HashMap<&'static str, (&Slot0Result, &'static MarketData)> = slot0_results
+        .iter()
+        .map(|(slot0, market)| (market.name, (slot0, *market)))
+        .collect();
+
+    let mut truncate_from = plans.len();
+    for idx in 0..plans.len() {
+        let failed_step = {
+            let plan = &mut plans[idx];
+            if apply_market_context_to_plan(actions, plan, &slot0_by_market, move_frac) {
+                None
+            } else {
+                Some(plan.profitability_step_index)
+            }
+        };
+        if let Some(step_index) = failed_step {
+            truncate_from = plans
+                .iter()
+                .position(|plan| plan.profitability_step_index == step_index)
+                .unwrap_or(idx);
+            tracing::info!(
+                step_index,
+                "stopping planning at first profitability step invalidated by conservative execution repricing"
+            );
+            break;
+        }
+    }
+    plans.truncate(truncate_from);
 }
 
 pub fn build_group_plans_with_edge_provider<F>(
@@ -387,10 +678,57 @@ pub fn build_group_plans_with_default_edges(
     )
 }
 
+pub fn build_group_plans_with_market_context<F>(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    conservative_config: ConservativeExecutionConfig,
+    gas_assumptions: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd_assumed: f64,
+    buffer: BufferConfig,
+    edge_provider: F,
+) -> Result<Vec<ExecutionGroupPlan>, GroupPlanningError>
+where
+    F: FnMut(usize, &ExecutionGroup) -> Option<f64>,
+{
+    let mut plans = build_group_plans_with_edge_provider(
+        actions,
+        gas_assumptions,
+        gas_price_eth,
+        eth_usd_assumed,
+        buffer,
+        edge_provider,
+    )?;
+    apply_market_context_to_plans(actions, &mut plans, slot0_results, conservative_config);
+    Ok(plans)
+}
+
+pub fn build_group_plans_with_default_edges_and_market_context(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    conservative_config: ConservativeExecutionConfig,
+    gas_assumptions: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd_assumed: f64,
+    buffer: BufferConfig,
+) -> Result<Vec<ExecutionGroupPlan>, GroupPlanningError> {
+    let mut plans = build_group_plans_with_default_edges(
+        actions,
+        gas_assumptions,
+        gas_price_eth,
+        eth_usd_assumed,
+        buffer,
+    )?;
+    apply_market_context_to_plans(actions, &mut plans, slot0_results, conservative_config);
+    Ok(plans)
+}
+
 /// Hydration-first planning helper: refresh Optimism L1 fee-per-byte (cache-aware)
-/// before building plans with default edges.
+/// before building market-context plans with default edges.
 pub async fn build_group_plans_with_default_edges_and_l1_hydration(
     actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    conservative_config: ConservativeExecutionConfig,
     gas_assumptions: &GasAssumptions,
     rpc_url: &str,
     gas_price_eth: f64,
@@ -405,7 +743,15 @@ pub async fn build_group_plans_with_default_edges_and_l1_hydration(
             reason: err.to_string(),
         })?;
 
-    build_group_plans_with_default_edges(actions, &hydrated, gas_price_eth, eth_usd_assumed, buffer)
+    build_group_plans_with_default_edges_and_market_context(
+        actions,
+        slot0_results,
+        conservative_config,
+        &hydrated,
+        gas_price_eth,
+        eth_usd_assumed,
+        buffer,
+    )
 }
 
 #[cfg(test)]
@@ -877,8 +1223,14 @@ mod tests {
     #[tokio::test]
     async fn hydration_entrypoint_returns_error_when_hydration_fails() {
         let actions = vec![sell("x", 1.0, 2.0)];
+        let slot0_results = Vec::new();
         let err = build_group_plans_with_default_edges_and_l1_hydration(
             &actions,
+            &slot0_results,
+            ConservativeExecutionConfig {
+                quote_latency_blocks: 1,
+                adverse_move_bps_per_block: 15,
+            },
             &GasAssumptions::default(),
             "",
             1e-10,
@@ -1144,20 +1496,24 @@ mod tests {
                     market_name: Some("a"),
                     kind: LegKind::Buy,
                     planned_quote_susd: 1.0,
+                    conservative_quote_susd: 1.0,
                     adverse_notional_susd: 1.0,
                     allocated_slippage_susd: 0.1,
                     max_cost_susd: Some(1.1),
                     min_proceeds_susd: None,
+                    sqrt_price_limit_x96: Some(U160::from(1u8)),
                 },
                 ExecutionLegPlan {
                     action_index: 1,
                     market_name: Some("b"),
                     kind: LegKind::Sell,
                     planned_quote_susd: 1.5,
+                    conservative_quote_susd: 1.5,
                     adverse_notional_susd: 1.5,
                     allocated_slippage_susd: 0.1,
                     max_cost_susd: None,
                     min_proceeds_susd: Some(1.4),
+                    sqrt_price_limit_x96: Some(U160::from(1u8)),
                 },
             ],
             planned_at_block: Some(100),
@@ -1187,10 +1543,12 @@ mod tests {
                 market_name: Some("a"),
                 kind: LegKind::Buy,
                 planned_quote_susd: 1.0,
+                conservative_quote_susd: 1.0,
                 adverse_notional_susd: 1.0,
                 allocated_slippage_susd: 0.1,
                 max_cost_susd: Some(1.1),
                 min_proceeds_susd: None,
+                sqrt_price_limit_x96: Some(U160::from(1u8)),
             }],
             planned_at_block: None,
             edge_plan_susd: 1.0,
@@ -1208,5 +1566,202 @@ mod tests {
         stamp_plan_with_block(&mut plan, 90);
         let err = derive_batch_quote_bounds(&plan, 100, 2).expect_err("stale plans should fail");
         assert_eq!(err, BatchBoundsError::StalePlan);
+    }
+
+    #[test]
+    fn batch_bounds_use_conservative_quotes() {
+        let plan = ExecutionGroupPlan {
+            kind: GroupKind::DirectBuy,
+            action_indices: vec![0],
+            profitability_step_index: 0,
+            step_subgroup_index: 0,
+            step_subgroup_count: 1,
+            legs: vec![ExecutionLegPlan {
+                action_index: 0,
+                market_name: Some("a"),
+                kind: LegKind::Buy,
+                planned_quote_susd: 1.0,
+                conservative_quote_susd: 1.2,
+                adverse_notional_susd: 1.2,
+                allocated_slippage_susd: 0.1,
+                max_cost_susd: Some(1.3),
+                min_proceeds_susd: None,
+                sqrt_price_limit_x96: Some(U160::from(1u8)),
+            }],
+            planned_at_block: Some(100),
+            edge_plan_susd: 1.0,
+            l2_gas_units: 1,
+            gas_l2_susd: 0.1,
+            gas_total_susd: 0.2,
+            profit_buffer_susd: 0.25,
+            slippage_budget_susd: 0.4,
+            guaranteed_profit_floor_susd: 0.25,
+        };
+        let bounds = derive_batch_quote_bounds(&plan, 100, 2)
+            .expect("bounds derivation should succeed")
+            .expect("buy bounds expected");
+        assert_eq!(
+            bounds,
+            BatchQuoteBounds::Buy {
+                planned_total_in_susd: 1.2,
+                max_total_in_susd: 1.6,
+            }
+        );
+    }
+
+    #[test]
+    fn market_context_populates_conservative_quotes_and_price_limits() {
+        let slot0_results = full_slot0_results_with_prediction_multiplier(0.35);
+        let gas = GasAssumptions {
+            l1_fee_per_byte_wei: 1.0e8,
+            ..GasAssumptions::default()
+        };
+        let actions = portfolio::rebalance_with_gas_pricing(
+            &HashMap::new(),
+            200.0,
+            &slot0_results,
+            RebalanceMode::Full,
+            &gas,
+            1e-9,
+            3000.0,
+        );
+        let baseline_plans = build_group_plans_with_default_edges(
+            &actions,
+            &gas,
+            1e-9,
+            3000.0,
+            BufferConfig::default(),
+        )
+        .expect("baseline planning should succeed");
+        let plans = build_group_plans_with_default_edges_and_market_context(
+            &actions,
+            &slot0_results,
+            ConservativeExecutionConfig {
+                quote_latency_blocks: 1,
+                adverse_move_bps_per_block: 15,
+            },
+            &gas,
+            1e-9,
+            3000.0,
+            BufferConfig::default(),
+        )
+        .expect("planning with market context should succeed");
+        let dex_leg = plans
+            .iter()
+            .flat_map(|plan| plan.legs.iter())
+            .find(|leg| leg.kind == LegKind::Buy && leg.market_name.is_some())
+            .expect("expected at least one buy dex leg");
+        assert!(
+            dex_leg.conservative_quote_susd >= dex_leg.planned_quote_susd,
+            "buy legs should widen conservatively"
+        );
+        assert!(
+            dex_leg.sqrt_price_limit_x96.is_some(),
+            "market-aware planning should populate price limits"
+        );
+
+        let baseline_plan = baseline_plans
+            .iter()
+            .find(|plan| !plan.legs.is_empty())
+            .expect("expected at least one baseline dex plan");
+        let repriced_plan = plans
+            .iter()
+            .find(|plan| plan.action_indices == baseline_plan.action_indices)
+            .expect("repriced plan should preserve the same leading execution group");
+        let expected_delta: f64 = baseline_plan
+            .legs
+            .iter()
+            .map(|leg| conservative_quote_delta(leg.planned_quote_susd, leg.kind, 0.0015))
+            .sum();
+        let expected_slippage = (baseline_plan.slippage_budget_susd - expected_delta).max(0.0);
+        let tol = 1e-9 * (1.0 + expected_slippage.abs());
+        assert!(
+            (repriced_plan.slippage_budget_susd - expected_slippage).abs() <= tol,
+            "conservative widening should be debited from residual slippage budget"
+        );
+        assert!(
+            repriced_plan.guaranteed_profit_floor_susd > 0.0,
+            "repriced plans should preserve a positive profit floor or be dropped"
+        );
+    }
+
+    #[test]
+    fn buy_price_limit_tracks_terminal_price_not_spot() {
+        let slot0_results = full_slot0_results_with_prediction_multiplier(0.35);
+        let gas = GasAssumptions {
+            l1_fee_per_byte_wei: 1.0e8,
+            ..GasAssumptions::default()
+        };
+        let actions = portfolio::rebalance_with_gas_pricing(
+            &HashMap::new(),
+            200.0,
+            &slot0_results,
+            RebalanceMode::Full,
+            &gas,
+            1e-9,
+            3000.0,
+        );
+        let plans = build_group_plans_with_default_edges_and_market_context(
+            &actions,
+            &slot0_results,
+            ConservativeExecutionConfig {
+                quote_latency_blocks: 1,
+                adverse_move_bps_per_block: 15,
+            },
+            &gas,
+            1e-9,
+            3000.0,
+            BufferConfig::default(),
+        )
+        .expect("planning with market context should succeed");
+
+        let buy_leg = plans
+            .iter()
+            .flat_map(|plan| plan.legs.iter())
+            .filter(|leg| leg.kind == LegKind::Buy)
+            .max_by(|lhs, rhs| {
+                let lhs_amount = action_amount_for_leg(&actions, lhs).unwrap_or(0.0);
+                let rhs_amount = action_amount_for_leg(&actions, rhs).unwrap_or(0.0);
+                lhs_amount
+                    .partial_cmp(&rhs_amount)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("expected at least one buy leg");
+        let market_name = buy_leg
+            .market_name
+            .expect("buy leg should have market context");
+        let (slot0, market) = slot0_results
+            .iter()
+            .find(|(_, market)| market.name == market_name)
+            .expect("buy leg market should have slot0 data");
+        let state = market_price_state(slot0, *market).expect("market state should be available");
+        let amount =
+            action_amount_for_leg(&actions, buy_leg).expect("buy leg should map to action");
+        let lambda = state.current_price.sqrt() / state.liquidity_raw;
+        let denom = 1.0 - amount * lambda;
+        let terminal_price = if denom <= EPSILON {
+            state.buy_limit_price
+        } else {
+            (state.current_price / (denom * denom))
+                .max(state.current_price)
+                .min(state.buy_limit_price)
+        };
+        let expected_limit_price = (terminal_price * 1.0015).min(state.buy_limit_price);
+        let limit_price = u256_to_f64(
+            sqrt_price_x96_to_price_outcome(
+                U256::from(
+                    buy_leg
+                        .sqrt_price_limit_x96
+                        .expect("buy leg should have limit"),
+                ),
+                state.is_token1_outcome,
+            )
+            .expect("limit should convert back into an outcome price"),
+        );
+        let tol = 1e-9 * (1.0 + expected_limit_price.abs() + limit_price.abs());
+        assert!(
+            (limit_price - expected_limit_price).abs() <= tol,
+            "buy-side limit should be based on the planned terminal price, not spot"
+        );
     }
 }

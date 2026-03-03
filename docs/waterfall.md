@@ -86,11 +86,11 @@ Waterfall state:
 
 Admission/ranking:
 
-- `best_non_active()` is rescanned from current pool state each iteration.
-- Runtime gas gate for each candidate:
-  - direct: `remaining_budget * prof >= gas_direct_susd`
-  - mint: `remaining_budget * prof >= gas_mint_susd`
-- outcomes can appear twice (direct and mint), with independent profitability ranking.
+- The runtime seeds each waterfall iteration from a bundle frontier over outcomes, not from a raw `(idx, route)` active set.
+- Frontier membership is chosen from the best currently executable route per outcome:
+  - direct candidates use `remaining_budget * direct_prof >= gas_direct_susd`
+  - mint candidates use `remaining_budget * mint_prof >= gas_mint_susd`
+- This means mint-only opportunities are still admitted when every direct route is currently unprofitable.
 
 Execution-meaningful step gating:
 
@@ -102,8 +102,8 @@ Execution-meaningful step gating:
   - finite positive edge,
   - finite non-negative gas estimate,
   - `edge > gas + max(buffer_min_susd, buffer_frac * edge) + EPS`.
-- If a step fails, its `(idx, route)` is pruned from the active set for that descent and planning retries with remaining entries.
-- If no active entries remain after pruning, waterfall ends.
+- If the first segment in a bundle step fails the route gate and it was mint-first, the runtime retries the same frontier as a direct-only descent before stopping.
+- If no executable segment remains after that retry, waterfall ends.
 
 Iteration structure:
 
@@ -228,9 +228,14 @@ Requires full pooled L1 outcome set; partial snapshots fail closed.
 - Mint/merge are cross-contract complete-set operations (two L1 markets).
 - Post-run tests assert replay consistency and local gradient bounds.
 
+## On-Chain Counterpart
+
+The algorithm above runs off-chain in Rust simulation. An on-chain implementation exists in `contracts/Rebalancer.sol` that computes the same waterfall allocation atomically using live pool state. The on-chain version uses a closed-form ψ = (C - budget×(1-fee)) / D with iterative pruning, avoiding the simulation-backed bisection needed for mixed routes off-chain. See [docs/rebalancer.md](rebalancer.md) for the on-chain spec and [docs/slippage.md](slippage.md) §0 for why on-chain execution replaced the hybrid off-chain-plan + on-chain-execute approach.
+
 ## Related Docs
 
 - `docs/portfolio.md`: module overview and extensive test map.
 - `docs/model.md`: math derivations and implementation map.
 - `docs/gas_model.md`: gas threshold model details.
 - `docs/arb_mode.md`: arb-only API and equations.
+- `docs/rebalancer.md`: on-chain rebalancer algorithm and interface.

@@ -211,7 +211,11 @@ mod tests {
             let has_swap = set.contains(&(token, SWAP_ROUTER_ADDRESS));
             let has_batch = set.contains(&(token, BATCH_SWAP_ROUTER_ADDRESS));
             if market.pool.is_some() {
-                assert!(has_swap, "pooled market {} missing swap approval", market.name);
+                assert!(
+                    has_swap,
+                    "pooled market {} missing swap approval",
+                    market.name
+                );
                 assert!(
                     has_batch,
                     "pooled market {} missing batch approval",

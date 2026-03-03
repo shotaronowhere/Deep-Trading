@@ -411,26 +411,19 @@ impl RebalanceContext {
         }
     }
 
-    fn merge_route_gate_flags(&mut self, edge_susd: f64) -> (bool, bool) {
-        let buy_merge_allowed = passes_execution_gate(
-            edge_susd,
-            self.route_gates.buy_merge,
-            self.route_gates.buffer_frac,
-            self.route_gates.buffer_min_susd,
-        );
+    fn liquidation_merge_route_flags(&mut self, edge_susd: f64) -> (bool, bool) {
         let direct_merge_allowed = passes_execution_gate(
             edge_susd,
             self.route_gates.direct_merge,
             self.route_gates.buffer_frac,
             self.route_gates.buffer_min_susd,
         );
-        if self.mint_available && !buy_merge_allowed {
-            self.gate_counters.skipped_by_gate_buy_merge += 1;
-        }
         if self.mint_available && !direct_merge_allowed {
             self.gate_counters.skipped_by_gate_direct_merge += 1;
         }
-        (buy_merge_allowed, direct_merge_allowed)
+        // Phase 3 liquidation intentionally avoids buy-merge. It only unwinds via direct-merge
+        // when the inventory-backed exit clears the gate; complement-buying is handled earlier.
+        (false, direct_merge_allowed)
     }
 
     fn run_phase0_complete_set_arb(&mut self) {
@@ -535,7 +528,7 @@ impl RebalanceContext {
                 }
 
                 let (buy_merge_allowed, direct_merge_allowed) =
-                    self.merge_route_gate_flags(approx_edge);
+                    self.liquidation_merge_route_flags(approx_edge);
                 let sold_total = self.execute_optimal_sell(
                     i,
                     sell_amount,
@@ -570,7 +563,7 @@ impl RebalanceContext {
                         break;
                     }
                     let (buy_merge_allowed, direct_merge_allowed) =
-                        self.merge_route_gate_flags(remaining_edge);
+                        self.liquidation_merge_route_flags(remaining_edge);
                     let sold_remaining = self.execute_optimal_sell(
                         i,
                         new_held,
@@ -643,7 +636,7 @@ impl RebalanceContext {
                 }
 
                 let (buy_merge_allowed, direct_merge_allowed) =
-                    self.merge_route_gate_flags(approx_edge);
+                    self.liquidation_merge_route_flags(approx_edge);
                 let sold_total = trial.execute_optimal_sell(
                     idx,
                     sell_target,
@@ -682,7 +675,7 @@ impl RebalanceContext {
                             continue;
                         }
                         let (buy_merge_allowed, direct_merge_allowed) =
-                            self.merge_route_gate_flags(extra_edge);
+                            self.liquidation_merge_route_flags(extra_edge);
                         let sold_extra = trial.execute_optimal_sell(
                             idx,
                             remaining_legacy,
@@ -844,29 +837,13 @@ impl RebalanceContext {
     }
 }
 
-fn rebalance_full(
+fn finish_rebalance_full_inner(
+    mut ctx: RebalanceContext,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
-    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
-    route_gates: RouteGateThresholds,
+    verify_internal_state: bool,
 ) -> Vec<Action> {
-    let preds = crate::pools::prediction_map();
-    let expected_count = crate::predictions::PREDICTIONS_L1.len();
-    let mut ctx = match RebalanceContext::from_inputs(
-        balances,
-        susds_balance,
-        slot0_results,
-        &preds,
-        expected_count,
-    ) {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            log_rebalance_init_error(err);
-            return Vec::new();
-        }
-    };
-    ctx.route_gates = route_gates;
-
     // ── Phase 0: Complete-set arbitrage (two-sided) ──
     // Execute before any discretionary rebalancing so free budget is harvested first.
     ctx.run_phase0_complete_set_arb();
@@ -1022,9 +999,97 @@ fn rebalance_full(
     }
 
     #[cfg(test)]
-    assert_internal_state_matches_replay(&ctx, slot0_results, balances, susds_balance);
+    if verify_internal_state {
+        assert_internal_state_matches_replay(&ctx, slot0_results, balances, susds_balance);
+    }
+
+    #[cfg(not(test))]
+    let _ = (
+        slot0_results,
+        balances,
+        susds_balance,
+        verify_internal_state,
+    );
 
     ctx.log_gate_summary();
+    ctx.actions
+}
+
+fn rebalance_full(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    route_gates: RouteGateThresholds,
+) -> Vec<Action> {
+    let preds = crate::pools::prediction_map();
+    let expected_count = crate::predictions::PREDICTIONS_L1.len();
+    let mut ctx = match RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        &preds,
+        expected_count,
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log_rebalance_init_error(err);
+            return Vec::new();
+        }
+    };
+    ctx.route_gates = route_gates;
+    finish_rebalance_full_inner(ctx, slot0_results, balances, susds_balance, false)
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    let mut ctx = match RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log_rebalance_init_error(err);
+            return Vec::new();
+        }
+    };
+    ctx.route_gates = RouteGateThresholds::disabled();
+    ctx.mint_available = force_mint_available;
+    finish_rebalance_full_inner(ctx, slot0_results, balances, susds_balance, false)
+}
+
+#[cfg(test)]
+pub(super) fn phase1_liquidation_actions_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    let mut ctx = match RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log_rebalance_init_error(err);
+            return Vec::new();
+        }
+    };
+    ctx.route_gates = RouteGateThresholds::disabled();
+    ctx.mint_available = force_mint_available;
+    ctx.run_phase1_sell_overpriced();
     ctx.actions
 }
 

@@ -9,7 +9,8 @@ use alloy::signers::local::PrivateKeySigner;
 
 use deep_trading_bot::execution::approvals::ensure_executor_approvals;
 use deep_trading_bot::execution::bounds::{
-    BufferConfig, build_group_plans_with_default_edges, derive_batch_quote_bounds,
+    BufferConfig, ConservativeExecutionConfig,
+    build_group_plans_with_default_edges_and_market_context, derive_batch_quote_bounds,
     stamp_plans_with_block,
 };
 use deep_trading_bot::execution::gas::default_gas_assumptions_with_optimism_l1_fee;
@@ -51,6 +52,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = ExecutionRuntimeConfig::from_env()?;
     let mode = parse_rebalance_mode();
     let eth_usd = parse_eth_usd();
+    let conservative_execution = ConservativeExecutionConfig {
+        quote_latency_blocks: config.execution_quote_latency_blocks,
+        adverse_move_bps_per_block: config.execution_adverse_move_bps_per_block,
+    };
 
     let signer: PrivateKeySigner = config.private_key.parse()?;
     let signer_address = signer.address();
@@ -82,6 +87,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         reused_cache = resolved.reused_cache,
         execute_submit = config.execute_submit,
         mode = ?mode,
+        quote_latency_blocks = conservative_execution.quote_latency_blocks,
+        adverse_move_bps_per_block = conservative_execution.adverse_move_bps_per_block,
         "trade executor resolved"
     );
     if resolved.owner != signer_address {
@@ -149,8 +156,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        let mut plans = build_group_plans_with_default_edges(
+        let mut plans = build_group_plans_with_default_edges_and_market_context(
             &actions,
+            &slot0_results,
+            conservative_execution,
             &gas_assumptions,
             1e-9,
             eth_usd,
@@ -229,12 +238,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
 
-        let calls = build_trade_executor_calls(&actions, &plan, token_bounds).map_err(|err| {
-            format!(
-                "failed to build executor calls for {:?} step {}: {err}",
-                plan.kind, steps
-            )
-        })?;
+        let calls = build_trade_executor_calls(resolved.executor, &actions, &plan, token_bounds)
+            .map_err(|err| {
+                format!(
+                    "failed to build executor calls for {:?} step {}: {err}",
+                    plan.kind, steps
+                )
+            })?;
         if calls.is_empty() {
             return Err(format!("group {:?} produced zero executor calls", plan.kind).into());
         }

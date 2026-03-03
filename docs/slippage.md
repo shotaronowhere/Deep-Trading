@@ -1,6 +1,48 @@
 # Slippage Guard Sprint Spec (L1/Optimism)
 
-## 1. Scope
+## Update: Conservative Short-Horizon Execution Is Back In The Rust Executor
+
+The original static-budget hybrid design below is still obsolete, but the live Rust executor now uses a narrower and more defensible version of off-chain protection:
+
+1. Plans are still executed in a receding-horizon loop (one strict subgroup at a time).
+2. Each DEX leg now carries a non-zero `sqrtPriceLimitX96` derived from the leg's planned terminal price at the current `slot0` snapshot, then widened by a short-horizon adverse-move haircut.
+3. Aggregate basket bounds are derived from **conservative executable quotes**, and the quote-widening delta is debited from the group's residual slippage budget before any secondary cushion is allocated.
+4. If repricing consumes the entire post-gas margin or a DEX leg cannot be bounded, the executor drops that profitability step and all later steps instead of submitting a stale-risky prefix.
+
+This is intentionally different from the abandoned heuristic-only approach:
+
+1. The primary guard is now the explicit per-leg price limit.
+2. Conservative quote widening is tied to a short horizon (`latency_blocks * adverse_move_bps_per_block`), not a single static tolerance chosen in isolation, and it consumes part of the same bounded risk budget.
+3. The executor still fails closed on stale plans before submission and re-enters the replan loop instead of relaxing bounds.
+
+## 0. Why the Off-Chain Hybrid Approach Was Abandoned
+
+The spec below documents the original hybrid design: compute optimal swaps off-chain in Rust, then submit pre-computed baskets on-chain with aggregate slippage bounds (`sell(min)` / `buy(max)`).
+
+**This approach was abandoned** in favor of a fully on-chain rebalancer (`Rebalancer.sol`). The core problems:
+
+1. **Slippage tolerance definition is intractable.** Between the off-chain planning snapshot and on-chain inclusion, pool prices move. The hybrid approach required defining tolerance bands that are wide enough to avoid reverts but tight enough to avoid overpaying. No static tolerance works well across varying liquidity depths and market conditions.
+
+2. **Stale state between planning and execution.** Even with `planned_at_block` stamping and `max_stale_blocks` guards, the planner's view of pool state is always stale by the time the transaction executes. On-chain, we read `slot0()` and `liquidity()` live within the same transaction.
+
+3. **Replan loops are expensive and fragile.** The hybrid design required executing one group, refreshing state via RPC, and replanning — introducing latency and additional RPC round-trips that compound the staleness problem.
+
+4. **Per-leg bound allocation is heuristic.** Distributing a group-level slippage budget across legs by notional weight is a rough approximation. On-chain, each pool self-regulates via `sqrtPriceLimitX96` — no allocation heuristic needed.
+
+**The on-chain solution (`Rebalancer.sol`)** eliminates these problems:
+- Pool prices and liquidity are read atomically within the transaction
+- The closed-form waterfall allocation (ψ) is computed from live state
+- Uniswap V3 `sqrtPriceLimitX96` provides per-pool slippage protection: each swap stops at the computed target price, consuming exactly the right amount of budget
+- No tolerance parameters to tune — predictions directly determine price limits
+- Optimism gas costs make the on-chain computation economical (~16M gas for 98 outcomes)
+
+See [docs/rebalancer.md](rebalancer.md) for the full on-chain algorithm spec.
+
+---
+
+**The remainder of this document is retained for historical reference.**
+
+## 1. Scope (Historical)
 
 We add strict execution guardrails for stale pool states between planning and inclusion.
 
@@ -201,7 +243,7 @@ Inputs:
 3. temporary `l1_data_fee_floor_susd_tmp` (minimum per group).
 4. cached `l1_fee_per_byte_wei` from a two-point `getL1Fee(bytes)` marginal slope sample (256/512 non-zero bytes) with periodic refresh (default TTL 60s).
 5. heuristic `estimated_calldata_bytes` from group kind + leg counts.
-6. execution path should call `build_group_plans_with_default_edges_and_l1_hydration` for planning passes; it is cache-aware and refreshes on expiry.
+6. execution path should call `build_group_plans_with_default_edges_and_l1_hydration` for planning passes with the current `slot0` snapshot + conservative execution config; it is cache-aware, refreshes on expiry, and returns the same market-context price limits needed for tx building.
 7. if hydration fails (RPC unavailable or malformed response), the helper returns a typed planning error (`GroupPlanningError::L1FeeHydration`) and execution fail-closes.
 8. cache refresh is deduplicated with a single in-flight fetch lock so concurrent planning does not stampede RPC on cache expiry.
 9. planner snapshots one effective `l1_fee_per_byte_wei` value once per planning pass and reuses it for all groups in that pass, so group ordering compares a consistent gas baseline.

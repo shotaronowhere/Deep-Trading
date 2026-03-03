@@ -1,7 +1,11 @@
+use super::bundle::{BundleDirectEstimate, BundleMintEstimate};
+use super::sim::{DUST, EPS, PoolSim, target_price_for_prof};
+#[cfg(test)]
+use super::sim::{FEE_FACTOR, NEWTON_ITERS, alt_price};
+#[cfg(test)]
 use std::collections::HashSet;
 
-use super::sim::{DUST, EPS, FEE_FACTOR, NEWTON_ITERS, PoolSim, alt_price, target_price_for_prof};
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct MintLegParam {
     price: f64,
@@ -10,6 +14,114 @@ struct MintLegParam {
     prediction: f64,
 }
 
+pub(super) fn direct_bundle_cost_to_prof(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    target_prof: f64,
+) -> Option<BundleDirectEstimate> {
+    let mut cash_cost = 0.0_f64;
+    let mut member_plans = Vec::with_capacity(bundle_members.len());
+    for &idx in bundle_members {
+        let target_price = target_price_for_prof(sims[idx].prediction, target_prof);
+        let (cost, amount, new_price) = sims[idx].cost_to_price(target_price)?;
+        if !cost.is_finite() || !amount.is_finite() || !new_price.is_finite() {
+            return None;
+        }
+        cash_cost += cost;
+        member_plans.push((idx, amount, cost, new_price));
+    }
+    cash_cost.is_finite().then_some(BundleDirectEstimate {
+        cash_cost,
+        member_plans,
+    })
+}
+
+fn mint_bundle_boundary_amount(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    target_prof: f64,
+) -> Option<f64> {
+    let mut boundary_amount: Option<f64> = None;
+    for (idx, sim) in sims.iter().enumerate() {
+        if bundle_members.contains(&idx) {
+            continue;
+        }
+        let frontier_price = target_price_for_prof(sim.prediction, target_prof);
+        let tol = EPS * (1.0 + sim.price().abs().max(frontier_price.abs()));
+        if sim.price() <= frontier_price + tol {
+            continue;
+        }
+        let (sold, _, _) = sim.sell_to_price(frontier_price)?;
+        if sold <= DUST {
+            continue;
+        }
+        boundary_amount = Some(boundary_amount.map_or(sold, |current| current.min(sold)));
+    }
+    boundary_amount
+}
+
+pub(super) fn mint_bundle_cost_for_amount(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    target_prof: f64,
+    mint_amount: f64,
+) -> Option<BundleMintEstimate> {
+    if mint_amount <= DUST {
+        return Some(BundleMintEstimate {
+            cash_cost: 0.0,
+            mint_amount: 0.0,
+            sell_leg_plans: Vec::new(),
+        });
+    }
+
+    let mut sell_leg_plans = Vec::new();
+    let mut proceeds = 0.0_f64;
+    for (idx, sim) in sims.iter().enumerate() {
+        if bundle_members.contains(&idx) {
+            continue;
+        }
+        let frontier_price = target_price_for_prof(sim.prediction, target_prof);
+        let tol = EPS * (1.0 + sim.price().abs().max(frontier_price.abs()));
+        if sim.price() <= frontier_price + tol {
+            continue;
+        }
+        let (sold, leg_proceeds, new_price) = sim.sell_exact(mint_amount)?;
+        if sold <= DUST {
+            continue;
+        }
+        let frontier_tol = EPS * (1.0 + new_price.abs().max(frontier_price.abs()));
+        if new_price + frontier_tol < frontier_price {
+            return None;
+        }
+        if !leg_proceeds.is_finite() || !new_price.is_finite() {
+            return None;
+        }
+        proceeds += leg_proceeds;
+        sell_leg_plans.push((idx, sold, leg_proceeds, new_price));
+    }
+
+    if sell_leg_plans.is_empty() {
+        return None;
+    }
+
+    let cash_cost = mint_amount - proceeds;
+    cash_cost.is_finite().then_some(BundleMintEstimate {
+        cash_cost,
+        mint_amount,
+        sell_leg_plans,
+    })
+}
+
+pub(super) fn mint_bundle_cost_to_prof(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    target_prof: f64,
+) -> Option<BundleMintEstimate> {
+    let mint_amount = mint_bundle_boundary_amount(sims, bundle_members, target_prof)?;
+    mint_bundle_cost_for_amount(sims, bundle_members, target_prof, mint_amount)
+}
+
+#[cfg(test)]
 fn mint_rhs_for_target(
     sims: &[PoolSim],
     target_idx: usize,
@@ -26,6 +138,7 @@ fn mint_rhs_for_target(
     (rhs > 0.0).then_some(rhs)
 }
 
+#[cfg(test)]
 fn build_mint_leg_params(
     sims: &[PoolSim],
     target_idx: usize,
@@ -43,6 +156,7 @@ fn build_mint_leg_params(
         .collect()
 }
 
+#[cfg(test)]
 fn mint_reachability_bounds(params: &[MintLegParam]) -> (f64, f64, f64, f64) {
     let g0: f64 = params.iter().map(|p| p.price).sum();
     let m_cap: f64 = params.iter().map(|p| p.cap).fold(f64::INFINITY, f64::min);
@@ -61,6 +175,7 @@ fn mint_reachability_bounds(params: &[MintLegParam]) -> (f64, f64, f64, f64) {
     (g0, g_cap, g_tol, m_cap)
 }
 
+#[cfg(test)]
 fn solve_mint_amount_newton(
     params: &[MintLegParam],
     target_price: f64,
@@ -114,6 +229,7 @@ fn solve_mint_amount_newton(
     m
 }
 
+#[cfg(test)]
 fn mint_cost_from_amount(
     params: &[MintLegParam],
     mint_amount: f64,
@@ -157,6 +273,7 @@ fn mint_cost_from_amount(
     (cash_cost, value_cost, d_cost_d_pi)
 }
 
+#[cfg(test)]
 /// For the mint route, compute cost to bring an outcome's profitability to `target_prof`.
 /// Uses Newton's method to find mint amount where alt price = target price.
 /// Returns (cash_cost, value_cost, mint_amount, d_cash_cost_d_pi).

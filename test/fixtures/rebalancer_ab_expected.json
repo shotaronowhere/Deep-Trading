@@ -1,0 +1,26 @@
+{
+  "two_pool_single_tick_direct_only": {
+    "offchain_direct_ev_wei": 100102675011503407104,
+    "offchain_mixed_ev_wei": 100102675011503407104,
+    "offchain_action_count": 3,
+    "expected_onchain_exact_ev_wei": 100102546005066055662
+  },
+  "ninety_eight_outcome_multitick_direct_only": {
+    "offchain_direct_ev_wei": 98123254863635890176,
+    "offchain_mixed_ev_wei": 98123254863635890176,
+    "offchain_action_count": 98,
+    "expected_onchain_exact_ev_wei": 98122836565683311873
+  },
+  "small_bundle_mixed_case": {
+    "offchain_direct_ev_wei": 100132867689650405376,
+    "offchain_mixed_ev_wei": 100096481776136945664,
+    "offchain_action_count": 7,
+    "expected_onchain_exact_ev_wei": 100132739273228663690
+  },
+  "legacy_holdings_direct_only_case": {
+    "offchain_direct_ev_wei": 38863181796980015104,
+    "offchain_mixed_ev_wei": 38863181796980015104,
+    "offchain_action_count": 2,
+    "expected_onchain_exact_ev_wei": 38863079292458578752
+  }
+}
