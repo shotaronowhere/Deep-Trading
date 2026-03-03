@@ -1,0 +1,45 @@
+Loaded cached credentials.
+Here is the expert review of the self-financing mint execution and EV-guarded churn pruning implementations.
+
+### A) Findings
+
+**1. [P1] Preserve-aware mint bundle scoring ignores the expected value of preserved tokens, blinding the solver to optimal no-churn routes**
+* **Why it matters:** When EV-guarded churn pruning tests a preserved market, the planner calculates the mint route's profitability by treating the retained preserved token as a pure cash sink with no expected value return. This mathematically crushes the calculated profitability of the mint route. Furthermore, the `direct_minus_mint_marginal` route-switch threshold directly compares the cash cost of the mint route (which acquires BOTH the target and the preserved tokens) against the direct route (which acquires ONLY the target). These pricing flaws make the mint route falsely appear suboptimal, forcing the solver to abandon it and fall back to direct buys. The EV guard safely prevents an EV regression by rejecting this worse fallback plan, but the churn pruning feature completely fails to discover the actual optimal no-churn route.
+* **Evidence:** 
+  - `src/portfolio/core/bundle.rs:bundle_frontier`: `mint_prof` evaluates profitability using `sim.prediction` divided by `mint_price` (which includes the cost of all preserved legs), completely ignoring the `prediction` of the preserved legs.
+  - `src/portfolio/core/bundle.rs:direct_minus_mint_marginal`: Evaluates the direct cost of `bundle_members` against the mint cost without including the direct cost of the `preserve_sell_indices`.
+* **Recommended fix:**
+  - In `bundle_frontier`, aggregate the expected value of the preserved bundle: `let preserved_pred_sum: f64 = preserve_sell_indices.iter().filter(|&&i| i != idx).map(|&i| sims[i].prediction).sum();` and use `profitability(sim.prediction + preserved_pred_sum, mint_price)`.
+  - In `direct_minus_mint_marginal`, add the direct cost of acquiring the preserved tokens to the direct route side so the comparison is perfectly balanced:
+    ```rust
+    let mut direct = direct_bundle_marginal_cost_at_prof(sims, bundle_members, prof);
+    for &idx in preserve_sell_indices {
+        if !bundle_members.contains(&idx) {
+            direct += target_price_for_prof(sims[idx].prediction, prof) / FEE_FACTOR;
+        }
+    }
+    ```
+
+**2. [P2] Waterfall fully aborts if a mint segment hits the 256-round self-financing limit**
+* **Why it matters:** In cases of extreme budget constraint vs deep liquidity, a mint execution may require more than `MAX_ALT_ROUTE_ROUNDS` (256) to fully self-finance. If it hits this ceiling, `execute_mint_bundle_in_rounds` terminates early. `execute_bundle_step` then sees `minted + EPS < segment.mint_amount`, rolls back the entire step, and returns `false`. This causes `waterfall` to completely break out of its loop without attempting a direct-route fallback, permanently stranding unspent capital that could have been deployed into other independent outcomes.
+* **Evidence:** `src/portfolio/core/trading.rs:execute_bundle_step` strictly rolls back and returns false. `src/portfolio/core/waterfall.rs:waterfall_with_execution_gate_and_preserve` breaks the main loop on `!executed` instead of catching it.
+* **Recommended fix:** In `waterfall`, if `execute_bundle_step` fails, catch the failure and retry the iteration with `mint_available = false` (similar to how sub-gas steps are gracefully handled), or relax the strict rollback in `execute_bundle_step` to accept partial execution.
+
+**3. [P2] Budget-constrained mint segments report target profitability instead of realized profitability**
+* **Why it matters:** When `build_mint_segment` bisects to find an affordable `mint_amount`, it correctly sets `fully_affordable = false`, but returns the `target_prof` instead of the lower *realized* profitability. The `waterfall` loop then breaks due to budget exhaustion and returns this artificially low `target_prof` as `last_prof`. Passing this to Phase 3 recycling prevents it from correctly identifying and liquidating legacy inventory that sits below the true marginal frontier, leaving dead capital on the table.
+* **Evidence:** `src/portfolio/core/planning.rs:build_mint_segment` unconditionally assigns `target_prof: frontier_prof`. `src/portfolio/core/waterfall.rs` passes `executable_plan.final_prof` blindly to Phase 3.
+* **Recommended fix:** Calculate and return the realized profitability of the target bundle member in `build_mint_segment` when `fully_affordable` is false, or dynamically calculate `last_prof` from current pool state upon budget-exhaustion loop termination in `waterfall`.
+
+### B) Worth-resolving subset now (top-priority only)
+- **The [P1] bundle scoring flaws in `bundle.rs`.** This is the highest priority because the "EV-guarded greedy churn pruning" feature is functionally inert until it is fixed. The solver is currently blind to the actual economics of multi-target mints.
+- **The [P2] waterfall abort issue.** This is structurally dangerous as an extreme corner-case in a single pool can crash the entire off-chain plan generation. Adding a simple `mint_available = false` retry fallback is a cheap and effective safety net.
+
+### C) Test gaps
+- **No test validates that greedy EV-guarded churn pruning actually discovers and emits a multi-target mint route.** The existing `test_rebalance_preserve_set_blocks_sell_buy_churn_for_preserved_markets` only checks that churn is eliminated (which it technically achieves via the bug, by falling back to direct buys). A test must explicitly assert that `Action::Mint` is emitted with the preserved tokens successfully kept.
+- **No test verifies round-limit exhaustion.** There should be a test with a tiny budget and deep liquidity that proves hitting `MAX_ALT_ROUTE_ROUNDS` gracefully falls back to a direct route instead of stranding budget.
+- **No test validates `last_prof` precision after budget-partial mixed steps** to ensure Phase 3 recycling activates at the correct true marginal profitability.
+
+### D) Overall risk summary
+The **self-financing mint execution** is algorithmically sound, properly preventing upfront over-minting and cleanly maintaining cash invariants to eliminate flash-loan reliance. Floating-point drift is safely handled via the `EPS` bounds before rollback.
+
+However, the **EV-guarded greedy churn pruning** shipped with a foundational pricing flaw. Because it currently penalizes preserved tokens as pure liabilities (paying their cash cost without crediting their EV), the solver rejects optimal no-churn routes. Thanks to the strict EV-guard implementation, this fails safely in production (it simply falls back to the baseline plan with churn and no EV is lost), but the feature completely fails to deliver its intended gas/fee optimization. Applying the `[P1]` fix will immediately unlock the intended architectural benefits.

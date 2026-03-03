@@ -21,7 +21,7 @@ use deep_trading_bot::execution::runtime::{
 use deep_trading_bot::execution::tx_builder::build_trade_executor_calls;
 use deep_trading_bot::execution::{ITradeExecutor, SUSD_DECIMALS};
 use deep_trading_bot::pools;
-use deep_trading_bot::portfolio::{self, RebalanceMode};
+use deep_trading_bot::portfolio::{self, RebalanceFlags, RebalanceMode};
 
 fn parse_rebalance_mode() -> RebalanceMode {
     match std::env::var("REBALANCE_MODE")
@@ -42,6 +42,16 @@ fn parse_eth_usd() -> f64 {
         .unwrap_or(3000.0)
 }
 
+fn parse_enable_greedy_churn_pruning() -> bool {
+    matches!(
+        std::env::var("REBALANCE_ENABLE_GREEDY_CHURN_PRUNING")
+            .ok()
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on") | Some("enabled")
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
@@ -52,6 +62,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = ExecutionRuntimeConfig::from_env()?;
     let mode = parse_rebalance_mode();
     let eth_usd = parse_eth_usd();
+    let enable_greedy_churn_pruning = parse_enable_greedy_churn_pruning();
     let conservative_execution = ConservativeExecutionConfig {
         quote_latency_blocks: config.execution_quote_latency_blocks,
         adverse_move_bps_per_block: config.execution_adverse_move_bps_per_block,
@@ -87,6 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         reused_cache = resolved.reused_cache,
         execute_submit = config.execute_submit,
         mode = ?mode,
+        enable_greedy_churn_pruning,
         quote_latency_blocks = conservative_execution.quote_latency_blocks,
         adverse_move_bps_per_block = conservative_execution.adverse_move_bps_per_block,
         "trade executor resolved"
@@ -142,7 +154,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map(|(market, units)| (*market as &str, *units))
             .collect();
 
-        let actions = portfolio::rebalance_with_gas_pricing(
+        let actions = portfolio::rebalance_with_gas_pricing_and_flags(
             &balances_view,
             susds_balance,
             &slot0_results,
@@ -150,6 +162,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &gas_assumptions,
             1e-9,
             eth_usd,
+            RebalanceFlags {
+                enable_ev_guarded_greedy_churn_pruning: enable_greedy_churn_pruning,
+            },
         );
         if actions.is_empty() {
             tracing::info!(step = steps, "no actions generated; stopping execute loop");

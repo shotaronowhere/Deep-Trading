@@ -6,7 +6,8 @@ use super::merge::{
     split_sell_total_proceeds_with_inventory,
 };
 use super::rebalancer::{
-    RebalanceMode, phase1_liquidation_actions_for_test, rebalance, rebalance_with_mode,
+    RebalanceFlags, RebalanceMode, phase1_liquidation_actions_for_test, rebalance,
+    rebalance_with_mode, rebalance_with_mode_and_flags,
 };
 use super::sim::{PoolSim, Route, profitability};
 use super::trading::{ExecutionState, emit_mint_actions, execute_buy};
@@ -669,11 +670,140 @@ fn test_rebalance_with_mode_full_matches_rebalance_default() {
 
     let default_actions = rebalance(&balances, susd, &slot0_results);
     let mode_actions = rebalance_with_mode(&balances, susd, &slot0_results, RebalanceMode::Full);
+    let mode_default_flags_actions = rebalance_with_mode_and_flags(
+        &balances,
+        susd,
+        &slot0_results,
+        RebalanceMode::Full,
+        RebalanceFlags::default(),
+    );
 
     assert_eq!(
         format!("{default_actions:?}"),
         format!("{mode_actions:?}"),
         "full mode should match default rebalance behavior"
+    );
+    assert_eq!(
+        format!("{default_actions:?}"),
+        format!("{mode_default_flags_actions:?}"),
+        "default flags should preserve default full-mode behavior"
+    );
+}
+
+#[test]
+fn test_rebalance_full_flag_enabled_is_ev_guarded_vs_default() {
+    let markets = eligible_l1_markets_with_predictions();
+    assert!(
+        !markets.is_empty(),
+        "expected at least one eligible market with predictions"
+    );
+
+    let mut cases_with_preserve_candidates = 0usize;
+    for case_idx in 0..3usize {
+        let multipliers: Vec<f64> = (0..markets.len())
+            .map(|i| match (i + case_idx) % 6 {
+                0 => 1.45,
+                1 => 0.58,
+                2 => 1.22,
+                3 => 0.72,
+                4 => 1.08,
+                _ => 0.84,
+            })
+            .collect();
+        let slot0_results = build_slot0_results_for_markets(&markets, &multipliers);
+
+        let mut balances = HashMap::new();
+        for (i, market) in markets.iter().enumerate() {
+            if (i + case_idx) % 11 == 0 {
+                balances.insert(market.name, 1.0 + (i % 5) as f64 * 0.4);
+            }
+        }
+        let susd = 150.0 + 25.0 * case_idx as f64;
+
+        let default_actions = rebalance_with_mode_and_flags(
+            &balances,
+            susd,
+            &slot0_results,
+            RebalanceMode::Full,
+            RebalanceFlags::default(),
+        );
+        let flag_actions = rebalance_with_mode_and_flags(
+            &balances,
+            susd,
+            &slot0_results,
+            RebalanceMode::Full,
+            RebalanceFlags {
+                enable_ev_guarded_greedy_churn_pruning: true,
+            },
+        );
+
+        assert_action_values_are_finite(&default_actions);
+        assert_action_values_are_finite(&flag_actions);
+        assert_rebalance_action_invariants(&default_actions, &slot0_results, &balances, susd);
+        assert_rebalance_action_invariants(&flag_actions, &slot0_results, &balances, susd);
+
+        let default_ev = replay_actions_to_ev(&default_actions, &slot0_results, &balances, susd);
+        let flag_ev = replay_actions_to_ev(&flag_actions, &slot0_results, &balances, susd);
+        let tol = 1e-9 * (1.0 + default_ev.abs() + flag_ev.abs());
+        assert!(
+            flag_ev + tol >= default_ev,
+            "flag-enabled EV should not regress in case {}: default={:.12}, flag={:.12}, tol={:.12}",
+            case_idx,
+            default_ev,
+            flag_ev,
+            tol
+        );
+
+        let has_mint = default_actions
+            .iter()
+            .any(|action| matches!(action, Action::Mint { .. }));
+        if has_mint {
+            let mut sold_amounts: HashMap<&'static str, f64> = HashMap::new();
+            let mut seen_sell: HashSet<&'static str> = HashSet::new();
+            let mut sold_before_buy: HashSet<&'static str> = HashSet::new();
+            for action in &default_actions {
+                match action {
+                    Action::Sell {
+                        market_name,
+                        amount,
+                        ..
+                    } => {
+                        seen_sell.insert(*market_name);
+                        *sold_amounts.entry(*market_name).or_insert(0.0) += amount.max(0.0);
+                    }
+                    Action::Buy { market_name, .. } => {
+                        if seen_sell.contains(market_name) {
+                            sold_before_buy.insert(*market_name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let (final_holdings, _) =
+                replay_actions_to_state(&default_actions, &slot0_results, &balances, susd);
+            let has_preserve_candidate = sold_before_buy.iter().any(|market_name| {
+                let sold = sold_amounts.get(market_name).copied().unwrap_or(0.0);
+                if sold <= 0.0 {
+                    return false;
+                }
+                let initial_held = balances.get(market_name).copied().unwrap_or(0.0).max(0.0);
+                let final_held = final_holdings
+                    .get(market_name)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                final_held > initial_held + 1e-12
+            });
+            if has_preserve_candidate {
+                cases_with_preserve_candidates += 1;
+            }
+        }
+    }
+
+    assert!(
+        cases_with_preserve_candidates > 0,
+        "expected at least one deterministic case with preserve candidates so flag-on churn pruning path is exercised"
     );
 }
 

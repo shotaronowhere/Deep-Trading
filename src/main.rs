@@ -16,7 +16,7 @@ use deep_trading_bot::execution::runtime::{
     DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
 };
 use deep_trading_bot::pools;
-use deep_trading_bot::portfolio::{self, RebalanceMode, TraceConfig};
+use deep_trading_bot::portfolio::{self, RebalanceFlags, RebalanceMode, TraceConfig};
 
 fn parse_rebalance_mode() -> RebalanceMode {
     match std::env::var("REBALANCE_MODE")
@@ -66,6 +66,16 @@ fn parse_execution_max_stale_blocks() -> u64 {
         .unwrap_or(DEFAULT_EXECUTION_MAX_STALE_BLOCKS)
 }
 
+fn parse_enable_greedy_churn_pruning() -> bool {
+    matches!(
+        std::env::var("REBALANCE_ENABLE_GREEDY_CHURN_PRUNING")
+            .ok()
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on") | Some("enabled")
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     dotenvy::dotenv().ok();
@@ -91,6 +101,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mode = parse_rebalance_mode();
     let eth_usd = parse_eth_usd();
+    let enable_greedy_churn_pruning = parse_enable_greedy_churn_pruning();
     let conservative_execution = ConservativeExecutionConfig {
         quote_latency_blocks: parse_quote_latency_blocks(),
         adverse_move_bps_per_block: parse_adverse_move_bps_per_block(),
@@ -128,7 +139,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|(market, units)| (*market as &str, *units))
         .collect();
 
-    let actions = portfolio::rebalance_with_gas_pricing(
+    let actions = portfolio::rebalance_with_gas_pricing_and_flags(
         &balances_view,
         initial_susd,
         &slot0_results,
@@ -136,6 +147,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &gas_assumptions,
         1e-9,
         eth_usd,
+        RebalanceFlags {
+            enable_ev_guarded_greedy_churn_pruning: enable_greedy_churn_pruning,
+        },
     );
     let mut plans = build_group_plans_with_default_edges_and_market_context(
         &actions,
@@ -178,6 +192,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!(
         mode = ?mode,
         eth_usd,
+        enable_greedy_churn_pruning,
         markets = slot0_results.len(),
         actions = actions.len(),
         "completed rebalance planning"

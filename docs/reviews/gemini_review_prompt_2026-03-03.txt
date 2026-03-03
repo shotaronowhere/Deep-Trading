@@ -1,0 +1,48 @@
+You are reviewing a Rust off-chain DeFi rebalancing solver for correctness, EV behavior, and regression risk.
+
+Primary request:
+1) Review the implementation quality of these recent changes:
+- Self-financing mint execution (repeated mint+sell rounds under cash constraints)
+- Optional EV-guarded greedy churn pruning (default OFF, toggleable ON)
+2) Critique both algorithm and implementation.
+3) Focus on bugs, EV regressions, accounting/path-dependency issues, state consistency, and test adequacy.
+4) Provide severity-ranked findings with file/line references, plus concrete fixes.
+5) Explicitly call out which findings are truly worth resolving before production.
+
+Important context:
+- Default solver should remain the clean baseline flow:
+  liquidate -> waterfall -> recycle -> arb -> waterfall -> recycle loop
+- EV-guarded greedy churn pruning is optional and disabled by default.
+- The preserve/churn selector is intended as non-regressive local improvement (not global optimality).
+- Prior benchmark concern: preserve policies can worsen EV if over-constrained.
+
+Please output in this format:
+A) Findings (ordered by severity):
+- [P0/P1/P2/P3] title
+- Why it matters
+- Evidence with file:line
+- Recommended fix
+B) Worth-resolving subset now (top-priority only)
+C) Test gaps
+D) Overall risk summary
+
+Review these files and docs as context:
+@docs/architecture.md
+@docs/rebalancer.md
+@docs/portfolio.md
+@docs/waterfall.md
+@docs/rebalancer_mixed.md
+@docs/rebalancer_self_financing_no_churn_2026-03-03.md
+@src/portfolio/core/rebalancer.rs
+@src/portfolio/core/waterfall.rs
+@src/portfolio/core/planning.rs
+@src/portfolio/core/solver.rs
+@src/portfolio/core/bundle.rs
+@src/portfolio/core/trading.rs
+@src/portfolio/core/mod.rs
+@src/portfolio/mod.rs
+@src/portfolio/tests.rs
+@src/portfolio/tests/oracle.rs
+@src/main.rs
+@src/bin/execute.rs
+@src/bin/plan_preview.rs

@@ -5,6 +5,7 @@ pub use core::diagnostics::{
     replay_actions_to_portfolio_state,
 };
 pub use core::{
-    Action, RebalanceMode, rebalance, rebalance_with_gas, rebalance_with_gas_pricing,
-    rebalance_with_mode,
+    Action, RebalanceFlags, RebalanceMode, rebalance, rebalance_with_gas,
+    rebalance_with_gas_and_flags, rebalance_with_gas_pricing, rebalance_with_gas_pricing_and_flags,
+    rebalance_with_mode, rebalance_with_mode_and_flags,
 };

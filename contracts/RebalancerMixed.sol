@@ -116,7 +116,6 @@ contract RebalancerMixed is Rebalancer {
             _computePsiFromSorted(order, count, sqrtPrices, liquidities, params.sqrtPredX96, params.isToken1, budget, params.fee);
         if (activeCount == 0) return (0, 0, false, 0);
         if (activeCount > MAX_MIXED_ACTIVE) return (0, 0, true, FB_ACTIVE_TOO_LARGE);
-        if (activeCount >= count) return (0, 0, true, FB_NO_NON_ACTIVE);
 
         bool[] memory active = new bool[](params.tokens.length);
         uint256 piStarWad = 0;
@@ -126,15 +125,20 @@ contract RebalancerMixed is Rebalancer {
             uint256 p0 = _priceE18(sqrtPrices[i], params.isToken1[i]);
             priceSum += p0;
         }
-        for (uint256 k = 0; k < count; k++) {
+        for (uint256 k = 0; k < activeCount; k++) {
             uint256 idx = order[k];
-            if (k < activeCount) {
-                active[idx] = true;
-                piStarWad += _priceE18(params.sqrtPredX96[idx], params.isToken1[idx]);
+            active[idx] = true;
+            piStarWad += _priceE18(params.sqrtPredX96[idx], params.isToken1[idx]);
+        }
+        uint256 activeUniverseCount = 0;
+        for (uint256 i = 0; i < params.tokens.length; i++) {
+            if (active[i]) {
+                activeUniverseCount++;
             } else {
-                s0Wad += _priceE18(sqrtPrices[idx], params.isToken1[idx]);
+                s0Wad += _priceE18(sqrtPrices[i], params.isToken1[i]);
             }
         }
+        if (activeUniverseCount == params.tokens.length) return (0, 0, true, FB_NO_NON_ACTIVE);
 
         if (piStarWad == 0) return (0, 0, true, FB_SOLVE_FAILED);
 

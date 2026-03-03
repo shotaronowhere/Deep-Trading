@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::sim::{EPS, FEE_FACTOR, PoolSim, alt_price, profitability, target_price_for_prof};
 
 pub(super) const ACTIVE_FRONTIER_REL_TOL: f64 = 1e-9;
@@ -59,6 +61,7 @@ pub(super) fn bundle_frontier(
     remaining_budget: f64,
     gas_direct_susd: f64,
     gas_mint_susd: f64,
+    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<BundleFrontier> {
     let mut best_direct_prof = f64::NEG_INFINITY;
     for sim in sims {
@@ -98,9 +101,31 @@ pub(super) fn bundle_frontier(
     }
 
     let price_sum: f64 = sims.iter().map(|sim| sim.price()).sum();
+    let preserved_price_sum: f64 = preserve_sell_indices
+        .iter()
+        .filter_map(|&idx| sims.get(idx))
+        .map(|sim| sim.price())
+        .sum();
+    let preserved_prediction_sum: f64 = preserve_sell_indices
+        .iter()
+        .filter_map(|&idx| sims.get(idx))
+        .map(|sim| sim.prediction)
+        .sum();
     let mut best_mint_prof = f64::NEG_INFINITY;
     for (idx, sim) in sims.iter().enumerate() {
-        let mint_prof = profitability(sim.prediction, alt_price(sims, idx, price_sum));
+        let preserved_non_target_sum = if preserve_sell_indices.contains(&idx) {
+            preserved_price_sum - sim.price()
+        } else {
+            preserved_price_sum
+        };
+        let preserved_non_target_prediction_sum = if preserve_sell_indices.contains(&idx) {
+            preserved_prediction_sum - sim.prediction
+        } else {
+            preserved_prediction_sum
+        };
+        let mint_price = alt_price(sims, idx, price_sum) + preserved_non_target_sum.max(0.0);
+        let mint_prediction = sim.prediction + preserved_non_target_prediction_sum.max(0.0);
+        let mint_prof = profitability(mint_prediction, mint_price);
         if mint_prof > 0.0
             && remaining_budget * mint_prof >= gas_mint_susd
             && mint_prof > best_mint_prof
@@ -115,7 +140,19 @@ pub(super) fn bundle_frontier(
     let mut members = Vec::new();
     let mut next_prof = 0.0_f64;
     for (idx, sim) in sims.iter().enumerate() {
-        let mint_prof = profitability(sim.prediction, alt_price(sims, idx, price_sum));
+        let preserved_non_target_sum = if preserve_sell_indices.contains(&idx) {
+            preserved_price_sum - sim.price()
+        } else {
+            preserved_price_sum
+        };
+        let preserved_non_target_prediction_sum = if preserve_sell_indices.contains(&idx) {
+            preserved_prediction_sum - sim.prediction
+        } else {
+            preserved_prediction_sum
+        };
+        let mint_price = alt_price(sims, idx, price_sum) + preserved_non_target_sum.max(0.0);
+        let mint_prediction = sim.prediction + preserved_non_target_prediction_sum.max(0.0);
+        let mint_prof = profitability(mint_prediction, mint_price);
         if mint_prof <= 0.0 || remaining_budget * mint_prof < gas_mint_susd {
             continue;
         }
@@ -144,15 +181,32 @@ pub(super) fn direct_bundle_marginal_cost_at_prof(
         .sum()
 }
 
+pub(super) fn direct_preserve_marginal_cost_at_spot(
+    sims: &[PoolSim],
+    bundle_members: &[usize],
+    preserve_sell_indices: &HashSet<usize>,
+) -> f64 {
+    preserve_sell_indices
+        .iter()
+        .filter_map(|&idx| {
+            if idx >= sims.len() || bundle_members.contains(&idx) {
+                return None;
+            }
+            Some(sims[idx].price() / FEE_FACTOR)
+        })
+        .sum()
+}
+
 pub(super) fn mint_bundle_marginal_cost_at_prof(
     sims: &[PoolSim],
     bundle_members: &[usize],
     target_prof: f64,
+    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<f64> {
     let mut sellable_credit = 0.0_f64;
     let mut sellable = false;
     for (idx, sim) in sims.iter().enumerate() {
-        if bundle_members.contains(&idx) {
+        if bundle_members.contains(&idx) || preserve_sell_indices.contains(&idx) {
             continue;
         }
         let frontier_price = target_price_for_prof(sim.prediction, target_prof);

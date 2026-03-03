@@ -1,11 +1,11 @@
-#[cfg(test)]
 use std::collections::HashSet;
 #[cfg(test)]
 use std::sync::OnceLock;
 
 use super::bundle::{
     BundleFrontier, BundleRouteKind, BundleSegmentPlan, BundleStepPlan,
-    direct_bundle_marginal_cost_at_prof, mint_bundle_marginal_cost_at_prof,
+    direct_bundle_marginal_cost_at_prof, direct_preserve_marginal_cost_at_spot,
+    mint_bundle_marginal_cost_at_prof,
 };
 use super::sim::{DUST, EPS, PoolSim};
 #[cfg(test)]
@@ -138,9 +138,14 @@ fn direct_minus_mint_marginal(
     sims: &[PoolSim],
     bundle_members: &[usize],
     prof: f64,
+    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<f64> {
-    let mint = mint_bundle_marginal_cost_at_prof(sims, bundle_members, prof)?;
-    Some(direct_bundle_marginal_cost_at_prof(sims, bundle_members, prof) - mint)
+    let mint =
+        mint_bundle_marginal_cost_at_prof(sims, bundle_members, prof, preserve_sell_indices)?;
+    let direct_bundle = direct_bundle_marginal_cost_at_prof(sims, bundle_members, prof);
+    let direct_preserve =
+        direct_preserve_marginal_cost_at_spot(sims, bundle_members, preserve_sell_indices);
+    Some((direct_bundle + direct_preserve) - mint)
 }
 
 fn build_direct_segment(
@@ -187,8 +192,10 @@ fn build_mint_segment(
     bundle_members: &[usize],
     frontier_prof: f64,
     budget: Option<f64>,
+    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<(BundleSegmentPlan, bool)> {
-    let mut estimate = mint_bundle_cost_to_prof(sims, bundle_members, frontier_prof)?;
+    let mut estimate =
+        mint_bundle_cost_to_prof(sims, bundle_members, frontier_prof, preserve_sell_indices)?;
     let mut fully_affordable = true;
 
     if let Some(available_budget) = budget
@@ -202,9 +209,13 @@ fn build_mint_segment(
         let mut best = None;
         for _ in 0..SOLVE_PROF_ITERS {
             let mid = 0.5 * (lo + hi);
-            let Some(candidate) =
-                mint_bundle_cost_for_amount(sims, bundle_members, frontier_prof, mid)
-            else {
+            let Some(candidate) = mint_bundle_cost_for_amount(
+                sims,
+                bundle_members,
+                frontier_prof,
+                mid,
+                preserve_sell_indices,
+            ) else {
                 hi = mid;
                 continue;
             };
@@ -235,12 +246,26 @@ fn build_mint_segment(
     ))
 }
 
-fn maybe_route_switch_prof(sims: &[PoolSim], frontier: &BundleFrontier) -> Option<f64> {
+fn maybe_route_switch_prof(
+    sims: &[PoolSim],
+    frontier: &BundleFrontier,
+    preserve_sell_indices: &HashSet<usize>,
+) -> Option<f64> {
     if frontier.next_prof <= 0.0 || frontier.next_prof + EPS >= frontier.current_prof {
         return None;
     }
-    let start_gap = direct_minus_mint_marginal(sims, &frontier.members, frontier.current_prof)?;
-    let end_gap = direct_minus_mint_marginal(sims, &frontier.members, frontier.next_prof)?;
+    let start_gap = direct_minus_mint_marginal(
+        sims,
+        &frontier.members,
+        frontier.current_prof,
+        preserve_sell_indices,
+    )?;
+    let end_gap = direct_minus_mint_marginal(
+        sims,
+        &frontier.members,
+        frontier.next_prof,
+        preserve_sell_indices,
+    )?;
     if start_gap >= 0.0 || end_gap <= 0.0 {
         return None;
     }
@@ -249,7 +274,9 @@ fn maybe_route_switch_prof(sims: &[PoolSim], frontier: &BundleFrontier) -> Optio
     let mut hi = frontier.current_prof;
     for _ in 0..SOLVE_PROF_ITERS {
         let mid = 0.5 * (lo + hi);
-        let Some(gap_mid) = direct_minus_mint_marginal(sims, &frontier.members, mid) else {
+        let Some(gap_mid) =
+            direct_minus_mint_marginal(sims, &frontier.members, mid, preserve_sell_indices)
+        else {
             return None;
         };
         if gap_mid > 0.0 {
@@ -270,6 +297,7 @@ pub(super) fn plan_bundle_step_with_scratch(
     mint_available: bool,
     budget: Option<f64>,
     sim_state: &mut Vec<PoolSim>,
+    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<BundleStepPlan> {
     if frontier.members.is_empty() || frontier.current_prof <= 0.0 {
         return None;
@@ -281,7 +309,12 @@ pub(super) fn plan_bundle_step_with_scratch(
         direct_bundle_marginal_cost_at_prof(sims, &frontier.members, frontier.current_prof)
     });
     let mint_start = if mint_available {
-        mint_bundle_marginal_cost_at_prof(sims, &frontier.members, frontier.current_prof)
+        mint_bundle_marginal_cost_at_prof(
+            sims,
+            &frontier.members,
+            frontier.current_prof,
+            preserve_sell_indices,
+        )
     } else {
         None
     };
@@ -289,8 +322,13 @@ pub(super) fn plan_bundle_step_with_scratch(
     if let Some(mint_cost) = mint_start
         && mint_cost + EPS < direct_start.unwrap_or(f64::INFINITY)
     {
-        let (segment, _) =
-            build_mint_segment(sims, &frontier.members, frontier.current_prof, budget)?;
+        let (segment, _) = build_mint_segment(
+            sims,
+            &frontier.members,
+            frontier.current_prof,
+            budget,
+            preserve_sell_indices,
+        )?;
         return Some(BundleStepPlan {
             segments: vec![segment],
             final_prof: frontier.current_prof,
@@ -299,8 +337,13 @@ pub(super) fn plan_bundle_step_with_scratch(
 
     if !direct_feasible_at_frontier {
         if mint_available {
-            let (segment, _) =
-                build_mint_segment(sims, &frontier.members, frontier.current_prof, budget)?;
+            let (segment, _) = build_mint_segment(
+                sims,
+                &frontier.members,
+                frontier.current_prof,
+                budget,
+                preserve_sell_indices,
+            )?;
             return Some(BundleStepPlan {
                 segments: vec![segment],
                 final_prof: frontier.current_prof,
@@ -310,7 +353,7 @@ pub(super) fn plan_bundle_step_with_scratch(
     }
 
     let route_switch_prof = if mint_available {
-        maybe_route_switch_prof(sims, frontier)
+        maybe_route_switch_prof(sims, frontier, preserve_sell_indices)
     } else {
         None
     };
@@ -345,6 +388,7 @@ pub(super) fn plan_bundle_step_with_scratch(
             &frontier.members,
             direct_final_prof,
             remaining_budget,
+            preserve_sell_indices,
         ) {
             if mint_segment.cash_cost > DUST {
                 segments.push(mint_segment);

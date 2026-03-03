@@ -2,7 +2,6 @@ use super::bundle::{BundleDirectEstimate, BundleMintEstimate};
 use super::sim::{DUST, EPS, PoolSim, target_price_for_prof};
 #[cfg(test)]
 use super::sim::{FEE_FACTOR, NEWTON_ITERS, alt_price};
-#[cfg(test)]
 use std::collections::HashSet;
 
 #[cfg(test)]
@@ -40,10 +39,11 @@ fn mint_bundle_boundary_amount(
     sims: &[PoolSim],
     bundle_members: &[usize],
     target_prof: f64,
+    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<f64> {
     let mut boundary_amount: Option<f64> = None;
     for (idx, sim) in sims.iter().enumerate() {
-        if bundle_members.contains(&idx) {
+        if bundle_members.contains(&idx) || preserve_sell_indices.contains(&idx) {
             continue;
         }
         let frontier_price = target_price_for_prof(sim.prediction, target_prof);
@@ -65,6 +65,7 @@ pub(super) fn mint_bundle_cost_for_amount(
     bundle_members: &[usize],
     target_prof: f64,
     mint_amount: f64,
+    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<BundleMintEstimate> {
     if mint_amount <= DUST {
         return Some(BundleMintEstimate {
@@ -77,7 +78,7 @@ pub(super) fn mint_bundle_cost_for_amount(
     let mut sell_leg_plans = Vec::new();
     let mut proceeds = 0.0_f64;
     for (idx, sim) in sims.iter().enumerate() {
-        if bundle_members.contains(&idx) {
+        if bundle_members.contains(&idx) || preserve_sell_indices.contains(&idx) {
             continue;
         }
         let frontier_price = target_price_for_prof(sim.prediction, target_prof);
@@ -116,9 +117,17 @@ pub(super) fn mint_bundle_cost_to_prof(
     sims: &[PoolSim],
     bundle_members: &[usize],
     target_prof: f64,
+    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<BundleMintEstimate> {
-    let mint_amount = mint_bundle_boundary_amount(sims, bundle_members, target_prof)?;
-    mint_bundle_cost_for_amount(sims, bundle_members, target_prof, mint_amount)
+    let mint_amount =
+        mint_bundle_boundary_amount(sims, bundle_members, target_prof, preserve_sell_indices)?;
+    mint_bundle_cost_for_amount(
+        sims,
+        bundle_members,
+        target_prof,
+        mint_amount,
+        preserve_sell_indices,
+    )
 }
 
 #[cfg(test)]

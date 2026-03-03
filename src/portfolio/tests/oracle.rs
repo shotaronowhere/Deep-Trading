@@ -5,7 +5,10 @@ use super::super::planning::{
     PlannedRoute, active_skip_indices, cost_for_route, plan_active_routes,
     plan_active_routes_with_scratch, plan_is_budget_feasible, solve_prof,
 };
-use super::super::rebalancer::{RebalanceMode, rebalance, rebalance_with_gas_pricing};
+use super::super::rebalancer::{
+    RebalanceMode, rebalance, rebalance_with_custom_predictions_and_preserve_for_test,
+    rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test, rebalance_with_gas_pricing,
+};
 use super::super::sim::{
     EPS, PoolSim, Route, alt_price, build_sims, profitability, target_price_for_prof,
 };
@@ -2099,6 +2102,537 @@ fn test_waterfall_mint_brackets_preserve_frontier_members() {
     assert!(
         !sold_markets.contains("WB1"),
         "the highest direct-profitability frontier member must not be sold in the first mint bracket"
+    );
+}
+
+#[test]
+fn test_rebalance_preserve_set_blocks_sell_buy_churn_for_preserved_markets() {
+    let prices = [0.399554, 0.246718, 0.283701, 0.080065];
+    let preds = [0.524024, 0.313937, 0.342533, 0.100115];
+    let initial_budget = 17.358789;
+    let names = ["PC1", "PC2", "PC3", "PC4"];
+    let tokens = [
+        "0x4444444444444444444444444444444444444444",
+        "0x5555555555555555555555555555555555555555",
+        "0x6666666666666666666666666666666666666666",
+        "0x7777777777777777777777777777777777777777",
+    ];
+    let slot0_results: Vec<_> = names
+        .iter()
+        .zip(tokens.iter())
+        .zip(prices.iter())
+        .map(|((name, token), price)| {
+            mock_slot0_market_with_liquidity_and_ticks(
+                name,
+                token,
+                *price,
+                1_000_000_000_000_000_000_000,
+                -220_000,
+                220_000,
+            )
+        })
+        .collect();
+    let predictions: HashMap<String, f64> = names
+        .iter()
+        .zip(preds.iter())
+        .map(|(name, pred)| (normalize_market_name(name), *pred))
+        .collect();
+
+    let baseline_actions = rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test(
+        &HashMap::new(),
+        initial_budget,
+        &slot0_results,
+        &predictions,
+        true,
+    );
+    let preserve_markets: HashSet<&'static str> = baseline_actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Buy { market_name, .. } => Some(*market_name),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !preserve_markets.is_empty(),
+        "fixture should include buy-side outcomes to preserve"
+    );
+    let baseline_has_churn_overlap = baseline_actions.iter().any(|action| match action {
+        Action::Sell { market_name, .. } => preserve_markets.contains(market_name),
+        _ => false,
+    });
+    assert!(
+        baseline_has_churn_overlap,
+        "expected baseline strict-no-arb run to exhibit sell/buy overlap before preserve filter"
+    );
+
+    let preserved_actions = rebalance_with_custom_predictions_and_preserve_for_test(
+        &HashMap::new(),
+        initial_budget,
+        &slot0_results,
+        &predictions,
+        &preserve_markets,
+        true,
+    );
+    let preserved_has_overlap = preserved_actions.iter().any(|action| match action {
+        Action::Sell { market_name, .. } => preserve_markets.contains(market_name),
+        _ => false,
+    });
+    assert!(
+        !preserved_has_overlap,
+        "preserve set should block mint-sell churn for preserved future-buy markets"
+    );
+
+    let initial_balances: HashMap<&str, f64> = HashMap::new();
+    let (baseline_holdings, baseline_cash) = replay_actions_to_state(
+        &baseline_actions,
+        &slot0_results,
+        &initial_balances,
+        initial_budget,
+    );
+    let (preserved_holdings, preserved_cash) = replay_actions_to_state(
+        &preserved_actions,
+        &slot0_results,
+        &initial_balances,
+        initial_budget,
+    );
+    let custom_ev = |holdings: &HashMap<&str, f64>, cash: f64| -> f64 {
+        names
+            .iter()
+            .zip(preds.iter())
+            .fold(cash, |acc, (name, pred)| {
+                acc + holdings.get(name).copied().unwrap_or(0.0).max(0.0) * *pred
+            })
+    };
+    let baseline_ev = custom_ev(&baseline_holdings, baseline_cash);
+    let preserved_ev = custom_ev(&preserved_holdings, preserved_cash);
+    println!(
+        "[preserve-no-churn] baseline_ev={:.12} preserved_ev={:.12} delta={:.12}",
+        baseline_ev,
+        preserved_ev,
+        preserved_ev - baseline_ev
+    );
+    assert!(
+        baseline_ev.is_finite() && preserved_ev.is_finite(),
+        "EV should remain finite in preserve/no-churn fixture"
+    );
+}
+
+#[test]
+#[ignore = "search helper; run explicitly"]
+fn sweep_preserve_no_churn_ev_impact() {
+    let case_count = std::env::var("PRESERVE_SWEEP_CASES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(300);
+    let seed = std::env::var("PRESERVE_SWEEP_SEED")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0x50_52_45_53_45_52_56_45u64);
+    let force_partial_override =
+        std::env::var("PRESERVE_SWEEP_FORCE_PARTIAL")
+            .ok()
+            .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" => Some(true),
+                "0" | "false" => Some(false),
+                _ => None,
+            });
+    let mut rng = TestRng::new(seed);
+    let all_preds = crate::pools::prediction_map();
+
+    #[derive(Clone)]
+    struct CaseReport {
+        case_idx: usize,
+        markets: usize,
+        delta: f64,
+        baseline_ev: f64,
+        preserved_ev: f64,
+        changed: bool,
+        overlap: bool,
+        preserve_count: usize,
+        churn_sell_amount: f64,
+        churn_proceeds: f64,
+        baseline_mint: f64,
+        preserved_mint: f64,
+        baseline_actions: usize,
+        preserved_actions: usize,
+        guard_picks_preserve: bool,
+        guard_delta: f64,
+        greedy_delta: f64,
+    }
+
+    let mut reports: Vec<CaseReport> = Vec::with_capacity(case_count);
+    for case_idx in 0..case_count {
+        let force_partial = force_partial_override.unwrap_or_else(|| rng.chance(1, 2));
+        let (slot0_results, balances, susd_balance) =
+            build_rebalance_fuzz_case(&mut rng, force_partial);
+        let predictions: HashMap<String, f64> = slot0_results
+            .iter()
+            .map(|(_, market)| {
+                let key = normalize_market_name(market.name);
+                let pred = all_preds
+                    .get(&key)
+                    .copied()
+                    .expect("selected fuzz market should have prediction");
+                (key, pred)
+            })
+            .collect();
+
+        let baseline_actions = rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test(
+            &balances,
+            susd_balance,
+            &slot0_results,
+            &predictions,
+            true,
+        );
+        let mut sold_amounts: HashMap<&'static str, f64> = HashMap::new();
+        let mut seen_sell: HashSet<&'static str> = HashSet::new();
+        let mut sold_before_buy: HashSet<&'static str> = HashSet::new();
+        for action in &baseline_actions {
+            match action {
+                Action::Sell {
+                    market_name,
+                    amount,
+                    ..
+                } => {
+                    seen_sell.insert(*market_name);
+                    *sold_amounts.entry(*market_name).or_insert(0.0) += amount.max(0.0);
+                }
+                Action::Buy { market_name, .. } => {
+                    if seen_sell.contains(market_name) {
+                        sold_before_buy.insert(*market_name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (baseline_holdings, _) =
+            replay_actions_to_state(&baseline_actions, &slot0_results, &balances, susd_balance);
+        let mut preserve_candidates: Vec<(&'static str, f64)> = sold_before_buy
+            .iter()
+            .filter_map(|market_name| {
+                let final_held = baseline_holdings
+                    .get(market_name)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let initial_held = balances.get(market_name).copied().unwrap_or(0.0).max(0.0);
+                if final_held <= initial_held + EPS {
+                    return None;
+                }
+                let sold_amount = sold_amounts.get(market_name).copied().unwrap_or(0.0);
+                Some((*market_name, sold_amount))
+            })
+            .collect();
+        preserve_candidates.sort_by(|(name_a, sold_a), (name_b, sold_b)| {
+            sold_b.total_cmp(sold_a).then_with(|| name_a.cmp(name_b))
+        });
+        let preserve_markets: HashSet<&'static str> =
+            preserve_candidates.iter().map(|(name, _)| *name).collect();
+
+        let overlap = baseline_actions.iter().any(|action| match action {
+            Action::Sell { market_name, .. } => preserve_markets.contains(market_name),
+            _ => false,
+        });
+        let churn_sell_amount: f64 = baseline_actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Sell {
+                    market_name,
+                    amount,
+                    ..
+                } if preserve_markets.contains(market_name) => Some(*amount),
+                _ => None,
+            })
+            .sum();
+        let churn_proceeds: f64 = baseline_actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Sell {
+                    market_name,
+                    proceeds,
+                    ..
+                } if preserve_markets.contains(market_name) => Some(*proceeds),
+                _ => None,
+            })
+            .sum();
+        let baseline_mint: f64 = baseline_actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Mint { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .sum();
+
+        let preserved_actions = rebalance_with_custom_predictions_and_preserve_for_test(
+            &balances,
+            susd_balance,
+            &slot0_results,
+            &predictions,
+            &preserve_markets,
+            true,
+        );
+        let preserved_mint: f64 = preserved_actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Mint { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .sum();
+
+        assert_action_values_are_finite(&baseline_actions);
+        assert_action_values_are_finite(&preserved_actions);
+        assert_rebalance_action_invariants(
+            &baseline_actions,
+            &slot0_results,
+            &balances,
+            susd_balance,
+        );
+        assert_rebalance_action_invariants(
+            &preserved_actions,
+            &slot0_results,
+            &balances,
+            susd_balance,
+        );
+
+        let baseline_ev =
+            replay_actions_to_ev(&baseline_actions, &slot0_results, &balances, susd_balance);
+        let preserved_ev =
+            replay_actions_to_ev(&preserved_actions, &slot0_results, &balances, susd_balance);
+        let ev_tol = 1e-10 * (1.0 + baseline_ev.abs() + preserved_ev.abs());
+        let guard_picks_preserve = preserved_ev + ev_tol >= baseline_ev;
+        let guard_delta = if guard_picks_preserve {
+            preserved_ev - baseline_ev
+        } else {
+            0.0
+        };
+        let mut greedy_best_ev = baseline_ev;
+        let mut greedy_preserve: HashSet<&'static str> = HashSet::new();
+        for (market_name, _) in &preserve_candidates {
+            let mut trial_preserve = greedy_preserve.clone();
+            trial_preserve.insert(*market_name);
+            let trial_actions = rebalance_with_custom_predictions_and_preserve_for_test(
+                &balances,
+                susd_balance,
+                &slot0_results,
+                &predictions,
+                &trial_preserve,
+                true,
+            );
+            let trial_ev =
+                replay_actions_to_ev(&trial_actions, &slot0_results, &balances, susd_balance);
+            let trial_tol = 1e-10 * (1.0 + greedy_best_ev.abs() + trial_ev.abs());
+            if trial_ev > greedy_best_ev + trial_tol {
+                greedy_best_ev = trial_ev;
+                greedy_preserve = trial_preserve;
+            }
+        }
+        let greedy_delta = greedy_best_ev - baseline_ev;
+        assert!(
+            baseline_ev.is_finite() && preserved_ev.is_finite(),
+            "EV should be finite in preserve/no-churn sweep case {}",
+            case_idx
+        );
+
+        reports.push(CaseReport {
+            case_idx,
+            markets: slot0_results.len(),
+            delta: preserved_ev - baseline_ev,
+            baseline_ev,
+            preserved_ev,
+            changed: baseline_actions != preserved_actions,
+            overlap,
+            preserve_count: preserve_markets.len(),
+            churn_sell_amount,
+            churn_proceeds,
+            baseline_mint,
+            preserved_mint,
+            baseline_actions: baseline_actions.len(),
+            preserved_actions: preserved_actions.len(),
+            guard_picks_preserve,
+            guard_delta,
+            greedy_delta,
+        });
+    }
+
+    let mut improved = 0usize;
+    let mut tied = 0usize;
+    let mut worse = 0usize;
+    let mut overlap_cases = 0usize;
+    let mut changed_cases = 0usize;
+    let mut changed_with_overlap = 0usize;
+    let mut guard_picks_preserve_cases = 0usize;
+    let mut guard_strict_improved_count = 0usize;
+    let mut guard_regressions = 0usize;
+    let mut guard_sum_delta = 0.0_f64;
+    let mut guard_min_delta = f64::INFINITY;
+    let mut greedy_strict_improved_count = 0usize;
+    let mut greedy_regressions = 0usize;
+    let mut greedy_sum_delta = 0.0_f64;
+    let mut greedy_min_delta = f64::INFINITY;
+    let mut sum_delta = 0.0_f64;
+    let mut sum_changed_delta = 0.0_f64;
+    let mut min_delta = f64::INFINITY;
+    let mut max_delta = f64::NEG_INFINITY;
+    let mut changed_deltas: Vec<f64> = Vec::new();
+    let mut overlap_deltas: Vec<f64> = Vec::new();
+
+    for report in &reports {
+        let tol = 1e-9 * (1.0 + report.baseline_ev.abs() + report.preserved_ev.abs());
+        if report.delta > tol {
+            improved += 1;
+        } else if report.delta < -tol {
+            worse += 1;
+        } else {
+            tied += 1;
+        }
+
+        if report.overlap {
+            overlap_cases += 1;
+            overlap_deltas.push(report.delta);
+        }
+        if report.changed {
+            changed_cases += 1;
+            changed_deltas.push(report.delta);
+            sum_changed_delta += report.delta;
+            if report.overlap {
+                changed_with_overlap += 1;
+            }
+        }
+
+        sum_delta += report.delta;
+        min_delta = min_delta.min(report.delta);
+        max_delta = max_delta.max(report.delta);
+
+        if report.guard_picks_preserve {
+            guard_picks_preserve_cases += 1;
+        }
+        guard_sum_delta += report.guard_delta;
+        guard_min_delta = guard_min_delta.min(report.guard_delta);
+        if report.guard_delta < -tol {
+            guard_regressions += 1;
+        }
+        if report.guard_delta > tol {
+            guard_strict_improved_count += 1;
+        }
+
+        greedy_sum_delta += report.greedy_delta;
+        greedy_min_delta = greedy_min_delta.min(report.greedy_delta);
+        if report.greedy_delta > tol {
+            greedy_strict_improved_count += 1;
+        }
+        if report.greedy_delta < -tol {
+            greedy_regressions += 1;
+        }
+    }
+
+    let mean_delta = if reports.is_empty() {
+        0.0
+    } else {
+        sum_delta / reports.len() as f64
+    };
+    let mean_changed_delta = if changed_cases == 0 {
+        0.0
+    } else {
+        sum_changed_delta / changed_cases as f64
+    };
+    let mean_overlap_delta = if overlap_deltas.is_empty() {
+        0.0
+    } else {
+        overlap_deltas.iter().sum::<f64>() / overlap_deltas.len() as f64
+    };
+    let guard_mean_delta = if reports.is_empty() {
+        0.0
+    } else {
+        guard_sum_delta / reports.len() as f64
+    };
+    let greedy_mean_delta = if reports.is_empty() {
+        0.0
+    } else {
+        greedy_sum_delta / reports.len() as f64
+    };
+
+    changed_deltas.sort_by(|a, b| a.total_cmp(b));
+    let changed_median = if changed_deltas.is_empty() {
+        0.0
+    } else {
+        changed_deltas[changed_deltas.len() / 2]
+    };
+
+    println!(
+        "[preserve-sweep] cases={} seed={} force_partial_override={:?} improved={} tied={} worse={} changed={} overlap={} changed_with_overlap={} mean_delta={:+.12} mean_delta_changed={:+.12} mean_delta_overlap={:+.12} changed_median={:+.12} min_delta={:+.12} max_delta={:+.12} guard_picks_preserve={} guard_strict_improved_count={} guard_mean_delta={:+.12} guard_min_delta={:+.12} guard_regressions={} greedy_strict_improved_count={} greedy_mean_delta={:+.12} greedy_min_delta={:+.12} greedy_regressions={}",
+        case_count,
+        seed,
+        force_partial_override,
+        improved,
+        tied,
+        worse,
+        changed_cases,
+        overlap_cases,
+        changed_with_overlap,
+        mean_delta,
+        mean_changed_delta,
+        mean_overlap_delta,
+        changed_median,
+        min_delta,
+        max_delta,
+        guard_picks_preserve_cases,
+        guard_strict_improved_count,
+        guard_mean_delta,
+        guard_min_delta,
+        guard_regressions,
+        greedy_strict_improved_count,
+        greedy_mean_delta,
+        greedy_min_delta,
+        greedy_regressions
+    );
+
+    let mut worst_reports = reports.clone();
+    worst_reports.sort_by(|a, b| a.delta.total_cmp(&b.delta));
+    for report in worst_reports.iter().take(5) {
+        println!(
+            "[preserve-sweep][worst] case={} markets={} delta={:+.12} baseline_ev={:.12} preserved_ev={:.12} changed={} overlap={} preserve_count={} churn_sell_amount={:.12} churn_proceeds={:.12} baseline_mint={:.12} preserved_mint={:.12} baseline_actions={} preserved_actions={}",
+            report.case_idx,
+            report.markets,
+            report.delta,
+            report.baseline_ev,
+            report.preserved_ev,
+            report.changed,
+            report.overlap,
+            report.preserve_count,
+            report.churn_sell_amount,
+            report.churn_proceeds,
+            report.baseline_mint,
+            report.preserved_mint,
+            report.baseline_actions,
+            report.preserved_actions
+        );
+    }
+
+    let mut best_reports = reports.clone();
+    best_reports.sort_by(|a, b| b.delta.total_cmp(&a.delta));
+    for report in best_reports.iter().take(3) {
+        println!(
+            "[preserve-sweep][best] case={} markets={} delta={:+.12} baseline_ev={:.12} preserved_ev={:.12} changed={} overlap={} preserve_count={} churn_sell_amount={:.12} churn_proceeds={:.12} baseline_mint={:.12} preserved_mint={:.12} baseline_actions={} preserved_actions={}",
+            report.case_idx,
+            report.markets,
+            report.delta,
+            report.baseline_ev,
+            report.preserved_ev,
+            report.changed,
+            report.overlap,
+            report.preserve_count,
+            report.churn_sell_amount,
+            report.churn_proceeds,
+            report.baseline_mint,
+            report.preserved_mint,
+            report.baseline_actions,
+            report.preserved_actions
+        );
+    }
+
+    assert!(
+        !reports.is_empty(),
+        "sweep should execute at least one case"
     );
 }
 

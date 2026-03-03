@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::Action;
-use super::bundle::{BundleRouteKind, BundleStepPlan};
+use super::bundle::{BundleRouteKind, BundleSegmentPlan, BundleStepPlan};
 use super::merge::{
     action_contract_pair, execute_merge_sell_with_inventory, merge_usable_inventory,
     optimal_sell_split_with_inventory,
@@ -10,7 +10,9 @@ use super::merge::{
 use super::planning::PlannedRoute;
 #[cfg(test)]
 use super::sim::Route;
-use super::sim::{DUST, EPS, FEE_FACTOR, PoolSim, sanitize_nonnegative_finite};
+use super::sim::{
+    DUST, EPS, FEE_FACTOR, PoolSim, sanitize_nonnegative_finite, target_price_for_prof,
+};
 use super::types::{BalanceMap, apply_actions_to_sim_balances, subtract_balance};
 #[cfg(test)]
 use std::collections::HashSet;
@@ -429,6 +431,7 @@ impl<'a> ExecutionState<'a> {
         step: &BundleStepPlan,
         bundle_members: &[usize],
     ) -> bool {
+        let mut executed_any = false;
         for segment in &step.segments {
             if segment.cash_cost > *self.budget + EPS {
                 return false;
@@ -436,6 +439,9 @@ impl<'a> ExecutionState<'a> {
             match segment.kind {
                 BundleRouteKind::Direct => {
                     *self.budget -= segment.cash_cost;
+                    if segment.cash_cost > DUST {
+                        executed_any = true;
+                    }
                     for &(idx, amount, cost, new_price) in &segment.direct_member_plans {
                         if amount <= DUST {
                             continue;
@@ -453,28 +459,30 @@ impl<'a> ExecutionState<'a> {
                     }
                 }
                 BundleRouteKind::Mint => {
-                    let action_start = self.actions.len();
-                    *self.budget -= segment.mint_amount;
-                    let Some(proceeds) = emit_mint_bundle_actions(
-                        self.sims,
-                        bundle_members,
-                        segment.mint_amount,
-                        &segment.mint_sell_leg_plans,
-                        self.actions,
-                    ) else {
-                        *self.budget += segment.mint_amount;
-                        return false;
-                    };
-                    *self.budget += proceeds;
-                    apply_actions_to_sim_balances(
-                        &self.actions[action_start..],
-                        self.sims,
-                        self.sim_balances,
-                    );
+                    // Keep bundle-mint execution atomic at segment level.
+                    // We execute in self-financing rounds (bounded by current cash),
+                    // but rollback the whole segment if the planned mint amount
+                    // cannot be fully satisfied.
+                    let budget_before = *self.budget;
+                    let actions_len_before = self.actions.len();
+                    let sims_before = self.sims.to_vec();
+                    let balances_before = self.sim_balances.clone();
+                    let minted = execute_mint_bundle_in_rounds(self, bundle_members, segment);
+                    if minted + EPS < segment.mint_amount {
+                        *self.budget = budget_before;
+                        self.actions.truncate(actions_len_before);
+                        self.sims.clone_from_slice(&sims_before);
+                        *self.sim_balances = balances_before;
+                        // Keep earlier successfully executed segments, if any.
+                        return executed_any;
+                    }
+                    if minted > DUST {
+                        executed_any = true;
+                    }
                 }
             }
         }
-        true
+        executed_any || step.segments.is_empty()
     }
 
     #[cfg(test)]
@@ -596,17 +604,76 @@ pub(super) fn portfolio_expected_value(
     }
 }
 
-pub(super) fn emit_mint_bundle_actions(
+fn bundle_mint_sell_leg_indices(sell_legs: &[(usize, f64, f64, f64)]) -> Vec<usize> {
+    sell_legs.iter().map(|(idx, _, _, _)| *idx).collect()
+}
+
+fn bundle_mint_round_liquidity_cap(
+    sims: &[PoolSim],
+    sell_leg_indices: &[usize],
+    target_prof: f64,
+) -> f64 {
+    let mut cap = f64::INFINITY;
+    let mut has_leg = false;
+    for &idx in sell_leg_indices {
+        if idx >= sims.len() {
+            return 0.0;
+        }
+        let sim = &sims[idx];
+        let frontier_price = target_price_for_prof(sim.prediction, target_prof);
+        let tol = EPS * (1.0 + sim.price().abs().max(frontier_price.abs()));
+        if sim.price() <= frontier_price + tol {
+            return 0.0;
+        }
+        let Some((sell_to_frontier, _, _)) = sim.sell_to_price(frontier_price) else {
+            return 0.0;
+        };
+        if sell_to_frontier <= DUST {
+            return 0.0;
+        }
+        has_leg = true;
+        cap = cap.min(sell_to_frontier.max(0.0));
+    }
+    if has_leg { cap } else { 0.0 }
+}
+
+fn emit_mint_bundle_round_actions(
     sims: &mut [PoolSim],
     bundle_members: &[usize],
     mint_amount: f64,
-    sell_legs: &[(usize, f64, f64, f64)],
+    sell_leg_indices: &[usize],
+    target_prof: f64,
     actions: &mut Vec<Action>,
 ) -> Option<f64> {
-    if mint_amount <= DUST || bundle_members.is_empty() {
+    if mint_amount <= DUST || bundle_members.is_empty() || sell_leg_indices.is_empty() {
         return Some(0.0);
     }
-    if sell_legs.is_empty() {
+
+    let mut legs: Vec<(usize, f64, f64, f64)> = Vec::with_capacity(sell_leg_indices.len());
+    let mut total_proceeds = 0.0_f64;
+    for &idx in sell_leg_indices {
+        if idx >= sims.len() {
+            return None;
+        }
+        let sim = &sims[idx];
+        let frontier_price = target_price_for_prof(sim.prediction, target_prof);
+        let (sold, proceeds, new_price) = sim.sell_exact(mint_amount)?;
+        if sold + EPS < mint_amount
+            || sold <= DUST
+            || !proceeds.is_finite()
+            || !new_price.is_finite()
+        {
+            return None;
+        }
+        let frontier_tol = EPS * (1.0 + new_price.abs().max(frontier_price.abs()));
+        if new_price + frontier_tol < frontier_price {
+            return None;
+        }
+        total_proceeds += proceeds;
+        legs.push((idx, sold, proceeds, new_price));
+    }
+
+    if legs.is_empty() {
         return None;
     }
 
@@ -618,21 +685,93 @@ pub(super) fn emit_mint_bundle_actions(
         target_market: sims[bundle_members[0]].market_name,
     });
 
-    let mut total_proceeds = 0.0_f64;
-    for &(idx, sold, proceeds, new_price) in sell_legs {
-        if sold <= DUST {
-            continue;
-        }
+    for (idx, sold, proceeds, new_price) in legs {
         sims[idx].set_price(new_price);
-        total_proceeds += proceeds;
         actions.push(Action::Sell {
             market_name: sims[idx].market_name,
             amount: sold,
             proceeds,
         });
     }
-
     Some(total_proceeds)
+}
+
+fn execute_mint_bundle_in_rounds(
+    exec: &mut ExecutionState<'_>,
+    bundle_members: &[usize],
+    segment: &BundleSegmentPlan,
+) -> f64 {
+    let mut remaining = segment.mint_amount.max(0.0);
+    if remaining <= DUST {
+        return 0.0;
+    }
+    let sell_leg_indices = bundle_mint_sell_leg_indices(&segment.mint_sell_leg_plans);
+    if sell_leg_indices.is_empty() {
+        return 0.0;
+    }
+
+    let mut minted_total = 0.0_f64;
+    for _ in 0..MAX_ALT_ROUTE_ROUNDS {
+        if remaining <= DUST {
+            break;
+        }
+
+        let liquidity_cap =
+            bundle_mint_round_liquidity_cap(exec.sims, &sell_leg_indices, segment.target_prof);
+        if liquidity_cap <= DUST {
+            break;
+        }
+
+        let cash_cap = (*exec.budget).max(0.0);
+        if cash_cap <= DUST {
+            break;
+        }
+
+        let mut round_amount = remaining.min(liquidity_cap).min(cash_cap);
+        let mut executed_round = false;
+
+        for _ in 0..64 {
+            if round_amount <= DUST {
+                break;
+            }
+            let action_start = exec.actions.len();
+            let budget_before_round = *exec.budget;
+            *exec.budget -= round_amount;
+            let proceeds = emit_mint_bundle_round_actions(
+                exec.sims,
+                bundle_members,
+                round_amount,
+                &sell_leg_indices,
+                segment.target_prof,
+                exec.actions,
+            );
+            match proceeds {
+                Some(value) => {
+                    *exec.budget += value;
+                    apply_actions_to_sim_balances(
+                        &exec.actions[action_start..],
+                        exec.sims,
+                        exec.sim_balances,
+                    );
+                    minted_total += round_amount;
+                    remaining -= round_amount;
+                    executed_round = true;
+                    break;
+                }
+                None => {
+                    *exec.budget = budget_before_round;
+                    exec.actions.truncate(action_start);
+                    round_amount *= 0.5;
+                }
+            }
+        }
+
+        if !executed_round {
+            break;
+        }
+    }
+
+    minted_total
 }
 
 /// Emit mint actions: mint on both contracts, sell all non-target outcomes.

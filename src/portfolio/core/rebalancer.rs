@@ -14,7 +14,7 @@ use super::sim::{
 use super::trading::{ExecutionState, portfolio_expected_value};
 use super::types::BalanceMap;
 use super::types::{apply_actions_to_sim_balances, lookup_balance};
-use super::waterfall::{WaterfallGateStats, waterfall_with_execution_gate};
+use super::waterfall::{WaterfallGateStats, waterfall_with_execution_gate_and_preserve};
 
 const MAX_PHASE1_ITERS: usize = 128;
 const MAX_PHASE3_ITERS: usize = 8;
@@ -25,6 +25,8 @@ const PHASE3_ESCALATION_MIN_REMAINING_FRAC: f64 = 0.20;
 const PHASE3_ESCALATION_MIN_REMAINING_ABS: f64 = 1e-6;
 const MAX_POLISH_PASSES: usize = 64;
 const POLISH_EV_REL_TOL: f64 = 1e-10;
+const PRESERVE_SELECTION_EV_REL_TOL: f64 = 1e-10;
+const MAX_PRESERVE_GREEDY_CANDIDATES: usize = 24;
 const DEFAULT_GATE_BUFFER_FRAC: f64 = 0.20;
 const DEFAULT_GATE_BUFFER_MIN_SUSD: f64 = 0.25;
 
@@ -32,6 +34,11 @@ const DEFAULT_GATE_BUFFER_MIN_SUSD: f64 = 0.25;
 pub enum RebalanceMode {
     Full,
     ArbOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RebalanceFlags {
+    pub enable_ev_guarded_greedy_churn_pruning: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -207,6 +214,7 @@ struct RebalanceContext {
     budget: f64,
     sims: Vec<PoolSim>,
     mint_available: bool,
+    mint_sell_preserve_markets: HashSet<&'static str>,
     sim_balances: BalanceMap,
     legacy_remaining: BalanceMap,
     route_gates: RouteGateThresholds,
@@ -297,6 +305,7 @@ impl RebalanceContext {
             budget: susds_balance,
             sims,
             mint_available,
+            mint_sell_preserve_markets: HashSet::new(),
             sim_balances,
             legacy_remaining,
             route_gates: RouteGateThresholds::disabled(),
@@ -694,7 +703,7 @@ impl RebalanceContext {
             // Reallocate recovered capital and fold the acquired positions into simulated balances.
             let actions_before_realloc = trial.actions.len();
             let mut wf_stats = WaterfallGateStats::default();
-            let new_prof = waterfall_with_execution_gate(
+            let new_prof = waterfall_with_execution_gate_and_preserve(
                 &mut trial.sims,
                 &mut trial.budget,
                 &mut trial.actions,
@@ -703,6 +712,7 @@ impl RebalanceContext {
                 self.route_gates.mint_sell,
                 self.route_gates.buffer_frac,
                 self.route_gates.buffer_min_susd,
+                Some(&self.mint_sell_preserve_markets),
                 Some(&mut wf_stats),
             );
             self.merge_waterfall_gate_stats(wf_stats);
@@ -739,6 +749,7 @@ impl RebalanceContext {
     fn commit_trial_actions(&mut self, mut trial: RebalanceContext) {
         self.actions.append(&mut trial.actions);
         self.sims = trial.sims;
+        self.mint_sell_preserve_markets = trial.mint_sell_preserve_markets;
         self.sim_balances = trial.sim_balances;
         self.legacy_remaining = trial.legacy_remaining;
         self.budget = trial.budget;
@@ -777,6 +788,7 @@ impl RebalanceContext {
                 budget: self.budget,
                 sims: self.sims.clone(),
                 mint_available: self.mint_available,
+                mint_sell_preserve_markets: self.mint_sell_preserve_markets.clone(),
                 sim_balances: self.sim_balances.clone(),
                 // In polish mode, recycle across current inventory (not only initial legacy).
                 legacy_remaining: self.sim_balances.clone(),
@@ -792,7 +804,7 @@ impl RebalanceContext {
 
             let actions_before = trial.actions.len();
             let mut wf_stats = WaterfallGateStats::default();
-            let last_bought_prof = waterfall_with_execution_gate(
+            let last_bought_prof = waterfall_with_execution_gate_and_preserve(
                 &mut trial.sims,
                 &mut trial.budget,
                 &mut trial.actions,
@@ -801,6 +813,7 @@ impl RebalanceContext {
                 trial.route_gates.mint_sell,
                 trial.route_gates.buffer_frac,
                 trial.route_gates.buffer_min_susd,
+                Some(&trial.mint_sell_preserve_markets),
                 Some(&mut wf_stats),
             );
             trial.merge_waterfall_gate_stats(wf_stats);
@@ -858,7 +871,7 @@ fn finish_rebalance_full_inner(
     // ── Phase 2: Waterfall allocation ──
     let actions_before = ctx.actions.len();
     let mut wf_stats = WaterfallGateStats::default();
-    let last_bought_prof = waterfall_with_execution_gate(
+    let last_bought_prof = waterfall_with_execution_gate_and_preserve(
         &mut ctx.sims,
         &mut ctx.budget,
         &mut ctx.actions,
@@ -867,6 +880,7 @@ fn finish_rebalance_full_inner(
         ctx.route_gates.mint_sell,
         ctx.route_gates.buffer_frac,
         ctx.route_gates.buffer_min_susd,
+        Some(&ctx.mint_sell_preserve_markets),
         Some(&mut wf_stats),
     );
     ctx.merge_waterfall_gate_stats(wf_stats);
@@ -894,7 +908,7 @@ fn finish_rebalance_full_inner(
     ctx.run_phase1_sell_overpriced();
     let actions_before_cleanup = ctx.actions.len();
     let mut cleanup_wf_stats = WaterfallGateStats::default();
-    let cleanup_last_prof = waterfall_with_execution_gate(
+    let cleanup_last_prof = waterfall_with_execution_gate_and_preserve(
         &mut ctx.sims,
         &mut ctx.budget,
         &mut ctx.actions,
@@ -903,6 +917,7 @@ fn finish_rebalance_full_inner(
         ctx.route_gates.mint_sell,
         ctx.route_gates.buffer_frac,
         ctx.route_gates.buffer_min_susd,
+        Some(&ctx.mint_sell_preserve_markets),
         Some(&mut cleanup_wf_stats),
     );
     ctx.merge_waterfall_gate_stats(cleanup_wf_stats);
@@ -923,7 +938,7 @@ fn finish_rebalance_full_inner(
         ctx.run_phase1_sell_overpriced();
         let actions_before_direct_cleanup = ctx.actions.len();
         let mut direct_cleanup_wf_stats = WaterfallGateStats::default();
-        let _ = waterfall_with_execution_gate(
+        let _ = waterfall_with_execution_gate_and_preserve(
             &mut ctx.sims,
             &mut ctx.budget,
             &mut ctx.actions,
@@ -932,6 +947,7 @@ fn finish_rebalance_full_inner(
             ctx.route_gates.mint_sell,
             ctx.route_gates.buffer_frac,
             ctx.route_gates.buffer_min_susd,
+            Some(&ctx.mint_sell_preserve_markets),
             Some(&mut direct_cleanup_wf_stats),
         );
         ctx.merge_waterfall_gate_stats(direct_cleanup_wf_stats);
@@ -948,7 +964,7 @@ fn finish_rebalance_full_inner(
     if ctx.mint_available {
         let actions_before_mixed_cleanup = ctx.actions.len();
         let mut mixed_wf_stats = WaterfallGateStats::default();
-        let mixed_last_prof = waterfall_with_execution_gate(
+        let mixed_last_prof = waterfall_with_execution_gate_and_preserve(
             &mut ctx.sims,
             &mut ctx.budget,
             &mut ctx.actions,
@@ -957,6 +973,7 @@ fn finish_rebalance_full_inner(
             ctx.route_gates.mint_sell,
             ctx.route_gates.buffer_frac,
             ctx.route_gates.buffer_min_susd,
+            Some(&ctx.mint_sell_preserve_markets),
             Some(&mut mixed_wf_stats),
         );
         ctx.merge_waterfall_gate_stats(mixed_wf_stats);
@@ -976,7 +993,7 @@ fn finish_rebalance_full_inner(
             ctx.run_phase1_sell_overpriced();
             let actions_before_direct_cleanup = ctx.actions.len();
             let mut final_direct_wf_stats = WaterfallGateStats::default();
-            let _ = waterfall_with_execution_gate(
+            let _ = waterfall_with_execution_gate_and_preserve(
                 &mut ctx.sims,
                 &mut ctx.budget,
                 &mut ctx.actions,
@@ -985,6 +1002,7 @@ fn finish_rebalance_full_inner(
                 ctx.route_gates.mint_sell,
                 ctx.route_gates.buffer_frac,
                 ctx.route_gates.buffer_min_susd,
+                Some(&ctx.mint_sell_preserve_markets),
                 Some(&mut final_direct_wf_stats),
             );
             ctx.merge_waterfall_gate_stats(final_direct_wf_stats);
@@ -1020,20 +1038,170 @@ fn finish_rebalance_full_inner(
     ctx.actions
 }
 
+fn build_rebalance_context(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    expected_outcome_count: usize,
+    route_gates: RouteGateThresholds,
+) -> Result<RebalanceContext, RebalanceInitError> {
+    let mut ctx = RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        expected_outcome_count,
+    )?;
+    ctx.route_gates = route_gates;
+    Ok(ctx)
+}
+
+fn collect_mint_sell_preserve_candidates(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    initial_balances: &HashMap<&str, f64>,
+    initial_susd: f64,
+) -> Vec<&'static str> {
+    let mut sold_amounts: HashMap<&'static str, f64> = HashMap::new();
+    let mut seen_sell: HashSet<&'static str> = HashSet::new();
+    let mut sold_before_buy: HashSet<&'static str> = HashSet::new();
+
+    for action in actions {
+        match action {
+            Action::Sell {
+                market_name,
+                amount,
+                ..
+            } => {
+                seen_sell.insert(*market_name);
+                *sold_amounts.entry(*market_name).or_insert(0.0) += amount.max(0.0);
+            }
+            Action::Buy { market_name, .. } => {
+                if seen_sell.contains(market_name) {
+                    sold_before_buy.insert(*market_name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if sold_before_buy.is_empty() {
+        return Vec::new();
+    }
+
+    let (final_holdings, _) = super::diagnostics::replay_actions_to_portfolio_state(
+        actions,
+        slot0_results,
+        initial_balances,
+        initial_susd,
+    );
+    let mut candidates: Vec<(&'static str, f64)> = sold_before_buy
+        .into_iter()
+        .filter_map(|market_name| {
+            let final_held = final_holdings
+                .get(market_name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0);
+            let initial_held = lookup_balance(initial_balances, market_name).max(0.0);
+            if final_held <= initial_held + EPS {
+                return None;
+            }
+            let sold_amount = sold_amounts.get(market_name).copied().unwrap_or(0.0);
+            Some((market_name, sold_amount))
+        })
+        .collect();
+    candidates.sort_by(|(name_a, sold_a), (name_b, sold_b)| {
+        sold_b.total_cmp(sold_a).then_with(|| name_a.cmp(name_b))
+    });
+    candidates.truncate(MAX_PRESERVE_GREEDY_CANDIDATES);
+    candidates.into_iter().map(|(name, _)| name).collect()
+}
+
+fn action_plan_expected_value(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    initial_balances: &HashMap<&str, f64>,
+    initial_susd: f64,
+    predictions: &HashMap<String, f64>,
+) -> f64 {
+    let (final_holdings, final_cash) = super::diagnostics::replay_actions_to_portfolio_state(
+        actions,
+        slot0_results,
+        initial_balances,
+        initial_susd,
+    );
+    if !final_cash.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+
+    let mut ev = final_cash;
+    for (_, market) in slot0_results {
+        let held = final_holdings
+            .get(market.name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        let key = crate::pools::normalize_market_name(market.name);
+        let pred = predictions.get(&key).copied().unwrap_or(0.0);
+        ev += pred * held;
+    }
+    if ev.is_finite() {
+        ev
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+fn run_rebalance_full_with_preserve(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    expected_outcome_count: usize,
+    route_gates: RouteGateThresholds,
+    preserve_markets: &HashSet<&'static str>,
+) -> Option<Vec<Action>> {
+    let mut ctx = build_rebalance_context(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        expected_outcome_count,
+        route_gates,
+    )
+    .ok()?;
+    ctx.mint_sell_preserve_markets = preserve_markets.clone();
+    let verify_internal_state = cfg!(test);
+    Some(finish_rebalance_full_inner(
+        ctx,
+        slot0_results,
+        balances,
+        susds_balance,
+        true,
+        false,
+        true,
+        verify_internal_state,
+    ))
+}
+
 fn rebalance_full(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     route_gates: RouteGateThresholds,
+    flags: RebalanceFlags,
 ) -> Vec<Action> {
     let preds = crate::pools::prediction_map();
     let expected_count = crate::predictions::PREDICTIONS_L1.len();
-    let mut ctx = match RebalanceContext::from_inputs(
+    let ctx = match build_rebalance_context(
         balances,
         susds_balance,
         slot0_results,
         &preds,
         expected_count,
+        route_gates,
     ) {
         Ok(ctx) => ctx,
         Err(err) => {
@@ -1041,8 +1209,7 @@ fn rebalance_full(
             return Vec::new();
         }
     };
-    ctx.route_gates = route_gates;
-    finish_rebalance_full_inner(
+    let baseline_actions = finish_rebalance_full_inner(
         ctx,
         slot0_results,
         balances,
@@ -1051,7 +1218,68 @@ fn rebalance_full(
         false,
         true,
         false,
-    )
+    );
+    if !baseline_actions
+        .iter()
+        .any(|action| matches!(action, Action::Mint { .. }))
+    {
+        return baseline_actions;
+    }
+    if !flags.enable_ev_guarded_greedy_churn_pruning {
+        return baseline_actions;
+    }
+
+    let baseline_ev = action_plan_expected_value(
+        &baseline_actions,
+        slot0_results,
+        balances,
+        susds_balance,
+        &preds,
+    );
+    let preserve_candidates = collect_mint_sell_preserve_candidates(
+        &baseline_actions,
+        slot0_results,
+        balances,
+        susds_balance,
+    );
+    if preserve_candidates.is_empty() {
+        return baseline_actions;
+    }
+
+    let mut best_actions = baseline_actions;
+    let mut best_ev = baseline_ev;
+    let mut active_preserve: HashSet<&'static str> = HashSet::new();
+
+    for market_name in preserve_candidates {
+        let mut trial_preserve = active_preserve.clone();
+        trial_preserve.insert(market_name);
+        let Some(trial_actions) = run_rebalance_full_with_preserve(
+            balances,
+            susds_balance,
+            slot0_results,
+            &preds,
+            expected_count,
+            route_gates,
+            &trial_preserve,
+        ) else {
+            continue;
+        };
+        let trial_ev = action_plan_expected_value(
+            &trial_actions,
+            slot0_results,
+            balances,
+            susds_balance,
+            &preds,
+        );
+        let ev_tol = PRESERVE_SELECTION_EV_REL_TOL * (1.0 + best_ev.abs() + trial_ev.abs());
+        if trial_ev > best_ev + ev_tol {
+            best_actions = trial_actions;
+            best_ev = trial_ev;
+            active_preserve = trial_preserve;
+        }
+    }
+
+    best_actions
 }
 
 #[cfg(test)]
@@ -1147,6 +1375,43 @@ pub(super) fn rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test
     };
     ctx.route_gates = RouteGateThresholds::disabled();
     ctx.mint_available = force_mint_available;
+    finish_rebalance_full_inner(
+        ctx,
+        slot0_results,
+        balances,
+        susds_balance,
+        false,
+        false,
+        false,
+        false,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_and_preserve_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    preserve_sell_markets: &HashSet<&'static str>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    let mut ctx = match RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log_rebalance_init_error(err);
+            return Vec::new();
+        }
+    };
+    ctx.route_gates = RouteGateThresholds::disabled();
+    ctx.mint_available = force_mint_available;
+    ctx.mint_sell_preserve_markets = preserve_sell_markets.clone();
     finish_rebalance_full_inner(
         ctx,
         slot0_results,
@@ -1612,12 +1877,30 @@ pub fn rebalance_with_mode(
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     mode: RebalanceMode,
 ) -> Vec<Action> {
+    rebalance_with_mode_and_flags(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        RebalanceFlags::default(),
+    )
+}
+
+/// Computes optimal trades for L1 markets using explicit strategy flags.
+pub fn rebalance_with_mode_and_flags(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    flags: RebalanceFlags,
+) -> Vec<Action> {
     rebalance_with_mode_and_thresholds(
         balances,
         susds_balance,
         slot0_results,
         mode,
         RouteGateThresholds::disabled(),
+        flags,
     )
 }
 
@@ -1627,9 +1910,12 @@ fn rebalance_with_mode_and_thresholds(
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     mode: RebalanceMode,
     route_gates: RouteGateThresholds,
+    flags: RebalanceFlags,
 ) -> Vec<Action> {
     match mode {
-        RebalanceMode::Full => rebalance_full(balances, susds_balance, slot0_results, route_gates),
+        RebalanceMode::Full => {
+            rebalance_full(balances, susds_balance, slot0_results, route_gates, flags)
+        }
         RebalanceMode::ArbOnly => rebalance_arb_only(balances, susds_balance, slot0_results),
     }
 }
@@ -1688,7 +1974,26 @@ pub fn rebalance_with_gas(
     mode: RebalanceMode,
     gas: &GasAssumptions,
 ) -> Vec<Action> {
-    rebalance_with_gas_pricing(
+    rebalance_with_gas_and_flags(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        gas,
+        RebalanceFlags::default(),
+    )
+}
+
+/// Gas-aware entry point for `main.rs` with explicit strategy flags.
+pub fn rebalance_with_gas_and_flags(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    gas: &GasAssumptions,
+    flags: RebalanceFlags,
+) -> Vec<Action> {
+    rebalance_with_gas_pricing_and_flags(
         balances,
         susds_balance,
         slot0_results,
@@ -1696,6 +2001,7 @@ pub fn rebalance_with_gas(
         gas,
         THRESHOLD_GAS_PRICE_ETH,
         THRESHOLD_ETH_USD,
+        flags,
     )
 }
 
@@ -1709,9 +2015,39 @@ pub fn rebalance_with_gas_pricing(
     gas_price_eth: f64,
     eth_usd: f64,
 ) -> Vec<Action> {
+    rebalance_with_gas_pricing_and_flags(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        gas,
+        gas_price_eth,
+        eth_usd,
+        RebalanceFlags::default(),
+    )
+}
+
+/// Gas-aware entry point with explicit gas price/ETHUSD and strategy flags.
+pub fn rebalance_with_gas_pricing_and_flags(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+    flags: RebalanceFlags,
+) -> Vec<Action> {
     let n_sims = slot0_results.len();
     let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
-    rebalance_with_mode_and_thresholds(balances, susds_balance, slot0_results, mode, route_gates)
+    rebalance_with_mode_and_thresholds(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        route_gates,
+        flags,
+    )
 }
 
 /// Computes optimal rebalancing trades for L1 markets.

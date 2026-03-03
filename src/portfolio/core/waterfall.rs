@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::Action;
 use super::bundle::{BundleRouteKind, bundle_frontier};
@@ -8,8 +8,6 @@ use super::sim::{EPS, PoolSim};
 #[cfg(test)]
 use super::sim::{Route, alt_price, profitability};
 use super::trading::ExecutionState;
-#[cfg(test)]
-use std::collections::HashSet;
 
 #[cfg(test)]
 /// Legacy test helper: find the highest-profitability (outcome, route) pair not already active.
@@ -128,6 +126,32 @@ pub(super) fn waterfall_with_execution_gate(
     gas_mint_susd: f64,
     buffer_frac: f64,
     buffer_min_susd: f64,
+    gate_stats: Option<&mut WaterfallGateStats>,
+) -> f64 {
+    waterfall_with_execution_gate_and_preserve(
+        sims,
+        budget,
+        actions,
+        mint_available,
+        gas_direct_susd,
+        gas_mint_susd,
+        buffer_frac,
+        buffer_min_susd,
+        None,
+        gate_stats,
+    )
+}
+
+pub(super) fn waterfall_with_execution_gate_and_preserve(
+    sims: &mut [PoolSim],
+    budget: &mut f64,
+    actions: &mut Vec<Action>,
+    mint_available: bool,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
+    buffer_frac: f64,
+    buffer_min_susd: f64,
+    preserve_sell_markets: Option<&HashSet<&'static str>>,
     mut gate_stats: Option<&mut WaterfallGateStats>,
 ) -> f64 {
     if *budget <= 0.0 {
@@ -137,6 +161,14 @@ pub(super) fn waterfall_with_execution_gate(
     let mut last_prof = 0.0;
     let mut waterfall_balances: HashMap<&str, f64> = HashMap::new();
     let mut planning_sim_state: Vec<PoolSim> = Vec::with_capacity(sims.len());
+    let preserve_sell_indices: HashSet<usize> = preserve_sell_markets
+        .map(|names| {
+            sims.iter()
+                .enumerate()
+                .filter_map(|(idx, sim)| names.contains(sim.market_name).then_some(idx))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut stalled_continues = 0usize;
 
     for _iter in 0..MAX_WATERFALL_ITERS {
@@ -146,6 +178,7 @@ pub(super) fn waterfall_with_execution_gate(
             *budget,
             gas_direct_susd,
             gas_mint_susd,
+            &preserve_sell_indices,
         ) else {
             break;
         };
@@ -161,6 +194,7 @@ pub(super) fn waterfall_with_execution_gate(
             mint_available,
             Some(*budget),
             &mut planning_sim_state,
+            &preserve_sell_indices,
         ) else {
             last_prof = frontier.current_prof;
             break;
@@ -194,6 +228,7 @@ pub(super) fn waterfall_with_execution_gate(
                     false,
                     Some(*budget),
                     &mut planning_sim_state,
+                    &preserve_sell_indices,
                 ) {
                     let fallback_passing = direct_fallback
                         .segments
@@ -247,6 +282,72 @@ pub(super) fn waterfall_with_execution_gate(
             exec.execute_bundle_step(&executable_plan, &frontier.members)
         };
         if !executed {
+            // If mint execution fails (e.g., self-financing round limit or
+            // conservative atomic rollback), try a direct-only fallback before
+            // terminating the waterfall iteration.
+            if executable_plan
+                .segments
+                .first()
+                .is_some_and(|segment| segment.kind == BundleRouteKind::Mint)
+                && let Some(mut direct_fallback) = plan_bundle_step_with_scratch(
+                    sims,
+                    &frontier,
+                    false,
+                    Some(*budget),
+                    &mut planning_sim_state,
+                    &preserve_sell_indices,
+                )
+            {
+                let fallback_passing = direct_fallback
+                    .segments
+                    .iter()
+                    .take_while(|segment| {
+                        passes_step_execution_gate(
+                            segment,
+                            frontier.current_prof,
+                            gas_direct_susd,
+                            gas_mint_susd,
+                            buffer_frac,
+                            buffer_min_susd,
+                        )
+                    })
+                    .count();
+                if fallback_passing > 0 {
+                    if fallback_passing < direct_fallback.segments.len() {
+                        if let Some(stats) = gate_stats.as_deref_mut() {
+                            match direct_fallback.segments[fallback_passing].kind {
+                                BundleRouteKind::Direct => stats.skipped_direct += 1,
+                                BundleRouteKind::Mint => stats.skipped_mint += 1,
+                            }
+                            stats.steps_pruned_subgas += 1;
+                        }
+                        direct_fallback.segments.truncate(fallback_passing);
+                    }
+                    let fallback_executed = {
+                        waterfall_balances.clear();
+                        let mut exec =
+                            ExecutionState::new(sims, budget, actions, &mut waterfall_balances);
+                        exec.execute_bundle_step(&direct_fallback, &frontier.members)
+                    };
+                    if fallback_executed {
+                        last_prof = direct_fallback.final_prof;
+                        if !iteration_made_progress(
+                            iter_start_prof,
+                            direct_fallback.final_prof,
+                            iter_start_budget,
+                            *budget,
+                        ) {
+                            stalled_continues += 1;
+                            if stalled_continues >= MAX_STALLED_CONTINUES {
+                                break;
+                            }
+                        } else {
+                            stalled_continues = 0;
+                        }
+                        continue;
+                    }
+                }
+            }
             last_prof = frontier.current_prof;
             break;
         }
@@ -389,6 +490,105 @@ mod tests {
         assert!(
             !actions.is_empty(),
             "with zero gas thresholds, any positive profitability should produce actions"
+        );
+    }
+
+    #[test]
+    fn waterfall_mint_path_never_mints_above_available_cash() {
+        let mut sims = vec![
+            make_sim(
+                "sf1",
+                "0x1111111111111111111111111111111111111111",
+                0.399554,
+                0.524024,
+            ),
+            make_sim(
+                "sf2",
+                "0x2222222222222222222222222222222222222222",
+                0.246718,
+                0.313937,
+            ),
+            make_sim(
+                "sf3",
+                "0x3333333333333333333333333333333333333333",
+                0.283701,
+                0.342533,
+            ),
+            make_sim(
+                "sf4",
+                "0x4444444444444444444444444444444444444444",
+                0.080065,
+                0.100115,
+            ),
+        ];
+        let initial_budget = 17.358789_f64;
+        let mut budget = initial_budget;
+        let mut actions = vec![];
+
+        let _last_prof = waterfall(&mut sims, &mut budget, &mut actions, true, 0.0, 0.0);
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Mint { .. })),
+            "fixture should include mint actions"
+        );
+
+        let mut replay_cash = initial_budget;
+        for action in &actions {
+            match action {
+                Action::Buy { cost, .. } => replay_cash -= *cost,
+                Action::Sell { proceeds, .. } => replay_cash += *proceeds,
+                Action::Mint { amount, .. } => {
+                    assert!(
+                        *amount <= replay_cash + 1e-9,
+                        "mint amount must not exceed available cash in no-flash self-financing flow: amount={amount:.12}, cash_before={replay_cash:.12}"
+                    );
+                    replay_cash -= *amount;
+                }
+                Action::Merge { amount, .. } => replay_cash += *amount,
+            }
+        }
+    }
+
+    #[test]
+    fn bundle_frontier_accounts_for_preserved_prediction_value() {
+        let sims = vec![
+            make_sim(
+                "pv1",
+                "0x1111111111111111111111111111111111111111",
+                0.30,
+                0.05,
+            ),
+            make_sim(
+                "pv2",
+                "0x2222222222222222222222222222222222222222",
+                0.30,
+                0.05,
+            ),
+            make_sim(
+                "pv3",
+                "0x3333333333333333333333333333333333333333",
+                0.30,
+                0.30,
+            ),
+            make_sim(
+                "pv4",
+                "0x4444444444444444444444444444444444444444",
+                0.30,
+                0.30,
+            ),
+        ];
+        let preserve_sell_indices = std::collections::HashSet::from([2usize, 3usize]);
+
+        let frontier = bundle_frontier(&sims, true, 100.0, 0.0, 0.0, &preserve_sell_indices)
+            .expect("preserve-aware mint frontier should remain profitable in this fixture");
+        assert!(
+            frontier.current_prof > 0.0,
+            "preserve-aware mint frontier should have positive profitability"
+        );
+        assert!(
+            frontier.members.contains(&2) || frontier.members.contains(&3),
+            "frontier should include preserved-value members"
         );
     }
 
