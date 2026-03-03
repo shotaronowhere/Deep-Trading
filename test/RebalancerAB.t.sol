@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "forge-std/StdJson.sol";
 
 import {Rebalancer} from "../contracts/Rebalancer.sol";
+import {RebalancerMixed} from "../contracts/RebalancerMixed.sol";
 import {IV3SwapRouter} from "../contracts/interfaces/IV3SwapRouter.sol";
 import {FullMath} from "../contracts/libraries/FullMath.sol";
 
@@ -35,6 +36,15 @@ contract BenchmarkERC20 {
         allowance[from][msg.sender] = allowed - amount;
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
+        return true;
+    }
+
+    function burnFrom(address from, uint256 amount) external returns (bool) {
+        if (balanceOf[from] < amount) return false;
+        uint256 allowed = allowance[from][msg.sender];
+        if (allowed < amount) return false;
+        allowance[from][msg.sender] = allowed - amount;
+        balanceOf[from] -= amount;
         return true;
     }
 }
@@ -97,8 +107,28 @@ contract BenchmarkPool {
 }
 
 contract BenchmarkCTFRouter {
-    function splitPosition(address, address, uint256) external {}
-    function mergePositions(address, address, uint256) external {}
+    address[] internal tokens;
+
+    function setTokens(address[] memory tokens_) external {
+        delete tokens;
+        for (uint256 i = 0; i < tokens_.length; i++) {
+            tokens.push(tokens_[i]);
+        }
+    }
+
+    function splitPosition(address collateralToken, address, uint256 amount) external {
+        require(BenchmarkERC20(collateralToken).transferFrom(msg.sender, address(this), amount), "split pull failed");
+        for (uint256 i = 0; i < tokens.length; i++) {
+            BenchmarkERC20(tokens[i]).mint(msg.sender, amount);
+        }
+    }
+
+    function mergePositions(address collateralToken, address, uint256 amount) external {
+        for (uint256 i = 0; i < tokens.length; i++) {
+            require(BenchmarkERC20(tokens[i]).burnFrom(msg.sender, amount), "merge burn failed");
+        }
+        require(BenchmarkERC20(collateralToken).transfer(msg.sender, amount), "merge send failed");
+    }
 }
 
 contract BenchmarkRouter {
@@ -295,9 +325,21 @@ contract RebalancerABTest is Test {
     using stdJson for string;
 
     uint256 internal constant WAD = 1e18;
+    uint256 internal constant BENCHMARK_MAX_OUTER_ITERS = 24;
+    uint256 internal constant BENCHMARK_MAX_INNER_ITERS = 24;
+    address internal constant BENCHMARK_MARKET = address(0xBEEF);
+
     struct Scenario {
         BenchmarkERC20 collateral;
         Rebalancer rebalancer;
+        Rebalancer.RebalanceParams params;
+        BenchmarkERC20[] tokens;
+        uint256[] predictionsWad;
+    }
+
+    struct MixedScenario {
+        BenchmarkERC20 collateral;
+        RebalancerMixed rebalancerMixed;
         Rebalancer.RebalanceParams params;
         BenchmarkERC20[] tokens;
         uint256[] predictionsWad;
@@ -309,6 +351,17 @@ contract RebalancerABTest is Test {
         bool[] isToken1;
         uint256[] balances;
         uint160[] sqrtPredX96;
+    }
+
+    struct MixedComparisonResult {
+        uint256 rebalancerEv;
+        uint256 mixedEv;
+        uint256 rebalancerGas;
+        uint256 mixedGas;
+        int256 evDiff;
+        int256 gasDiff;
+        int256 evDiffBps;
+        int256 gasDiffBps;
     }
 
     function test_rebalancer_ab_benchmark() external {
@@ -401,6 +454,29 @@ contract RebalancerABTest is Test {
         );
     }
 
+    function test_rebalancer_vs_mixed_apples_to_apples_report() external {
+        string[] memory caseIds = new string[](6);
+        caseIds[0] = "two_pool_single_tick_direct_only";
+        caseIds[1] = "ninety_eight_outcome_multitick_direct_only";
+        caseIds[2] = "small_bundle_mixed_case";
+        caseIds[3] = "mixed_route_favorable_synthetic_case";
+        caseIds[4] = "heterogeneous_ninety_eight_outcome_l1_like_case";
+        caseIds[5] = "legacy_holdings_direct_only_case";
+
+        for (uint256 i = 0; i < caseIds.length; i++) {
+            MixedComparisonResult memory r = _runRebalancerVsMixedCase(caseIds[i]);
+            emit log_string(caseIds[i]);
+            emit log_named_uint("rebalancer_ev_wei", r.rebalancerEv);
+            emit log_named_uint("rebalancer_mixed_ev_wei", r.mixedEv);
+            emit log_named_int("ev_diff_wei_mixed_minus_rebalancer", r.evDiff);
+            emit log_named_int("ev_diff_bps_mixed_minus_rebalancer", r.evDiffBps);
+            emit log_named_uint("rebalancer_gas", r.rebalancerGas);
+            emit log_named_uint("rebalancer_mixed_gas", r.mixedGas);
+            emit log_named_int("gas_diff_mixed_minus_rebalancer", r.gasDiff);
+            emit log_named_int("gas_diff_bps_mixed_minus_rebalancer", r.gasDiffBps);
+        }
+    }
+
     function _checkDirectParity(string memory caseId) internal returns (string memory failure) {
         (uint256 offchainDirect,,,,) = _expectedRow(caseId);
         (uint256 constantEv, uint256 exactEv) = _runCase(caseId);
@@ -476,6 +552,39 @@ contract RebalancerABTest is Test {
         );
     }
 
+    function _runRebalancerVsMixedCase(string memory caseId) internal returns (MixedComparisonResult memory r) {
+        Scenario memory constantScenario = _buildCase(caseId);
+        uint256 gasStartConstant = gasleft();
+        constantScenario.rebalancer.rebalance(constantScenario.params);
+        r.rebalancerGas = gasStartConstant - gasleft();
+        r.rebalancerEv = _portfolioEvWad(
+            constantScenario.collateral,
+            constantScenario.tokens,
+            constantScenario.predictionsWad
+        );
+
+        MixedScenario memory mixedScenario = _buildMixedCase(caseId);
+        uint256 gasStartMixed = gasleft();
+        mixedScenario.rebalancerMixed.rebalanceMixedConstantL(
+            mixedScenario.params,
+            BENCHMARK_MARKET,
+            BENCHMARK_MAX_OUTER_ITERS,
+            BENCHMARK_MAX_INNER_ITERS,
+            0
+        );
+        r.mixedGas = gasStartMixed - gasleft();
+        r.mixedEv = _portfolioEvWad(
+            mixedScenario.collateral,
+            mixedScenario.tokens,
+            mixedScenario.predictionsWad
+        );
+
+        r.evDiff = _signedDiff(r.mixedEv, r.rebalancerEv);
+        r.gasDiff = _signedDiff(r.mixedGas, r.rebalancerGas);
+        r.evDiffBps = _signedBpsDiff(r.mixedEv, r.rebalancerEv);
+        r.gasDiffBps = _signedBpsDiff(r.mixedGas, r.rebalancerGas);
+    }
+
     function _buildCase(string memory caseId) internal returns (Scenario memory scenario) {
         string memory json = _casesJson();
         string memory prefix = string.concat(".", caseId);
@@ -496,6 +605,28 @@ contract RebalancerABTest is Test {
         bool[] memory isToken1 = json.readBoolArray(string.concat(prefix, ".is_token1"));
 
         return _buildScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
+    }
+
+    function _buildMixedCase(string memory caseId) internal returns (MixedScenario memory scenario) {
+        string memory json = _casesJson();
+        string memory prefix = string.concat(".", caseId);
+        uint256 uniformCount = json.readUint(string.concat(prefix, ".uniform_count"));
+        uint256 cashWad = json.readUint(string.concat(prefix, ".initial_cash_budget_wad"));
+        uint24 feeTier = uint24(json.readUint(string.concat(prefix, ".fee_tier")));
+
+        if (uniformCount > 0) {
+            uint256 uniformPriceBps = json.readUint(string.concat(prefix, ".uniform_price_bps"));
+            uint256 uniformLiquidity = json.readUint(string.concat(prefix, ".uniform_liquidity"));
+            return _buildMixedUniformScenario(uniformCount, uniformPriceBps, uniformLiquidity, cashWad, feeTier);
+        }
+
+        uint256[] memory pricesWad = json.readUintArray(string.concat(prefix, ".starting_prices_wad"));
+        uint256[] memory predsWad = json.readUintArray(string.concat(prefix, ".predictions_wad"));
+        uint256[] memory holdingsWad = json.readUintArray(string.concat(prefix, ".initial_holdings_wad"));
+        uint256[] memory liquidities = json.readUintArray(string.concat(prefix, ".liquidity"));
+        bool[] memory isToken1 = json.readBoolArray(string.concat(prefix, ".is_token1"));
+
+        return _buildMixedScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
     }
 
     function _buildScenario(
@@ -592,6 +723,102 @@ contract RebalancerABTest is Test {
         return _buildScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
     }
 
+    function _buildMixedScenario(
+        uint256[] memory pricesWad,
+        uint256[] memory predsWad,
+        uint256[] memory holdingsWad,
+        uint256[] memory liquidities,
+        bool[] memory isToken1,
+        uint256 cashWad,
+        uint24 feeTier
+    ) internal returns (MixedScenario memory scenario) {
+        uint256 n = pricesWad.length;
+        require(
+            n == predsWad.length &&
+            n == holdingsWad.length &&
+            n == liquidities.length &&
+            n == isToken1.length,
+            "length mismatch"
+        );
+
+        scenario.collateral = new BenchmarkERC20();
+        BenchmarkRouter router = new BenchmarkRouter();
+        BenchmarkCTFRouter ctfRouter = new BenchmarkCTFRouter();
+        scenario.rebalancerMixed = new RebalancerMixed(address(router), address(ctfRouter));
+        scenario.tokens = new BenchmarkERC20[](n);
+        scenario.predictionsWad = predsWad;
+
+        ScenarioArrays memory arrays = _allocScenarioArrays(n);
+
+        for (uint256 i = 0; i < n; i++) {
+            BenchmarkERC20 token = new BenchmarkERC20();
+            BenchmarkPool pool = new BenchmarkPool(
+                _priceWadToSqrtX96(pricesWad[i], isToken1[i]),
+                uint128(liquidities[i])
+            );
+            pool.setTick(0);
+
+            scenario.tokens[i] = token;
+            arrays.tokens[i] = address(token);
+            arrays.pools[i] = address(pool);
+            arrays.isToken1[i] = isToken1[i];
+            arrays.balances[i] = holdingsWad[i];
+            arrays.sqrtPredX96[i] = _priceWadToSqrtX96(predsWad[i], isToken1[i]);
+
+            router.configure(address(token), address(pool), isToken1[i]);
+
+            if (holdingsWad[i] > 0) {
+                token.mint(address(this), holdingsWad[i]);
+                token.approve(address(scenario.rebalancerMixed), holdingsWad[i]);
+            }
+        }
+        ctfRouter.setTokens(arrays.tokens);
+
+        if (cashWad > 0) {
+            scenario.collateral.mint(address(this), cashWad);
+            scenario.collateral.approve(address(scenario.rebalancerMixed), cashWad);
+        }
+
+        scenario.params = Rebalancer.RebalanceParams({
+            tokens: arrays.tokens,
+            pools: arrays.pools,
+            isToken1: arrays.isToken1,
+            balances: arrays.balances,
+            collateralAmount: cashWad,
+            sqrtPredX96: arrays.sqrtPredX96,
+            collateral: address(scenario.collateral),
+            fee: feeTier
+        });
+    }
+
+    function _buildMixedUniformScenario(
+        uint256 count,
+        uint256 priceBps,
+        uint256 liquidityPerPool,
+        uint256 cashWad,
+        uint24 feeTier
+    ) internal returns (MixedScenario memory) {
+        uint256[] memory pricesWad = new uint256[](count);
+        uint256[] memory predsWad = new uint256[](count);
+        uint256[] memory holdingsWad = new uint256[](count);
+        uint256[] memory liquidities = new uint256[](count);
+        bool[] memory isToken1 = new bool[](count);
+        uint256 basePred = WAD / count;
+        uint256 remainder = WAD - basePred * count;
+
+        for (uint256 i = 0; i < count; i++) {
+            uint256 pred = basePred;
+            if (i == 0) pred += remainder;
+            predsWad[i] = pred;
+            pricesWad[i] = pred * priceBps / 10_000;
+            holdingsWad[i] = 0;
+            liquidities[i] = liquidityPerPool;
+            isToken1[i] = true;
+        }
+
+        return _buildMixedScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
+    }
+
     function _allocScenarioArrays(uint256 n) internal pure returns (ScenarioArrays memory arrays) {
         arrays.tokens = new address[](n);
         arrays.pools = new address[](n);
@@ -638,6 +865,20 @@ contract RebalancerABTest is Test {
 
     function _absDiff(uint256 a, uint256 b) internal pure returns (uint256) {
         return a >= b ? a - b : b - a;
+    }
+
+    function _signedDiff(uint256 a, uint256 b) internal pure returns (int256) {
+        uint256 diff = _absDiff(a, b);
+        int256 signed = int256(diff);
+        return a >= b ? signed : -signed;
+    }
+
+    function _signedBpsDiff(uint256 nextValue, uint256 baseValue) internal pure returns (int256) {
+        if (baseValue == 0) return 0;
+        uint256 numerator = _absDiff(nextValue, baseValue);
+        uint256 bps = FullMath.mulDiv(numerator, 10_000, baseValue);
+        int256 signed = int256(bps);
+        return nextValue >= baseValue ? signed : -signed;
     }
 
     function _appendFailure(string memory failures, string memory next) internal pure returns (string memory) {

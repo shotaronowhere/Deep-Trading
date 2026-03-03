@@ -63,7 +63,7 @@ contract MixedMockPool {
     }
 
     function liquidity() external pure returns (uint128) {
-        return 1;
+        return 1e18;
     }
 }
 
@@ -132,6 +132,7 @@ contract MixedMockCTFRouter {
 
 contract RebalancerMixedTest is Test {
     uint160 internal constant TEST_Q96 = uint160(1 << 96);
+    event MixedSolveFallback(uint8 reasonCode);
 
     function testRebalanceMixedUsesDirectStepWhenPriceSumIsBelowOne() public {
         MixedMockERC20 collateral = new MixedMockERC20();
@@ -264,8 +265,8 @@ contract RebalancerMixedTest is Test {
 
         MixedMockPool poolA = new MixedMockPool((TEST_Q96 * 3) / 4);
         MixedMockPool poolB = new MixedMockPool((TEST_Q96 * 3) / 4);
-        MixedMockPool poolC = new MixedMockPool(TEST_Q96 / 2);
-        MixedMockPool poolD = new MixedMockPool(TEST_Q96 / 2);
+        MixedMockPool poolC = new MixedMockPool((TEST_Q96 * 11) / 20);
+        MixedMockPool poolD = new MixedMockPool((TEST_Q96 * 11) / 20);
 
         MixedMockRouter router = new MixedMockRouter();
         MixedMockCTFRouter ctfRouter = new MixedMockCTFRouter();
@@ -319,5 +320,333 @@ contract RebalancerMixedTest is Test {
         assertEq(tokenB.balanceOf(address(this)), 5);
         assertEq(tokenC.balanceOf(address(this)), 5);
         assertEq(tokenD.balanceOf(address(this)), 0);
+    }
+
+    function testRebalanceMixedConstantLInvalidIterationsReverts() public {
+        MixedMockRouter router = new MixedMockRouter();
+        MixedMockCTFRouter ctfRouter = new MixedMockCTFRouter();
+        RebalancerMixed rebalancer = new RebalancerMixed(address(router), address(ctfRouter));
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: new address[](0),
+            pools: new address[](0),
+            isToken1: new bool[](0),
+            balances: new uint256[](0),
+            collateralAmount: 0,
+            sqrtPredX96: new uint160[](0),
+            collateral: address(0),
+            fee: 0
+        });
+
+        vm.expectRevert(RebalancerMixed.InvalidIterations.selector);
+        rebalancer.rebalanceMixedConstantL(params, address(0xBEEF), 0, 24, 1);
+    }
+
+    function testRebalanceMixedConstantLNoUnderpricedReturnsZeroSpent() public {
+        MixedMockERC20 collateral = new MixedMockERC20();
+        MixedMockERC20 tokenA = new MixedMockERC20();
+        MixedMockERC20 tokenB = new MixedMockERC20();
+        MixedMockERC20 tokenC = new MixedMockERC20();
+
+        MixedMockPool poolA = new MixedMockPool(TEST_Q96 / 2);
+        MixedMockPool poolB = new MixedMockPool(TEST_Q96 / 2);
+        MixedMockPool poolC = new MixedMockPool(TEST_Q96 / 2);
+
+        MixedMockRouter router = new MixedMockRouter();
+        MixedMockCTFRouter ctfRouter = new MixedMockCTFRouter();
+        RebalancerMixed rebalancer = new RebalancerMixed(address(router), address(ctfRouter));
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+        tokens[2] = address(tokenC);
+        ctfRouter.setTokens(tokens);
+
+        address[] memory pools = new address[](3);
+        pools[0] = address(poolA);
+        pools[1] = address(poolB);
+        pools[2] = address(poolC);
+
+        bool[] memory isToken1 = new bool[](3);
+        uint256[] memory balances = new uint256[](3);
+        uint160[] memory sqrtPredX96 = new uint160[](3);
+        sqrtPredX96[0] = TEST_Q96 / 2;
+        sqrtPredX96[1] = TEST_Q96 / 2;
+        sqrtPredX96[2] = TEST_Q96 / 2;
+
+        collateral.mint(address(this), 5);
+        collateral.approve(address(rebalancer), 5);
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: 5,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        (uint256 proceeds, uint256 spent) = rebalancer.rebalanceMixedConstantL(params, address(0xBEEF), 24, 24, 5);
+
+        assertEq(proceeds, 0);
+        assertEq(spent, 0);
+        assertEq(ctfRouter.splitCount(), 0);
+        assertEq(ctfRouter.mergeCount(), 0);
+        assertEq(collateral.balanceOf(address(this)), 5);
+    }
+
+    function testRebalanceMixedConstantLFallsBackToDirectWhenNoNonActive() public {
+        MixedMockERC20 collateral = new MixedMockERC20();
+        MixedMockERC20 tokenA = new MixedMockERC20();
+        MixedMockERC20 tokenB = new MixedMockERC20();
+
+        MixedMockPool poolA = new MixedMockPool(TEST_Q96 / 4);
+        MixedMockPool poolB = new MixedMockPool(TEST_Q96 / 4);
+
+        MixedMockRouter router = new MixedMockRouter();
+        MixedMockCTFRouter ctfRouter = new MixedMockCTFRouter();
+        RebalancerMixed rebalancer = new RebalancerMixed(address(router), address(ctfRouter));
+
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+        ctfRouter.setTokens(tokens);
+
+        router.configure(address(tokenA), 1);
+        router.configure(address(tokenB), 1);
+
+        address[] memory pools = new address[](2);
+        pools[0] = address(poolA);
+        pools[1] = address(poolB);
+
+        bool[] memory isToken1 = new bool[](2);
+        uint256[] memory balances = new uint256[](2);
+        uint160[] memory sqrtPredX96 = new uint160[](2);
+        sqrtPredX96[0] = TEST_Q96 / 2;
+        sqrtPredX96[1] = TEST_Q96 / 2;
+
+        collateral.mint(address(this), 3);
+        collateral.approve(address(rebalancer), 3);
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: 3,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        (uint256 proceeds, uint256 spent) = rebalancer.rebalanceMixedConstantL(params, address(0xBEEF), 24, 24, 3);
+
+        assertEq(proceeds, 0);
+        assertGt(spent, 0);
+        assertEq(ctfRouter.splitCount(), 0);
+        assertGt(tokenA.balanceOf(address(this)), 0);
+        assertGt(tokenB.balanceOf(address(this)), 0);
+    }
+
+    function testRebalanceMixedConstantLFailClosedFallsBackWhenSolveInfeasible() public {
+        MixedMockERC20 collateral = new MixedMockERC20();
+        MixedMockERC20 tokenA = new MixedMockERC20();
+        MixedMockERC20 tokenB = new MixedMockERC20();
+        MixedMockERC20 tokenC = new MixedMockERC20();
+        MixedMockERC20 tokenD = new MixedMockERC20();
+
+        MixedMockPool poolA = new MixedMockPool((TEST_Q96 * 3) / 4);
+        MixedMockPool poolB = new MixedMockPool((TEST_Q96 * 3) / 4);
+        MixedMockPool poolC = new MixedMockPool(TEST_Q96 / 2);
+        MixedMockPool poolD = new MixedMockPool(TEST_Q96 / 2);
+
+        MixedMockRouter router = new MixedMockRouter();
+        MixedMockCTFRouter ctfRouter = new MixedMockCTFRouter();
+        RebalancerMixed rebalancer = new RebalancerMixed(address(router), address(ctfRouter));
+
+        address[] memory tokens = new address[](4);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+        tokens[2] = address(tokenC);
+        tokens[3] = address(tokenD);
+        ctfRouter.setTokens(tokens);
+
+        router.configure(address(collateral), 20);
+        router.configure(address(tokenA), 1);
+        router.configure(address(tokenB), 1);
+
+        address[] memory pools = new address[](4);
+        pools[0] = address(poolA);
+        pools[1] = address(poolB);
+        pools[2] = address(poolC);
+        pools[3] = address(poolD);
+
+        bool[] memory isToken1 = new bool[](4);
+        uint256[] memory balances = new uint256[](4);
+        uint160[] memory sqrtPredX96 = new uint160[](4);
+        sqrtPredX96[0] = (TEST_Q96 * 7) / 8;
+        sqrtPredX96[1] = (TEST_Q96 * 7) / 8;
+        sqrtPredX96[2] = (TEST_Q96 * 9) / 16;
+        sqrtPredX96[3] = (TEST_Q96 * 17) / 32;
+
+        collateral.mint(address(this), 100);
+        collateral.approve(address(rebalancer), 100);
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: 100,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        (uint256 proceeds, uint256 spent) = rebalancer.rebalanceMixedConstantL(params, address(0xBEEF), 24, 24, 100);
+
+        assertEq(ctfRouter.splitCount(), 0);
+        assertEq(ctfRouter.mergeCount(), 0);
+        assertGt(tokenA.balanceOf(address(this)), 0);
+        assertGt(tokenB.balanceOf(address(this)), 0);
+        assertEq(tokenC.balanceOf(address(this)), 0);
+        assertEq(tokenD.balanceOf(address(this)), 0);
+        assertEq(proceeds, 0);
+        assertGt(spent, 0);
+    }
+
+    function testRebalanceMixedConstantLEmitsFallbackReasonCodeOnSolveFailure() public {
+        MixedMockERC20 collateral = new MixedMockERC20();
+        MixedMockERC20 tokenA = new MixedMockERC20();
+        MixedMockERC20 tokenB = new MixedMockERC20();
+        MixedMockERC20 tokenC = new MixedMockERC20();
+        MixedMockERC20 tokenD = new MixedMockERC20();
+
+        MixedMockPool poolA = new MixedMockPool((TEST_Q96 * 3) / 4);
+        MixedMockPool poolB = new MixedMockPool((TEST_Q96 * 3) / 4);
+        MixedMockPool poolC = new MixedMockPool(TEST_Q96 / 2);
+        MixedMockPool poolD = new MixedMockPool(TEST_Q96 / 2);
+
+        MixedMockRouter router = new MixedMockRouter();
+        MixedMockCTFRouter ctfRouter = new MixedMockCTFRouter();
+        RebalancerMixed rebalancer = new RebalancerMixed(address(router), address(ctfRouter));
+
+        address[] memory tokens = new address[](4);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+        tokens[2] = address(tokenC);
+        tokens[3] = address(tokenD);
+        ctfRouter.setTokens(tokens);
+
+        router.configure(address(collateral), 20);
+        router.configure(address(tokenA), 1);
+        router.configure(address(tokenB), 1);
+
+        address[] memory pools = new address[](4);
+        pools[0] = address(poolA);
+        pools[1] = address(poolB);
+        pools[2] = address(poolC);
+        pools[3] = address(poolD);
+
+        bool[] memory isToken1 = new bool[](4);
+        uint256[] memory balances = new uint256[](4);
+        uint160[] memory sqrtPredX96 = new uint160[](4);
+        sqrtPredX96[0] = (TEST_Q96 * 7) / 8;
+        sqrtPredX96[1] = (TEST_Q96 * 7) / 8;
+        sqrtPredX96[2] = (TEST_Q96 * 9) / 16;
+        sqrtPredX96[3] = (TEST_Q96 * 17) / 32;
+
+        collateral.mint(address(this), 100);
+        collateral.approve(address(rebalancer), 100);
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: 100,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        vm.expectEmit(false, false, false, true, address(rebalancer));
+        emit MixedSolveFallback(4);
+        rebalancer.rebalanceMixedConstantL(params, address(0xBEEF), 24, 24, 100);
+    }
+
+    function testGasProfileMixedConstantLEightOutcomeSingleTick() public {
+        uint256 gasUsed = _runMixedConstantLGasProfile(8);
+        emit log_named_uint("mixed_constant_l_8_gas", gasUsed);
+        assertLt(gasUsed, 250_000_000);
+    }
+
+    function testGasProfileMixedConstantLSixteenOutcomeSingleTick() public {
+        uint256 gasUsed = _runMixedConstantLGasProfile(16);
+        emit log_named_uint("mixed_constant_l_16_gas", gasUsed);
+        assertLt(gasUsed, 250_000_000);
+    }
+
+    function testGasProfileMixedConstantLThirtyTwoOutcomeSingleTick() public {
+        uint256 gasUsed = _runMixedConstantLGasProfile(32);
+        emit log_named_uint("mixed_constant_l_32_gas", gasUsed);
+        assertLt(gasUsed, 250_000_000);
+    }
+
+    function testGasProfileMixedConstantLNinetyEightOutcomeSingleTick() public {
+        uint256 gasUsed = _runMixedConstantLGasProfile(98);
+        emit log_named_uint("mixed_constant_l_98_gas", gasUsed);
+        assertLt(gasUsed, 250_000_000);
+    }
+
+    function _runMixedConstantLGasProfile(uint256 outcomeCount) internal returns (uint256 gasUsed) {
+        vm.pauseGasMetering();
+
+        MixedMockERC20 collateral = new MixedMockERC20();
+        MixedMockRouter router = new MixedMockRouter();
+        MixedMockCTFRouter ctfRouter = new MixedMockCTFRouter();
+        RebalancerMixed rebalancer = new RebalancerMixed(address(router), address(ctfRouter));
+
+        address[] memory tokens = new address[](outcomeCount);
+        address[] memory pools = new address[](outcomeCount);
+        bool[] memory isToken1 = new bool[](outcomeCount);
+        uint256[] memory balances = new uint256[](outcomeCount);
+        uint160[] memory sqrtPredX96 = new uint160[](outcomeCount);
+
+        for (uint256 i = 0; i < outcomeCount; i++) {
+            MixedMockERC20 token = new MixedMockERC20();
+            tokens[i] = address(token);
+            sqrtPredX96[i] = TEST_Q96 / 2;
+            uint160 sqrtStart = i < outcomeCount / 4 ? (TEST_Q96 * 3) / 4 : (TEST_Q96 * 9) / 16;
+            MixedMockPool pool = new MixedMockPool(sqrtStart);
+            pools[i] = address(pool);
+            router.configure(address(token), 1);
+        }
+        router.configure(address(collateral), 1);
+
+        ctfRouter.setTokens(tokens);
+
+        uint256 budget = outcomeCount * 10;
+        collateral.mint(address(this), budget);
+        collateral.approve(address(rebalancer), budget);
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: budget,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        vm.resumeGasMetering();
+        uint256 gasStart = gasleft();
+        rebalancer.rebalanceMixedConstantL(params, address(0xBEEF), 24, 24, budget);
+        gasUsed = gasStart - gasleft();
+        vm.pauseGasMetering();
     }
 }

@@ -1,12 +1,11 @@
 # Experimental On-Chain Mixed Rebalancer
 
-`contracts/RebalancerMixed.sol` is an experimental sibling to `contracts/Rebalancer.sol`. It does not modify the original contract.
+`contracts/RebalancerMixed.sol` is an experimental sibling to `contracts/Rebalancer.sol`. It keeps the base contract unchanged and provides two mixed-route entrypoints:
 
-## Goal
+1. legacy heuristic stepper (`rebalanceMixed`)
+2. constant-L single-tick bisection solver (`rebalanceMixedConstantL`)
 
-Provide a conservative on-chain approximation of a mixed direct-vs-mint buy path without porting the full off-chain mixed-route solver.
-
-## Entry Point
+## Entry Points
 
 ```solidity
 function rebalanceMixed(
@@ -15,57 +14,81 @@ function rebalanceMixed(
     uint256 maxMixedSteps,
     uint256 maxStepCollateral
 ) external returns (uint256 totalProceeds, uint256 totalSpent);
+
+function rebalanceMixedConstantL(
+    RebalanceParams calldata params,
+    address market,
+    uint256 maxOuterIterations,
+    uint256 maxInnerIterations,
+    uint256 maxMintCollateral
+) external returns (uint256 totalProceeds, uint256 totalSpent);
 ```
 
-- `maxMixedSteps` bounds the greedy loop.
-- `maxStepCollateral` caps how much collateral a single step may commit up front.
+## Legacy Heuristic (`rebalanceMixed`)
 
-## Step Algorithm
+The legacy path is unchanged:
 
-Each loop iteration:
+- repeatedly picks the top direct-profitability tie-group,
+- chooses direct-vs-mint greedily by a local bundle price heuristic,
+- executes capped steps and re-reads state.
 
-1. Reads current pool prices.
-2. Finds the highest direct-profitability outcome set, including exact ratio ties.
-3. Uses the next lower direct-profitability outcome as the frontier. If none exists, the frontier is prediction (`profitability = 0`).
-4. Chooses a route heuristically:
-   - compute direct bundle cost as the sum of the current top-set token prices;
-   - compute alternative mint cost as `1 - sum(sellable non-top token prices)`, where only legs that can still be sold to the current frontier count;
-   - execute the cheaper route for that step.
-5. Re-reads pool state and repeats until no effective step is found, budget is exhausted, or `maxMixedSteps` is reached.
+This remains useful as an A/B baseline and rollback-safe path.
 
-## Direct Step
+## Constant-L Solver (`rebalanceMixedConstantL`)
 
-- Buys only the current top-profitability set.
-- Uses the shared frontier as the per-token `sqrtPriceLimitX96`.
-- Spends at most `maxStepCollateral` across the step.
+### Scope
 
-This is a bounded greedy approximation of a direct waterfall descent across the current top set.
+- constant in-range liquidity (`liquidity()` snapshot)
+- single-tick assumptions in the analytical model
+- rebalance-only (no arb/recycle in this entrypoint)
 
-## Mint Step
+### High-level flow
 
-- Splits at most `maxStepCollateral` collateral into a full complete set using `market`.
-- Keeps the freshly minted tokens that are currently in the top-profitability set.
-- Sells only the newly minted non-top tokens, each only down to the shared frontier.
-- Merges only freshly residual complete sets after those sells.
+1. `_pullAndSell(params)`
+2. attempt mixed solve + single-pass mixed execution
+3. if any gate fails, emit `MixedSolveFallback(reasonCode)` and run direct-only `_readAndBuyConstantL(params)`
+4. `_returnAll(params)`
 
-This is the experimental tie-aware approximation of “mint and sell the rest”:
+### Solve shape
 
-- when several tokens share the current top profitability, the contract keeps all of them in the same mint step;
-- the sell limits on the other tokens stop them at the same frontier so they are not pushed arbitrarily far past the current active boundary;
-- non-top tokens already sitting at that boundary do not contribute to the alternative buy credit for that step.
+- outer bisection on frontier profitability `pi`
+- inner bisection on aggregate mint amount `M`
+- active set is seeded from direct-only sorted-prefix solve
+- pre-execution residual/tolerance gate must pass
 
-## Important Limits
+### Fixed defaults/constants
 
-- This is intentionally heuristic. It is not the full mixed-route waterfall from the Rust planner.
-- Route choice is greedy, not globally optimized.
-- It only supports the same single `market` split/merge interface used by `ICTFRouter`.
-- For connected multi-market trees, it still relies on the caller-side `market` abstraction and does not introduce a new cross-market mint interface.
-- Tie grouping uses exact on-chain profitability-ratio equality, so near-ties are not merged unless the ratios match exactly in integer math.
+- `MAX_MIXED_ACTIVE = type(uint256).max` (uncapped for benchmark exploration)
+- `COST_TOL_WAD = 1e6`
+- `MINT_RESIDUAL_TOL_WAD = 5e15`
+
+### Fail-closed policy
+
+The path falls back to direct-only when mixed assumptions fail (for example, active set too large, no sellable non-active legs, infeasible solve, residual tolerance breach, zero effective mint). This preserves deterministic execution safety while keeping mixed logic optional.
+
+## Errors and Events
+
+```solidity
+error ZeroStepBudget();
+error ZeroSteps();
+error InvalidIterations();
+error MixedSolveInfeasible();
+
+event MixedSolveFallback(uint8 reasonCode);
+```
+
+`InvalidIterations` is hard-fail input validation for the constant-L solver. Runtime mixed-route failure modes are soft-failed into direct-only via `MixedSolveFallback`.
 
 ## Verification Notes
 
-- `test/RebalancerMixed.t.sol` covers:
-  - a direct-preferred low-total-price branch,
-  - a direct-preferred high-total-price branch where the frontier blocks the mint credit,
-  - a mint-preferred branch where the alternative buy route is genuinely cheaper.
-- The tests intentionally keep the router and CTF mocks simple; they verify branch shape and accounting, not execution optimality.
+`test/RebalancerMixed.t.sol` now includes:
+
+- legacy heuristic behavior checks,
+- constant-L invalid-iteration guard,
+- constant-L no-underpriced no-op,
+- constant-L fail-closed fallback checks,
+- gas profile matrix for 8/16/32/98 outcomes.
+
+Apples-to-apples on-chain EV+gas comparison against `Rebalancer.rebalance(...)` is documented in `docs/rebalancer_vs_rebalancer_mixed_benchmark_2026-03-03.md` and generated by `test/RebalancerAB.t.sol::test_rebalancer_vs_mixed_apples_to_apples_report`.
+
+The mock router/CTF fixtures are intentionally simplified; they validate control-flow and accounting behavior, not production EV optimality.
