@@ -385,7 +385,7 @@ fn conservative_sqrt_price_limit(
             }
         }
         LegKind::Sell => {
-            const EXECUTION_FEE_FACTOR: f64 = 1.0 - (500.0 / 1_000_000.0);
+            const EXECUTION_FEE_FACTOR: f64 = 1.0 - (100.0 / 1_000_000.0);
             let kappa = EXECUTION_FEE_FACTOR * sqrt_current / state.liquidity_raw;
             let denom = 1.0 + amount * kappa;
             if !denom.is_finite() || denom <= 0.0 {

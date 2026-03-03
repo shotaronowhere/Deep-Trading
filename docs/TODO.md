@@ -4,7 +4,8 @@
 
 - [ ] Integrate gas/MEV-aware net-PnL objective (EV minus execution costs) once live gas-cost estimator wiring is available.
 - [ ] Replace heuristic L1 data-fee model (estimated calldata bytes + cached two-point `getL1Fee(bytes)` marginal fee/byte estimate) with exact transaction-serialization-based `getL1Fee(txData)` now that strict action->transaction calldata wiring is implemented.
-- [ ] Review the current benchmark finding that the experimental off-chain mixed planner underperforms on-chain `Rebalancer.rebalanceExact()` on `small_bundle_mixed_case` (~0.036% lower EV on the committed fixture). Determine whether the issue is in the bundle planner, fixture assumptions, or execution-model mismatch before treating mixed routing as an EV improvement.
+- [ ] If we want to benchmark the Phase 0-arb-inclusive off-chain strategy directly, add a CTF-aware on-chain `rebalanceAndArb()` / `rebalanceAndArbExact()` fixture. The current apples-to-apples A/B benchmark now compares direct parity and full rebalance-only dominance against `Rebalancer.rebalance()`; the historical Phase 0 mismatch is documented separately in `docs/rebalancer_ab_mixed_gap_investigation_2026-03-03.md`.
+- [ ] Explore strict arb-at-end cyclic scheduling (`rebalance` with no internal arb, then `arb`, repeated to convergence) as an optional mode. Include anti-churn guards to avoid fee-negative buy/sell round-trips and benchmark against start-arb flow on both 4-outcome and 98-outcome suites.
 
 ## Done (On-Chain)
 

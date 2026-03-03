@@ -83,7 +83,7 @@ fn assert_flash_brackets_are_well_formed(actions: &[Action]) {
         .expect("action stream should satisfy no-flash grouping shapes");
 }
 
-async fn fetch_live_expected_l1_slot0_results(
+pub(super) async fn fetch_live_expected_l1_slot0_results(
     label: &str,
 ) -> Option<Vec<(Slot0Result, &'static crate::markets::MarketData)>> {
     dotenvy::dotenv().ok();

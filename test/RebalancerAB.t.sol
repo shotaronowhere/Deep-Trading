@@ -120,12 +120,18 @@ contract BenchmarkRouter {
     function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata params) external payable returns (uint256 amountOut) {
         address outcomeToken = configs[params.tokenOut].enabled ? params.tokenOut : params.tokenIn;
         Config memory config = configs[outcomeToken];
-        require(config.enabled && config.isToken1, "unsupported benchmark route");
+        require(config.enabled, "unsupported benchmark route");
 
         if (outcomeToken == params.tokenOut) {
-            return _buyToken1WithToken0(params, BenchmarkPool(config.pool));
+            if (config.isToken1) {
+                return _buyToken1WithToken0(params, BenchmarkPool(config.pool));
+            }
+            return _buyToken0WithToken1(params, BenchmarkPool(config.pool));
         }
-        return _sellToken1ForToken0(params, BenchmarkPool(config.pool));
+        if (config.isToken1) {
+            return _sellToken1ForToken0(params, BenchmarkPool(config.pool));
+        }
+        return _sellToken0ForToken1(params, BenchmarkPool(config.pool));
     }
 
     function exactOutputSingle(IV3SwapRouter.ExactOutputSingleParams calldata) external pure returns (uint256) {
@@ -203,6 +209,77 @@ contract BenchmarkRouter {
         pool.setSqrtPrice(end);
     }
 
+    function _buyToken0WithToken1(
+        IV3SwapRouter.ExactInputSingleParams calldata params,
+        BenchmarkPool pool
+    ) internal returns (uint256 amountOut) {
+        (uint160 start,,,,,,) = pool.slot0();
+        uint128 liquidity = pool.liquidity();
+        uint160 end;
+        uint256 actualIn;
+
+        unchecked {
+            uint256 feeComp = FEE_UNITS - uint256(params.fee);
+            uint256 effectiveIn = FullMath.mulDiv(params.amountIn, feeComp, FEE_UNITS);
+
+            uint160 endFromInput = start;
+            if (effectiveIn > 0) {
+                endFromInput = uint160(uint256(start) + FullMath.mulDiv(effectiveIn, Q96, uint256(liquidity)));
+            }
+
+            uint160 target = params.sqrtPriceLimitX96;
+            end = endFromInput > target ? target : endFromInput;
+            if (end < start) end = start;
+            uint256 priceDelta = uint256(end) > uint256(start) ? uint256(end) - uint256(start) : 0;
+            uint256 noFeeIn = priceDelta == 0 ? 0 : FullMath.mulDiv(uint256(liquidity), priceDelta, Q96);
+            actualIn = feeComp == 0 ? 0 : _mulDivRoundingUp(noFeeIn, FEE_UNITS, feeComp);
+            if (actualIn > params.amountIn) actualIn = params.amountIn;
+            uint256 lq96 = uint256(liquidity) * Q96;
+            amountOut = priceDelta == 0 ? 0 : FullMath.mulDiv(lq96, priceDelta, uint256(end) * uint256(start));
+        }
+
+        require(BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "buy transferFrom failed");
+        BenchmarkERC20(params.tokenOut).mint(params.recipient, amountOut);
+        pool.setSqrtPrice(end);
+    }
+
+    function _sellToken0ForToken1(
+        IV3SwapRouter.ExactInputSingleParams calldata params,
+        BenchmarkPool pool
+    ) internal returns (uint256 amountOut) {
+        (uint160 start,,,,,,) = pool.slot0();
+        uint128 liquidity = pool.liquidity();
+        uint160 end;
+        uint256 actualIn;
+
+        unchecked {
+            uint256 feeComp = FEE_UNITS - uint256(params.fee);
+            uint256 effectiveIn = FullMath.mulDiv(params.amountIn, feeComp, FEE_UNITS);
+            uint256 lq96 = uint256(liquidity) * Q96;
+
+            uint160 endFromInput = start;
+            if (effectiveIn > 0) {
+                uint256 denom = lq96 + effectiveIn * uint256(start);
+                endFromInput = uint160(FullMath.mulDiv(lq96, uint256(start), denom));
+            }
+
+            uint160 target = params.sqrtPriceLimitX96;
+            end = endFromInput < target ? target : endFromInput;
+            if (end > start) end = start;
+            uint256 priceDelta = uint256(start) > uint256(end) ? uint256(start) - uint256(end) : 0;
+            uint256 noFeeIn = priceDelta == 0
+                ? 0
+                : _mulDivRoundingUp(lq96, priceDelta, uint256(start) * uint256(end));
+            actualIn = feeComp == 0 ? 0 : _mulDivRoundingUp(noFeeIn, FEE_UNITS, feeComp);
+            if (actualIn > params.amountIn) actualIn = params.amountIn;
+            amountOut = priceDelta == 0 ? 0 : FullMath.mulDiv(uint256(liquidity), priceDelta, Q96);
+        }
+
+        require(BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "sell transferFrom failed");
+        BenchmarkERC20(params.tokenOut).mint(params.recipient, amountOut);
+        pool.setSqrtPrice(end);
+    }
+
     function _mulDivRoundingUp(uint256 a, uint256 b, uint256 denominator) internal pure returns (uint256 result) {
         if (a == 0 || b == 0) return 0;
         result = FullMath.mulDiv(a, b, denominator);
@@ -239,25 +316,107 @@ contract RebalancerABTest is Test {
 
         failures = _appendFailure(failures, _checkDirectParity("two_pool_single_tick_direct_only"));
         failures = _appendFailure(failures, _checkDirectParity("ninety_eight_outcome_multitick_direct_only"));
-        failures = _appendFailure(failures, _checkMixedGap("small_bundle_mixed_case"));
+        failures = _appendFailure(failures, _checkFullDominance("small_bundle_mixed_case"));
+        failures = _appendFailure(failures, _checkFullDominance("mixed_route_favorable_synthetic_case"));
+        failures = _appendFailure(failures, _checkFullDominance("heterogeneous_ninety_eight_outcome_l1_like_case"));
         failures = _appendFailure(failures, _checkDirectParity("legacy_holdings_direct_only_case"));
 
         assertEq(bytes(failures).length, 0, failures);
     }
 
+    function test_rebalancer_ab_live_l1_snapshot_report() external {
+        string memory json = _liveReportJson();
+        string memory caseId = json.readString(".case_id");
+        uint256 offchainDirect = json.readUint(".offchain_direct_ev_wei");
+        uint256 offchainFullRebalanceOnly = json.readUint(".offchain_full_rebalance_only_ev_wei");
+        uint256[] memory pricesWad = json.readUintArray(".starting_prices_wad");
+        uint256[] memory predsWad = json.readUintArray(".predictions_wad");
+        uint256[] memory holdingsWad = json.readUintArray(".initial_holdings_wad");
+        uint256[] memory liquidities = json.readUintArray(".liquidity");
+        bool[] memory isToken1 = json.readBoolArray(".is_token1");
+        uint24 feeTier = uint24(json.readUint(".fee_tier"));
+        uint256 cashWad = json.readUint(".initial_cash_budget_wad");
+
+        Scenario memory constantScenario = _buildScenario(
+            pricesWad,
+            predsWad,
+            holdingsWad,
+            liquidities,
+            isToken1,
+            cashWad,
+            feeTier
+        );
+        constantScenario.rebalancer.rebalance(constantScenario.params);
+        uint256 constantEv = _portfolioEvWad(
+            constantScenario.collateral,
+            constantScenario.tokens,
+            constantScenario.predictionsWad
+        );
+
+        Scenario memory exactScenario = _buildScenario(
+            pricesWad,
+            predsWad,
+            holdingsWad,
+            liquidities,
+            isToken1,
+            cashWad,
+            feeTier
+        );
+        exactScenario.rebalancer.rebalanceExact(exactScenario.params, 24, 4);
+        uint256 exactEv = _portfolioEvWad(
+            exactScenario.collateral,
+            exactScenario.tokens,
+            exactScenario.predictionsWad
+        );
+
+        uint256 directTol = _evParityTol(offchainDirect, constantEv);
+        uint256 fullTol = _evParityTol(offchainFullRebalanceOnly, constantEv);
+
+        emit log_string(caseId);
+        emit log_named_uint("offchain_direct_ev", offchainDirect);
+        emit log_named_uint("offchain_full_rebalance_only_ev", offchainFullRebalanceOnly);
+        emit log_named_uint("onchain_constant_ev", constantEv);
+        emit log_named_uint("onchain_exact_ev", exactEv);
+        emit log_named_int("constant_minus_offchain_direct", int256(constantEv) - int256(offchainDirect));
+        emit log_named_int(
+            "offchain_full_minus_onchain_constant",
+            int256(offchainFullRebalanceOnly) - int256(constantEv)
+        );
+
+        assertTrue(
+            offchainDirect + directTol >= constantEv,
+            string.concat(caseId, ": onchain constant exceeded offchain direct")
+        );
+        assertTrue(
+            _absDiff(constantEv, offchainDirect) <= directTol,
+            string.concat(caseId, ": onchain constant vs offchain direct mismatch")
+        );
+        assertTrue(
+            offchainFullRebalanceOnly + fullTol >= constantEv,
+            string.concat(caseId, ": offchain full rebalance-only underperformed onchain constant")
+        );
+        assertTrue(
+            exactEv + fullTol >= constantEv,
+            string.concat(caseId, ": exact path underperformed constant path")
+        );
+    }
+
     function _checkDirectParity(string memory caseId) internal returns (string memory failure) {
-        (uint256 offchainDirect,,,) = _expectedRow(caseId);
+        (uint256 offchainDirect,,,,) = _expectedRow(caseId);
         (uint256 constantEv, uint256 exactEv) = _runCase(caseId);
-        uint256 tol = _evParityTol(offchainDirect, exactEv);
+        uint256 tol = _evParityTol(offchainDirect, constantEv);
 
         emit log_string(caseId);
         emit log_named_uint("offchain_direct_ev", offchainDirect);
         emit log_named_uint("onchain_constant_ev", constantEv);
         emit log_named_uint("onchain_exact_ev", exactEv);
-        emit log_named_int("exact_minus_offchain_direct", int256(exactEv) - int256(offchainDirect));
+        emit log_named_int("constant_minus_offchain_direct", int256(constantEv) - int256(offchainDirect));
 
-        if (_absDiff(exactEv, offchainDirect) > tol) {
-            return string.concat(caseId, ": onchain exact vs offchain direct mismatch");
+        if (offchainDirect + tol < constantEv) {
+            return string.concat(caseId, ": onchain constant exceeded offchain direct");
+        }
+        if (_absDiff(constantEv, offchainDirect) > tol) {
+            return string.concat(caseId, ": onchain constant vs offchain direct mismatch");
         }
         if (exactEv + tol < constantEv) {
             return string.concat(caseId, ": exact path underperformed constant path");
@@ -266,19 +425,34 @@ contract RebalancerABTest is Test {
         return "";
     }
 
-    function _checkMixedGap(string memory caseId) internal returns (string memory failure) {
-        (, uint256 offchainMixed,, uint256 expectedExact) = _expectedRow(caseId);
+    function _checkFullDominance(string memory caseId) internal returns (string memory failure) {
+        (uint256 offchainDirect,, uint256 offchainFullRebalanceOnly,,) = _expectedRow(caseId);
         (uint256 constantEv, uint256 exactEv) = _runCase(caseId);
-        uint256 tol = _evGapTol(exactEv, expectedExact);
+        uint256 directTol = _evParityTol(offchainDirect, constantEv);
+        uint256 tol = _evParityTol(offchainFullRebalanceOnly, constantEv);
 
         emit log_string(caseId);
-        emit log_named_uint("offchain_mixed_ev", offchainMixed);
+        emit log_named_uint("offchain_direct_ev", offchainDirect);
+        emit log_named_uint("offchain_full_rebalance_only_ev", offchainFullRebalanceOnly);
         emit log_named_uint("onchain_constant_ev", constantEv);
         emit log_named_uint("onchain_exact_ev", exactEv);
-        emit log_named_int("offchain_mixed_minus_onchain_exact", int256(offchainMixed) - int256(exactEv));
+        emit log_named_int("constant_minus_offchain_direct", int256(constantEv) - int256(offchainDirect));
+        emit log_named_int(
+            "offchain_full_minus_onchain_constant",
+            int256(offchainFullRebalanceOnly) - int256(constantEv)
+        );
 
-        if (_absDiff(exactEv, expectedExact) > tol) {
-            return string.concat(caseId, ": onchain exact EV drifted from committed anomaly snapshot");
+        if (offchainDirect + directTol < constantEv) {
+            return string.concat(caseId, ": onchain constant exceeded offchain direct");
+        }
+        if (_absDiff(constantEv, offchainDirect) > directTol) {
+            return string.concat(caseId, ": onchain constant vs offchain direct mismatch");
+        }
+        if (offchainFullRebalanceOnly + tol < constantEv) {
+            return string.concat(caseId, ": offchain full rebalance-only underperformed onchain constant");
+        }
+        if (exactEv + tol < constantEv) {
+            return string.concat(caseId, ": exact path underperformed constant path");
         }
 
         return "";
@@ -352,9 +526,8 @@ contract RebalancerABTest is Test {
 
         for (uint256 i = 0; i < n; i++) {
             BenchmarkERC20 token = new BenchmarkERC20();
-            require(isToken1[i], "benchmark harness supports token1 pools only");
             BenchmarkPool pool = new BenchmarkPool(
-                _priceWadToSqrtX96Token1(pricesWad[i]),
+                _priceWadToSqrtX96(pricesWad[i], isToken1[i]),
                 uint128(liquidities[i])
             );
             pool.setTick(0);
@@ -364,7 +537,7 @@ contract RebalancerABTest is Test {
             arrays.pools[i] = address(pool);
             arrays.isToken1[i] = isToken1[i];
             arrays.balances[i] = holdingsWad[i];
-            arrays.sqrtPredX96[i] = _priceWadToSqrtX96Token1(predsWad[i]);
+            arrays.sqrtPredX96[i] = _priceWadToSqrtX96(predsWad[i], isToken1[i]);
 
             router.configure(address(token), address(pool), isToken1[i]);
 
@@ -441,12 +614,19 @@ contract RebalancerABTest is Test {
     function _expectedRow(string memory caseId)
         internal
         view
-        returns (uint256 offchainDirect, uint256 offchainMixed, uint256 offchainActions, uint256 expectedExact)
+        returns (
+            uint256 offchainDirect,
+            uint256 offchainMixed,
+            uint256 offchainFullRebalanceOnly,
+            uint256 offchainActions,
+            uint256 expectedExact
+        )
     {
         string memory json = _expectedJson();
         string memory prefix = string.concat(".", caseId);
         offchainDirect = json.readUint(string.concat(prefix, ".offchain_direct_ev_wei"));
         offchainMixed = json.readUint(string.concat(prefix, ".offchain_mixed_ev_wei"));
+        offchainFullRebalanceOnly = json.readUint(string.concat(prefix, ".offchain_full_rebalance_only_ev_wei"));
         offchainActions = json.readUint(string.concat(prefix, ".offchain_action_count"));
         expectedExact = json.readUint(string.concat(prefix, ".expected_onchain_exact_ev_wei"));
     }
@@ -454,11 +634,6 @@ contract RebalancerABTest is Test {
     function _evParityTol(uint256 a, uint256 b) internal pure returns (uint256) {
         uint256 maxValue = a > b ? a : b;
         return 5e12 * (1 + maxValue / WAD);
-    }
-
-    function _evGapTol(uint256 a, uint256 b) internal pure returns (uint256) {
-        uint256 maxValue = a > b ? a : b;
-        return 5e13 * (1 + maxValue / WAD);
     }
 
     function _absDiff(uint256 a, uint256 b) internal pure returns (uint256) {
@@ -479,10 +654,16 @@ contract RebalancerABTest is Test {
         return vm.readFile(string.concat(vm.projectRoot(), "/test/fixtures/rebalancer_ab_expected.json"));
     }
 
-    function _priceWadToSqrtX96Token1(uint256 priceWad) internal pure returns (uint160) {
+    function _liveReportJson() internal view returns (string memory) {
+        return vm.readFile(string.concat(vm.projectRoot(), "/test/fixtures/rebalancer_ab_live_l1_snapshot_report.json"));
+    }
+
+    function _priceWadToSqrtX96(uint256 priceWad, bool isToken1Outcome) internal pure returns (uint160) {
         require(priceWad > 0, "price=0");
         uint256 two192 = uint256(1) << 192;
-        uint256 scaled = FullMath.mulDiv(two192, WAD, priceWad);
+        uint256 scaled = isToken1Outcome
+            ? FullMath.mulDiv(two192, WAD, priceWad)
+            : FullMath.mulDiv(two192, priceWad, WAD);
         return uint160(_sqrt(scaled));
     }
 

@@ -41,18 +41,55 @@ pub(super) fn mock_slot0_market(
     outcome_token: &'static str,
     price_fraction: f64,
 ) -> (Slot0Result, &'static MarketData) {
+    mock_slot0_market_with_orientation_liquidity_and_ticks(
+        name,
+        outcome_token,
+        price_fraction,
+        1_000_000_000_000_000_000_000u128,
+        1,
+        92_108,
+        true,
+    )
+}
+
+pub(super) fn mock_slot0_market_with_orientation_liquidity_and_ticks(
+    name: &'static str,
+    outcome_token: &'static str,
+    price_fraction: f64,
+    liquidity: u128,
+    tick_lo: i32,
+    tick_hi: i32,
+    is_token1_outcome: bool,
+) -> (Slot0Result, &'static MarketData) {
     let mut p = mock_pool();
-    p.token1 = outcome_token;
+    if is_token1_outcome {
+        p.token1 = outcome_token;
+    } else {
+        p.token0 = outcome_token;
+        p.token1 = "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0";
+    }
+
+    let liq_str = Box::leak(liquidity.to_string().into_boxed_str());
+    p.liquidity = liq_str;
+    let liq_i128 = i128::try_from(liquidity).unwrap_or(i128::MAX);
+    let lo = tick_lo.min(tick_hi);
+    let hi = tick_lo.max(tick_hi);
+    let ticks = Box::leak(Box::new([
+        Tick {
+            tick_idx: lo,
+            liquidity_net: liq_i128,
+        },
+        Tick {
+            tick_idx: hi,
+            liquidity_net: -liq_i128,
+        },
+    ]));
+    p.ticks = ticks;
+
     let pool = leak_pool(p);
 
-    // token0 is quote (sUSD), token1 is outcome
-    // is_token1_outcome = true
-    // outcome price = inv_price = 2^192 / sqrtPriceX96^2
-    // To get outcome price = price_fraction:
-    // sqrtPriceX96 = sqrt(2^192 / (price_fraction * 1e18)) * sqrt(1e18)
-    // Simpler: use prediction_to_sqrt_price_x96
-    let sqrt_price =
-        prediction_to_sqrt_price_x96(price_fraction, true).unwrap_or(U256::from(1u128 << 96));
+    let sqrt_price = prediction_to_sqrt_price_x96(price_fraction, is_token1_outcome)
+        .unwrap_or(U256::from(1u128 << 96));
 
     let market = leak_market(MarketData {
         name,
@@ -108,50 +145,15 @@ pub(super) fn mock_slot0_market_with_liquidity_and_ticks(
     tick_lo: i32,
     tick_hi: i32,
 ) -> (Slot0Result, &'static MarketData) {
-    let mut p = mock_pool();
-    p.token1 = outcome_token;
-
-    let liq_str = Box::leak(liquidity.to_string().into_boxed_str());
-    p.liquidity = liq_str;
-    let liq_i128 = i128::try_from(liquidity).unwrap_or(i128::MAX);
-    let lo = tick_lo.min(tick_hi);
-    let hi = tick_lo.max(tick_hi);
-    let ticks = Box::leak(Box::new([
-        Tick {
-            tick_idx: lo,
-            liquidity_net: liq_i128,
-        },
-        Tick {
-            tick_idx: hi,
-            liquidity_net: -liq_i128,
-        },
-    ]));
-    p.ticks = ticks;
-
-    let pool = leak_pool(p);
-    let sqrt_price =
-        prediction_to_sqrt_price_x96(price_fraction, true).unwrap_or(U256::from(1u128 << 96));
-
-    let market = leak_market(MarketData {
+    mock_slot0_market_with_orientation_liquidity_and_ticks(
         name,
-        market_id: crate::markets::MARKETS_L1[0].market_id,
         outcome_token,
-        pool: Some(*pool),
-        quote_token: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
-    });
-
-    let slot0 = Slot0Result {
-        pool_id: Address::ZERO,
-        sqrt_price_x96: sqrt_price,
-        tick: 0,
-        observation_index: 0,
-        observation_cardinality: 0,
-        observation_cardinality_next: 0,
-        fee_protocol: 0,
-        unlocked: true,
-    };
-
-    (slot0, market)
+        price_fraction,
+        liquidity,
+        tick_lo,
+        tick_hi,
+        true,
+    )
 }
 
 pub(super) fn mock_slot0_market_with_liquidity(

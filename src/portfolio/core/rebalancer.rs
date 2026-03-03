@@ -412,18 +412,12 @@ impl RebalanceContext {
     }
 
     fn liquidation_merge_route_flags(&mut self, edge_susd: f64) -> (bool, bool) {
-        let direct_merge_allowed = passes_execution_gate(
-            edge_susd,
-            self.route_gates.direct_merge,
-            self.route_gates.buffer_frac,
-            self.route_gates.buffer_min_susd,
-        );
-        if self.mint_available && !direct_merge_allowed {
+        let _ = edge_susd;
+        if self.mint_available {
             self.gate_counters.skipped_by_gate_direct_merge += 1;
         }
-        // Phase 3 liquidation intentionally avoids buy-merge. It only unwinds via direct-merge
-        // when the inventory-backed exit clears the gate; complement-buying is handled earlier.
-        (false, direct_merge_allowed)
+        // Liquidation intentionally avoids merge-based routes for now.
+        (false, false)
     }
 
     fn run_phase0_complete_set_arb(&mut self) {
@@ -766,7 +760,7 @@ impl RebalanceContext {
             trial.gate_counters.phase3_candidates_skipped_subgas;
     }
 
-    fn run_polish_reoptimization(&mut self) {
+    fn run_polish_reoptimization(&mut self, run_phase0_in_polish: bool) {
         for _ in 0..MAX_POLISH_PASSES {
             if self.budget <= EPS {
                 break;
@@ -790,7 +784,9 @@ impl RebalanceContext {
                 gate_counters: RebalanceGateCounters::default(),
             };
 
-            trial.run_phase0_complete_set_arb();
+            if run_phase0_in_polish {
+                trial.run_phase0_complete_set_arb();
+            }
 
             trial.run_phase1_sell_overpriced();
 
@@ -842,11 +838,16 @@ fn finish_rebalance_full_inner(
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
+    run_phase0_arb: bool,
+    run_phase0_arb_at_end: bool,
+    run_phase0_in_polish: bool,
     verify_internal_state: bool,
 ) -> Vec<Action> {
     // ── Phase 0: Complete-set arbitrage (two-sided) ──
     // Execute before any discretionary rebalancing so free budget is harvested first.
-    ctx.run_phase0_complete_set_arb();
+    if run_phase0_arb {
+        ctx.run_phase0_complete_set_arb();
+    }
 
     // ── Phase 1: Sell overpriced holdings ──
     ctx.run_phase1_sell_overpriced();
@@ -885,7 +886,7 @@ fn finish_rebalance_full_inner(
 
     // ── Phase 4: Short polish re-optimization loop ──
     // Run bounded extra passes only when they increase EV.
-    ctx.run_polish_reoptimization();
+    ctx.run_polish_reoptimization(run_phase0_in_polish);
 
     // ── Phase 5: Final local cleanup pass ──
     // Run one final sell-overpriced + waterfall pass so the terminal state
@@ -998,6 +999,10 @@ fn finish_rebalance_full_inner(
         }
     }
 
+    if run_phase0_arb_at_end {
+        ctx.run_phase0_complete_set_arb();
+    }
+
     #[cfg(test)]
     if verify_internal_state {
         assert_internal_state_matches_replay(&ctx, slot0_results, balances, susds_balance);
@@ -1037,7 +1042,16 @@ fn rebalance_full(
         }
     };
     ctx.route_gates = route_gates;
-    finish_rebalance_full_inner(ctx, slot0_results, balances, susds_balance, false)
+    finish_rebalance_full_inner(
+        ctx,
+        slot0_results,
+        balances,
+        susds_balance,
+        true,
+        false,
+        true,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -1063,7 +1077,113 @@ pub(super) fn rebalance_with_custom_predictions_for_test(
     };
     ctx.route_gates = RouteGateThresholds::disabled();
     ctx.mint_available = force_mint_available;
-    finish_rebalance_full_inner(ctx, slot0_results, balances, susds_balance, false)
+    finish_rebalance_full_inner(
+        ctx,
+        slot0_results,
+        balances,
+        susds_balance,
+        true,
+        false,
+        true,
+        false,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_rebalance_only_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    let mut ctx = match RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log_rebalance_init_error(err);
+            return Vec::new();
+        }
+    };
+    ctx.route_gates = RouteGateThresholds::disabled();
+    ctx.mint_available = force_mint_available;
+    finish_rebalance_full_inner(
+        ctx,
+        slot0_results,
+        balances,
+        susds_balance,
+        false,
+        false,
+        true,
+        false,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    let mut ctx = match RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log_rebalance_init_error(err);
+            return Vec::new();
+        }
+    };
+    ctx.route_gates = RouteGateThresholds::disabled();
+    ctx.mint_available = force_mint_available;
+    finish_rebalance_full_inner(
+        ctx,
+        slot0_results,
+        balances,
+        susds_balance,
+        false,
+        false,
+        false,
+        false,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn arb_only_with_custom_predictions_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    let mut ctx = match RebalanceContext::from_inputs(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            log_rebalance_init_error(err);
+            return Vec::new();
+        }
+    };
+    ctx.route_gates = RouteGateThresholds::disabled();
+    ctx.mint_available = force_mint_available;
+    ctx.run_phase0_complete_set_arb();
+    ctx.actions
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ use crate::portfolio::Action;
 use crate::{execution::ExecutionGroupPlan, execution::GroupKind, execution::LegKind};
 
 const TOKEN_DECIMALS: u8 = 18;
-const SWAP_FEE_TIER: u16 = 500;
+const SWAP_FEE_TIER: u16 = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxBuildError {
     ActionIndexOutOfBounds {
