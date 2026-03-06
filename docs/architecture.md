@@ -53,6 +53,9 @@ API (deep.seer.pm)
 - **src/pools/analytics.rs**: Profitability/depth analytics
 - **src/pools/rpc.rs**: On-chain pool + balance multicall queries
 - **src/pools/cache.rs**: Local balance cache serialization and staleness checks
+- **docs/README.md**: Canonical documentation index and precedence rules
+- **docs/rebalancer_approaches_playbook.md**: Canonical cross-approach strategy playbook and live validation protocol
+- **docs/batch_swap_router.md**: Canonical BatchSwapRouter API and coverage reference
 - **src/execution/bounds.rs**: Profitability-step-aware strict-subgroup planning, strict gating, and prefix-safe execution-plan orchestration
 - **src/execution/tx_builder.rs**: Encodes per-leg `SwapRouter02` calls for runtime execution; the batch-router ABI in Rust remains compatibility-only until a new batch router is deployed
 - **src/execution/edge.rs**: Group cashflow/EV edge derivation helpers
@@ -94,7 +97,7 @@ Converts Uniswap V3 `sqrtPriceX96` to outcome token prices (18-decimal fixed poi
 
 ## On-Chain Contracts
 
-- **contracts/Rebalancer.sol**: Fully on-chain rebalancer that reads pool state, computes closed-form waterfall allocation (ψ), and executes sell/buy swaps atomically. Replaces the off-chain hybrid approach (see [docs/slippage.md](slippage.md) §0). Also includes complete-set arbitrage (`arb()`).
+- **contracts/Rebalancer.sol**: Fully on-chain rebalancer that reads pool state, computes closed-form waterfall allocation (ψ), and executes sell/buy swaps atomically. Replaces the off-chain hybrid approach (see [docs/slippage.md](slippage.md)). Also includes complete-set arbitrage (`arb()`).
 - **contracts/BatchSwapRouter.sol**: Batch router contract/API for explicit basket execution and tests. The current Rust runtime executor does not target it directly; it emits per-leg `SwapRouter02` calls while the deployed batch-router ABI is kept in Rust for compatibility.
 - **contracts/interfaces/**: `IV3SwapRouter`, `ICTFRouter`, `IUniswapV3Pool`, `IERC20`, `IBatchSwapRouter`
 - **contracts/libraries/FullMath.sol**: 512-bit `mulDiv` from Uniswap V3 core

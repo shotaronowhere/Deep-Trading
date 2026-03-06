@@ -222,6 +222,12 @@ Goal: reduce residual local positive gradients before returning final actions.
 
 Requires full pooled L1 outcome set; partial snapshots fail closed.
 
+Sizing semantics:
+
+- buy-merge side solves largest feasible `m` such that marginal buy cost stays `<= 1`
+- mint-sell side solves largest feasible `m` such that marginal sell proceeds stay `>= 1`
+- both sides are bounded by pool liquidity caps and return fail-closed zero when not feasible
+
 ## Accounting and State Invariants
 
 - `apply_actions_to_sim_balances` updates holdings for all four action types.
@@ -230,12 +236,11 @@ Requires full pooled L1 outcome set; partial snapshots fail closed.
 
 ## On-Chain Counterpart
 
-The algorithm above runs off-chain in Rust simulation. An on-chain implementation exists in `contracts/Rebalancer.sol` that computes the same waterfall allocation atomically using live pool state. The on-chain version uses a closed-form ψ = (C - budget×(1-fee)) / D with iterative pruning, avoiding the simulation-backed bisection needed for mixed routes off-chain. See [docs/rebalancer.md](rebalancer.md) for the on-chain spec and [docs/slippage.md](slippage.md) §0 for why on-chain execution replaced the hybrid off-chain-plan + on-chain-execute approach.
+The algorithm above runs off-chain in Rust simulation. An on-chain implementation exists in `contracts/Rebalancer.sol` that computes the same waterfall allocation atomically using live pool state. The on-chain version uses a closed-form ψ = (C - budget×(1-fee)) / D with iterative pruning, avoiding the simulation-backed bisection needed for mixed routes off-chain. See [docs/rebalancer.md](rebalancer.md) for the on-chain spec and [docs/slippage.md](slippage.md) for the current slippage policy.
 
 ## Related Docs
 
 - `docs/portfolio.md`: module overview and extensive test map.
 - `docs/model.md`: math derivations and implementation map.
 - `docs/gas_model.md`: gas threshold model details.
-- `docs/arb_mode.md`: arb-only API and equations.
 - `docs/rebalancer.md`: on-chain rebalancer algorithm and interface.

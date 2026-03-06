@@ -1,0 +1,31 @@
+You are doing an independent documentation architecture review.
+
+Context:
+- This repo was recently cleaned up to simplify docs, remove redundancy, and enforce single-source-of-truth.
+- Canonical index now exists in `docs/README.md`.
+- Many historical docs were moved under `docs/archive/`.
+- Several docs were merged/simplified (portfolio, execution runbook, batch router docs, waterfall references).
+
+Your task:
+Review whether the consolidation and simplification are actually high quality.
+
+Focus areas:
+1) Does the current layout have a clear, enforceable single source of truth?
+2) Are there still redundant docs, conflicting statements, or duplicate algorithm/spec content?
+3) Is discoverability good for a new engineer? (Can they find canonical docs quickly?)
+4) Are archive boundaries clean and sensible, or are there misplaced files?
+5) Are there stale links, misleading references, or subtle structure regressions introduced by consolidation?
+6) What surgical additional improvements would make the docs truly pristine?
+
+Strict output format:
+- Section 1: Top Findings (High/Medium/Low, ordered by severity)
+- Section 2: What’s Working Well
+- Section 3: Recommended Final Consolidation Steps (numbered, concrete)
+- Section 4: Canonical Docs Set (explicit keep list)
+- Section 5: Archive/Remove Candidates (explicit list with reasons)
+- Section 6: Residual Risks
+
+Constraints:
+- Be specific and cite exact file paths.
+- Prioritize practical doc architecture outcomes over stylistic comments.
+- Do not propose code changes; docs structure/content only.

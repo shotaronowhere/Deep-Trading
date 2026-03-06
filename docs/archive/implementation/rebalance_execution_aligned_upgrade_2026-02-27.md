@@ -42,7 +42,7 @@ Runtime env support:
 ### Phase 0 (Baseline Lock)
 
 - Baseline doc recorded at:
-  - `docs/rebalance_execution_alignment_baseline_2026-02-27.md`
+  - `docs/archive/implementation/rebalance_execution_alignment_baseline_2026-02-27.md`
 
 ### Phase 1 (Execution Gate Alignment)
 

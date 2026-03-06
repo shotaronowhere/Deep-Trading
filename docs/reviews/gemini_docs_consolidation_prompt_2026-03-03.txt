@@ -1,0 +1,36 @@
+You are performing an independent documentation architecture review for this repo.
+
+Context:
+- We just consolidated docs to reduce redundancy and enforce a single source of truth.
+- We introduced a canonical docs index (`docs/README.md`) and moved historical docs under `docs/archive/`.
+- We also replaced the old oversized slippage sprint doc with a concise current policy doc and archived the legacy long-form writeup.
+
+Please analyze the full context in:
+- @readme
+- @docs/
+
+Primary review goals:
+1) Evaluate whether the consolidation actually achieved simplification and a clear single source of truth.
+2) Identify any remaining redundancy, overlap, or conflicting canonical statements.
+3) Verify discoverability: whether a new engineer can find the right canonical docs quickly.
+4) Find any structural problems introduced by archiving/moving docs (stale references, broken cross-links, misleading pointers).
+5) Evaluate whether the playbook + canonical specs cleanly separate:
+   - off-chain algorithm truth,
+   - on-chain solver truth,
+   - policy/threshold truth,
+   - historical research notes.
+6) Propose concrete improvements to make the documentation set more pristine and maintainable.
+
+Output format (strict):
+- Section 1: "Top Findings" (ordered by severity: High, Medium, Low)
+- Section 2: "What Is Working Well"
+- Section 3: "Actionable Consolidation Plan" (numbered, surgical, minimal)
+- Section 4: "Files To Keep As Canonical" (explicit list)
+- Section 5: "Files To Archive Further Or Merge" (explicit list + why)
+- Section 6: "Residual Risks" (if any)
+
+Important constraints:
+- Be specific and reference exact file paths.
+- Prefer deleting/moving redundant docs over keeping near-duplicates.
+- If something is already good, explicitly say so.
+- Do not rewrite code; review docs architecture and content quality only.

@@ -60,6 +60,20 @@ Unequal per-leg amount arrays are preserved for `BuyMerge` and `MintSell`.
 - Dry-run requires a valid cached executor entry and will not deploy or send approval transactions.
 - Live mode (`EXECUTE_SUBMIT=1`): submits one subgroup tx per loop iteration and replans after receipt.
 
+## Plan preview diagnostic
+
+`cargo run --bin plan_preview` prints the first live executable subgroup without submitting transactions.
+
+It shares the same preview formatter as runtime output (`src/execution/preview.rs`) so line format and leg summaries match `deep_trading_bot`.
+
+Inputs used by the preview path:
+
+1. `.env` load (if present)
+2. live `slot0` snapshots from `RPC`
+3. wallet balances when `WALLET` is set, otherwise synthetic `STARTING_SUSD`
+4. current rebalance mode/gas assumptions
+5. conservative execution repricing assumptions
+
 ## Expected fail-closed behavior
 
 Execution aborts the current run on:

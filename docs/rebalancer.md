@@ -2,6 +2,8 @@
 
 ## Overview
 
+For cross-approach strategy selection (off-chain vs on-chain, constant-`L` vs exact, mixed-route policy, and validation protocol), see [Rebalancer Approaches Playbook](rebalancer_approaches_playbook.md). For the documentation precedence map, see [docs/README.md](README.md).
+
 `Rebalancer.sol` implements the full portfolio rebalancing logic on-chain using a closed-form waterfall allocation. Given a belief vector (predictions as `sqrtPriceX96` values), it:
 
 1. **Pulls** the caller's explicit collateral budget plus any configured outcome balances into the contract

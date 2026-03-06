@@ -23,7 +23,7 @@ Deep-Trading/
 │   ├── execution/         # Trade execution logic
 │   └── portfolio/         # Portfolio management
 ├── contracts/             # Solidity smart contracts
-│   └── BatchRouter.sol   # Batch routing contract
+│   └── BatchSwapRouter.sol # Batch routing contract
 ├── docs/                  # Documentation
 │   ├── architecture.md    # System architecture
 │   ├── model.md           # ML model details
@@ -72,8 +72,12 @@ Optional environment:
 ## Documentation
 
 See the [docs](./docs/) directory for detailed documentation:
-- [Waterfall Algorithm (Canonical Spec)](./docs/waterfall.md) - Definitive waterfall/rebalance implementation behavior
+- [Documentation Map (SSOT)](./docs/README.md) - Canonical docs index and precedence
+- [Rebalancer Approaches Playbook (Canonical)](./docs/rebalancer_approaches_playbook.md) - Strategy selection, thresholds, and validation protocol
+- [On-Chain Rebalancer (Canonical)](./docs/rebalancer.md) - On-chain direct solver behavior
+- [Waterfall Algorithm (Canonical)](./docs/waterfall.md) - Off-chain waterfall/rebalance behavior
+- [Rebalancer Policy Metrics Schema](./docs/rebalancer_policy_metrics_schema.md) - Threshold dashboard row schema and parser usage
+- [BatchSwapRouter (Canonical)](./docs/batch_swap_router.md) - Router API and coverage map
+- [Rebalancing Mechanism Design Review](./docs/rebalancing_mechanism_design_review.md) - Deep-dive mechanism critique and improvement ideas
 - [Architecture](./docs/architecture.md) - System architecture overview
-- [Model](./docs/model.md) - ML prediction model details
-- [Portfolio](./docs/portfolio.md) - Portfolio management
-- [Slippage](./docs/slippage.md) - Slippage analysis
+- [Archive](./docs/archive/README.md) - Historical/superseded notes

@@ -32,7 +32,7 @@ Review these files and docs as context:
 @docs/portfolio.md
 @docs/waterfall.md
 @docs/rebalancer_mixed.md
-@docs/rebalancer_self_financing_no_churn_2026-03-03.md
+@docs/archive/rebalancer/rebalancer_self_financing_no_churn_2026-03-03.md
 @src/portfolio/core/rebalancer.rs
 @src/portfolio/core/waterfall.rs
 @src/portfolio/core/planning.rs

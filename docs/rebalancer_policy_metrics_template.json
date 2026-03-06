@@ -1,0 +1,64 @@
+{
+  "date_utc": "2026-03-03",
+  "block_ref": "136002137",
+  "gas_price_gwei": "1.0",
+  "eth_usd": "3000.0",
+  "policy_a": {
+    "case": "testBenchmarkABMultiTickSyntheticNinetyEightOutcomeConstantLVsExact",
+    "constant_ev_wei": "319743852785843393829282",
+    "exact_ev_wei": "320463674792566460803522",
+    "ev_gain_wei": "719822006723066974240",
+    "ev_gain_susd": "719.822006723066974240",
+    "constant_gas": "3617638",
+    "exact_gas": "38777197",
+    "extra_gas_susd": "105.478677000000000000",
+    "hurdle_susd": "316.436031000000000000",
+    "hurdle_met": "true",
+    "trigger_now": "true"
+  },
+  "policy_b": {
+    "case_count": 3,
+    "median_ev_gain_susd": "0.086815181476786574",
+    "p10_ev_gain_susd": "0.015610289881018035",
+    "median_extra_gas_susd": "2.733302999999999816",
+    "hurdle_susd": "13.666514999999999080",
+    "hurdle_met": "false",
+    "negative_tail_breach": "false",
+    "fallback_total": 0,
+    "fallback_rate_pct": "0",
+    "fallback_dominant_reason": "",
+    "fallback_dominant_share_pct": "0",
+    "fallback_reliability_met": "true",
+    "fallback_dominance_met": "true",
+    "enable_now": "false",
+    "cases": [
+      {
+        "case": "small_bundle_mixed_case",
+        "rebalancer_ev_wei": "100132867689650403452",
+        "mixed_ev_wei": "100148477979531421487",
+        "ev_gain_susd": "0.015610289881018035",
+        "rebalancer_gas": 271605,
+        "mixed_gas": 968691,
+        "extra_gas_susd": "2.091258000000000000"
+      },
+      {
+        "case": "mixed_route_favorable_synthetic_case",
+        "rebalancer_ev_wei": "100021703842635411426",
+        "mixed_ev_wei": "100108519024112198000",
+        "ev_gain_susd": "0.086815181476786574",
+        "rebalancer_gas": 212458,
+        "mixed_gas": 1123559,
+        "extra_gas_susd": "2.733303000000000000"
+      },
+      {
+        "case": "heterogeneous_ninety_eight_outcome_l1_like_case",
+        "rebalancer_ev_wei": "150258288614947875485",
+        "mixed_ev_wei": "150380322266504052605",
+        "ev_gain_susd": "0.122033651556177120",
+        "rebalancer_gas": 5057031,
+        "mixed_gas": 22441994,
+        "extra_gas_susd": "52.154889000000000000"
+      }
+    ]
+  }
+}
