@@ -55,13 +55,16 @@ pub(super) fn direct_profit(sim: &PoolSim) -> f64 {
     profitability(sim.prediction, sim.price())
 }
 
-pub(super) fn bundle_frontier(
+fn sorted_preserve_indices(preserve_sell_indices: &HashSet<usize>) -> Vec<usize> {
+    let mut indices: Vec<usize> = preserve_sell_indices.iter().copied().collect();
+    indices.sort_unstable();
+    indices
+}
+
+pub(super) fn direct_bundle_frontier(
     sims: &[PoolSim],
-    mint_available: bool,
     remaining_budget: f64,
     gas_direct_susd: f64,
-    gas_mint_susd: f64,
-    preserve_sell_indices: &HashSet<usize>,
 ) -> Option<BundleFrontier> {
     let mut best_direct_prof = f64::NEG_INFINITY;
     for sim in sims {
@@ -96,17 +99,28 @@ pub(super) fn bundle_frontier(
         });
     }
 
+    None
+}
+
+pub(super) fn mint_bundle_frontier(
+    sims: &[PoolSim],
+    mint_available: bool,
+    remaining_budget: f64,
+    gas_mint_susd: f64,
+    preserve_sell_indices: &HashSet<usize>,
+) -> Option<BundleFrontier> {
     if !mint_available {
         return None;
     }
 
     let price_sum: f64 = sims.iter().map(|sim| sim.price()).sum();
-    let preserved_price_sum: f64 = preserve_sell_indices
+    let sorted_preserve = sorted_preserve_indices(preserve_sell_indices);
+    let preserved_price_sum: f64 = sorted_preserve
         .iter()
         .filter_map(|&idx| sims.get(idx))
         .map(|sim| sim.price())
         .sum();
-    let preserved_prediction_sum: f64 = preserve_sell_indices
+    let preserved_prediction_sum: f64 = sorted_preserve
         .iter()
         .filter_map(|&idx| sims.get(idx))
         .map(|sim| sim.prediction)
@@ -170,6 +184,25 @@ pub(super) fn bundle_frontier(
     })
 }
 
+pub(super) fn bundle_frontier(
+    sims: &[PoolSim],
+    mint_available: bool,
+    remaining_budget: f64,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
+    preserve_sell_indices: &HashSet<usize>,
+) -> Option<BundleFrontier> {
+    direct_bundle_frontier(sims, remaining_budget, gas_direct_susd).or_else(|| {
+        mint_bundle_frontier(
+            sims,
+            mint_available,
+            remaining_budget,
+            gas_mint_susd,
+            preserve_sell_indices,
+        )
+    })
+}
+
 pub(super) fn direct_bundle_marginal_cost_at_prof(
     sims: &[PoolSim],
     bundle_members: &[usize],
@@ -186,9 +219,9 @@ pub(super) fn direct_preserve_marginal_cost_at_spot(
     bundle_members: &[usize],
     preserve_sell_indices: &HashSet<usize>,
 ) -> f64 {
-    preserve_sell_indices
-        .iter()
-        .filter_map(|&idx| {
+    sorted_preserve_indices(preserve_sell_indices)
+        .into_iter()
+        .filter_map(|idx| {
             if idx >= sims.len() || bundle_members.contains(&idx) {
                 return None;
             }

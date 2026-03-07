@@ -1,13 +1,24 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fs;
 
 use serde::{Deserialize, Serialize};
 
 use super::super::rebalancer::{
-    arb_only_with_custom_predictions_for_test, rebalance_with_custom_predictions_for_test,
+    TestPhaseOrderVariant, arb_only_with_custom_predictions_for_test,
+    collect_mint_sell_preserve_candidates_for_test,
+    rebalance_with_custom_predictions_and_stats_for_test,
+    rebalance_with_custom_predictions_arb_first_for_test,
+    rebalance_with_custom_predictions_arb_last_for_test,
+    rebalance_with_custom_predictions_arb_primed_family_for_test,
+    rebalance_with_custom_predictions_exact_no_arb_for_test,
+    rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test,
+    rebalance_with_custom_predictions_for_test,
+    rebalance_with_custom_predictions_plain_family_for_test,
     rebalance_with_custom_predictions_rebalance_only_for_test,
     rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test,
+    rebalance_with_custom_predictions_staged_reference_for_test,
+    rebalance_with_custom_predictions_variant_and_preserve_for_test,
 };
 use super::fixtures::mock_slot0_market_with_orientation_liquidity_and_ticks;
 use super::replay_actions_to_state;
@@ -623,7 +634,7 @@ fn start_arb_result_for_built_case(
     built: &BuiltCase,
     force_mint_available: bool,
 ) -> (u128, u64, Option<HeldProfitabilityStats>) {
-    let actions = rebalance_with_custom_predictions_for_test(
+    let actions = rebalance_with_custom_predictions_arb_first_for_test(
         &built.balances_view,
         built.cash_budget,
         &built.slot0_results,
@@ -633,6 +644,52 @@ fn start_arb_result_for_built_case(
     let ev_wei = benchmark_ev_wei(&actions, built);
     let held_stats = held_profitability_stats_for_actions(&actions, built);
     (ev_wei, actions.len() as u64, held_stats)
+}
+
+fn phase_order_greedy_prescan_result_for_built_case(
+    built: &BuiltCase,
+    variant: TestPhaseOrderVariant,
+    force_mint_available: bool,
+) -> (u128, usize) {
+    let baseline_actions = rebalance_with_custom_predictions_variant_and_preserve_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        variant,
+        &HashSet::new(),
+        force_mint_available,
+    );
+    let mut best_actions = baseline_actions.clone();
+    let mut best_ev = benchmark_ev_wei(&baseline_actions, built);
+    let preserve_candidates = collect_mint_sell_preserve_candidates_for_test(
+        &baseline_actions,
+        &built.slot0_results,
+        &built.balances_view,
+        built.cash_budget,
+        12,
+    );
+    let mut active_preserve: HashSet<&'static str> = HashSet::new();
+    for market_name in preserve_candidates {
+        let mut trial_preserve = active_preserve.clone();
+        trial_preserve.insert(market_name);
+        let trial_actions = rebalance_with_custom_predictions_variant_and_preserve_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            variant,
+            &trial_preserve,
+            force_mint_available,
+        );
+        let trial_ev = benchmark_ev_wei(&trial_actions, built);
+        if trial_ev > best_ev || (trial_ev == best_ev && trial_actions.len() < best_actions.len()) {
+            best_actions = trial_actions;
+            best_ev = trial_ev;
+            active_preserve = trial_preserve;
+        }
+    }
+    (best_ev, best_actions.len())
 }
 
 fn sample_random_case(rng: &mut Lcg, case_idx: usize, outcomes: usize) -> ExplicitCaseSpec {
@@ -874,6 +931,298 @@ fn benchmark_snapshot_matches_current_optimizer() {
 }
 
 #[test]
+fn benchmark_ev_non_decreasing_vs_fixture() {
+    let cases = cases_from_fixture();
+    let expected = expected_from_fixture();
+
+    for case in &cases {
+        let expected_row = expected
+            .get(&case.case_id)
+            .unwrap_or_else(|| panic!("missing snapshot row for {}", case.case_id));
+        let (direct_ev, mixed_ev, full_rebalance_only_ev, action_count) =
+            current_result_for_case(case);
+
+        assert!(
+            direct_ev >= expected_row.offchain_direct_ev_wei,
+            "{} direct regressed: expected_floor={} actual={}",
+            case.case_id,
+            expected_row.offchain_direct_ev_wei,
+            direct_ev
+        );
+        assert!(
+            mixed_ev >= expected_row.offchain_mixed_ev_wei,
+            "{} mixed regressed: expected_floor={} actual={}",
+            case.case_id,
+            expected_row.offchain_mixed_ev_wei,
+            mixed_ev
+        );
+        assert!(
+            full_rebalance_only_ev >= expected_row.offchain_full_rebalance_only_ev_wei,
+            "{} full_rebalance_only regressed: expected_floor={} actual={}",
+            case.case_id,
+            expected_row.offchain_full_rebalance_only_ev_wei,
+            full_rebalance_only_ev
+        );
+        assert!(
+            action_count > 0 || case.direct_only_reference,
+            "{} should produce at least one mixed/meta-solver action in benchmark fixture",
+            case.case_id
+        );
+    }
+}
+
+#[test]
+fn ultimate_solver_mixed_ev_dominates_staged_reference() {
+    let cases = cases_from_fixture();
+
+    for case in &cases {
+        let built = build_case(case);
+        let force_mint_available = !case.direct_only_reference;
+        let ultimate_actions = rebalance_with_custom_predictions_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let staged_actions = rebalance_with_custom_predictions_staged_reference_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let ultimate_ev = benchmark_ev_wei(&ultimate_actions, &built);
+        let staged_ev = benchmark_ev_wei(&staged_actions, &built);
+
+        assert!(
+            ultimate_ev >= staged_ev,
+            "{} ultimate solver underperformed staged reference: ultimate={} staged={}",
+            case.case_id,
+            ultimate_ev,
+            staged_ev
+        );
+        if ultimate_ev == staged_ev {
+            assert!(
+                ultimate_actions.len() <= staged_actions.len(),
+                "{} ultimate solver matched staged EV but used more actions: ultimate_actions={} staged_actions={}",
+                case.case_id,
+                ultimate_actions.len(),
+                staged_actions.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn exact_no_arb_dominates_heuristic_no_arb() {
+    let cases = cases_from_fixture();
+
+    for case in &cases {
+        let built = build_case(case);
+        let force_mint_available = !case.direct_only_reference;
+        let exact_actions = rebalance_with_custom_predictions_exact_no_arb_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let heuristic_actions = rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let exact_ev = benchmark_ev_wei(&exact_actions, &built);
+        let heuristic_ev = benchmark_ev_wei(&heuristic_actions, &built);
+
+        assert!(
+            exact_ev >= heuristic_ev,
+            "{} exact no-arb underperformed heuristic no-arb: exact={} heuristic={}",
+            case.case_id,
+            exact_ev,
+            heuristic_ev
+        );
+        if exact_ev == heuristic_ev {
+            assert!(
+                exact_actions.len() <= heuristic_actions.len(),
+                "{} exact no-arb matched heuristic EV but used more actions: exact_actions={} heuristic_actions={}",
+                case.case_id,
+                exact_actions.len(),
+                heuristic_actions.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_family_is_non_regressive_vs_exact_no_arb() {
+    let cases = cases_from_fixture();
+
+    for case in &cases {
+        let built = build_case(case);
+        let force_mint_available = !case.direct_only_reference;
+        let plain_actions = rebalance_with_custom_predictions_plain_family_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let exact_actions = rebalance_with_custom_predictions_exact_no_arb_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+
+        let plain_ev = benchmark_ev_wei(&plain_actions, &built);
+        let exact_ev = benchmark_ev_wei(&exact_actions, &built);
+        assert!(
+            plain_ev >= exact_ev,
+            "{} plain family regressed versus exact no-arb: plain={} exact={}",
+            case.case_id,
+            plain_ev,
+            exact_ev
+        );
+        if plain_ev == exact_ev {
+            assert!(
+                plain_actions.len() <= exact_actions.len(),
+                "{} plain family matched exact no-arb EV but used more actions: plain_actions={} exact_actions={}",
+                case.case_id,
+                plain_actions.len(),
+                exact_actions.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn arb_primed_root_is_only_taken_when_start_arb_is_positive() {
+    let cases = cases_from_fixture();
+
+    for case in &cases {
+        let built = build_case(case);
+        let force_mint_available = !case.direct_only_reference;
+        let (_actions, stats) = rebalance_with_custom_predictions_and_stats_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let start_arb_actions = arb_only_with_custom_predictions_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let start_arb_ev = benchmark_ev_wei(&start_arb_actions, &built);
+        let arb_primed_actions = rebalance_with_custom_predictions_arb_primed_family_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let initial_ev = ev_to_wei(state_ev(
+            &built.balances_view,
+            built.cash_budget,
+            &built.predictions,
+        ));
+        let should_take_root = start_arb_ev > initial_ev;
+
+        assert!(
+            stats.arb_primed_root_taken == should_take_root,
+            "{} arb-primed root mismatch: took_root={} should_take_root={} start_arb_ev={} initial_ev={}",
+            case.case_id,
+            stats.arb_primed_root_taken,
+            should_take_root,
+            start_arb_ev,
+            initial_ev
+        );
+        assert_eq!(
+            arb_primed_actions.is_some(),
+            stats.arb_primed_root_taken,
+            "{} arb-primed family helper/root-taken stats diverged",
+            case.case_id
+        );
+    }
+}
+
+#[test]
+fn ultimate_solver_is_deterministic_under_parallel_candidate_evaluation() {
+    let cases = cases_from_fixture();
+
+    for case in &cases {
+        let built = build_case(case);
+        let force_mint_available = !case.direct_only_reference;
+        let baseline = rebalance_with_custom_predictions_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        for _ in 0..3 {
+            let rerun = rebalance_with_custom_predictions_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+            );
+            assert_eq!(
+                rerun, baseline,
+                "{} solver produced nondeterministic actions under parallel exact enumeration",
+                case.case_id
+            );
+        }
+    }
+}
+
+#[test]
+fn ultimate_solver_mixed_ev_dominates_end_arb_cyclic_hypothesis() {
+    let cases = cases_from_fixture();
+
+    for case in &cases {
+        let built = build_case(case);
+        let force_mint_available = !case.direct_only_reference;
+        let ultimate_actions = rebalance_with_custom_predictions_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let ultimate_ev = benchmark_ev_wei(&ultimate_actions, &built);
+        let (cyclic_ev, cyclic_action_count, _) =
+            arb_end_cyclic_result_for_built_case(&built, force_mint_available);
+
+        assert!(
+            ultimate_ev >= cyclic_ev,
+            "{} ultimate solver underperformed end-arb cyclic hypothesis: ultimate={} cyclic={}",
+            case.case_id,
+            ultimate_ev,
+            cyclic_ev
+        );
+        if ultimate_ev == cyclic_ev {
+            assert!(
+                (ultimate_actions.len() as u64) <= cyclic_action_count,
+                "{} ultimate solver matched end-arb cyclic EV but used more actions: ultimate_actions={} cyclic_actions={}",
+                case.case_id,
+                ultimate_actions.len(),
+                cyclic_action_count
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "snapshot helper; run explicitly"]
 fn print_current_optimizer_benchmark_rows() {
     let cases = cases_from_fixture();
@@ -890,6 +1239,204 @@ fn print_current_optimizer_benchmark_rows() {
         );
         println!("  offchain_action_count={}", action_count);
     }
+}
+
+#[test]
+#[ignore = "debug helper; run explicitly"]
+fn print_heterogeneous_ninety_eight_exact_preserve_oracle_breakdown() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "heterogeneous_ninety_eight_outcome_l1_like_case")
+        .expect("heterogeneous benchmark case should exist");
+    let built = build_case(&case);
+    let force_mint_available = !case.direct_only_reference;
+
+    let exact_k4 = rebalance_with_custom_predictions_exact_no_arb_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let exact_k8 = rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+        8,
+        false,
+    );
+    let exact_k8_with_arb_seed =
+        rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+            8,
+            true,
+        );
+    let staged = rebalance_with_custom_predictions_staged_reference_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+
+    let exact_k4_ev = benchmark_ev_wei(&exact_k4, &built);
+    let exact_k8_ev = benchmark_ev_wei(&exact_k8, &built);
+    let exact_k8_with_arb_seed_ev = benchmark_ev_wei(&exact_k8_with_arb_seed, &built);
+    let staged_ev = benchmark_ev_wei(&staged, &built);
+
+    println!("exact_k4 ev={} actions={}", exact_k4_ev, exact_k4.len());
+    println!("exact_k8 ev={} actions={}", exact_k8_ev, exact_k8.len());
+    println!(
+        "exact_k8_with_arb_seed ev={} actions={}",
+        exact_k8_with_arb_seed_ev,
+        exact_k8_with_arb_seed.len()
+    );
+    println!("staged ev={} actions={}", staged_ev, staged.len());
+
+    assert!(
+        exact_k8_ev >= exact_k4_ev,
+        "expanded preserve cap should not underperform k4 on the heterogeneous oracle case"
+    );
+    assert!(
+        exact_k8_with_arb_seed_ev >= exact_k8_ev,
+        "adding a positive root-arb preserve seed should not underperform the same expanded cap without it"
+    );
+}
+
+#[test]
+#[ignore = "debug helper; run explicitly"]
+fn print_heterogeneous_ninety_eight_case_family_breakdown() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "heterogeneous_ninety_eight_outcome_l1_like_case")
+        .expect("heterogeneous benchmark case should exist");
+    let built = build_case(&case);
+    let force_mint_available = !case.direct_only_reference;
+
+    let exact_no_arb = rebalance_with_custom_predictions_exact_no_arb_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let plain = rebalance_with_custom_predictions_plain_family_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let arb_primed = rebalance_with_custom_predictions_arb_primed_family_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let no_arb = rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let arb_first = rebalance_with_custom_predictions_arb_first_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let arb_last = rebalance_with_custom_predictions_arb_last_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let rebalance_only = rebalance_with_custom_predictions_rebalance_only_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let staged = rebalance_with_custom_predictions_staged_reference_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let ultimate = rebalance_with_custom_predictions_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let (cyclic_ev, cyclic_actions, _) =
+        arb_end_cyclic_result_for_built_case(&built, force_mint_available);
+
+    println!(
+        "exact_no_arb ev={} actions={}",
+        benchmark_ev_wei(&exact_no_arb, &built),
+        exact_no_arb.len()
+    );
+    println!(
+        "plain ev={} actions={}",
+        benchmark_ev_wei(&plain, &built),
+        plain.len()
+    );
+    println!(
+        "arb_primed ev={} actions={}",
+        arb_primed
+            .as_ref()
+            .map(|actions| benchmark_ev_wei(actions, &built))
+            .unwrap_or(0),
+        arb_primed
+            .as_ref()
+            .map(|actions| actions.len())
+            .unwrap_or(0)
+    );
+    println!(
+        "no_arb ev={} actions={}",
+        benchmark_ev_wei(&no_arb, &built),
+        no_arb.len()
+    );
+    println!(
+        "arb_first ev={} actions={}",
+        benchmark_ev_wei(&arb_first, &built),
+        arb_first.len()
+    );
+    println!(
+        "arb_last ev={} actions={}",
+        benchmark_ev_wei(&arb_last, &built),
+        arb_last.len()
+    );
+    println!(
+        "rebalance_only ev={} actions={}",
+        benchmark_ev_wei(&rebalance_only, &built),
+        rebalance_only.len()
+    );
+    println!(
+        "staged ev={} actions={}",
+        benchmark_ev_wei(&staged, &built),
+        staged.len()
+    );
+    println!(
+        "ultimate ev={} actions={}",
+        benchmark_ev_wei(&ultimate, &built),
+        ultimate.len()
+    );
+    println!("cyclic ev={} actions={}", cyclic_ev, cyclic_actions);
 }
 
 #[test]

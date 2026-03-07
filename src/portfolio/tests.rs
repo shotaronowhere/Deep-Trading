@@ -6,8 +6,9 @@ use super::merge::{
     split_sell_total_proceeds_with_inventory,
 };
 use super::rebalancer::{
-    RebalanceFlags, RebalanceMode, phase1_liquidation_actions_for_test, rebalance,
-    rebalance_with_mode, rebalance_with_mode_and_flags,
+    RebalanceFlags, RebalanceMode, collect_mint_sell_preserve_candidates_for_test,
+    phase1_liquidation_actions_for_test, rebalance, rebalance_with_mode,
+    rebalance_with_mode_and_flags,
 };
 use super::sim::{PoolSim, Route, profitability};
 use super::trading::{ExecutionState, emit_mint_actions, execute_buy};
@@ -691,7 +692,7 @@ fn test_rebalance_with_mode_full_matches_rebalance_default() {
 }
 
 #[test]
-fn test_rebalance_full_flag_enabled_is_ev_guarded_vs_default() {
+fn test_rebalance_full_flag_enabled_matches_default_meta_solver() {
     let markets = eligible_l1_markets_with_predictions();
     assert!(
         !markets.is_empty(),
@@ -746,8 +747,8 @@ fn test_rebalance_full_flag_enabled_is_ev_guarded_vs_default() {
         let flag_ev = replay_actions_to_ev(&flag_actions, &slot0_results, &balances, susd);
         let tol = 1e-9 * (1.0 + default_ev.abs() + flag_ev.abs());
         assert!(
-            flag_ev + tol >= default_ev,
-            "flag-enabled EV should not regress in case {}: default={:.12}, flag={:.12}, tol={:.12}",
+            (default_ev - flag_ev).abs() <= tol,
+            "compat flag should not alter default meta-solver behavior in case {}: default={:.12}, flag={:.12}, tol={:.12}",
             case_idx,
             default_ev,
             flag_ev,
@@ -803,7 +804,61 @@ fn test_rebalance_full_flag_enabled_is_ev_guarded_vs_default() {
 
     assert!(
         cases_with_preserve_candidates > 0,
-        "expected at least one deterministic case with preserve candidates so flag-on churn pruning path is exercised"
+        "expected at least one deterministic case with preserve candidates so default meta-solver preserve search is exercised"
+    );
+}
+
+#[test]
+fn test_preserve_candidate_extraction_includes_neutral_churn_round_trips() {
+    let (slot0, market) = mock_slot0_market(
+        "round_trip_candidate",
+        "0x1111111111111111111111111111111111111112",
+        0.42,
+    );
+    let slot0_results = vec![(slot0, market)];
+    let mut balances = HashMap::new();
+    balances.insert(market.name, 10.0);
+    let susd = 100.0;
+
+    let neutral_churn_actions = vec![
+        Action::Sell {
+            market_name: market.name,
+            amount: 5.0,
+            proceeds: 2.5,
+        },
+        Action::Buy {
+            market_name: market.name,
+            amount: 5.0,
+            cost: 2.5,
+        },
+    ];
+    let neutral_candidates = collect_mint_sell_preserve_candidates_for_test(
+        &neutral_churn_actions,
+        &slot0_results,
+        &balances,
+        susd,
+        12,
+    );
+    assert!(
+        neutral_candidates.contains(&market.name),
+        "sell-then-rebuy neutral churn should surface as a preserve candidate"
+    );
+
+    let liquidation_actions = vec![Action::Sell {
+        market_name: market.name,
+        amount: 5.0,
+        proceeds: 2.5,
+    }];
+    let liquidation_candidates = collect_mint_sell_preserve_candidates_for_test(
+        &liquidation_actions,
+        &slot0_results,
+        &balances,
+        susd,
+        12,
+    );
+    assert!(
+        liquidation_candidates.is_empty(),
+        "pure liquidation with no rebuy should not surface as a preserve candidate"
     );
 }
 

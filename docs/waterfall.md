@@ -2,7 +2,7 @@
 
 This is the definitive implementation spec for the waterfall rebalancing algorithm.
 
-Status: current as of 2026-02-27.  
+Status: current as of 2026-03-07.  
 Source-of-truth code paths:
 
 - `src/portfolio/core/rebalancer.rs`
@@ -51,9 +51,51 @@ No flash-loan actions are emitted.
 - `mint_available` is true only when simulated pool count equals expected L1 tradeable outcome count.
 - `ArbOnly` requires a complete pooled L1 snapshot (exact expected names/count); otherwise fails closed to no actions.
 
+## Full-Mode Solver
+
+`RebalanceMode::Full` now keeps the waterfall as the continuous core and searches a smaller operator surface around it.
+
+Inner problem:
+
+- the existing waterfall, recycle, polish, and cleanup logic optimize a fixed route/frontier choice
+
+Outer problem:
+
+- choose first-frontier family
+- choose preserve subset on a capped churn universe
+- choose whether arb is applied before or after the exact rebalance operator
+
+Current runtime behavior:
+
+1. Build `R_exact(state)` from the current state:
+   - evaluate three no-preserve frontier seeds from fresh state:
+     - `default`
+     - forced first frontier `direct`
+     - forced first frontier `mint`
+   - extract preserve candidates from sell-then-rebuy churn in those seed action streams
+   - run one-step singleton-preserve probes to expand the churn universe once
+   - aggregate by max churn amount, then max sold amount, then stable market order
+   - cap the online preserve universe at `K = 4`
+   - enumerate every `(frontier_family, preserve_subset)` pair from fresh state
+   - score the resulting plans by the existing raw EV mark and reduce deterministically
+2. Evaluate two bounded whole-plan families:
+   - `Plain`: `R_exact`
+   - `ArbPrimed`: positive root `A`, then `R_exact`
+3. For either family, attempt one late correction tail:
+   - append `A` only if raw EV improves on the terminal state
+   - then rerun `R_exact` once on the post-arb state
+4. Compare the operator-based winner against the retained staged-reference solver and return the better whole-plan result under the same raw-EV comparator.
+
+Important boundaries:
+
+- The inner waterfall is still the continuous optimizer; the online exactness is only over the chosen discrete block around it.
+- First-frontier-family forcing is bounded to the first Phase-2 frontier choice only. After that, the waterfall returns to its existing deterministic frontier logic.
+- The staged meta-solver is still kept as a dominance fallback because the flat exact operator does not yet subsume every preserve/frontier corner on the 98-outcome benchmark set.
+- `RebalanceFlags.enable_ev_guarded_greedy_churn_pruning` remains for compatibility but does not change default full-mode behavior.
+
 ## Full-Mode Phase Flow
 
-`RebalanceMode::Full` executes six phases:
+After the meta-solver chooses a candidate, that candidate executes six phases:
 
 1. `Phase 0`: complete-set arbitrage pre-pass when mint routes are available.
    - runtime gas-gated path: two-sided (`sum(prices) < 1` buy-merge, `sum(prices) > 1` mint-sell)
@@ -186,7 +228,7 @@ Bounds:
 
 Trial context from current state:
 
-- optional arb pre-pass (if mint available),
+- optional arb pre-pass if the chosen phase-order variant enables phase-0 inside polish,
 - phase 1,
 - waterfall,
 - phase 3 over current inventory.

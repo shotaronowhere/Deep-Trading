@@ -118,9 +118,21 @@ Historical benchmark context:
 
 ## Churn
 
-- Off-chain has optional EV-guarded greedy preserve selection (`RebalanceFlags.enable_ev_guarded_greedy_churn_pruning`).
-- This is a local non-regressive selector, not a global optimum solver.
-- Keep optional and measurable.
+- Off-chain full mode now uses an operator-based exact rebalance core instead of the older staged phase-order meta-solver as its primary path.
+- Current default full-mode search:
+  - build `R_exact` by enumerating `(first_frontier_family, preserve_subset)` over a capped churn universe
+  - evaluate `Plain = R_exact` and `ArbPrimed = A -> R_exact`
+  - allow one late correction tail `... -> A -> R_exact`
+  - score all whole-plan candidates by the existing raw EV mark
+- The preserve universe is still heuristic even though the subset solve is exact:
+  - no-preserve frontier seeds are used to discover churn candidates
+  - singleton-preserve probes expand that universe once
+  - the online preserve universe is capped at `K = 4`
+- The old staged solver remains compiled and is still used as a dominance fallback:
+  - the runtime compares the new operator-based winner against the staged-reference plan
+  - whichever has better raw EV, then fewer actions, is returned
+  - this keeps the committed EV frontier while the flatter exact operator is still missing some preserve/frontier corners
+- `RebalanceFlags.enable_ev_guarded_greedy_churn_pruning` remains as a compatibility shim in the public API, but it no longer changes the default full-mode behavior.
 
 ## Production strategy policy (v1 thresholds)
 

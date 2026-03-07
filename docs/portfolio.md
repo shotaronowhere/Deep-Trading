@@ -67,6 +67,48 @@ Planner inputs are built from live on-chain state and optional wallet balances:
 3. gas assumptions (`src/execution/gas.rs`)
 4. mode (`full` or `arb_only`)
 
+## Off-Chain Full Solver
+
+Default full-mode planning is now operator-based:
+
+- `R_exact(state)` is the exact online rebalance operator over the chosen discrete block:
+  - first-frontier family in `{default, direct, mint}`
+  - preserve subset over a capped churn universe
+- `A(state)` is the existing arb-only operator on the current state.
+- The runtime evaluates two bounded whole-plan families:
+  - `Plain`: `R_exact`, then optional late `A -> R_exact`
+  - `ArbPrimed`: positive `A`, then `R_exact`, then optional late `A -> R_exact`
+- Candidate ranking is raw EV first, then fewer actions, then stable family/frontier/preserve ordering.
+
+`R_exact` keeps the existing waterfall, recycle, polish, and cleanup logic unchanged. The exactness is only over the online discrete block around that continuous core.
+
+Preserve-universe construction:
+
+- start from the three no-preserve frontier seeds (`default`, forced `direct`, forced `mint`)
+- extract sell-then-rebuy churn candidates from those seed action streams
+- run one-step singleton-preserve probes from the same state to expand that churn universe once
+- aggregate by max churn amount, then max sold amount, then stable market order
+- cap the online preserve universe at `K = 4`
+- enumerate every preserve subset across every frontier family from fresh state
+- evaluate that grid in parallel, then reduce deterministically
+
+Practical dominance fallback:
+
+- the old staged meta-solver path is still compiled as a reference implementation
+- the default runtime compares the new operator-based winner against that staged-reference plan under the same raw-EV comparator
+- whichever whole-plan result is better is returned
+- this keeps the new solver live while preserving the previously committed EV frontier on cases the flat exact operator does not yet subsume
+
+Compatibility note:
+
+- `RebalanceFlags.enable_ev_guarded_greedy_churn_pruning` remains in the public API for compatibility, but it no longer changes default full-mode behavior
+
+Operational diagnostics:
+
+- exact rebalance tracing reports family label, exact-rebalance call count, candidate-evaluation count, preserve-universe size, chosen frontier family, chosen preserve-set size, EV, and action count
+- final selection tracing reports chosen family, chosen frontier family, preserve-set size, EV/actions, arb-operator evaluation count, arb-correction count, and whether the arb-primed root was taken
+- an ignored test helper prints per-family breakdown on the heterogeneous 98-outcome fixture for targeted debugging
+
 ## Diagnostics and operator tools
 
 - Execution submission and strict fail-closed gates: `docs/execution_submission.md`
@@ -101,9 +143,7 @@ Key classes covered:
 
 `test_rebalance_perf_full_l1` benchmarks full rebalance across the 98 tradeable L1 outcomes.
 
-Typical release benchmark figure from the committed harness:
-
-- ~3.6ms per call (98 outcomes)
+The current exact-family plus staged-fallback path is materially heavier than the previous bounded meta-solver. The release benchmark should be rerun after any further solver simplification or after removing the staged fallback; the older single-digit-millisecond figure is no longer a reliable description of the default path.
 
 Run with:
 

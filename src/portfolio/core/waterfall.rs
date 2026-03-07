@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::Action;
-use super::bundle::{BundleRouteKind, bundle_frontier};
+use super::bundle::{
+    BundleFrontier, BundleRouteKind, bundle_frontier, direct_bundle_frontier, mint_bundle_frontier,
+};
 use super::planning::plan_bundle_step_with_scratch;
 use super::rebalancer::passes_execution_gate;
 use super::sim::{EPS, PoolSim};
@@ -71,6 +73,12 @@ pub(super) struct WaterfallGateStats {
     pub(super) steps_pruned_subgas: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WaterfallRunResult {
+    last_prof: f64,
+    forced_first_step_executed: bool,
+}
+
 fn passes_step_execution_gate(
     step: &super::bundle::BundleSegmentPlan,
     current_prof: f64,
@@ -88,6 +96,126 @@ fn passes_step_execution_gate(
         BundleRouteKind::Mint => gas_mint_susd,
     };
     passes_execution_gate(edge_susd, gas_susd, buffer_frac, buffer_min_susd)
+}
+
+fn frontier_for_family(
+    sims: &[PoolSim],
+    family: BundleRouteKind,
+    mint_available: bool,
+    remaining_budget: f64,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
+    preserve_sell_indices: &HashSet<usize>,
+) -> Option<BundleFrontier> {
+    match family {
+        BundleRouteKind::Direct => direct_bundle_frontier(sims, remaining_budget, gas_direct_susd),
+        BundleRouteKind::Mint => mint_bundle_frontier(
+            sims,
+            mint_available,
+            remaining_budget,
+            gas_mint_susd,
+            preserve_sell_indices,
+        ),
+    }
+}
+
+fn executable_plan_for_frontier(
+    sims: &[PoolSim],
+    frontier: &BundleFrontier,
+    mint_available: bool,
+    budget: f64,
+    planning_sim_state: &mut Vec<PoolSim>,
+    preserve_sell_indices: &HashSet<usize>,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
+    buffer_frac: f64,
+    buffer_min_susd: f64,
+    mut gate_stats: Option<&mut WaterfallGateStats>,
+) -> Option<super::bundle::BundleStepPlan> {
+    let plan = plan_bundle_step_with_scratch(
+        sims,
+        frontier,
+        mint_available,
+        Some(budget),
+        planning_sim_state,
+        preserve_sell_indices,
+    )?;
+
+    let mut executable_plan = plan.clone();
+    let mut passing_segments = executable_plan
+        .segments
+        .iter()
+        .take_while(|segment| {
+            passes_step_execution_gate(
+                segment,
+                frontier.current_prof,
+                gas_direct_susd,
+                gas_mint_susd,
+                buffer_frac,
+                buffer_min_susd,
+            )
+        })
+        .count();
+
+    if passing_segments == 0
+        && executable_plan
+            .segments
+            .first()
+            .is_some_and(|segment| segment.kind == BundleRouteKind::Mint)
+    {
+        if let Some(direct_fallback) = plan_bundle_step_with_scratch(
+            sims,
+            frontier,
+            false,
+            Some(budget),
+            planning_sim_state,
+            preserve_sell_indices,
+        ) {
+            let fallback_passing = direct_fallback
+                .segments
+                .iter()
+                .take_while(|segment| {
+                    passes_step_execution_gate(
+                        segment,
+                        frontier.current_prof,
+                        gas_direct_susd,
+                        gas_mint_susd,
+                        buffer_frac,
+                        buffer_min_susd,
+                    )
+                })
+                .count();
+            if fallback_passing > 0 {
+                executable_plan = direct_fallback;
+                passing_segments = fallback_passing;
+            }
+        }
+    }
+
+    if passing_segments == 0 {
+        if let Some(stats) = gate_stats.as_deref_mut() {
+            match executable_plan.segments.first().map(|segment| segment.kind) {
+                Some(BundleRouteKind::Direct) => stats.skipped_direct += 1,
+                Some(BundleRouteKind::Mint) => stats.skipped_mint += 1,
+                None => {}
+            }
+            stats.steps_pruned_subgas += 1;
+        }
+        return None;
+    }
+
+    if passing_segments < executable_plan.segments.len() {
+        if let Some(stats) = gate_stats.as_deref_mut() {
+            match executable_plan.segments[passing_segments].kind {
+                BundleRouteKind::Direct => stats.skipped_direct += 1,
+                BundleRouteKind::Mint => stats.skipped_mint += 1,
+            }
+            stats.steps_pruned_subgas += 1;
+        }
+        executable_plan.segments.truncate(passing_segments);
+    }
+
+    Some(executable_plan)
 }
 
 /// Waterfall allocation: deploy capital to the highest profitability outcome.
@@ -152,10 +280,73 @@ pub(super) fn waterfall_with_execution_gate_and_preserve(
     buffer_frac: f64,
     buffer_min_susd: f64,
     preserve_sell_markets: Option<&HashSet<&'static str>>,
-    mut gate_stats: Option<&mut WaterfallGateStats>,
+    gate_stats: Option<&mut WaterfallGateStats>,
 ) -> f64 {
+    waterfall_with_execution_gate_and_preserve_with_forced_first_frontier(
+        sims,
+        budget,
+        actions,
+        mint_available,
+        gas_direct_susd,
+        gas_mint_susd,
+        buffer_frac,
+        buffer_min_susd,
+        preserve_sell_markets,
+        None,
+        gate_stats,
+    )
+    .last_prof
+}
+
+pub(super) fn waterfall_with_execution_gate_and_forced_first_frontier_and_preserve(
+    sims: &mut [PoolSim],
+    budget: &mut f64,
+    actions: &mut Vec<Action>,
+    mint_available: bool,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
+    buffer_frac: f64,
+    buffer_min_susd: f64,
+    preserve_sell_markets: Option<&HashSet<&'static str>>,
+    forced_first_frontier_family: BundleRouteKind,
+    gate_stats: Option<&mut WaterfallGateStats>,
+) -> Option<f64> {
+    let result = waterfall_with_execution_gate_and_preserve_with_forced_first_frontier(
+        sims,
+        budget,
+        actions,
+        mint_available,
+        gas_direct_susd,
+        gas_mint_susd,
+        buffer_frac,
+        buffer_min_susd,
+        preserve_sell_markets,
+        Some(forced_first_frontier_family),
+        gate_stats,
+    );
+    result
+        .forced_first_step_executed
+        .then_some(result.last_prof)
+}
+
+fn waterfall_with_execution_gate_and_preserve_with_forced_first_frontier(
+    sims: &mut [PoolSim],
+    budget: &mut f64,
+    actions: &mut Vec<Action>,
+    mint_available: bool,
+    gas_direct_susd: f64,
+    gas_mint_susd: f64,
+    buffer_frac: f64,
+    buffer_min_susd: f64,
+    preserve_sell_markets: Option<&HashSet<&'static str>>,
+    forced_first_frontier_family: Option<BundleRouteKind>,
+    mut gate_stats: Option<&mut WaterfallGateStats>,
+) -> WaterfallRunResult {
     if *budget <= 0.0 {
-        return 0.0;
+        return WaterfallRunResult {
+            last_prof: 0.0,
+            forced_first_step_executed: forced_first_frontier_family.is_none(),
+        };
     }
 
     let mut last_prof = 0.0;
@@ -170,16 +361,37 @@ pub(super) fn waterfall_with_execution_gate_and_preserve(
         })
         .unwrap_or_default();
     let mut stalled_continues = 0usize;
+    let mut forced_first_frontier_family = forced_first_frontier_family;
+    let mut forced_first_step_executed = forced_first_frontier_family.is_none();
 
     for _iter in 0..MAX_WATERFALL_ITERS {
-        let Some(frontier) = bundle_frontier(
-            sims,
-            mint_available,
-            *budget,
-            gas_direct_susd,
-            gas_mint_susd,
-            &preserve_sell_indices,
-        ) else {
+        let using_forced_frontier = forced_first_frontier_family.is_some();
+        let Some(frontier) = (if let Some(family) = forced_first_frontier_family.take() {
+            frontier_for_family(
+                sims,
+                family,
+                mint_available,
+                *budget,
+                gas_direct_susd,
+                gas_mint_susd,
+                &preserve_sell_indices,
+            )
+        } else {
+            bundle_frontier(
+                sims,
+                mint_available,
+                *budget,
+                gas_direct_susd,
+                gas_mint_susd,
+                &preserve_sell_indices,
+            )
+        }) else {
+            if using_forced_frontier {
+                return WaterfallRunResult {
+                    last_prof,
+                    forced_first_step_executed: false,
+                };
+            }
             break;
         };
         if *budget <= EPS || frontier.current_prof <= 0.0 {
@@ -188,93 +400,28 @@ pub(super) fn waterfall_with_execution_gate_and_preserve(
 
         let iter_start_prof = frontier.current_prof;
         let iter_start_budget = *budget;
-        let Some(plan) = plan_bundle_step_with_scratch(
+        let Some(executable_plan) = executable_plan_for_frontier(
             sims,
             &frontier,
             mint_available,
-            Some(*budget),
+            *budget,
             &mut planning_sim_state,
             &preserve_sell_indices,
+            gas_direct_susd,
+            gas_mint_susd,
+            buffer_frac,
+            buffer_min_susd,
+            gate_stats.as_deref_mut(),
         ) else {
             last_prof = frontier.current_prof;
+            if using_forced_frontier {
+                return WaterfallRunResult {
+                    last_prof,
+                    forced_first_step_executed: false,
+                };
+            }
             break;
         };
-
-        let mut executable_plan = plan.clone();
-        let mut passing_segments = executable_plan
-            .segments
-            .iter()
-            .take_while(|segment| {
-                passes_step_execution_gate(
-                    segment,
-                    frontier.current_prof,
-                    gas_direct_susd,
-                    gas_mint_susd,
-                    buffer_frac,
-                    buffer_min_susd,
-                )
-            })
-            .count();
-
-        if passing_segments == 0 {
-            if executable_plan
-                .segments
-                .first()
-                .is_some_and(|segment| segment.kind == BundleRouteKind::Mint)
-            {
-                if let Some(direct_fallback) = plan_bundle_step_with_scratch(
-                    sims,
-                    &frontier,
-                    false,
-                    Some(*budget),
-                    &mut planning_sim_state,
-                    &preserve_sell_indices,
-                ) {
-                    let fallback_passing = direct_fallback
-                        .segments
-                        .iter()
-                        .take_while(|segment| {
-                            passes_step_execution_gate(
-                                segment,
-                                frontier.current_prof,
-                                gas_direct_susd,
-                                gas_mint_susd,
-                                buffer_frac,
-                                buffer_min_susd,
-                            )
-                        })
-                        .count();
-                    if fallback_passing > 0 {
-                        executable_plan = direct_fallback;
-                        passing_segments = fallback_passing;
-                    }
-                }
-            }
-        }
-
-        if passing_segments == 0 {
-            if let Some(stats) = gate_stats.as_deref_mut() {
-                match executable_plan.segments.first().map(|segment| segment.kind) {
-                    Some(BundleRouteKind::Direct) => stats.skipped_direct += 1,
-                    Some(BundleRouteKind::Mint) => stats.skipped_mint += 1,
-                    None => {}
-                }
-                stats.steps_pruned_subgas += 1;
-            }
-            last_prof = frontier.current_prof;
-            break;
-        }
-
-        if passing_segments < executable_plan.segments.len() {
-            if let Some(stats) = gate_stats.as_deref_mut() {
-                match executable_plan.segments[passing_segments].kind {
-                    BundleRouteKind::Direct => stats.skipped_direct += 1,
-                    BundleRouteKind::Mint => stats.skipped_mint += 1,
-                }
-                stats.steps_pruned_subgas += 1;
-            }
-            executable_plan.segments.truncate(passing_segments);
-        }
 
         let executed = {
             waterfall_balances.clear();
@@ -331,6 +478,9 @@ pub(super) fn waterfall_with_execution_gate_and_preserve(
                     };
                     if fallback_executed {
                         last_prof = direct_fallback.final_prof;
+                        if using_forced_frontier {
+                            forced_first_step_executed = true;
+                        }
                         if !iteration_made_progress(
                             iter_start_prof,
                             direct_fallback.final_prof,
@@ -349,10 +499,19 @@ pub(super) fn waterfall_with_execution_gate_and_preserve(
                 }
             }
             last_prof = frontier.current_prof;
+            if using_forced_frontier {
+                return WaterfallRunResult {
+                    last_prof,
+                    forced_first_step_executed: false,
+                };
+            }
             break;
         }
 
         last_prof = executable_plan.final_prof;
+        if using_forced_frontier {
+            forced_first_step_executed = true;
+        }
         if !iteration_made_progress(
             iter_start_prof,
             executable_plan.final_prof,
@@ -368,7 +527,10 @@ pub(super) fn waterfall_with_execution_gate_and_preserve(
         }
     }
 
-    last_prof
+    WaterfallRunResult {
+        last_prof,
+        forced_first_step_executed,
+    }
 }
 
 #[cfg(test)]
