@@ -114,6 +114,7 @@ Operational diagnostics:
 - Execution submission and strict fail-closed gates: `docs/execution_submission.md`
 - First-group preview diagnostics (`plan_preview` + runtime preview output): `docs/execution_submission.md`
 - Cross-approach policy thresholds: `docs/rebalancer_approaches_playbook.md`
+- Off-chain EV optimization memory and keep/cut decisions: `docs/offchain_ev_optimization_log.md`
 
 ## Balance fetching and local cache
 

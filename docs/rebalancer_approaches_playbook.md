@@ -134,6 +134,7 @@ Historical benchmark context:
   - replaying the staged solver's actual chosen preserve set and first-frontier choice through the flat no-arb operator recovers the staged EV on that case, up to a tiny rounding wobble
   - this means the remaining hard-case gap is a discrete choice-recovery problem, not a continuous waterfall problem
   - do not spend more runtime complexity on larger online `2^K` exact subset search until preserve/frontier choice recovery is improved
+- Permanent EV-optimization memory, benchmark deltas, and stop conditions live in `docs/offchain_ev_optimization_log.md`.
 - The old staged solver remains compiled and is still used as a dominance fallback:
   - the runtime compares the new operator-based winner against the staged-reference plan
   - whichever has better raw EV, then fewer actions, is returned
