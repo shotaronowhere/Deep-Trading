@@ -12,6 +12,8 @@ use super::super::rebalancer::{
     rebalance_with_custom_predictions_arb_last_for_test,
     rebalance_with_custom_predictions_arb_primed_family_for_test,
     rebalance_with_custom_predictions_exact_no_arb_for_test,
+    rebalance_with_custom_predictions_exact_no_arb_with_explicit_choice_for_test,
+    rebalance_with_custom_predictions_exact_no_arb_with_explicit_preserve_universe_for_test,
     rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test,
     rebalance_with_custom_predictions_for_test,
     rebalance_with_custom_predictions_plain_family_for_test,
@@ -19,6 +21,7 @@ use super::super::rebalancer::{
     rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test,
     rebalance_with_custom_predictions_staged_reference_for_test,
     rebalance_with_custom_predictions_variant_and_preserve_for_test,
+    staged_reference_choice_for_test,
 };
 use super::fixtures::mock_slot0_market_with_orientation_liquidity_and_ticks;
 use super::replay_actions_to_state;
@@ -1284,10 +1287,46 @@ fn print_heterogeneous_ninety_eight_exact_preserve_oracle_breakdown() {
         &built.predictions,
         force_mint_available,
     );
+    let staged_preserve_candidates = collect_mint_sell_preserve_candidates_for_test(
+        &staged,
+        &built.slot0_results,
+        &built.balances_view,
+        built.cash_budget,
+        8,
+    );
+    let exact_staged_seed_k8 =
+        rebalance_with_custom_predictions_exact_no_arb_with_explicit_preserve_universe_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+            &staged_preserve_candidates,
+        );
+    let staged_choice = staged_reference_choice_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    )
+    .expect("staged reference should produce a candidate on the heterogeneous benchmark case");
+    let exact_staged_choice =
+        rebalance_with_custom_predictions_exact_no_arb_with_explicit_choice_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+            &staged_choice.preserve_markets,
+            staged_choice.frontier_family,
+        );
 
     let exact_k4_ev = benchmark_ev_wei(&exact_k4, &built);
     let exact_k8_ev = benchmark_ev_wei(&exact_k8, &built);
     let exact_k8_with_arb_seed_ev = benchmark_ev_wei(&exact_k8_with_arb_seed, &built);
+    let exact_staged_seed_k8_ev = benchmark_ev_wei(&exact_staged_seed_k8, &built);
+    let exact_staged_choice_ev = benchmark_ev_wei(&exact_staged_choice, &built);
     let staged_ev = benchmark_ev_wei(&staged, &built);
 
     println!("exact_k4 ev={} actions={}", exact_k4_ev, exact_k4.len());
@@ -1296,6 +1335,29 @@ fn print_heterogeneous_ninety_eight_exact_preserve_oracle_breakdown() {
         "exact_k8_with_arb_seed ev={} actions={}",
         exact_k8_with_arb_seed_ev,
         exact_k8_with_arb_seed.len()
+    );
+    println!(
+        "exact_staged_seed_k8 ev={} actions={}",
+        exact_staged_seed_k8_ev,
+        exact_staged_seed_k8.len()
+    );
+    println!(
+        "exact_staged_choice ev={} actions={}",
+        exact_staged_choice_ev,
+        exact_staged_choice.len()
+    );
+    println!("staged_choice_variant={}", staged_choice.variant_label);
+    println!(
+        "staged_choice_frontier_family={:?}",
+        staged_choice.frontier_family
+    );
+    println!(
+        "staged_choice_preserve_markets={:?}",
+        staged_choice.preserve_markets
+    );
+    println!(
+        "staged_preserve_candidates={:?}",
+        staged_preserve_candidates
     );
     println!("staged ev={} actions={}", staged_ev, staged.len());
 
@@ -1306,6 +1368,10 @@ fn print_heterogeneous_ninety_eight_exact_preserve_oracle_breakdown() {
     assert!(
         exact_k8_with_arb_seed_ev >= exact_k8_ev,
         "adding a positive root-arb preserve seed should not underperform the same expanded cap without it"
+    );
+    assert!(
+        exact_staged_seed_k8_ev >= exact_k4_ev,
+        "staged-derived preserve universe should not underperform the baseline k4 exact solver on the heterogeneous oracle case"
     );
 }
 

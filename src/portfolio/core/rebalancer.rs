@@ -1792,6 +1792,59 @@ fn enumerate_preserve_subsets(preserve_universe: &[&'static str]) -> Vec<Vec<&'s
     subsets
 }
 
+fn enumerate_exact_no_arb_candidates_over_preserve_universe(
+    mut candidates: Vec<PlanResult>,
+    state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    expected_outcome_count: usize,
+    route_gates: RouteGateThresholds,
+    force_mint_available: Option<bool>,
+    verify_internal_state: bool,
+    run_phase0_in_polish: bool,
+    family: SolverFamily,
+    preserve_universe: &[&'static str],
+    stats: &mut SolverRunStats,
+) -> Vec<PlanResult> {
+    if preserve_universe.is_empty() {
+        candidates.sort_by(plan_result_cmp);
+        return candidates;
+    }
+
+    let frontier_modes = frontier_family_candidates();
+    let preserve_subsets = enumerate_preserve_subsets(preserve_universe);
+    let tasks: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> = frontier_modes
+        .into_iter()
+        .flat_map(|frontier_family| {
+            preserve_subsets
+                .iter()
+                .filter(|subset| !subset.is_empty())
+                .cloned()
+                .map(move |subset| (frontier_family, subset))
+        })
+        .collect();
+    stats.exact_rebalance_candidate_evals += tasks.len();
+    let mut extra_candidates: Vec<PlanResult> = tasks
+        .into_par_iter()
+        .filter_map(|(frontier_family, preserve_markets)| {
+            run_no_arb_rebalance_plan_from_state(
+                state,
+                predictions,
+                expected_outcome_count,
+                route_gates,
+                &preserve_markets,
+                frontier_family,
+                force_mint_available,
+                verify_internal_state,
+                run_phase0_in_polish,
+                family,
+            )
+        })
+        .collect();
+    candidates.append(&mut extra_candidates);
+    candidates.sort_by(plan_result_cmp);
+    candidates
+}
+
 fn collect_no_preserve_frontier_seed_plans(
     state: &SolverStateSnapshot,
     predictions: &HashMap<String, f64>,
@@ -1910,41 +1963,19 @@ fn enumerate_exact_no_arb_candidates_with_options(
         merge_preserve_candidate_scores(&preserve_score_sets),
         online_preserve_cap,
     );
-    let mut candidates = candidates;
-    if !preserve_universe.is_empty() {
-        let frontier_modes = frontier_family_candidates();
-        let preserve_subsets = enumerate_preserve_subsets(&preserve_universe);
-        let tasks: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> = frontier_modes
-            .into_iter()
-            .flat_map(|frontier_family| {
-                preserve_subsets
-                    .iter()
-                    .filter(|subset| !subset.is_empty())
-                    .cloned()
-                    .map(move |subset| (frontier_family, subset))
-            })
-            .collect();
-        stats.exact_rebalance_candidate_evals += tasks.len();
-        let mut extra_candidates: Vec<PlanResult> = tasks
-            .into_par_iter()
-            .filter_map(|(frontier_family, preserve_markets)| {
-                run_no_arb_rebalance_plan_from_state(
-                    state,
-                    predictions,
-                    expected_outcome_count,
-                    route_gates,
-                    &preserve_markets,
-                    frontier_family,
-                    force_mint_available,
-                    verify_internal_state,
-                    run_phase0_in_polish,
-                    family,
-                )
-            })
-            .collect();
-        candidates.append(&mut extra_candidates);
-    }
-    candidates.sort_by(plan_result_cmp);
+    let candidates = enumerate_exact_no_arb_candidates_over_preserve_universe(
+        candidates,
+        state,
+        predictions,
+        expected_outcome_count,
+        route_gates,
+        force_mint_available,
+        verify_internal_state,
+        run_phase0_in_polish,
+        family,
+        &preserve_universe,
+        stats,
+    );
 
     tracing::debug!(
         family = family.as_str(),
@@ -3128,7 +3159,7 @@ fn preserve_candidates_for_candidate(
     )
 }
 
-fn rebalance_full_with_predictions_and_budget(
+fn rebalance_full_with_predictions_and_budget_candidate(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -3140,7 +3171,7 @@ fn rebalance_full_with_predictions_and_budget(
     verify_internal_state: bool,
     max_meta_solver_invocations: usize,
     enable_first_frontier_branch: bool,
-) -> Vec<Action> {
+) -> Option<CandidateResult> {
     // Retained for API compatibility; full-mode meta search always evaluates
     // the bounded preserve search when the winning plan contains mint activity.
     let _ = _flags.enable_ev_guarded_greedy_churn_pruning;
@@ -3157,23 +3188,7 @@ fn rebalance_full_with_predictions_and_budget(
         &mut meta_budget,
     );
     if phase_order_evaluations.is_empty() {
-        let err = build_rebalance_context_with_options(
-            balances,
-            susds_balance,
-            slot0_results,
-            predictions,
-            expected_count,
-            route_gates,
-            force_mint_available,
-        )
-        .err()
-        .unwrap_or(RebalanceInitError::NoEligibleSims {
-            slot0_result_count: slot0_results.len(),
-            prediction_count: predictions.len(),
-            expected_outcome_count: expected_count,
-        });
-        log_rebalance_init_error(err);
-        return Vec::new();
+        return None;
     }
 
     let stage1_selection = phase_order_evaluations
@@ -3381,6 +3396,53 @@ fn rebalance_full_with_predictions_and_budget(
         "rebalance meta-solver result"
     );
 
+    Some(best)
+}
+
+fn rebalance_full_with_predictions_and_budget(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    expected_count: usize,
+    route_gates: RouteGateThresholds,
+    flags: RebalanceFlags,
+    force_mint_available: Option<bool>,
+    verify_internal_state: bool,
+    max_meta_solver_invocations: usize,
+    enable_first_frontier_branch: bool,
+) -> Vec<Action> {
+    let Some(best) = rebalance_full_with_predictions_and_budget_candidate(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        expected_count,
+        route_gates,
+        flags,
+        force_mint_available,
+        verify_internal_state,
+        max_meta_solver_invocations,
+        enable_first_frontier_branch,
+    ) else {
+        let err = build_rebalance_context_with_options(
+            balances,
+            susds_balance,
+            slot0_results,
+            predictions,
+            expected_count,
+            route_gates,
+            force_mint_available,
+        )
+        .err()
+        .unwrap_or(RebalanceInitError::NoEligibleSims {
+            slot0_result_count: slot0_results.len(),
+            prediction_count: predictions.len(),
+            expected_outcome_count: expected_count,
+        });
+        log_rebalance_init_error(err);
+        return Vec::new();
+    };
     best.actions
 }
 
@@ -3466,6 +3528,14 @@ pub(super) enum TestPhaseOrderVariant {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone)]
+pub(super) struct StagedReferenceChoice {
+    pub(super) variant_label: &'static str,
+    pub(super) frontier_family: Option<BundleRouteKind>,
+    pub(super) preserve_markets: Vec<&'static str>,
+}
+
+#[cfg(test)]
 impl From<TestPhaseOrderVariant> for PhaseOrderVariant {
     fn from(value: TestPhaseOrderVariant) -> Self {
         match value {
@@ -3540,6 +3610,40 @@ pub(super) fn rebalance_with_custom_predictions_staged_reference_for_test(
 }
 
 #[cfg(test)]
+pub(super) fn staged_reference_choice_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Option<StagedReferenceChoice> {
+    rebalance_full_with_predictions_and_budget_candidate(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        RebalanceFlags::default(),
+        Some(force_mint_available),
+        false,
+        MAX_META_SOLVER_INVOCATIONS,
+        true,
+    )
+    .map(|best| StagedReferenceChoice {
+        variant_label: best.variant.as_str(),
+        frontier_family: best.forced_first_frontier_family,
+        preserve_markets: sorted_preserve_markets(
+            &best
+                .preserve_markets
+                .iter()
+                .copied()
+                .collect::<Vec<&'static str>>(),
+        ),
+    })
+}
+
+#[cfg(test)]
 pub(super) fn rebalance_with_custom_predictions_exact_no_arb_for_test(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -3561,6 +3665,33 @@ pub(super) fn rebalance_with_custom_predictions_exact_no_arb_for_test(
         &mut stats,
     )
     .actions
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_explicit_choice_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    preserve_markets: &[&'static str],
+    frontier_family: Option<BundleRouteKind>,
+) -> Vec<Action> {
+    let state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    run_no_arb_rebalance_plan_from_state(
+        &state,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        preserve_markets,
+        frontier_family,
+        Some(force_mint_available),
+        false,
+        false,
+        SolverFamily::Plain,
+    )
+    .map(|plan| plan.actions)
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3604,6 +3735,50 @@ pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_search_config_
         &mut stats,
     )
     .actions
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_explicit_preserve_universe_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    preserve_universe: &[&'static str],
+) -> Vec<Action> {
+    let state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    let mut stats = SolverRunStats::default();
+    let seed_candidates = collect_no_preserve_frontier_seed_plans(
+        &state,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        Some(force_mint_available),
+        false,
+        false,
+        SolverFamily::Plain,
+        &mut stats,
+    );
+    let mut best = solver_identity_plan(&state, SolverFamily::Plain);
+    best.ev = state_snapshot_expected_value(&state, predictions);
+    for candidate in enumerate_exact_no_arb_candidates_over_preserve_universe(
+        seed_candidates,
+        &state,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        Some(force_mint_available),
+        false,
+        false,
+        SolverFamily::Plain,
+        preserve_universe,
+        &mut stats,
+    ) {
+        if plan_result_is_better(&candidate, &best) {
+            best = candidate;
+        }
+    }
+    best.actions
 }
 
 #[cfg(test)]

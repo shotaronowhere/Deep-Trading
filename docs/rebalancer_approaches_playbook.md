@@ -128,6 +128,12 @@ Historical benchmark context:
   - no-preserve frontier seeds are used to discover churn candidates
   - singleton-preserve probes expand that universe once
   - the online preserve universe is capped at `K = 4`
+- Teacher-oracle result on the heterogeneous 98-outcome benchmark case:
+  - expanding the flat exact operator from `K = 4` to `K = 8` improves EV, but still stays below the staged fallback
+  - seeding the exact operator with the top-`8` churn candidates extracted from the staged winner action stream also stays below the staged fallback
+  - replaying the staged solver's actual chosen preserve set and first-frontier choice through the flat no-arb operator recovers the staged EV on that case, up to a tiny rounding wobble
+  - this means the remaining hard-case gap is a discrete choice-recovery problem, not a continuous waterfall problem
+  - do not spend more runtime complexity on larger online `2^K` exact subset search until preserve/frontier choice recovery is improved
 - The old staged solver remains compiled and is still used as a dominance fallback:
   - the runtime compares the new operator-based winner against the staged-reference plan
   - whichever has better raw EV, then fewer actions, is returned
