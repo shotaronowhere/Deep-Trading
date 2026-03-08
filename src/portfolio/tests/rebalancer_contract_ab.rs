@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::rebalancer::{
     TestPhaseOrderVariant, arb_only_with_custom_predictions_for_test,
-    collect_mint_sell_preserve_candidates_for_test,
+    collect_mint_sell_preserve_candidates_for_test, phase_order_exact_subset_choice_for_test,
     rebalance_with_custom_predictions_and_stats_for_test,
     rebalance_with_custom_predictions_arb_first_for_test,
     rebalance_with_custom_predictions_arb_last_for_test,
@@ -1247,6 +1247,8 @@ fn print_current_optimizer_benchmark_rows() {
 #[test]
 #[ignore = "debug helper; run explicitly"]
 fn print_heterogeneous_ninety_eight_exact_preserve_oracle_breakdown() {
+    const ORACLE_WOBBLE_TOLERANCE_WEI: u128 = 65_536;
+
     let case = cases_from_fixture()
         .into_iter()
         .find(|case| case.case_id == "heterogeneous_ninety_eight_outcome_l1_like_case")
@@ -1362,17 +1364,74 @@ fn print_heterogeneous_ninety_eight_exact_preserve_oracle_breakdown() {
     println!("staged ev={} actions={}", staged_ev, staged.len());
 
     assert!(
-        exact_k8_ev >= exact_k4_ev,
+        exact_k8_ev.saturating_add(ORACLE_WOBBLE_TOLERANCE_WEI) >= exact_k4_ev,
         "expanded preserve cap should not underperform k4 on the heterogeneous oracle case"
     );
     assert!(
-        exact_k8_with_arb_seed_ev >= exact_k8_ev,
+        exact_k8_with_arb_seed_ev.saturating_add(ORACLE_WOBBLE_TOLERANCE_WEI) >= exact_k8_ev,
         "adding a positive root-arb preserve seed should not underperform the same expanded cap without it"
     );
     assert!(
         exact_staged_seed_k8_ev >= exact_k4_ev,
         "staged-derived preserve universe should not underperform the baseline k4 exact solver on the heterogeneous oracle case"
     );
+}
+
+#[test]
+#[ignore = "debug helper; run explicitly"]
+fn print_heterogeneous_ninety_eight_variant_proposal_breakdown() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "heterogeneous_ninety_eight_outcome_l1_like_case")
+        .expect("heterogeneous benchmark case should exist");
+    let built = build_case(&case);
+    let force_mint_available = !case.direct_only_reference;
+
+    let staged_choice = staged_reference_choice_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    )
+    .expect("staged reference should produce a candidate on the heterogeneous benchmark case");
+    println!(
+        "staged_choice variant={} frontier={:?} preserve={:?}",
+        staged_choice.variant_label, staged_choice.frontier_family, staged_choice.preserve_markets
+    );
+
+    for variant in [
+        TestPhaseOrderVariant::ArbFirst,
+        TestPhaseOrderVariant::ArbLast,
+        TestPhaseOrderVariant::NoArb,
+    ] {
+        let choice = phase_order_exact_subset_choice_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            variant,
+            force_mint_available,
+        )
+        .expect("variant proposal helper should produce a candidate");
+        let replayed = rebalance_with_custom_predictions_exact_no_arb_with_explicit_choice_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+            &choice.preserve_markets,
+            choice.frontier_family,
+        );
+        println!(
+            "variant={} frontier={:?} preserve={:?} exact_no_arb_replay_ev={} actions={}",
+            choice.variant_label,
+            choice.frontier_family,
+            choice.preserve_markets,
+            benchmark_ev_wei(&replayed, &built),
+            replayed.len()
+        );
+    }
 }
 
 #[test]

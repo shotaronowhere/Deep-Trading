@@ -1563,7 +1563,10 @@ fn plan_result_is_better(candidate: &PlanResult, incumbent: &PlanResult) -> bool
     if candidate.preserve_markets.len() != incumbent.preserve_markets.len() {
         return candidate.preserve_markets.len() < incumbent.preserve_markets.len();
     }
-    candidate.preserve_markets < incumbent.preserve_markets
+    if candidate.preserve_markets != incumbent.preserve_markets {
+        return candidate.preserve_markets < incumbent.preserve_markets;
+    }
+    candidate.ev.total_cmp(&incumbent.ev).is_gt()
 }
 
 fn plan_result_cmp(left: &PlanResult, right: &PlanResult) -> Ordering {
@@ -2357,8 +2360,28 @@ fn candidate_is_better(candidate: &CandidateResult, incumbent: &CandidateResult)
     if candidate.variant != incumbent.variant {
         return candidate.variant.stable_rank() < incumbent.variant.stable_rank();
     }
-    first_frontier_family_stable_rank(candidate.forced_first_frontier_family)
-        < first_frontier_family_stable_rank(incumbent.forced_first_frontier_family)
+    if candidate.forced_first_frontier_family != incumbent.forced_first_frontier_family {
+        return first_frontier_family_stable_rank(candidate.forced_first_frontier_family)
+            < first_frontier_family_stable_rank(incumbent.forced_first_frontier_family);
+    }
+    let candidate_preserve = sorted_preserve_markets(
+        &candidate
+            .preserve_markets
+            .iter()
+            .copied()
+            .collect::<Vec<&'static str>>(),
+    );
+    let incumbent_preserve = sorted_preserve_markets(
+        &incumbent
+            .preserve_markets
+            .iter()
+            .copied()
+            .collect::<Vec<&'static str>>(),
+    );
+    if candidate_preserve != incumbent_preserve {
+        return candidate_preserve < incumbent_preserve;
+    }
+    candidate.ev.total_cmp(&incumbent.ev).is_gt()
 }
 
 fn candidate_cmp(left: &CandidateResult, right: &CandidateResult) -> Ordering {
@@ -3631,6 +3654,79 @@ pub(super) fn staged_reference_choice_for_test(
         true,
     )
     .map(|best| StagedReferenceChoice {
+        variant_label: best.variant.as_str(),
+        frontier_family: best.forced_first_frontier_family,
+        preserve_markets: sorted_preserve_markets(
+            &best
+                .preserve_markets
+                .iter()
+                .copied()
+                .collect::<Vec<&'static str>>(),
+        ),
+    })
+}
+
+#[cfg(test)]
+pub(super) fn phase_order_exact_subset_choice_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    variant: TestPhaseOrderVariant,
+    force_mint_available: bool,
+) -> Option<StagedReferenceChoice> {
+    let mut meta_budget = MetaSearchBudget::new(MAX_META_SOLVER_INVOCATIONS);
+    let preserve_markets = HashSet::new();
+    let baseline = run_rebalance_full_variant_candidate(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        PhaseOrderVariant::from(variant),
+        &preserve_markets,
+        None,
+        Some(force_mint_available),
+        false,
+        &mut meta_budget,
+    )?;
+    let mut best = baseline.clone();
+    if let Some((greedy_best, preserve_candidates)) = greedy_preserve_candidate(
+        &baseline,
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        Some(force_mint_available),
+        false,
+        MAX_PRESERVE_SEARCH_CANDIDATES,
+        &mut meta_budget,
+    ) {
+        if candidate_is_better(&greedy_best, &best) {
+            best = greedy_best.clone();
+        }
+        let exact_candidate = exact_preserve_subset_candidate(
+            &baseline,
+            best.clone(),
+            &preserve_candidates,
+            balances,
+            susds_balance,
+            slot0_results,
+            predictions,
+            slot0_results.len(),
+            RouteGateThresholds::disabled(),
+            Some(force_mint_available),
+            false,
+            &mut meta_budget,
+        );
+        if candidate_is_better(&exact_candidate, &best) {
+            best = exact_candidate;
+        }
+    }
+    Some(StagedReferenceChoice {
         variant_label: best.variant.as_str(),
         frontier_family: best.forced_first_frontier_family,
         preserve_markets: sorted_preserve_markets(

@@ -103,6 +103,21 @@ Conclusion:
 - the remaining gap is discrete choice recovery
 - the next online win is to recover the right preserve/frontier choice cheaply, not to add more generic search depth
 
+Follow-up diagnostic:
+
+- `cargo test print_heterogeneous_ninety_eight_variant_proposal_breakdown -- --ignored --nocapture`
+
+Result:
+
+- extracting an exact preserve-set proposal independently from each static phase-order variant converges to the same 4-name preserve set
+- replaying that proposal through `exact_no_arb` recovers most of the residual heterogeneous-case gap
+- but it still trails the staged choice by about `0.000011913546661888` EV while materially increasing runtime when wired into the online solver
+
+Conclusion:
+
+- this is a useful teacher signal
+- it is not worth keeping in the online default path until it can be distilled into a much cheaper proposal heuristic
+
 ## Explored ideas and status
 
 ### Keep online
@@ -127,6 +142,7 @@ Conclusion:
 | Larger online `2^K` preserve enumeration (`K > 4`) | Reject | Improves EV, but runtime cost is too high and still does not fully close the gap |
 | Positive root-arb seed for preserve discovery | Reject | No measurable benefit on the hard case |
 | Staged-action churn seeding | Reject | Still misses the staged winner |
+| Online per-variant exact-subset preserve proposals | Reject | Recovers most of the residual hard-case gap, but runtime cost is too high for the remaining dust-sized EV |
 | Preserve local search / pair-add / pairwise probes | Reject | Added complexity without moving the hard case |
 | Deeper generic frontier branching | Defer | No strong evidence that it is the binding constraint now |
 
@@ -152,7 +168,7 @@ Only resume online EV work from this list:
 
 2. Variant-aware preserve proposal generation.
    - Use `arb_first` and `no_arb` seed plans to propose preserve sets.
-   - Do not expand back into a broad `2^K` lattice unless evidence forces it.
+   - Do not recompute full per-variant exact subsets online unless evidence forces it.
 
 3. Remove staged fallback after proposal parity.
    - Once the proposal heuristic matches staged on the hard cases, delete the fallback and remeasure release performance.
