@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
+#[cfg(test)]
+use serde::Serialize;
 
 use crate::execution::GroupKind;
 use crate::execution::gas::{GasAssumptions, estimate_min_gas_susd_for_group};
@@ -12,8 +14,8 @@ use super::bundle::BundleRouteKind;
 #[cfg(test)]
 use super::sim::DUST;
 use super::sim::{
-    EPS, PoolSim, SimBuildError, build_sims, build_sims_without_predictions, profitability,
-    target_price_for_prof,
+    EPS, PoolSim, SimBuildError, alt_price, build_sims, build_sims_without_predictions,
+    profitability, target_price_for_prof,
 };
 use super::trading::{ExecutionState, portfolio_expected_value};
 use super::types::BalanceMap;
@@ -34,6 +36,8 @@ const MAX_POLISH_PASSES: usize = 64;
 const POLISH_EV_REL_TOL: f64 = 1e-10;
 const PRESERVE_SELECTION_EV_REL_TOL: f64 = 1e-13;
 const MAX_ONLINE_PRESERVE_CANDIDATES: usize = 4;
+const MAX_DISTILLED_PRESERVE_SET_SIZE: usize = 5;
+const MAX_DISTILLED_EXTRA_PROPOSAL_SETS: usize = 3;
 const ARB_OPERATOR_EV_REL_TOL: f64 = 1e-10;
 const MAX_META_SOLVER_INVOCATIONS: usize = 192;
 const MAX_PRESERVE_SEARCH_CANDIDATES: usize = 12;
@@ -227,6 +231,8 @@ struct PlanResult {
 pub(super) struct SolverRunStats {
     pub(super) exact_rebalance_calls: usize,
     pub(super) exact_rebalance_candidate_evals: usize,
+    pub(super) distilled_proposal_sets: usize,
+    pub(super) distilled_proposal_candidate_evals: usize,
     pub(super) arb_operator_evals: usize,
     pub(super) arb_corrections_taken: usize,
     pub(super) arb_primed_root_taken: bool,
@@ -237,6 +243,46 @@ struct PreserveCandidateScore {
     market_name: &'static str,
     churn_amount: f64,
     sold_amount: f64,
+}
+
+#[derive(Debug, Clone)]
+struct DistilledMarketFeature {
+    market_name: &'static str,
+    holding: f64,
+    churn_amount: f64,
+    sold_amount: f64,
+    direct_profitability: f64,
+    direct_profitability_rank: usize,
+    prediction_minus_price: f64,
+    mint_profitability: f64,
+    hold_through_mint_value: f64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct TeacherMarketFeatureRow {
+    market_name: &'static str,
+    holding: f64,
+    churn_amount: f64,
+    sold_amount: f64,
+    direct_profitability: f64,
+    direct_profitability_rank: usize,
+    prediction_minus_price: f64,
+    mint_profitability: f64,
+    hold_through_mint_value: f64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct TeacherDecisionSnapshot {
+    winning_family: &'static str,
+    winning_frontier_family: &'static str,
+    preserve_markets: Vec<&'static str>,
+    root_arb_fired: bool,
+    late_arb_improved: bool,
+    raw_ev: f64,
+    action_count: usize,
+    features: Vec<TeacherMarketFeatureRow>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1539,6 +1585,97 @@ fn solver_identity_plan(state: &SolverStateSnapshot, family: SolverFamily) -> Pl
     }
 }
 
+fn action_cmp(left: &Action, right: &Action) -> Ordering {
+    fn cmp_f64(left: f64, right: f64) -> Ordering {
+        left.total_cmp(&right)
+    }
+
+    match (left, right) {
+        (
+            Action::Mint {
+                contract_1: left_contract_1,
+                contract_2: left_contract_2,
+                amount: left_amount,
+                target_market: left_target_market,
+            },
+            Action::Mint {
+                contract_1: right_contract_1,
+                contract_2: right_contract_2,
+                amount: right_amount,
+                target_market: right_target_market,
+            },
+        ) => left_target_market
+            .cmp(right_target_market)
+            .then_with(|| left_contract_1.cmp(right_contract_1))
+            .then_with(|| left_contract_2.cmp(right_contract_2))
+            .then_with(|| cmp_f64(*left_amount, *right_amount)),
+        (
+            Action::Buy {
+                market_name: left_market_name,
+                amount: left_amount,
+                cost: left_cost,
+            },
+            Action::Buy {
+                market_name: right_market_name,
+                amount: right_amount,
+                cost: right_cost,
+            },
+        ) => left_market_name
+            .cmp(right_market_name)
+            .then_with(|| cmp_f64(*left_amount, *right_amount))
+            .then_with(|| cmp_f64(*left_cost, *right_cost)),
+        (
+            Action::Sell {
+                market_name: left_market_name,
+                amount: left_amount,
+                proceeds: left_proceeds,
+            },
+            Action::Sell {
+                market_name: right_market_name,
+                amount: right_amount,
+                proceeds: right_proceeds,
+            },
+        ) => left_market_name
+            .cmp(right_market_name)
+            .then_with(|| cmp_f64(*left_amount, *right_amount))
+            .then_with(|| cmp_f64(*left_proceeds, *right_proceeds)),
+        (
+            Action::Merge {
+                contract_1: left_contract_1,
+                contract_2: left_contract_2,
+                amount: left_amount,
+                source_market: left_source_market,
+            },
+            Action::Merge {
+                contract_1: right_contract_1,
+                contract_2: right_contract_2,
+                amount: right_amount,
+                source_market: right_source_market,
+            },
+        ) => left_source_market
+            .cmp(right_source_market)
+            .then_with(|| left_contract_1.cmp(right_contract_1))
+            .then_with(|| left_contract_2.cmp(right_contract_2))
+            .then_with(|| cmp_f64(*left_amount, *right_amount)),
+        (Action::Mint { .. }, _) => Ordering::Less,
+        (_, Action::Mint { .. }) => Ordering::Greater,
+        (Action::Buy { .. }, _) => Ordering::Less,
+        (_, Action::Buy { .. }) => Ordering::Greater,
+        (Action::Sell { .. }, _) => Ordering::Less,
+        (_, Action::Sell { .. }) => Ordering::Greater,
+    }
+}
+
+fn actions_cmp(left: &[Action], right: &[Action]) -> Ordering {
+    for (left_action, right_action) in left.iter().zip(right.iter()) {
+        let ordering = action_cmp(left_action, right_action);
+        if !ordering.is_eq() {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
 fn plan_result_is_better(candidate: &PlanResult, incumbent: &PlanResult) -> bool {
     let ev_tol = PRESERVE_SELECTION_EV_REL_TOL
         * (1.0
@@ -1566,7 +1703,10 @@ fn plan_result_is_better(candidate: &PlanResult, incumbent: &PlanResult) -> bool
     if candidate.preserve_markets != incumbent.preserve_markets {
         return candidate.preserve_markets < incumbent.preserve_markets;
     }
-    candidate.ev.total_cmp(&incumbent.ev).is_gt()
+    if candidate.actions != incumbent.actions {
+        return actions_cmp(&candidate.actions, &incumbent.actions).is_lt();
+    }
+    false
 }
 
 fn plan_result_cmp(left: &PlanResult, right: &PlanResult) -> Ordering {
@@ -1780,6 +1920,298 @@ fn merge_preserve_candidate_scores(
     merged
 }
 
+fn descending_rank_map(
+    features: &[DistilledMarketFeature],
+    value: impl Fn(&DistilledMarketFeature) -> f64,
+) -> HashMap<&'static str, usize> {
+    let mut ranked: Vec<(&'static str, f64)> = features
+        .iter()
+        .map(|feature| (feature.market_name, value(feature)))
+        .collect();
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    ranked
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (market_name, _))| (market_name, rank))
+        .collect()
+}
+
+fn rank_weight(rank: usize, total: usize) -> f64 {
+    total.saturating_sub(rank) as f64
+}
+
+fn collect_distilled_market_features(
+    state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    preserve_scores: &[PreserveCandidateScore],
+) -> Vec<DistilledMarketFeature> {
+    let Ok(sims) = build_sims(&state.slot0_results, predictions) else {
+        return Vec::new();
+    };
+    let price_sum: f64 = sims.iter().map(|sim| sim.price()).sum();
+    let preserve_score_map: HashMap<&'static str, (f64, f64)> = preserve_scores
+        .iter()
+        .map(|score| (score.market_name, (score.churn_amount, score.sold_amount)))
+        .collect();
+
+    let mut features: Vec<DistilledMarketFeature> = sims
+        .iter()
+        .map(|sim| {
+            let holding = state
+                .holdings
+                .get(sim.market_name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0);
+            let (churn_amount, sold_amount) = preserve_score_map
+                .get(sim.market_name)
+                .copied()
+                .unwrap_or((0.0, 0.0));
+            let direct_profitability = profitability(sim.prediction, sim.price());
+            let prediction_minus_price = sim.prediction - sim.price();
+            let mint_price = alt_price(
+                &sims,
+                sims.iter()
+                    .position(|candidate| candidate.market_name == sim.market_name)
+                    .expect("sim index should exist for current market"),
+                price_sum,
+            );
+            let mint_profitability = profitability(sim.prediction, mint_price);
+            let hold_through_mint_value = holding * (sim.prediction - mint_price).max(0.0);
+            DistilledMarketFeature {
+                market_name: sim.market_name,
+                holding,
+                churn_amount,
+                sold_amount,
+                direct_profitability,
+                direct_profitability_rank: 0,
+                prediction_minus_price,
+                mint_profitability,
+                hold_through_mint_value,
+            }
+        })
+        .collect();
+
+    let direct_ranks = descending_rank_map(&features, |feature| feature.direct_profitability);
+    let feature_count = features.len();
+    for feature in &mut features {
+        feature.direct_profitability_rank = direct_ranks
+            .get(feature.market_name)
+            .copied()
+            .unwrap_or(feature_count);
+    }
+    features.sort_by(|left, right| left.market_name.cmp(right.market_name));
+    features
+}
+
+#[cfg(test)]
+fn distilled_feature_rows(features: &[DistilledMarketFeature]) -> Vec<TeacherMarketFeatureRow> {
+    features
+        .iter()
+        .map(|feature| TeacherMarketFeatureRow {
+            market_name: feature.market_name,
+            holding: feature.holding,
+            churn_amount: feature.churn_amount,
+            sold_amount: feature.sold_amount,
+            direct_profitability: feature.direct_profitability,
+            direct_profitability_rank: feature.direct_profitability_rank,
+            prediction_minus_price: feature.prediction_minus_price,
+            mint_profitability: feature.mint_profitability,
+            hold_through_mint_value: feature.hold_through_mint_value,
+        })
+        .collect()
+}
+
+fn capped_top_markets_by_score(
+    features: &[DistilledMarketFeature],
+    score: impl Fn(&DistilledMarketFeature) -> f64,
+) -> Vec<&'static str> {
+    let mut ranked: Vec<(&'static str, f64)> = features
+        .iter()
+        .filter(|feature| {
+            feature.holding > EPS
+                && (feature.churn_amount > EPS
+                    || feature.direct_profitability > 0.0
+                    || feature.hold_through_mint_value > 0.0)
+        })
+        .map(|feature| (feature.market_name, score(feature)))
+        .filter(|(_, score)| score.is_finite() && *score > 0.0)
+        .collect();
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    ranked.truncate(MAX_DISTILLED_PRESERVE_SET_SIZE);
+    ranked
+        .into_iter()
+        .map(|(market_name, _)| market_name)
+        .collect()
+}
+
+fn choose_distilled_frontier_family(
+    features: &[DistilledMarketFeature],
+    preserve_markets: &[&'static str],
+) -> Option<BundleRouteKind> {
+    if preserve_markets.is_empty() {
+        return None;
+    }
+    let preserve_set: HashSet<&'static str> = preserve_markets.iter().copied().collect();
+    let mut direct_score = 0.0;
+    let mut mint_score = 0.0;
+    for feature in features {
+        if !preserve_set.contains(feature.market_name) {
+            continue;
+        }
+        let weight = 1.0 + feature.holding.sqrt();
+        direct_score += feature.direct_profitability.max(0.0) * weight;
+        mint_score +=
+            (feature.mint_profitability.max(0.0) + feature.hold_through_mint_value) * weight;
+    }
+    if mint_score > direct_score + EPS {
+        Some(BundleRouteKind::Mint)
+    } else if direct_score > EPS {
+        Some(BundleRouteKind::Direct)
+    } else {
+        None
+    }
+}
+
+fn distilled_preserve_proposals(features: &[DistilledMarketFeature]) -> Vec<Vec<&'static str>> {
+    if features.is_empty() {
+        return Vec::new();
+    }
+    let total = features.len();
+    let churn_ranks = descending_rank_map(features, |feature| feature.churn_amount);
+    let holding_ranks = descending_rank_map(features, |feature| feature.holding);
+    let direct_ranks = descending_rank_map(features, |feature| feature.direct_profitability);
+    let hold_through_ranks =
+        descending_rank_map(features, |feature| feature.hold_through_mint_value);
+
+    let p1 = capped_top_markets_by_score(features, |feature| {
+        6.0 * rank_weight(
+            churn_ranks
+                .get(feature.market_name)
+                .copied()
+                .unwrap_or(total),
+            total,
+        ) + 3.0
+            * rank_weight(
+                holding_ranks
+                    .get(feature.market_name)
+                    .copied()
+                    .unwrap_or(total),
+                total,
+            )
+            + 2.0
+                * rank_weight(
+                    direct_ranks
+                        .get(feature.market_name)
+                        .copied()
+                        .unwrap_or(total),
+                    total,
+                )
+            + 0.5 * feature.sold_amount
+            + feature.prediction_minus_price.max(0.0)
+    });
+    let p2 = capped_top_markets_by_score(features, |feature| {
+        6.0 * rank_weight(
+            direct_ranks
+                .get(feature.market_name)
+                .copied()
+                .unwrap_or(total),
+            total,
+        ) + 5.0
+            * rank_weight(
+                hold_through_ranks
+                    .get(feature.market_name)
+                    .copied()
+                    .unwrap_or(total),
+                total,
+            )
+            + 2.0
+                * rank_weight(
+                    holding_ranks
+                        .get(feature.market_name)
+                        .copied()
+                        .unwrap_or(total),
+                    total,
+                )
+            + rank_weight(
+                churn_ranks
+                    .get(feature.market_name)
+                    .copied()
+                    .unwrap_or(total),
+                total,
+            )
+    });
+
+    let mut proposals = Vec::new();
+    if !p1.is_empty() {
+        proposals.push(sorted_preserve_markets(&p1));
+    }
+    if !p2.is_empty() {
+        let proposal = sorted_preserve_markets(&p2);
+        if !proposals.contains(&proposal) {
+            proposals.push(proposal);
+        }
+    }
+
+    let p1_set: HashSet<&'static str> = p1.iter().copied().collect();
+    let p2_set: HashSet<&'static str> = p2.iter().copied().collect();
+    let symmetric_diff = p1_set.symmetric_difference(&p2_set).count();
+    if symmetric_diff >= 2 {
+        let union = capped_top_markets_by_score(features, |feature| {
+            let p1_rank = rank_weight(
+                churn_ranks
+                    .get(feature.market_name)
+                    .copied()
+                    .unwrap_or(total),
+                total,
+            ) + rank_weight(
+                direct_ranks
+                    .get(feature.market_name)
+                    .copied()
+                    .unwrap_or(total),
+                total,
+            );
+            let p2_rank = rank_weight(
+                direct_ranks
+                    .get(feature.market_name)
+                    .copied()
+                    .unwrap_or(total),
+                total,
+            ) + rank_weight(
+                hold_through_ranks
+                    .get(feature.market_name)
+                    .copied()
+                    .unwrap_or(total),
+                total,
+            );
+            p1_rank.max(p2_rank) + feature.holding.max(0.0)
+        });
+        if !union.is_empty() {
+            let union = sorted_preserve_markets(&union);
+            if !proposals.contains(&union) {
+                proposals.push(union);
+            }
+        }
+    }
+
+    proposals.truncate(MAX_DISTILLED_EXTRA_PROPOSAL_SETS);
+    proposals
+}
+
+fn distilled_proposal_tasks(
+    features: &[DistilledMarketFeature],
+) -> Vec<(Option<BundleRouteKind>, Vec<&'static str>)> {
+    let mut tasks = Vec::new();
+    for preserve_markets in distilled_preserve_proposals(features) {
+        tasks.push((None, preserve_markets.clone()));
+        if let Some(frontier_family) = choose_distilled_frontier_family(features, &preserve_markets)
+        {
+            tasks.push((Some(frontier_family), preserve_markets));
+        }
+    }
+    tasks
+}
+
 fn enumerate_preserve_subsets(preserve_universe: &[&'static str]) -> Vec<Vec<&'static str>> {
     let subset_count = 1usize << preserve_universe.len();
     let mut subsets = Vec::with_capacity(subset_count);
@@ -1892,6 +2324,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
     family: SolverFamily,
     extra_preserve_seed_states: &[SolverStateSnapshot],
     online_preserve_cap: usize,
+    include_distilled_proposals: bool,
     stats: &mut SolverRunStats,
 ) -> (Vec<PlanResult>, usize) {
     stats.exact_rebalance_calls += 1;
@@ -1962,11 +2395,10 @@ fn enumerate_exact_no_arb_candidates_with_options(
             ));
         }
     }
-    let preserve_universe = cap_preserve_candidate_universe(
-        merge_preserve_candidate_scores(&preserve_score_sets),
-        online_preserve_cap,
-    );
-    let candidates = enumerate_exact_no_arb_candidates_over_preserve_universe(
+    let merged_preserve_scores = merge_preserve_candidate_scores(&preserve_score_sets);
+    let preserve_universe =
+        cap_preserve_candidate_universe(merged_preserve_scores.clone(), online_preserve_cap);
+    let mut candidates = enumerate_exact_no_arb_candidates_over_preserve_universe(
         candidates,
         state,
         predictions,
@@ -1980,10 +2412,40 @@ fn enumerate_exact_no_arb_candidates_with_options(
         stats,
     );
 
+    if include_distilled_proposals {
+        let features =
+            collect_distilled_market_features(state, predictions, &merged_preserve_scores);
+        let proposal_tasks = distilled_proposal_tasks(&features);
+        stats.distilled_proposal_sets += proposal_tasks.len();
+        stats.distilled_proposal_candidate_evals += proposal_tasks.len();
+        let mut proposal_candidates: Vec<PlanResult> = proposal_tasks
+            .into_par_iter()
+            .filter_map(|(frontier_family, preserve_markets)| {
+                run_no_arb_rebalance_plan_from_state(
+                    state,
+                    predictions,
+                    expected_outcome_count,
+                    route_gates,
+                    &preserve_markets,
+                    frontier_family,
+                    force_mint_available,
+                    verify_internal_state,
+                    run_phase0_in_polish,
+                    family,
+                )
+            })
+            .collect();
+        stats.exact_rebalance_candidate_evals += proposal_candidates.len();
+        candidates.append(&mut proposal_candidates);
+        candidates.sort_by(plan_result_cmp);
+    }
+
     tracing::debug!(
         family = family.as_str(),
         exact_rebalance_calls = stats.exact_rebalance_calls,
         exact_rebalance_candidate_evals = stats.exact_rebalance_candidate_evals,
+        distilled_proposal_sets = stats.distilled_proposal_sets,
+        distilled_proposal_candidate_evals = stats.distilled_proposal_candidate_evals,
         preserve_universe_size = preserve_universe.len(),
         candidate_count = candidates.len(),
         run_phase0_in_polish,
@@ -2015,6 +2477,7 @@ fn enumerate_exact_no_arb_candidates(
         family,
         &[],
         MAX_ONLINE_PRESERVE_CANDIDATES,
+        true,
         stats,
     )
 }
@@ -2030,6 +2493,7 @@ fn run_exact_no_arb_plan_with_options(
     family: SolverFamily,
     extra_preserve_seed_states: &[SolverStateSnapshot],
     online_preserve_cap: usize,
+    include_distilled_proposals: bool,
     stats: &mut SolverRunStats,
 ) -> PlanResult {
     let mut best = solver_identity_plan(state, family);
@@ -2045,6 +2509,7 @@ fn run_exact_no_arb_plan_with_options(
         family,
         extra_preserve_seed_states,
         online_preserve_cap,
+        include_distilled_proposals,
         stats,
     );
     for candidate in candidates {
@@ -2057,6 +2522,8 @@ fn run_exact_no_arb_plan_with_options(
         family = family.as_str(),
         exact_rebalance_calls = stats.exact_rebalance_calls,
         exact_rebalance_candidate_evals = stats.exact_rebalance_candidate_evals,
+        distilled_proposal_sets = stats.distilled_proposal_sets,
+        distilled_proposal_candidate_evals = stats.distilled_proposal_candidate_evals,
         preserve_universe_size,
         best_ev = best.ev,
         best_actions = best.actions.len(),
@@ -2093,6 +2560,7 @@ fn run_exact_no_arb_plan(
         family,
         &[],
         MAX_ONLINE_PRESERVE_CANDIDATES,
+        true,
         stats,
     )
 }
@@ -3667,6 +4135,87 @@ pub(super) fn staged_reference_choice_for_test(
 }
 
 #[cfg(test)]
+fn action_is_complete_set_arb_marker(action: &Action) -> bool {
+    match action {
+        Action::Merge { source_market, .. } => *source_market == "complete_set_arb",
+        Action::Mint { target_market, .. } => *target_market == "complete_set_arb",
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn analyze_complete_set_arb_usage(actions: &[Action]) -> (bool, bool) {
+    let mut root_arb_fired = false;
+    let mut late_arb_improved = false;
+    let mut seen_non_arb = false;
+
+    for action in actions {
+        if action_is_complete_set_arb_marker(action) {
+            if seen_non_arb {
+                late_arb_improved = true;
+            } else {
+                root_arb_fired = true;
+            }
+        } else {
+            seen_non_arb = true;
+        }
+    }
+
+    (root_arb_fired, late_arb_improved)
+}
+
+#[cfg(test)]
+pub(super) fn staged_teacher_snapshot_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Option<TeacherDecisionSnapshot> {
+    let candidate = rebalance_full_with_predictions_and_budget_candidate(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        RebalanceFlags::default(),
+        Some(force_mint_available),
+        false,
+        MAX_META_SOLVER_INVOCATIONS,
+        true,
+    )?;
+    let state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    let preserve_scores = collect_mint_sell_preserve_candidate_scores(
+        &candidate.actions,
+        slot0_results,
+        balances,
+        susds_balance,
+        slot0_results.len(),
+    );
+    let features = collect_distilled_market_features(&state, predictions, &preserve_scores);
+    let (root_arb_fired, late_arb_improved) = analyze_complete_set_arb_usage(&candidate.actions);
+    Some(TeacherDecisionSnapshot {
+        winning_family: candidate.variant.as_str(),
+        winning_frontier_family: first_frontier_family_label(
+            candidate.forced_first_frontier_family,
+        ),
+        preserve_markets: sorted_preserve_markets(
+            &candidate
+                .preserve_markets
+                .iter()
+                .copied()
+                .collect::<Vec<&'static str>>(),
+        ),
+        root_arb_fired,
+        late_arb_improved,
+        raw_ev: candidate.ev,
+        action_count: candidate.actions.len(),
+        features: distilled_feature_rows(&features),
+    })
+}
+
+#[cfg(test)]
 pub(super) fn phase_order_exact_subset_choice_for_test(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -3828,6 +4377,7 @@ pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_search_config_
         SolverFamily::Plain,
         &extra_seed_states,
         online_preserve_cap,
+        false,
         &mut stats,
     )
     .actions
@@ -3919,6 +4469,40 @@ pub(super) fn rebalance_with_custom_predictions_arb_primed_family_for_test(
         &mut stats,
     )
     .map(|plan| plan.actions)
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_operator_only_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> (Vec<Action>, SolverRunStats) {
+    let initial_state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    let mut stats = SolverRunStats::default();
+    let mut best = run_plain_family_plan(
+        &initial_state,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        Some(force_mint_available),
+        false,
+        &mut stats,
+    );
+    if let Some(arb_primed) = run_arb_primed_family_plan(
+        &initial_state,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        Some(force_mint_available),
+        false,
+        &mut stats,
+    ) && plan_result_is_better(&arb_primed, &best)
+    {
+        best = arb_primed;
+    }
+    (best.actions, stats)
 }
 
 #[cfg(test)]

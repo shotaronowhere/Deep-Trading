@@ -124,6 +124,10 @@ Historical benchmark context:
   - evaluate `Plain = R_exact` and `ArbPrimed = A -> R_exact`
   - allow one late correction tail `... -> A -> R_exact`
   - score all whole-plan candidates by the existing raw EV mark
+- Current follow-up phase adds a tiny teacher-distilled proposal layer inside `R_exact`:
+  - benchmark and seeded hard cases can emit machine-readable staged-winner teacher snapshots
+  - online exact no-arb evaluation also tries a very small deterministic preserve/frontier proposal codebook
+  - this proposal layer is non-regressive versus the flat `K = 4` exact baseline, but it still does not replace the staged fallback on the heterogeneous hard case
 - The preserve universe is still heuristic even though the subset solve is exact:
   - no-preserve frontier seeds are used to discover churn candidates
   - singleton-preserve probes expand that universe once

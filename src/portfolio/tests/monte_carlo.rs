@@ -5,7 +5,10 @@ use crate::execution::grouping::{
     ProfitabilityStepKind, group_execution_actions_by_profitability_step,
 };
 
-use super::super::rebalancer::rebalance;
+use super::super::rebalancer::{
+    rebalance, rebalance_with_custom_predictions_operator_only_for_test,
+    rebalance_with_custom_predictions_staged_reference_for_test, staged_teacher_snapshot_for_test,
+};
 use super::super::sim::{DUST, EPS, PoolSim, build_sims};
 use super::{
     TestRng, assert_rebalance_action_invariants, build_rebalance_fuzz_case,
@@ -1460,5 +1463,87 @@ fn test_rebalance_second_pass_gain_complex_cases() {
                 first_gain
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "debug helper; run explicitly"]
+fn print_teacher_distillation_seeded_hard_cases_jsonl() {
+    let cases = vec![
+        (
+            "fuzz_full_case_0",
+            scenario_case_from_fuzz_seed(0xFEED_FACE_1234_4321u64, false, 0),
+        ),
+        (
+            "fuzz_full_case_1",
+            scenario_case_from_fuzz_seed(0xFEED_FACE_1234_4321u64, false, 1),
+        ),
+        (
+            "fuzz_partial_case_0",
+            scenario_case_from_fuzz_seed(0xABCD_1234_EF99_7788u64, true, 0),
+        ),
+        (
+            "fuzz_partial_case_1",
+            scenario_case_from_fuzz_seed(0xABCD_1234_EF99_7788u64, true, 1),
+        ),
+    ];
+
+    for (label, case) in cases {
+        let balances: HashMap<&str, f64> = case
+            .balances
+            .iter()
+            .map(|(market_name, amount)| (*market_name as &str, *amount))
+            .collect();
+        let predictions = crate::pools::prediction_map();
+        let force_mint_available =
+            case.slot0_results.len() == crate::predictions::PREDICTIONS_L1.len();
+        let teacher = staged_teacher_snapshot_for_test(
+            &balances,
+            case.susd_balance,
+            &case.slot0_results,
+            &predictions,
+            force_mint_available,
+        )
+        .expect("teacher snapshot should exist for seeded hard case");
+        let operator_only_actions = rebalance_with_custom_predictions_operator_only_for_test(
+            &balances,
+            case.susd_balance,
+            &case.slot0_results,
+            &predictions,
+            force_mint_available,
+        )
+        .0;
+        let staged_actions = rebalance_with_custom_predictions_staged_reference_for_test(
+            &balances,
+            case.susd_balance,
+            &case.slot0_results,
+            &predictions,
+            force_mint_available,
+        );
+        let (operator_holdings, operator_cash) = replay_actions_to_state(
+            &operator_only_actions,
+            &case.slot0_results,
+            &balances,
+            case.susd_balance,
+        );
+        let operator_ev = ev_from_state(&operator_holdings, operator_cash);
+        let (staged_holdings, staged_cash) = replay_actions_to_state(
+            &staged_actions,
+            &case.slot0_results,
+            &balances,
+            case.susd_balance,
+        );
+        let staged_ev = ev_from_state(&staged_holdings, staged_cash);
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "case_id": label,
+                "teacher": teacher,
+                "operator_only_ev": operator_ev,
+                "staged_ev": staged_ev,
+                "gap": staged_ev - operator_ev,
+            })
+        );
     }
 }

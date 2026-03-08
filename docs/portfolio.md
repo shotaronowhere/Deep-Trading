@@ -92,6 +92,12 @@ Preserve-universe construction:
 - enumerate every preserve subset across every frontier family from fresh state
 - evaluate that grid in parallel, then reduce deterministically
 
+Teacher-distilled proposal layer:
+
+- the exact no-arb operator now also evaluates a tiny deterministic preserve/frontier proposal codebook learned from staged-winner features
+- these proposals are kept deliberately small and non-regressive versus the flat `K = 4` exact baseline
+- they do not yet remove the need for the staged dominance fallback on the heterogeneous 98-outcome hard case
+
 Practical dominance fallback:
 
 - the old staged meta-solver path is still compiled as a reference implementation
@@ -106,8 +112,9 @@ Compatibility note:
 Operational diagnostics:
 
 - exact rebalance tracing reports family label, exact-rebalance call count, candidate-evaluation count, preserve-universe size, chosen frontier family, chosen preserve-set size, EV, and action count
+- exact rebalance tracing also reports distilled-proposal set count and candidate-evaluation count
 - final selection tracing reports chosen family, chosen frontier family, preserve-set size, EV/actions, arb-operator evaluation count, arb-correction count, and whether the arb-primed root was taken
-- an ignored test helper prints per-family breakdown on the heterogeneous 98-outcome fixture for targeted debugging
+- ignored test helpers print machine-readable teacher snapshots for benchmark and seeded hard cases, plus per-family breakdown on the heterogeneous 98-outcome fixture
 
 ## Diagnostics and operator tools
 

@@ -103,6 +103,30 @@ Conclusion:
 - the remaining gap is discrete choice recovery
 - the next online win is to recover the right preserve/frontier choice cheaply, not to add more generic search depth
 
+## Teacher distillation phase
+
+Implemented in the current code:
+
+- offline teacher snapshots from the staged winner on benchmark and seeded hard cases
+- machine-readable ignored test printers for benchmark and seeded hard-case rows
+- a tiny online distilled preserve/frontier proposal heuristic inside `R_exact`
+
+What the phase proved:
+
+- the new teacher harness is useful and permanent
+- the distilled online proposals are non-regressive versus the old flat `K = 4` exact no-arb path
+- the fallback-removal gate does not pass yet:
+  - the heterogeneous 98-outcome operator-only gap remains far above the `65_536`-wei target
+  - the staged fallback still protects the committed mixed-EV frontier
+- this means the plan succeeded in turning the last online EV idea into code, and the answer was negative: the idea is not yet strong enough to replace the fallback
+
+Engineering decision:
+
+- keep the staged fallback enabled
+- do not add another online search dimension on top of this phase
+- if EV work resumes, it should be teacher-to-student proposal distillation only
+- otherwise shift effort to speed/simplicity work and keep only the optimization paths that clearly earn their cost
+
 Follow-up diagnostic:
 
 - `cargo test print_heterogeneous_ninety_eight_variant_proposal_breakdown -- --ignored --nocapture`
@@ -127,6 +151,7 @@ Conclusion:
 | Mixed-route capability | Keep | Real EV uplift on the mixed cases |
 | `R_exact` over `{default, direct, mint}` frontier families | Keep | Cheap exactness over the right continuous core |
 | Small preserve-set search | Keep | Preserve choice is a real EV lever |
+| Tiny distilled preserve/frontier proposals | Keep, but only with fallback | Non-regressive versus flat `K = 4`, but not yet sufficient to replace staged dominance guard |
 | Conditional cyclic late-arb | Keep | Closed the small-bundle late-arb gap and reduced action count there |
 
 ### Keep only as temporary safety net
@@ -157,6 +182,29 @@ Implication:
 
 - ordering should be state-triggered
 - do not hardcode a single global phase order as the "ultimate" solver
+
+## External review synthesis
+
+External reviews from Gemini and Claude on 2026-03-08 agreed on the main conclusion:
+
+- online EV is near saturation
+- the waterfall is not the bottleneck
+- the remaining gap is discrete choice recovery, mainly preserve/frontier choice
+- more online brute force is the wrong direction
+- the only credible remaining idea class is teacher-driven proposal generation followed by simplification
+
+Critique of those reviews:
+
+- Gemini was directionally strongest on the engineering conclusion: stop adding online search layers and distill the remaining preserve/frontier signal into a cheap runtime heuristic.
+- Claude was right that the remaining structure is low-dimensional, but too optimistic that a flat small exact online loop is already sufficient. The heterogeneous hard case still shows path-dependent preserve discovery.
+- Claude's suggestion to switch the main comparator to net-EV/gas-adjusted scoring is reasonable as an experimental metric, but not as the default objective while the benchmark target remains raw EV.
+
+Decision:
+
+- treat online EV optimization as effectively exhausted except for teacher-distilled preserve/frontier proposals
+- do not add new online search dimensions such as larger preserve enumeration, more phase variants, or deeper branching
+- the next worthwhile online change must be a tiny deterministic proposal heuristic learned from staged winners
+- after that proposal heuristic reaches parity on the hard cases, remove the staged fallback and shift focus to speed, robustness, and gas-aware execution quality
 
 ## Best next ideas if EV work resumes
 

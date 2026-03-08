@@ -16,12 +16,13 @@ use super::super::rebalancer::{
     rebalance_with_custom_predictions_exact_no_arb_with_explicit_preserve_universe_for_test,
     rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test,
     rebalance_with_custom_predictions_for_test,
+    rebalance_with_custom_predictions_operator_only_for_test,
     rebalance_with_custom_predictions_plain_family_for_test,
     rebalance_with_custom_predictions_rebalance_only_for_test,
     rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test,
     rebalance_with_custom_predictions_staged_reference_for_test,
     rebalance_with_custom_predictions_variant_and_preserve_for_test,
-    staged_reference_choice_for_test,
+    staged_reference_choice_for_test, staged_teacher_snapshot_for_test,
 };
 use super::fixtures::mock_slot0_market_with_orientation_liquidity_and_ticks;
 use super::replay_actions_to_state;
@@ -1061,6 +1062,52 @@ fn exact_no_arb_dominates_heuristic_no_arb() {
 }
 
 #[test]
+fn distilled_exact_no_arb_is_non_regressive_vs_baseline_k4_search() {
+    let cases = cases_from_fixture();
+
+    for case in &cases {
+        let built = build_case(case);
+        let force_mint_available = !case.direct_only_reference;
+        let distilled_actions = rebalance_with_custom_predictions_exact_no_arb_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let baseline_k4_actions =
+            rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                4,
+                false,
+            );
+        let distilled_ev = benchmark_ev_wei(&distilled_actions, &built);
+        let baseline_k4_ev = benchmark_ev_wei(&baseline_k4_actions, &built);
+
+        assert!(
+            distilled_ev >= baseline_k4_ev,
+            "{} distilled exact no-arb regressed versus baseline k4 exact search: distilled={} baseline_k4={}",
+            case.case_id,
+            distilled_ev,
+            baseline_k4_ev
+        );
+        if distilled_ev == baseline_k4_ev {
+            assert!(
+                distilled_actions.len() <= baseline_k4_actions.len(),
+                "{} distilled exact no-arb matched baseline k4 EV but used more actions: distilled_actions={} baseline_k4_actions={}",
+                case.case_id,
+                distilled_actions.len(),
+                baseline_k4_actions.len()
+            );
+        }
+    }
+}
+
+#[test]
 fn plain_family_is_non_regressive_vs_exact_no_arb() {
     let cases = cases_from_fixture();
 
@@ -1100,6 +1147,53 @@ fn plain_family_is_non_regressive_vs_exact_no_arb() {
                 exact_actions.len()
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "debug helper; run explicitly"]
+fn print_teacher_distillation_benchmark_cases_jsonl() {
+    for case in cases_from_fixture() {
+        let built = build_case(&case);
+        let force_mint_available = !case.direct_only_reference;
+        let teacher = staged_teacher_snapshot_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        )
+        .expect("teacher snapshot should exist for benchmark case");
+        let operator_only_actions = rebalance_with_custom_predictions_operator_only_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        )
+        .0;
+        let staged_actions = rebalance_with_custom_predictions_staged_reference_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let operator_only_ev = benchmark_ev_wei(&operator_only_actions, &built);
+        let staged_ev = benchmark_ev_wei(&staged_actions, &built);
+        let gap_wei = staged_ev.saturating_sub(operator_only_ev);
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "case_id": case.case_id,
+                "teacher": teacher,
+                "operator_only_ev_wei": operator_only_ev.to_string(),
+                "staged_ev_wei": staged_ev.to_string(),
+                "gap_wei": gap_wei.to_string(),
+                "within_wobble": gap_wei <= 65_536u128,
+            })
+        );
     }
 }
 
