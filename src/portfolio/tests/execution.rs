@@ -17,10 +17,15 @@ use super::{
 };
 use crate::execution::GroupKind;
 use crate::execution::bounds::{
-    BufferConfig, build_group_plans_from_cashflow, build_group_plans_with_default_edges,
-    derive_batch_quote_bounds, stamp_plans_with_block,
+    BufferConfig, ConservativeExecutionConfig,
+    build_group_plans_for_gas_replay_with_market_context, build_group_plans_from_cashflow,
+    build_group_plans_with_default_edges, derive_batch_quote_bounds, stamp_plans_with_block,
 };
-use crate::execution::gas::GasAssumptions;
+use crate::execution::gas::{
+    GasAssumptions, default_gas_assumptions_with_optimism_l1_fee,
+    estimate_group_plan_l2_gas_units_live, fetch_live_optimism_fee_inputs,
+    quote_group_plan_exact_gas_with_fee_inputs,
+};
 use crate::execution::grouping::{group_actions, group_execution_actions};
 use crate::markets::{MarketData, Pool, Tick};
 use crate::pools::{
@@ -75,6 +80,113 @@ fn test_gas_assumptions() -> GasAssumptions {
     GasAssumptions {
         l1_fee_per_byte_wei: 1.0e11,
         ..GasAssumptions::default()
+    }
+}
+
+fn gas_replay_assumptions() -> GasAssumptions {
+    GasAssumptions {
+        l1_data_fee_floor_susd: 0.0,
+        l1_fee_per_byte_wei: 1.0,
+        ..GasAssumptions::default()
+    }
+}
+
+fn canonical_small_shape_actions() -> Vec<(&'static str, Vec<Action>)> {
+    let markets = eligible_l1_markets_with_predictions();
+    let selected: Vec<_> = markets.into_iter().take(3).collect();
+    let market_a = selected[0].name;
+    let market_b = selected[1].name;
+
+    vec![
+        (
+            "DirectBuy",
+            vec![Action::Buy {
+                market_name: market_a,
+                amount: 1.0,
+                cost: 0.25,
+            }],
+        ),
+        (
+            "DirectSell",
+            vec![Action::Sell {
+                market_name: market_a,
+                amount: 1.0,
+                proceeds: 0.25,
+            }],
+        ),
+        (
+            "DirectMerge",
+            vec![Action::Merge {
+                contract_1: "c1",
+                contract_2: "c2",
+                amount: 1.0,
+                source_market: market_a,
+            }],
+        ),
+        (
+            "MintSell(1)",
+            vec![
+                Action::Mint {
+                    contract_1: "c1",
+                    contract_2: "c2",
+                    amount: 1.0,
+                    target_market: market_a,
+                },
+                Action::Sell {
+                    market_name: market_b,
+                    amount: 1.0,
+                    proceeds: 0.25,
+                },
+            ],
+        ),
+        (
+            "BuyMerge(1)",
+            vec![
+                Action::Buy {
+                    market_name: market_b,
+                    amount: 1.0,
+                    cost: 0.25,
+                },
+                Action::Merge {
+                    contract_1: "c1",
+                    contract_2: "c2",
+                    amount: 1.0,
+                    source_market: market_a,
+                },
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn gas_replay_helper_reconstructs_canonical_small_shapes() {
+    let slot0_results = full_pooled_slot0_results_with_uniform_price(0.02);
+
+    for (shape, actions) in canonical_small_shape_actions() {
+        let replay = build_group_plans_for_gas_replay_with_market_context(
+            &actions,
+            &slot0_results,
+            ConservativeExecutionConfig {
+                quote_latency_blocks: 1,
+                adverse_move_bps_per_block: 15,
+            },
+            &gas_replay_assumptions(),
+            1e-9,
+            3000.0,
+        )
+        .unwrap_or_else(|err| panic!("gas replay planning should succeed for {shape}: {err}"));
+        assert_eq!(
+            replay.plans.len(),
+            1,
+            "{} should produce exactly one replayable subgroup plan",
+            shape
+        );
+        assert!(
+            replay.skipped_groups.is_empty(),
+            "{} should not skip replay groups: {:?}",
+            shape,
+            replay.skipped_groups
+        );
     }
 }
 
@@ -261,6 +373,167 @@ fn assert_live_subset_rebalance_non_decreasing_ev(
         label,
         initial_susd,
         ev_after
+    );
+}
+
+#[tokio::test]
+#[ignore = "live OP gas-aware report helper; run explicitly"]
+async fn print_live_op_first_group_exact_gas_report() {
+    let rpc_url = std::env::var("RPC").unwrap_or_else(|_| "https://optimism.drpc.org".to_string());
+    let Some(slot0_results) =
+        fetch_live_expected_l1_slot0_results("live_op_exact_gas_report").await
+    else {
+        return;
+    };
+    let gas_assumptions = default_gas_assumptions_with_optimism_l1_fee(&rpc_url)
+        .await
+        .unwrap_or_else(|_| GasAssumptions::default());
+    let initial_balances: HashMap<&str, f64> = HashMap::new();
+    let actions = rebalance_with_gas_pricing(
+        &initial_balances,
+        100.0,
+        &slot0_results,
+        RebalanceMode::Full,
+        &gas_assumptions,
+        1e-9,
+        3000.0,
+    );
+    assert!(
+        !actions.is_empty(),
+        "live gas-aware report requires at least one planned action"
+    );
+    let replay = build_group_plans_for_gas_replay_with_market_context(
+        &actions,
+        &slot0_results,
+        ConservativeExecutionConfig {
+            quote_latency_blocks: 1,
+            adverse_move_bps_per_block: 15,
+        },
+        &gas_replay_assumptions(),
+        1e-9,
+        3000.0,
+    )
+    .expect("gas replay plans should build for live gas report");
+    if replay.plans.is_empty() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "planned_action_count": actions.len(),
+                "planned_groups": 0,
+                "skipped_groups": replay.skipped_groups.len(),
+                "note": "no executable group plan under current live snapshot",
+            })
+        );
+        return;
+    }
+    let mut plans = replay.plans;
+    stamp_plans_with_block(&mut plans, 0);
+    let first = plans.first().expect("first group plan should exist");
+    let fee_inputs = fetch_live_optimism_fee_inputs(&rpc_url, Address::ZERO)
+        .await
+        .expect("live OP fee inputs should resolve");
+    let executor = Address::repeat_byte(0x44);
+    let exact_quote = quote_group_plan_exact_gas_with_fee_inputs(
+        &rpc_url, executor, &actions, first, fee_inputs, 3000.0,
+    )
+    .await
+    .expect("exact gas quote should succeed");
+    let live_l2_gas_units =
+        estimate_group_plan_l2_gas_units_live(&rpc_url, Address::ZERO, executor, &actions, first)
+            .await
+            .expect("live eth_estimateGas should succeed");
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "planned_action_count": actions.len(),
+            "planned_groups": plans.len(),
+            "skipped_groups": replay.skipped_groups.len(),
+            "first_group_kind": format!("{:?}", first.kind),
+            "first_group_action_count": first.action_indices.len(),
+            "unsigned_tx_bytes": exact_quote.unsigned_tx_data.len(),
+            "gas_price_wei": exact_quote.gas_price_wei.to_string(),
+            "calibrated_l2_gas_units": exact_quote.l2_gas_units,
+            "live_estimated_l2_gas_units": live_l2_gas_units,
+            "l2_fee_wei": exact_quote.l2_fee_wei.to_string(),
+            "l1_fee_wei": exact_quote.l1_fee_wei.to_string(),
+            "l2_fee_susd": exact_quote.l2_fee_susd,
+            "l1_fee_susd": exact_quote.l1_fee_susd,
+            "total_fee_susd": exact_quote.total_fee_susd,
+            "net_ev_susd": exact_quote.net_ev_susd,
+        })
+    );
+}
+
+#[tokio::test]
+#[ignore = "live OP canonical shape L1 fee calibration helper; run explicitly"]
+async fn print_live_op_canonical_small_shape_l1_fee_floor_calibration() {
+    let rpc_url = std::env::var("RPC").unwrap_or_else(|_| "https://optimism.drpc.org".to_string());
+    let fee_inputs = fetch_live_optimism_fee_inputs(&rpc_url, Address::ZERO)
+        .await
+        .expect("live OP fee inputs should resolve");
+    let executor = Address::repeat_byte(0x44);
+    let slot0_results = full_pooled_slot0_results_with_uniform_price(0.02);
+    let mut max_total_fee_susd = 0.0_f64;
+
+    for (shape, actions) in canonical_small_shape_actions() {
+        let mut replay = build_group_plans_for_gas_replay_with_market_context(
+            &actions,
+            &slot0_results,
+            ConservativeExecutionConfig {
+                quote_latency_blocks: 1,
+                adverse_move_bps_per_block: 15,
+            },
+            &gas_replay_assumptions(),
+            fee_inputs.gas_price_wei as f64 / 1e18,
+            3000.0,
+        )
+        .unwrap_or_else(|err| panic!("gas replay planning should succeed for {shape}: {err}"));
+        assert_eq!(
+            replay.plans.len(),
+            1,
+            "{} should produce exactly one replayable subgroup plan",
+            shape
+        );
+        assert!(
+            replay.skipped_groups.is_empty(),
+            "{} should not skip replay groups: {:?}",
+            shape,
+            replay.skipped_groups
+        );
+        stamp_plans_with_block(&mut replay.plans, 0);
+        let plan = replay
+            .plans
+            .first()
+            .expect("canonical shape replay plan should exist");
+        let exact_quote = quote_group_plan_exact_gas_with_fee_inputs(
+            &rpc_url, executor, &actions, plan, fee_inputs, 3000.0,
+        )
+        .await
+        .expect("exact gas quote should succeed for canonical shape");
+        max_total_fee_susd = max_total_fee_susd.max(exact_quote.total_fee_susd);
+        println!(
+            "{}",
+            serde_json::json!({
+                "shape": shape,
+                "unsigned_tx_bytes": exact_quote.unsigned_tx_data.len(),
+                "gas_price_wei": exact_quote.gas_price_wei.to_string(),
+                "l1_fee_wei": exact_quote.l1_fee_wei.to_string(),
+                "l1_fee_susd": exact_quote.l1_fee_susd,
+                "l2_gas_units": exact_quote.l2_gas_units,
+                "l2_fee_susd": exact_quote.l2_fee_susd,
+                "total_fee_susd": exact_quote.total_fee_susd,
+            })
+        );
+    }
+
+    let recommended_floor = (max_total_fee_susd * 2.0 * 1000.0).ceil() / 1000.0;
+    println!(
+        "{}",
+        serde_json::json!({
+            "recommended_l1_data_fee_floor_susd": recommended_floor,
+            "max_small_shape_total_fee_susd": max_total_fee_susd,
+        })
     );
 }
 

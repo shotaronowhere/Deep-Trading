@@ -42,7 +42,7 @@ fn oldest(paths: &[PathBuf]) -> (&PathBuf, SystemTime) {
 
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|err| panic!("missing CARGO_MANIFEST_DIR: {}", err));
+        .unwrap_or_else(|err| panic!("missing CARGO_MANIFEST_DIR: {err}"));
     let root = Path::new(&manifest_dir);
 
     let output_paths: Vec<PathBuf> = GENERATED_FILES.iter().map(|p| root.join(p)).collect();
@@ -56,9 +56,10 @@ fn main() {
     }
 
     for output in &output_paths {
-        if !output.exists() {
-            panic!("Generated files missing. Run: cargo run --bin regenerate");
-        }
+        assert!(
+            output.exists(),
+            "Generated files missing. Run: cargo run --bin regenerate"
+        );
     }
 
     if std::env::var_os(SKIP_STALENESS_ENV).is_some() {
@@ -68,12 +69,11 @@ fn main() {
     let (newest_input, newest_input_mtime) = newest(&input_paths);
     let (oldest_output, oldest_output_mtime) = oldest(&output_paths);
 
-    if newest_input_mtime > oldest_output_mtime {
-        panic!(
-            "Generated files are stale: '{}' is newer than '{}'. Run: cargo run --bin regenerate (or set {}=1 only while regenerating)",
-            newest_input.display(),
-            oldest_output.display(),
-            SKIP_STALENESS_ENV
-        );
-    }
+    assert!(
+        newest_input_mtime <= oldest_output_mtime,
+        "Generated files are stale: '{}' is newer than '{}'. Run: cargo run --bin regenerate (or set {}=1 only while regenerating)",
+        newest_input.display(),
+        oldest_output.display(),
+        SKIP_STALENESS_ENV
+    );
 }

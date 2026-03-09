@@ -364,6 +364,13 @@ contract RebalancerABTest is Test {
         int256 gasDiffBps;
     }
 
+    struct OnchainBenchmarkCallArtifact {
+        address target;
+        bytes calldataBytes;
+        uint256 gasUnits;
+        uint256 rawEvWei;
+    }
+
     function test_rebalancer_ab_benchmark() external {
         string memory failures = "";
 
@@ -477,6 +484,44 @@ contract RebalancerABTest is Test {
         }
     }
 
+    function test_write_rebalancer_ab_onchain_call_report() external {
+        string[] memory caseIds = new string[](6);
+        caseIds[0] = "two_pool_single_tick_direct_only";
+        caseIds[1] = "ninety_eight_outcome_multitick_direct_only";
+        caseIds[2] = "small_bundle_mixed_case";
+        caseIds[3] = "mixed_route_favorable_synthetic_case";
+        caseIds[4] = "heterogeneous_ninety_eight_outcome_l1_like_case";
+        caseIds[5] = "legacy_holdings_direct_only_case";
+
+        string memory rootKey = "rebalancer_ab_onchain_call_report";
+        string memory rootJson = "";
+        for (uint256 i = 0; i < caseIds.length; i++) {
+            string memory caseId = caseIds[i];
+            OnchainBenchmarkCallArtifact memory exact = _buildExactArtifact(caseId);
+            OnchainBenchmarkCallArtifact memory mixed = _buildMixedArtifact(caseId);
+
+            string memory exactKey = string.concat(caseId, "_exact");
+            string memory exactJson = vm.serializeAddress(exactKey, "target", exact.target);
+            exactJson = vm.serializeBytes(exactKey, "calldata", exact.calldataBytes);
+            exactJson = vm.serializeUint(exactKey, "gas_units", exact.gasUnits);
+            exactJson = vm.serializeString(exactKey, "raw_ev_wei", vm.toString(exact.rawEvWei));
+
+            string memory mixedKey = string.concat(caseId, "_mixed");
+            string memory mixedJson = vm.serializeAddress(mixedKey, "target", mixed.target);
+            mixedJson = vm.serializeBytes(mixedKey, "calldata", mixed.calldataBytes);
+            mixedJson = vm.serializeUint(mixedKey, "gas_units", mixed.gasUnits);
+            mixedJson = vm.serializeString(mixedKey, "raw_ev_wei", vm.toString(mixed.rawEvWei));
+
+            string memory caseKey = string.concat(caseId, "_case");
+            string memory caseJson = vm.serializeString(caseKey, "case_id", caseId);
+            caseJson = vm.serializeString(caseKey, "exact", exactJson);
+            caseJson = vm.serializeString(caseKey, "mixed", mixedJson);
+            rootJson = vm.serializeString(rootKey, caseId, caseJson);
+        }
+
+        vm.writeJson(rootJson, _onchainCallReportPath());
+    }
+
     function _checkDirectParity(string memory caseId) internal returns (string memory failure) {
         (uint256 offchainDirect,,,,) = _expectedRow(caseId);
         (uint256 constantEv, uint256 exactEv) = _runCase(caseId);
@@ -583,6 +628,52 @@ contract RebalancerABTest is Test {
         r.gasDiff = _signedDiff(r.mixedGas, r.rebalancerGas);
         r.evDiffBps = _signedBpsDiff(r.mixedEv, r.rebalancerEv);
         r.gasDiffBps = _signedBpsDiff(r.mixedGas, r.rebalancerGas);
+    }
+
+    function _buildExactArtifact(string memory caseId) internal returns (OnchainBenchmarkCallArtifact memory artifact) {
+        Scenario memory exactScenario = _buildCase(caseId);
+        artifact.target = address(exactScenario.rebalancer);
+        artifact.calldataBytes = abi.encodeCall(
+            exactScenario.rebalancer.rebalanceExact,
+            (exactScenario.params, 24, 4)
+        );
+        uint256 gasStart = gasleft();
+        exactScenario.rebalancer.rebalanceExact(exactScenario.params, 24, 4);
+        artifact.gasUnits = gasStart - gasleft();
+        artifact.rawEvWei = _portfolioEvWad(
+            exactScenario.collateral,
+            exactScenario.tokens,
+            exactScenario.predictionsWad
+        );
+    }
+
+    function _buildMixedArtifact(string memory caseId) internal returns (OnchainBenchmarkCallArtifact memory artifact) {
+        MixedScenario memory mixedScenario = _buildMixedCase(caseId);
+        artifact.target = address(mixedScenario.rebalancerMixed);
+        artifact.calldataBytes = abi.encodeCall(
+            mixedScenario.rebalancerMixed.rebalanceMixedConstantL,
+            (
+                mixedScenario.params,
+                BENCHMARK_MARKET,
+                BENCHMARK_MAX_OUTER_ITERS,
+                BENCHMARK_MAX_INNER_ITERS,
+                0
+            )
+        );
+        uint256 gasStart = gasleft();
+        mixedScenario.rebalancerMixed.rebalanceMixedConstantL(
+            mixedScenario.params,
+            BENCHMARK_MARKET,
+            BENCHMARK_MAX_OUTER_ITERS,
+            BENCHMARK_MAX_INNER_ITERS,
+            0
+        );
+        artifact.gasUnits = gasStart - gasleft();
+        artifact.rawEvWei = _portfolioEvWad(
+            mixedScenario.collateral,
+            mixedScenario.tokens,
+            mixedScenario.predictionsWad
+        );
     }
 
     function _buildCase(string memory caseId) internal returns (Scenario memory scenario) {
@@ -897,6 +988,10 @@ contract RebalancerABTest is Test {
 
     function _liveReportJson() internal view returns (string memory) {
         return vm.readFile(string.concat(vm.projectRoot(), "/test/fixtures/rebalancer_ab_live_l1_snapshot_report.json"));
+    }
+
+    function _onchainCallReportPath() internal view returns (string memory) {
+        return string.concat(vm.projectRoot(), "/test/fixtures/rebalancer_ab_onchain_call_report.json");
     }
 
     function _priceWadToSqrtX96(uint256 priceWad, bool isToken1Outcome) internal pure returns (uint160) {

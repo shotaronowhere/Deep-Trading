@@ -8,6 +8,7 @@ mod edge;
 pub mod gas;
 pub mod grouping;
 pub mod preview;
+pub mod program;
 pub mod runtime;
 pub mod tx_builder;
 
@@ -143,14 +144,14 @@ sol! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
     Strict,
-    Aggressive,
+    Packed,
 }
 
 impl ExecutionMode {
     pub fn groups_per_tx(self) -> usize {
         match self {
             Self::Strict => 1,
-            Self::Aggressive => 2,
+            Self::Packed => usize::MAX,
         }
     }
 }

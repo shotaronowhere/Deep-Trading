@@ -76,9 +76,12 @@ Default full-mode planning is now operator-based:
   - preserve subset over a capped churn universe
 - `A(state)` is the existing arb-only operator on the current state.
 - The runtime evaluates two bounded whole-plan families:
-  - `Plain`: `R_exact`, then optional late `A -> R_exact`
-  - `ArbPrimed`: positive `A`, then `R_exact`, then optional late `A -> R_exact`
-- Candidate ranking is raw EV first, then fewer actions, then stable family/frontier/preserve ordering.
+  - `Plain`: `R_exact`
+  - `ArbPrimed`: positive `A`, then `R_exact`
+- Each chosen action plan is then compiled into an execution program:
+  - `Packed`: greedily pack consecutive strict subgroups into tx chunks under the `40_000_000` L2-gas cap
+  - `Strict`: one tx per strict subgroup
+- Candidate ranking is estimated net EV first, then raw EV, then fewer tx chunks, then fewer actions, then stable family/frontier/preserve ordering.
 
 `R_exact` keeps the existing waterfall, recycle, polish, and cleanup logic unchanged. The exactness is only over the online discrete block around that continuous core.
 
@@ -92,18 +95,36 @@ Preserve-universe construction:
 - enumerate every preserve subset across every frontier family from fresh state
 - evaluate that grid in parallel, then reduce deterministically
 
-Teacher-distilled proposal layer:
+Runtime pruning result:
 
-- the exact no-arb operator now also evaluates a tiny deterministic preserve/frontier proposal codebook learned from staged-winner features
-- these proposals are kept deliberately small and non-regressive versus the flat `K = 4` exact baseline
-- they do not yet remove the need for the staged dominance fallback on the heterogeneous 98-outcome hard case
+- the tiny teacher-distilled preserve/frontier proposal layer remains available in test/diagnostic helpers, but it was removed from the default runtime path after gas-aware ablation
+- the late arb-correction tail was also removed from the default runtime path
+- both were non-regressive, but neither earned enough committed-benchmark EV or net-EV improvement to justify default-path complexity
 
-Practical dominance fallback:
+Execution-program compilation:
+
+- the runtime no longer prices the discovered trace as one transaction per strict subgroup
+- exact no-arb candidates are no longer compacted only by deleting profitability steps
+- instead the runtime compares:
+  - `baseline_step_prune`
+  - `target_delta` re-emission from the rich terminal holdings
+  - `analytic_mixed` compact common-shift solver
+  - `coupled_mixed` continuous mixed-frontier compiler
+  - `direct_only` compact no-mint/no-merge guard
+  - `noop`
+- instead it compiles that trace into the cheaper of:
+  - packed chunked execution
+  - strict subgroup execution
+- only consecutive strict subgroups are packed in v1; there is no reordering or algebraic fusion
+
+Reference fallback:
 
 - the old staged meta-solver path is still compiled as a reference implementation
-- the default runtime compares the new operator-based winner against that staged-reference plan under the same raw-EV comparator
-- whichever whole-plan result is better is returned
-- this keeps the new solver live while preserving the previously committed EV frontier on cases the flat exact operator does not yet subsume
+- it is now opt-in via `REBALANCE_ENABLE_STAGED_FALLBACK=1`
+- the default runtime hot path is the packed operator solver, not staged fallback selection
+- the realistic heterogeneous 98-outcome benchmark now clears the on-chain net-EV references under the shared snapshot after `analytic_mixed` is enabled
+- the remaining mixed-route favorable synthetic gap is now treated as a true compact target-discovery gap, not an execution-fragmentation gap
+- `coupled_mixed` is now part of the default compiler set, but it did not displace the selected benchmark winners; that is the current stop signal for further online solver expansion
 
 Compatibility note:
 
@@ -112,16 +133,26 @@ Compatibility note:
 Operational diagnostics:
 
 - exact rebalance tracing reports family label, exact-rebalance call count, candidate-evaluation count, preserve-universe size, chosen frontier family, chosen preserve-set size, EV, and action count
-- exact rebalance tracing also reports distilled-proposal set count and candidate-evaluation count
-- final selection tracing reports chosen family, chosen frontier family, preserve-set size, EV/actions, arb-operator evaluation count, arb-correction count, and whether the arb-primed root was taken
-- ignored test helpers print machine-readable teacher snapshots for benchmark and seeded hard cases, plus per-family breakdown on the heterogeneous 98-outcome fixture
+- final selection tracing reports chosen family, chosen frontier family, preserve-set size, EV/actions, estimated tx count, arb-operator evaluation count, and whether the arb-primed root was taken
+- exact first-group gas tracing on the execution path now reports:
+  - unsigned `batchExecute` tx bytes
+  - live OP gas price
+  - exact `getL1Fee(txData)`
+  - calibrated L2 fee and net EV after gas
+- ignored test helpers print:
+  - machine-readable teacher snapshots for benchmark and seeded hard cases
+  - benchmark-layer gas-aware ablation rows
+  - seeded hard-case gas-aware ablation rows
+  - per-family breakdown on the heterogeneous 98-outcome fixture
 
 ## Diagnostics and operator tools
 
+- Execution-program packing and chunked submission: `docs/execution_program_packing.md`
 - Execution submission and strict fail-closed gates: `docs/execution_submission.md`
 - First-group preview diagnostics (`plan_preview` + runtime preview output): `docs/execution_submission.md`
 - Cross-approach policy thresholds: `docs/rebalancer_approaches_playbook.md`
 - Off-chain EV optimization memory and keep/cut decisions: `docs/offchain_ev_optimization_log.md`
+- Central release-facing solver benchmark table: `docs/solver_benchmark_matrix.md`
 
 ## Balance fetching and local cache
 
@@ -151,7 +182,14 @@ Key classes covered:
 
 `test_rebalance_perf_full_l1` benchmarks full rebalance across the 98 tradeable L1 outcomes.
 
-The current exact-family plus staged-fallback path is materially heavier than the previous bounded meta-solver. The release benchmark should be rerun after any further solver simplification or after removing the staged fallback; the older single-digit-millisecond figure is no longer a reliable description of the default path.
+Current release measurements after the packed-execution change are not yet rerun in a stable release harness.
+
+- default packed path: `n/a`
+- staged-reference opt-in path (`REBALANCE_ENABLE_STAGED_FALLBACK=1`): `n/a`
+
+See `docs/solver_benchmark_matrix.md` for the current benchmark-facing economics table. Runtime speed should be treated as pending until the release perf harness is rerun on the packed default path.
+
+For the release-facing EV / gas / speed comparison matrix across all solver flavors, see `docs/solver_benchmark_matrix.md`.
 
 Run with:
 

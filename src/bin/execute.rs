@@ -13,13 +13,18 @@ use deep_trading_bot::execution::bounds::{
     build_group_plans_with_default_edges_and_market_context, derive_batch_quote_bounds,
     stamp_plans_with_block,
 };
-use deep_trading_bot::execution::gas::default_gas_assumptions_with_optimism_l1_fee;
+use deep_trading_bot::execution::gas::{
+    default_gas_assumptions_with_optimism_l1_fee, fetch_live_optimism_fee_inputs,
+};
+use deep_trading_bot::execution::program::{
+    build_chunk_calls_checked, compile_execution_program_unchecked,
+};
 use deep_trading_bot::execution::runtime::{
     ExecutionRuntimeConfig, is_submission_deadline_exceeded, resolve_trade_executor,
     resolve_trade_executor_readonly,
 };
 use deep_trading_bot::execution::tx_builder::build_trade_executor_calls;
-use deep_trading_bot::execution::{ITradeExecutor, SUSD_DECIMALS};
+use deep_trading_bot::execution::{ExecutionMode, ITradeExecutor, SUSD_DECIMALS};
 use deep_trading_bot::pools;
 use deep_trading_bot::portfolio::{self, RebalanceFlags, RebalanceMode};
 
@@ -222,26 +227,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map_err(|err| format!("failed to fetch planning block: {err}"))?;
         stamp_plans_with_block(&mut plans, planning_block);
 
-        let plan = plans
-            .first()
-            .cloned()
-            .ok_or_else(|| "strict execution expected one first group".to_string())?;
+        let fee_inputs = fetch_live_optimism_fee_inputs(&config.rpc_url, signer_address).await?;
+        let packed_program = compile_execution_program_unchecked(
+            ExecutionMode::Packed,
+            resolved.executor,
+            &actions,
+            &plans,
+            fee_inputs,
+            &gas_assumptions,
+            eth_usd,
+        );
 
         let submit_block = provider
             .get_block_number()
             .await
             .map_err(|err| format!("failed to fetch submit block: {err}"))?;
-        let quote_bounds =
-            derive_batch_quote_bounds(&plan, submit_block, config.execution_max_stale_blocks)
-                .map_err(|err| {
-                    format!(
-                        "stale or invalid bounds for group {:?} at step {}: {err}",
-                        plan.kind, steps
-                    )
-                })?;
-        let token_bounds = quote_bounds
-            .map(|bounds| bounds.to_token_bounds(SUSD_DECIMALS))
-            .transpose()?;
         if is_submission_deadline_exceeded(
             step_started_at.elapsed(),
             config.execution_deadline_secs,
@@ -253,27 +253,133 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
 
-        let calls = build_trade_executor_calls(resolved.executor, &actions, &plan, token_bounds)
-            .map_err(|err| {
-                format!(
-                    "failed to build executor calls for {:?} step {}: {err}",
-                    plan.kind, steps
+        let (execution_mode, chunk_plans, calls) = match packed_program {
+            Ok(program) => {
+                let first_chunk = program
+                    .chunks
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "packed execution expected a first chunk".to_string())?;
+                match build_chunk_calls_checked(
+                    resolved.executor,
+                    &actions,
+                    &first_chunk.plans,
+                    submit_block,
+                    config.execution_max_stale_blocks,
+                ) {
+                    Ok(calls) if !calls.is_empty() => {
+                        tracing::info!(
+                            step = steps,
+                            block = submit_block,
+                            tx_mode = "packed",
+                            packed_tx_count = program.tx_count,
+                            packed_strict_subgroup_count = program.strict_subgroup_count,
+                            first_chunk_subgroups = first_chunk.plans.len(),
+                            first_chunk_l2_gas_units = first_chunk.total_l2_gas_units,
+                            first_chunk_estimated_fee_susd = first_chunk.estimated_total_fee_susd,
+                            "prepared packed chunk transaction"
+                        );
+                        (ExecutionMode::Packed, first_chunk.plans, calls)
+                    }
+                    Ok(_) => {
+                        return Err("packed chunk produced zero executor calls".into());
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            step = steps,
+                            error = %err,
+                            "packed chunk assembly failed; falling back to strict subgroup submission"
+                        );
+                        let plan = plans.first().cloned().ok_or_else(|| {
+                            "strict execution expected one first group".to_string()
+                        })?;
+                        let quote_bounds = derive_batch_quote_bounds(
+                            &plan,
+                            submit_block,
+                            config.execution_max_stale_blocks,
+                        )
+                        .map_err(|bound_err| {
+                            format!(
+                                "stale or invalid bounds for group {:?} at step {}: {bound_err}",
+                                plan.kind, steps
+                            )
+                        })?;
+                        let token_bounds = quote_bounds
+                            .map(|bounds| bounds.to_token_bounds(SUSD_DECIMALS))
+                            .transpose()?;
+                        let calls = build_trade_executor_calls(
+                            resolved.executor,
+                            &actions,
+                            &plan,
+                            token_bounds,
+                        )
+                        .map_err(|tx_err| {
+                            format!(
+                                "failed to build executor calls for {:?} step {}: {tx_err}",
+                                plan.kind, steps
+                            )
+                        })?;
+                        tracing::info!(
+                            step = steps,
+                            block = submit_block,
+                            tx_mode = "strict_fallback",
+                            group_kind = ?plan.kind,
+                            action_indices = ?plan.action_indices,
+                            calls = calls.len(),
+                            quote_bounds = ?quote_bounds,
+                            token_bounds = ?token_bounds,
+                            "prepared strict subgroup transaction"
+                        );
+                        (ExecutionMode::Strict, vec![plan], calls)
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    step = steps,
+                    error = %err,
+                    "packed program compilation failed; falling back to strict subgroup submission"
+                );
+                let plan = plans
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "strict execution expected one first group".to_string())?;
+                let quote_bounds = derive_batch_quote_bounds(
+                    &plan,
+                    submit_block,
+                    config.execution_max_stale_blocks,
                 )
-            })?;
-        if calls.is_empty() {
-            return Err(format!("group {:?} produced zero executor calls", plan.kind).into());
-        }
-
-        tracing::info!(
-            step = steps,
-            block = submit_block,
-            group_kind = ?plan.kind,
-            action_indices = ?plan.action_indices,
-            calls = calls.len(),
-            quote_bounds = ?quote_bounds,
-            token_bounds = ?token_bounds,
-            "prepared strict subgroup transaction"
-        );
+                .map_err(|bound_err| {
+                    format!(
+                        "stale or invalid bounds for group {:?} at step {}: {bound_err}",
+                        plan.kind, steps
+                    )
+                })?;
+                let token_bounds = quote_bounds
+                    .map(|bounds| bounds.to_token_bounds(SUSD_DECIMALS))
+                    .transpose()?;
+                let calls =
+                    build_trade_executor_calls(resolved.executor, &actions, &plan, token_bounds)
+                        .map_err(|tx_err| {
+                            format!(
+                                "failed to build executor calls for {:?} step {}: {tx_err}",
+                                plan.kind, steps
+                            )
+                        })?;
+                tracing::info!(
+                    step = steps,
+                    block = submit_block,
+                    tx_mode = "strict_fallback",
+                    group_kind = ?plan.kind,
+                    action_indices = ?plan.action_indices,
+                    calls = calls.len(),
+                    quote_bounds = ?quote_bounds,
+                    token_bounds = ?token_bounds,
+                    "prepared strict subgroup transaction"
+                );
+                (ExecutionMode::Strict, vec![plan], calls)
+            }
+        };
 
         if !config.execute_submit {
             for (call_index, call) in calls.iter().enumerate() {
@@ -287,7 +393,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             tracing::info!(
                 step = steps,
-                "dry-run mode active (set EXECUTE_SUBMIT=1 to broadcast); stopping after first subgroup"
+                tx_mode = ?execution_mode,
+                subgroups = chunk_plans.len(),
+                "dry-run mode active (set EXECUTE_SUBMIT=1 to broadcast); stopping after first chunk"
             );
             break;
         }
@@ -308,7 +416,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tx_hash = %receipt.transaction_hash(),
             block = ?receipt.block_number(),
             gas_used = receipt.gas_used(),
-            "strict subgroup submitted"
+            tx_mode = ?execution_mode,
+            submitted_subgroups = chunk_plans.len(),
+            "execution chunk submitted"
         );
     }
 

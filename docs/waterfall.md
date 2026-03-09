@@ -2,7 +2,7 @@
 
 This is the definitive implementation spec for the waterfall rebalancing algorithm.
 
-Status: current as of 2026-03-07.  
+Status: current as of 2026-03-09.  
 Source-of-truth code paths:
 
 - `src/portfolio/core/rebalancer.rs`
@@ -28,9 +28,9 @@ pub fn rebalance_with_gas_pricing(
 ```
 
 - `rebalance(...)` is equivalent to `rebalance_with_mode(..., RebalanceMode::Full)`.
-- `rebalance_with_mode(...)` uses zero gas thresholds (`0.0, 0.0`) for route admission.
+- `rebalance_with_mode(...)` uses conservative default pricing inputs, not zero gas thresholds.
 - In zero-threshold compatibility mode, full-mode phase-0 uses legacy one-sided complete-set arb (`buy-all -> merge` only when `sum(prices) < 1`).
-- `rebalance_with_gas_pricing(...)` computes per-route thresholds from runtime gas assumptions and threads them into the full rebalance flow.
+- `rebalance_with_gas_pricing(...)` computes per-route thresholds from runtime gas assumptions and also supplies the shared pricing snapshot used for net-EV ranking.
 - `rebalance_with_gas(...)` is a compatibility wrapper over `rebalance_with_gas_pricing(...)` using conservative defaults (`gas_price_eth = 1e-9`, `eth_usd = 3000.0`).
 
 ## Action Model
@@ -77,20 +77,34 @@ Current runtime behavior:
    - aggregate by max churn amount, then max sold amount, then stable market order
    - cap the online preserve universe at `K = 4`
    - enumerate every `(frontier_family, preserve_subset)` pair from fresh state
-   - score the resulting plans by the existing raw EV mark and reduce deterministically
+   - for each exact no-arb candidate, keep the rich trace, replay it to terminal holdings, and compare exactly six compact forms:
+     - `baseline_step_prune`
+     - `target_delta`
+     - `analytic_mixed`
+     - `coupled_mixed`
+     - `direct_only`
+     - `noop`
+   - score the resulting compact plans by estimated net EV and reduce deterministically
 2. Evaluate two bounded whole-plan families:
    - `Plain`: `R_exact`
    - `ArbPrimed`: positive root `A`, then `R_exact`
-3. For either family, attempt one late correction tail:
-   - append `A` only if raw EV improves on the terminal state
-   - then rerun `R_exact` once on the post-arb state
-4. Compare the operator-based winner against the retained staged-reference solver and return the better whole-plan result under the same raw-EV comparator.
+3. Compile the chosen action plan into an execution program:
+   - `Strict`: one tx per strict subgroup
+   - `Packed`: greedily pack consecutive strict subgroups into gas-capped tx chunks (`< 40_000_000` estimated L2 gas)
+   - rank those execution programs by net EV and keep the better one
+4. Execute the packed program by default; strict execution remains the safety fallback when a chunk cannot be safely assembled.
 
 Important boundaries:
 
 - The inner waterfall is still the continuous optimizer; the online exactness is only over the chosen discrete block around it.
+- The current compact normal forms are target-holdings-based, not chronological-trace-based:
+  - `target_delta` re-emits the rich terminal holdings as one common-shift action plus residual direct buys/sells when that raises net EV
+  - `analytic_mixed` solves directly for a compact common-shift-plus-residual frontier target without matching the rich trace holdings exactly
+  - `coupled_mixed` solves profitable direct prefixes as a continuous mixed frontier candidate and keeps the result only if it beats the other compact forms on net EV
+  - `direct_only` is the mandatory no-mint/no-merge net-EV guard
 - First-frontier-family forcing is bounded to the first Phase-2 frontier choice only. After that, the waterfall returns to its existing deterministic frontier logic.
-- The staged meta-solver is still kept as a dominance fallback because the flat exact operator does not yet subsume every preserve/frontier corner on the 98-outcome benchmark set.
+- Execution is now optimized over packed tx chunks, not priced as one tx per replay subgroup.
+- The staged meta-solver remains compiled as a reference path during rollout, but it is no longer part of the default hot-path objective.
 - `RebalanceFlags.enable_ev_guarded_greedy_churn_pruning` remains for compatibility but does not change default full-mode behavior.
 
 ## Full-Mode Phase Flow

@@ -1,12 +1,25 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
+use crate::execution::bounds::{
+    ConservativeExecutionConfig, build_group_plans_for_gas_replay_with_market_context,
+};
+use crate::execution::gas::{
+    build_unsigned_group_plan_batch_execute_tx_bytes, default_gas_assumptions_with_optimism_l1_fee,
+    fetch_live_optimism_fee_inputs,
+};
 use crate::execution::grouping::{
     ProfitabilityStepKind, group_execution_actions_by_profitability_step,
 };
+use crate::execution::runtime::{
+    DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK, DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
+};
+use alloy::primitives::Address;
 
 use super::super::rebalancer::{
-    rebalance, rebalance_with_custom_predictions_operator_only_for_test,
+    rebalance, rebalance_with_custom_predictions_exact_no_arb_with_distilled_proposals_for_test,
+    rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test,
+    rebalance_with_custom_predictions_operator_only_for_test,
     rebalance_with_custom_predictions_staged_reference_for_test, staged_teacher_snapshot_for_test,
 };
 use super::super::sim::{DUST, EPS, PoolSim, build_sims};
@@ -116,6 +129,130 @@ struct ScenarioCase {
     )>,
     balances: HashMap<&'static str, f64>,
     susd_balance: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SeededHardCaseGasAblationRow {
+    case_id: String,
+    layer: String,
+    raw_ev_susd: f64,
+    action_count: usize,
+    group_count: usize,
+    skipped_group_count: usize,
+    runtime_millis: u128,
+    total_fee_susd: f64,
+    net_ev_susd: f64,
+    incremental_raw_ev_susd: f64,
+    incremental_net_ev_susd: f64,
+}
+
+fn seeded_hard_case_layer_actions(
+    balances: &HashMap<&str, f64>,
+    susd_balance: f64,
+    slot0_results: &[(
+        crate::pools::Slot0Result,
+        &'static crate::markets::MarketData,
+    )],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<(&'static str, Vec<super::Action>)> {
+    vec![
+        (
+            "r_exact_baseline_k4",
+            rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test(
+                balances,
+                susd_balance,
+                slot0_results,
+                predictions,
+                force_mint_available,
+                4,
+                false,
+            ),
+        ),
+        (
+            "distilled_proposals",
+            rebalance_with_custom_predictions_exact_no_arb_with_distilled_proposals_for_test(
+                balances,
+                susd_balance,
+                slot0_results,
+                predictions,
+                force_mint_available,
+            ),
+        ),
+        (
+            "operator_only",
+            rebalance_with_custom_predictions_operator_only_for_test(
+                balances,
+                susd_balance,
+                slot0_results,
+                predictions,
+                force_mint_available,
+            )
+            .0,
+        ),
+        (
+            "staged_fallback",
+            rebalance_with_custom_predictions_staged_reference_for_test(
+                balances,
+                susd_balance,
+                slot0_results,
+                predictions,
+                force_mint_available,
+            ),
+        ),
+    ]
+}
+
+async fn exact_total_gas_susd_for_seeded_case(
+    actions: &[super::Action],
+    balances: &HashMap<&str, f64>,
+    _susd_balance: f64,
+    slot0_results: &[(
+        crate::pools::Slot0Result,
+        &'static crate::markets::MarketData,
+    )],
+    _predictions: &HashMap<String, f64>,
+    gas_assumptions: &crate::execution::gas::GasAssumptions,
+    fee_inputs: crate::execution::gas::LiveOptimismFeeInputs,
+    executor: Address,
+    eth_usd: f64,
+) -> (usize, usize, f64) {
+    let replay = build_group_plans_for_gas_replay_with_market_context(
+        actions,
+        slot0_results,
+        ConservativeExecutionConfig {
+            quote_latency_blocks: DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
+            adverse_move_bps_per_block: DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK,
+        },
+        gas_assumptions,
+        fee_inputs.gas_price_wei as f64 / 1e18,
+        eth_usd,
+    )
+    .unwrap_or_else(|_| {
+        panic!(
+            "group planning should succeed for seeded case with balances={} actions={}",
+            balances.len(),
+            actions.len()
+        )
+    });
+
+    let mut total_fee_susd = 0.0;
+    for plan in &replay.plans {
+        let unsigned_tx_data =
+            build_unsigned_group_plan_batch_execute_tx_bytes(executor, actions, plan, fee_inputs)
+                .expect("unsigned tx bytes should be buildable for seeded hard-case ablation");
+        let l1_fee_susd = gas_assumptions.l1_data_fee_floor_susd.max(
+            (unsigned_tx_data.len() as f64 * gas_assumptions.l1_fee_per_byte_wei) * eth_usd / 1e18,
+        );
+        let l2_fee_susd =
+            (plan.l2_gas_units as f64 * fee_inputs.gas_price_wei as f64) * eth_usd / 1e18;
+        total_fee_susd += l1_fee_susd + l2_fee_susd;
+    }
+    (
+        replay.plans.len(),
+        replay.skipped_groups.len(),
+        total_fee_susd,
+    )
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -1545,5 +1682,108 @@ fn print_teacher_distillation_seeded_hard_cases_jsonl() {
                 "gap": staged_ev - operator_ev,
             })
         );
+    }
+}
+
+#[tokio::test]
+#[ignore = "debug helper; run explicitly"]
+async fn print_gas_aware_seeded_hard_case_ablation_jsonl() {
+    let rpc_url = std::env::var("RPC").unwrap_or_else(|_| "https://optimism.drpc.org".to_string());
+    let gas_assumptions = default_gas_assumptions_with_optimism_l1_fee(&rpc_url)
+        .await
+        .unwrap_or_else(|_| crate::execution::gas::GasAssumptions::default());
+    let fee_inputs = fetch_live_optimism_fee_inputs(&rpc_url, Address::ZERO)
+        .await
+        .expect("live OP fee inputs should resolve");
+    let executor = Address::repeat_byte(0x44);
+    let eth_usd = 3000.0;
+    let predictions = crate::pools::prediction_map();
+    let cases = vec![
+        (
+            "fuzz_full_case_0",
+            scenario_case_from_fuzz_seed(0xFEED_FACE_1234_4321u64, false, 0),
+        ),
+        (
+            "fuzz_full_case_1",
+            scenario_case_from_fuzz_seed(0xFEED_FACE_1234_4321u64, false, 1),
+        ),
+        (
+            "fuzz_partial_case_0",
+            scenario_case_from_fuzz_seed(0xABCD_1234_EF99_7788u64, true, 0),
+        ),
+        (
+            "fuzz_partial_case_1",
+            scenario_case_from_fuzz_seed(0xABCD_1234_EF99_7788u64, true, 1),
+        ),
+    ];
+
+    for (label, case) in cases {
+        let balances: HashMap<&str, f64> = case
+            .balances
+            .iter()
+            .map(|(market_name, amount)| (*market_name as &str, *amount))
+            .collect();
+        let force_mint_available =
+            case.slot0_results.len() == crate::predictions::PREDICTIONS_L1.len();
+        let mut previous_raw_ev_susd: Option<f64> = None;
+        let mut previous_net_ev_susd: Option<f64> = None;
+
+        for (layer, actions) in seeded_hard_case_layer_actions(
+            &balances,
+            case.susd_balance,
+            &case.slot0_results,
+            predictions,
+            force_mint_available,
+        ) {
+            let started = Instant::now();
+            let (group_count, skipped_group_count, total_fee_susd) =
+                exact_total_gas_susd_for_seeded_case(
+                    &actions,
+                    &balances,
+                    case.susd_balance,
+                    &case.slot0_results,
+                    predictions,
+                    &gas_assumptions,
+                    fee_inputs,
+                    executor,
+                    eth_usd,
+                )
+                .await;
+            let runtime_millis = started.elapsed().as_millis();
+            let (holdings, cash) = replay_actions_to_state(
+                &actions,
+                &case.slot0_results,
+                &balances,
+                case.susd_balance,
+            );
+            let raw_ev_susd = ev_from_state(&holdings, cash);
+            let net_ev_susd = raw_ev_susd - total_fee_susd;
+            let incremental_raw_ev_susd = previous_raw_ev_susd
+                .map(|previous| raw_ev_susd - previous)
+                .unwrap_or(0.0);
+            let incremental_net_ev_susd = previous_net_ev_susd
+                .map(|previous| net_ev_susd - previous)
+                .unwrap_or(0.0);
+            previous_raw_ev_susd = Some(raw_ev_susd);
+            previous_net_ev_susd = Some(net_ev_susd);
+
+            println!(
+                "{}",
+                serde_json::to_string(&SeededHardCaseGasAblationRow {
+                    case_id: label.to_string(),
+                    layer: layer.to_string(),
+                    raw_ev_susd,
+                    action_count: actions.len(),
+                    group_count,
+                    skipped_group_count,
+                    runtime_millis,
+                    total_fee_susd,
+                    net_ev_susd,
+                    incremental_raw_ev_susd,
+                    incremental_net_ev_susd,
+                })
+                .expect("seeded hard-case ablation row should serialize")
+            );
+        }
     }
 }

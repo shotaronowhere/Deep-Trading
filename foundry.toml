@@ -10,7 +10,8 @@ fs_permissions = [
     { access = "read", path = "./node_modules" },
     { access = "read", path = "./lib/swap-router-contracts/node_modules" },
     { access = "read", path = "./lib/swap-router-contracts/artifacts" },
-    { access = "read", path = "./test/fixtures" }
+    { access = "read", path = "./test/fixtures" },
+    { access = "write", path = "./test/fixtures" }
 ]
 remappings = [
     "forge-std/=lib/forge-std/src/",

@@ -57,6 +57,29 @@ pub enum GroupPlanningError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GasReplaySkippedGroup {
+    pub group_index: usize,
+    pub step_index: usize,
+    pub step_subgroup_index: usize,
+    pub group_kind: GroupKind,
+    pub first_action_index: usize,
+    pub reason: GasReplaySkipReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GasReplaySkipReason {
+    MissingFirstActionIndex,
+    Group(GroupSkipReason),
+    ConservativeRepricingFailed,
+}
+
+#[derive(Debug, Clone)]
+pub struct GasReplayPlanSet {
+    pub plans: Vec<ExecutionGroupPlan>,
+    pub skipped_groups: Vec<GasReplaySkippedGroup>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSkipReason {
     NonPositiveEdge,
@@ -105,10 +128,49 @@ impl fmt::Display for GroupSkipReason {
     }
 }
 
+impl fmt::Display for GasReplaySkipReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingFirstActionIndex => {
+                write!(f, "group has no first action index")
+            }
+            Self::Group(reason) => write!(f, "{reason}"),
+            Self::ConservativeRepricingFailed => write!(
+                f,
+                "group could not be hydrated with conservative execution market context"
+            ),
+        }
+    }
+}
+
 impl From<GroupingError> for GroupPlanningError {
     fn from(value: GroupingError) -> Self {
         Self::Grouping(value)
     }
+}
+
+fn build_group_plan_for_gas_replay(
+    group: &ExecutionGroup,
+    gas_assumptions: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd_assumed: f64,
+) -> Result<ExecutionGroupPlan, GroupSkipReason> {
+    let replay_edge_susd =
+        1_000_000.0f64.max(group.planned_cost_susd.abs() + group.planned_proceeds_susd.abs() + 1.0);
+    build_group_plan_with_reason(
+        group,
+        replay_edge_susd,
+        gas_assumptions,
+        gas_price_eth,
+        eth_usd_assumed,
+        BufferConfig {
+            buffer_frac: 0.0,
+            // Keep a tiny positive floor so conservative repricing can still
+            // hydrate exact execution limits for diagnostics without using
+            // profitability admission.
+            buffer_min_susd: 1e-9,
+        },
+    )
 }
 
 pub fn build_group_plan(
@@ -516,6 +578,93 @@ fn apply_market_context_to_plans(
         }
     }
     plans.truncate(truncate_from);
+}
+
+pub fn build_group_plans_for_gas_replay_with_market_context(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    conservative_config: ConservativeExecutionConfig,
+    gas_assumptions: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd_assumed: f64,
+) -> Result<GasReplayPlanSet, GroupPlanningError> {
+    let step_groups = group_execution_actions_by_profitability_step(actions)?;
+    let mut effective_gas_assumptions = *gas_assumptions;
+    if let Some(l1_fee_per_byte_wei) = resolve_l1_fee_per_byte_wei(gas_assumptions) {
+        effective_gas_assumptions.l1_fee_per_byte_wei = l1_fee_per_byte_wei;
+    }
+
+    let move_frac = conservative_move_frac(conservative_config);
+    let slot0_by_market: HashMap<&'static str, (&Slot0Result, &'static MarketData)> = slot0_results
+        .iter()
+        .map(|(slot0, market)| (market.name, (slot0, *market)))
+        .collect();
+
+    let mut plans = Vec::new();
+    let mut skipped_groups = Vec::new();
+    let mut group_index = 0usize;
+
+    for (step_index, step_group) in step_groups.iter().enumerate() {
+        let step_subgroup_count = step_group.strict_groups.len();
+        for (step_subgroup_index, group) in step_group.strict_groups.iter().enumerate() {
+            let subgroup_index = group_index;
+            group_index += 1;
+            let Some(first_action_index) = group.first_action_index() else {
+                skipped_groups.push(GasReplaySkippedGroup {
+                    group_index: subgroup_index,
+                    step_index,
+                    step_subgroup_index,
+                    group_kind: group.kind,
+                    first_action_index: 0,
+                    reason: GasReplaySkipReason::MissingFirstActionIndex,
+                });
+                continue;
+            };
+
+            let mut plan = match build_group_plan_for_gas_replay(
+                group,
+                &effective_gas_assumptions,
+                gas_price_eth,
+                eth_usd_assumed,
+            ) {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    skipped_groups.push(GasReplaySkippedGroup {
+                        group_index: subgroup_index,
+                        step_index,
+                        step_subgroup_index,
+                        group_kind: group.kind,
+                        first_action_index,
+                        reason: GasReplaySkipReason::Group(reason),
+                    });
+                    continue;
+                }
+            };
+
+            plan.profitability_step_index = step_index;
+            plan.step_subgroup_index = step_subgroup_index;
+            plan.step_subgroup_count = step_subgroup_count;
+
+            if !apply_market_context_to_plan(actions, &mut plan, &slot0_by_market, move_frac) {
+                skipped_groups.push(GasReplaySkippedGroup {
+                    group_index: subgroup_index,
+                    step_index,
+                    step_subgroup_index,
+                    group_kind: group.kind,
+                    first_action_index,
+                    reason: GasReplaySkipReason::ConservativeRepricingFailed,
+                });
+                continue;
+            }
+
+            plans.push(plan);
+        }
+    }
+
+    Ok(GasReplayPlanSet {
+        plans,
+        skipped_groups,
+    })
 }
 
 pub fn build_group_plans_with_edge_provider<F>(

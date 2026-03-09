@@ -23,6 +23,7 @@ If documents conflict, follow this precedence:
 
 ## Operational runbooks
 
+- `docs/execution_program_packing.md`: packed execution-program compilation and chunked submission model.
 - `docs/execution_submission.md`: strict execution submission gates and operator steps.
 - `docs/deployments.md`: contract addresses/constants.
 - `docs/batch_swap_router.md`: BatchSwapRouter API + test coverage map.
@@ -32,6 +33,7 @@ If documents conflict, follow this precedence:
 ## Module and validation docs
 
 - `docs/portfolio.md`: portfolio module surface, diagnostics, and test map.
+- `docs/solver_benchmark_matrix.md`: central release-facing EV / gas / speed comparison across solver flavors.
 - `docs/gas_model.md`: gas threshold assumptions.
 - `docs/rebalance_test_ev_trace.md`: EV trace instrumentation.
 - `docs/monte_carlo_rebalance_validation.md`: Monte Carlo EV validation harness.

@@ -1,3 +1,5 @@
+#![allow(clippy::unreadable_literal, clippy::unusual_byte_groupings)]
+
 use alloy::sol;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
