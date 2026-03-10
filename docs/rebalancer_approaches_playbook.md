@@ -142,9 +142,9 @@ Historical benchmark context:
   - this means the remaining hard-case gap is a discrete choice-recovery problem, not a continuous waterfall problem
   - do not spend more runtime complexity on larger online `2^K` exact subset search until preserve/frontier choice recovery is improved
 - Permanent EV-optimization memory, benchmark deltas, and stop conditions live in `docs/offchain_ev_optimization_log.md`.
-- The old staged solver remains compiled only as an opt-in rollout/reference path:
+- The old staged solver remains compiled only as a test/reference path:
   - default runtime is the packed operator solver
-  - staged comparison can be re-enabled with `REBALANCE_ENABLE_STAGED_FALLBACK=1`
+  - staged comparison is exercised only in test diagnostics
   - residual gaps after packing should now be treated as route/search gaps rather than execution-fragmentation gaps
 - Gas-aware pruning result:
   - keep `R_exact`, `Plain`, `ArbPrimed`, and packed execution-program compilation
@@ -160,8 +160,9 @@ Historical benchmark context:
 - Canonical small-shape live OP calibration supports the current `l1_data_fee_floor_susd = 0.001`.
 - Benchmark-layer gas replay now reconstructs nonzero strict subgroup plans on the committed benchmark fixture.
 - Seeded hard-case gas replay is still incomplete; many seeded cases currently report only skipped groups, so net-EV pruning should be treated as benchmark-trustworthy first.
-- Raw EV is still the planner objective in the default path.
+- Estimated net EV is the planner objective in the default path under the pinned/shared fee snapshot.
 - Gas is now a measured diagnostic input for pruning decisions, not just a rough heuristic.
+- Heavy single-tick release validations belong in the nightly release-validation lane; live-L1 reports and large teacher diagnostics remain manual-only.
 
 ## Production strategy policy (v1 thresholds)
 

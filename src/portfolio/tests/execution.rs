@@ -1447,6 +1447,7 @@ fn test_merge_not_chosen_for_low_price() {
 }
 
 #[test]
+#[ignore = "release perf helper; run explicitly"]
 fn test_rebalance_perf_full_l1() {
     use crate::markets::MARKETS_L1;
     use std::time::Instant;
@@ -1557,6 +1558,7 @@ fn test_rebalance_perf_full_l1() {
 }
 
 #[test]
+#[ignore = "release perf helper; run explicitly"]
 fn test_rebalance_perf_full_l1_with_gas_pricing() {
     use crate::markets::MARKETS_L1;
     use std::time::Instant;

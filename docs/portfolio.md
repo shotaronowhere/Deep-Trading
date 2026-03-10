@@ -97,9 +97,10 @@ Preserve-universe construction:
 
 Runtime pruning result:
 
-- the tiny teacher-distilled preserve/frontier proposal layer remains available in test/diagnostic helpers, but it was removed from the default runtime path after gas-aware ablation
+- the legacy distilled preserve/frontier proposal layer still participates in the default exact-no-arb path
+- the newer preserve/frontier V2 proposal remains additive and test-gated behind `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1`
 - the late arb-correction tail was also removed from the default runtime path
-- both were non-regressive, but neither earned enough committed-benchmark EV or net-EV improvement to justify default-path complexity
+- the V2 proposal diagnostics were non-regressive, but they did not earn enough committed-benchmark EV or net-EV improvement to justify promotion into the default path
 
 Execution-program compilation:
 
@@ -109,7 +110,9 @@ Execution-program compilation:
   - `baseline_step_prune`
   - `target_delta` re-emission from the rich terminal holdings
   - `analytic_mixed` compact common-shift solver
+  - `constant_l_mixed` packed-program common-shift solver
   - `coupled_mixed` continuous mixed-frontier compiler
+  - `staged_constant_l_2` staged constant-`L` teacher-derived fallback candidate
   - `direct_only` compact no-mint/no-merge guard
   - `noop`
 - instead it compiles that trace into the cheaper of:
@@ -119,12 +122,11 @@ Execution-program compilation:
 
 Reference fallback:
 
-- the old staged meta-solver path is still compiled as a reference implementation
-- it is now opt-in via `REBALANCE_ENABLE_STAGED_FALLBACK=1`
-- the default runtime hot path is the packed operator solver, not staged fallback selection
-- the realistic heterogeneous 98-outcome benchmark now clears the on-chain net-EV references under the shared snapshot after `analytic_mixed` is enabled
-- the remaining mixed-route favorable synthetic gap is now treated as a true compact target-discovery gap, not an execution-fragmentation gap
-- `coupled_mixed` is now part of the default compiler set, but it did not displace the selected benchmark winners; that is the current stop signal for further online solver expansion
+- the old staged meta-solver path remains only as a `#[cfg(test)]` reference implementation
+- the default runtime hot path is the packed operator solver, with no staged-fallback branch
+- the realistic heterogeneous 98-outcome benchmark now clears the on-chain net-EV references under the shared snapshot with `constant_l_mixed`
+- the mixed-route favorable synthetic gap is closed under the current packed `constant_l_mixed` path
+- `coupled_mixed` remains in the compiler set, but it did not displace the selected benchmark winners; that is the current stop signal for further online solver expansion
 
 Compatibility note:
 
@@ -182,20 +184,25 @@ Key classes covered:
 
 `test_rebalance_perf_full_l1` benchmarks full rebalance across the 98 tradeable L1 outcomes.
 
-Current release measurements after the packed-execution change are not yet rerun in a stable release harness.
+Current release measurements after the packed-execution change:
 
-- default packed path: `n/a`
-- staged-reference opt-in path (`REBALANCE_ENABLE_STAGED_FALLBACK=1`): `n/a`
+- default packed path: `12.002361733s`
+- default packed path with gas pricing: `5.117809954s`
+- staged-reference runtime path: removed
 
-See `docs/solver_benchmark_matrix.md` for the current benchmark-facing economics table. Runtime speed should be treated as pending until the release perf harness is rerun on the packed default path.
+These are release-only measurements and are now part of the nightly single-tick release-validation lane, not default CI.
+
+See `docs/solver_benchmark_matrix.md` for the current benchmark-facing economics table and release perf table.
 
 For the release-facing EV / gas / speed comparison matrix across all solver flavors, see `docs/solver_benchmark_matrix.md`.
 
 Run with:
 
 ```bash
-cargo test --release test_rebalance_perf_full_l1 -- --nocapture
+cargo test --release test_rebalance_perf_full_l1 -- --ignored --exact --nocapture
 ```
+
+Release-facing parity scope is still single-tick only. The `crossing_light` and `crossing_heavy` synthetic cases are validation-only scope tests and are not part of the “matches/beats on-chain” claim.
 
 ## Related docs
 

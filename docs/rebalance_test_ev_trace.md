@@ -43,6 +43,7 @@ The helper is wired into the stress/optimization rebalance tests:
   - `test_rebalance_regression_full_l1_snapshot_variant_b_invariants`
 - `src/portfolio/tests/execution.rs`
   - `test_rebalance_perf_full_l1`
+  - `test_rebalance_perf_full_l1_with_gas_pricing`
 
 ## Verification
 
@@ -53,6 +54,13 @@ After integration, these tests were run with `--nocapture` to confirm:
 - final portfolio logs are emitted,
 - EV before/after/gain is printed,
 - strict EV improvement assertions hold.
+
+The two release perf helpers in `src/portfolio/tests/execution.rs` are now `#[ignore]`d and should be run explicitly in `--release`:
+
+```bash
+cargo test --release test_rebalance_perf_full_l1 -- --ignored --exact --nocapture
+cargo test --release test_rebalance_perf_full_l1_with_gas_pricing -- --ignored --exact --nocapture
+```
 
 ## Live full-L1 optimization test
 

@@ -2,7 +2,7 @@
 
 This is the definitive implementation spec for the waterfall rebalancing algorithm.
 
-Status: current as of 2026-03-09.  
+Status: current as of 2026-03-10.
 Source-of-truth code paths:
 
 - `src/portfolio/core/rebalancer.rs`
@@ -77,11 +77,13 @@ Current runtime behavior:
    - aggregate by max churn amount, then max sold amount, then stable market order
    - cap the online preserve universe at `K = 4`
    - enumerate every `(frontier_family, preserve_subset)` pair from fresh state
-   - for each exact no-arb candidate, keep the rich trace, replay it to terminal holdings, and compare exactly six compact forms:
+   - for each exact no-arb candidate, keep the rich trace, replay it to terminal holdings, and compare exactly eight compact forms:
      - `baseline_step_prune`
      - `target_delta`
      - `analytic_mixed`
+     - `constant_l_mixed`
      - `coupled_mixed`
+     - `staged_constant_l_2`
      - `direct_only`
      - `noop`
    - score the resulting compact plans by estimated net EV and reduce deterministically
@@ -104,7 +106,9 @@ Important boundaries:
   - `direct_only` is the mandatory no-mint/no-merge net-EV guard
 - First-frontier-family forcing is bounded to the first Phase-2 frontier choice only. After that, the waterfall returns to its existing deterministic frontier logic.
 - Execution is now optimized over packed tx chunks, not priced as one tx per replay subgroup.
-- The staged meta-solver remains compiled as a reference path during rollout, but it is no longer part of the default hot-path objective.
+- The staged meta-solver remains compiled only in `#[cfg(test)]` as a reference teacher; it is not part of the runtime objective.
+- Release-facing parity claims are single-tick only; `crossing_light` and `crossing_heavy` synthetic cases remain validation-only scope tests.
+- Legacy distilled preserve/frontier proposals remain in the default exact-no-arb path; the newer V2 proposal path is diagnostic-only behind `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1`.
 - `RebalanceFlags.enable_ev_guarded_greedy_churn_pruning` remains for compatibility but does not change default full-mode behavior.
 
 ## Full-Mode Phase Flow

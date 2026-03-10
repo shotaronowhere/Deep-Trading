@@ -28,6 +28,7 @@ use super::super::rebalancer::{
     rebalance_with_custom_predictions_rebalance_only_for_test,
     rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test,
     rebalance_with_custom_predictions_selected_plan_for_test,
+    rebalance_with_custom_predictions_selected_plan_with_pricing_for_test,
     rebalance_with_custom_predictions_staged_reference_for_test, staged_reference_choice_for_test,
     staged_teacher_snapshot_for_test,
 };
@@ -149,6 +150,13 @@ struct OnchainBenchmarkCaseArtifact {
 struct SharedSnapshotSolverRow {
     case_id: String,
     flavor: String,
+    scenario_family: String,
+    outcome_count: usize,
+    profitable_count: usize,
+    profitable_count_bucket: String,
+    budget_regime: String,
+    fee_regime: String,
+    tick_regime: String,
     raw_ev_wei: String,
     raw_ev_susd: f64,
     total_fee_susd: f64,
@@ -184,12 +192,33 @@ type Slot0Case = Vec<(
 const BENCHMARK_OP_CHAIN_ID: u64 = 10;
 const BENCHMARK_OP_GAS_PRICE_WEI: u128 = 1_002_325;
 const BENCHMARK_OP_ETH_USD: f64 = 3000.0;
+const BENCHMARK_OP_GAS_PRICE_ETH: f64 = BENCHMARK_OP_GAS_PRICE_WEI as f64 / 1e18;
 
+#[derive(Debug, Clone)]
 struct BuiltCase {
     slot0_results: Slot0Case,
     balances_view: HashMap<&'static str, f64>,
     predictions: HashMap<String, f64>,
     cash_budget: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CaseRowMetadata {
+    scenario_family: &'static str,
+    outcome_count: usize,
+    profitable_count: usize,
+    profitable_count_bucket: &'static str,
+    budget_regime: &'static str,
+    fee_regime: &'static str,
+    tick_regime: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct StressCaseDefinition {
+    case_id: String,
+    built: BuiltCase,
+    force_mint_available: bool,
+    metadata: CaseRowMetadata,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -235,6 +264,167 @@ fn k1_teacher_row_diagnostics_for_built_case(built: &BuiltCase) -> K1TeacherRowD
     }
 
     K1TeacherRowDiagnostics::default()
+}
+
+fn profitable_count_bucket(count: usize) -> &'static str {
+    match count {
+        0 => "0",
+        1..=4 => "1-4",
+        5..=8 => "5-8",
+        9..=13 => "9-13",
+        14..=16 => "14-16",
+        17..=20 => "17-20",
+        21..=24 => "21-24",
+        25..=32 => "25-32",
+        _ => "33+",
+    }
+}
+
+fn budget_regime_for_cash_budget(cash_budget: f64) -> &'static str {
+    if cash_budget <= 10.0 + 1e-12 {
+        "tiny"
+    } else if cash_budget <= 40.0 + 1e-12 {
+        "medium"
+    } else {
+        "full"
+    }
+}
+
+fn fee_regime_label(multiplier: f64) -> &'static str {
+    if (multiplier - 0.5).abs() <= 1e-12 {
+        "0.5x"
+    } else if (multiplier - 2.0).abs() <= 1e-12 {
+        "2.0x"
+    } else {
+        "1.0x"
+    }
+}
+
+fn direct_gross_profitable_outcome_count(built: &BuiltCase) -> usize {
+    built
+        .slot0_results
+        .iter()
+        .filter(|(slot0, market)| {
+            let pool = match market.pool.as_ref() {
+                Some(pool) => pool,
+                None => return false,
+            };
+            let is_token1 = pool.token1.eq_ignore_ascii_case(market.outcome_token);
+            let Some(price_wad) = sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1)
+                .and_then(|value| u128::try_from(value).ok())
+            else {
+                return false;
+            };
+            let price = wad_to_f64(price_wad);
+            let pred = built
+                .predictions
+                .get(&normalize_market_name(market.name))
+                .copied()
+                .unwrap_or(0.0);
+            pred > price + 1e-12
+        })
+        .count()
+}
+
+fn fixture_scenario_family(case_id: &str) -> &'static str {
+    match case_id {
+        "mixed_route_favorable_synthetic_case" => "synthetic_adversarial",
+        _ => "release_fixture",
+    }
+}
+
+fn fixture_tick_regime(case: &BenchmarkCase) -> &'static str {
+    if case.case_id.contains("multitick") {
+        "crossing_light"
+    } else {
+        "single_tick"
+    }
+}
+
+fn case_row_metadata(
+    built: &BuiltCase,
+    scenario_family: &'static str,
+    budget_regime: &'static str,
+    fee_regime: &'static str,
+    tick_regime: &'static str,
+) -> CaseRowMetadata {
+    let profitable_count = direct_gross_profitable_outcome_count(built);
+    CaseRowMetadata {
+        scenario_family,
+        outcome_count: built.slot0_results.len(),
+        profitable_count,
+        profitable_count_bucket: profitable_count_bucket(profitable_count),
+        budget_regime,
+        fee_regime,
+        tick_regime,
+    }
+}
+
+fn fixture_case_row_metadata(
+    case: &BenchmarkCase,
+    built: &BuiltCase,
+    fee_multiplier: f64,
+) -> CaseRowMetadata {
+    case_row_metadata(
+        built,
+        fixture_scenario_family(&case.case_id),
+        budget_regime_for_cash_budget(built.cash_budget),
+        fee_regime_label(fee_multiplier),
+        fixture_tick_regime(case),
+    )
+}
+
+fn scaled_benchmark_gas_assumptions(multiplier: f64) -> crate::execution::gas::GasAssumptions {
+    let mut assumptions = benchmark_gas_assumptions_for_test();
+    assumptions.l1_fee_per_byte_wei *= multiplier;
+    assumptions.l1_data_fee_floor_susd *= multiplier;
+    assumptions
+}
+
+fn benchmark_fee_inputs_with_multiplier(
+    multiplier: f64,
+) -> crate::execution::gas::LiveOptimismFeeInputs {
+    crate::execution::gas::LiveOptimismFeeInputs {
+        sender_nonce: 0,
+        chain_id: BENCHMARK_OP_CHAIN_ID,
+        gas_price_wei: (BENCHMARK_OP_GAS_PRICE_WEI as f64 * multiplier).round() as u128,
+    }
+}
+
+fn modeled_total_fee_susd_for_onchain_artifact(
+    artifact: &OnchainBenchmarkCallArtifact,
+    gas_assumptions: &crate::execution::gas::GasAssumptions,
+    fee_inputs: crate::execution::gas::LiveOptimismFeeInputs,
+    eth_usd: f64,
+) -> f64 {
+    let unsigned_tx_data = build_unsigned_contract_call_tx_bytes(
+        artifact.target,
+        artifact.calldata.clone().into(),
+        fee_inputs,
+        artifact.gas_units,
+    )
+    .expect("unsigned tx bytes should build for benchmark call");
+    let l1_fee_susd =
+        modeled_l1_fee_susd_for_tx_bytes(gas_assumptions, unsigned_tx_data.len(), eth_usd);
+    let l2_fee_susd =
+        (artifact.gas_units as f64 * fee_inputs.gas_price_wei as f64) * eth_usd / 1e18;
+    l1_fee_susd + l2_fee_susd
+}
+
+fn stress_case(
+    case_id: String,
+    built: BuiltCase,
+    scenario_family: &'static str,
+    budget_regime: &'static str,
+    tick_regime: &'static str,
+) -> StressCaseDefinition {
+    let metadata = case_row_metadata(&built, scenario_family, budget_regime, "1.0x", tick_regime);
+    StressCaseDefinition {
+        case_id,
+        built,
+        force_mint_available: true,
+        metadata,
+    }
 }
 
 fn solver_layer_actions_for_case(
@@ -413,6 +603,13 @@ fn onchain_call_report_path() -> String {
     )
 }
 
+fn stress_onchain_call_report_path() -> String {
+    format!(
+        "{}/test/fixtures/rebalancer_ab_stress_onchain_call_report.json",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
 fn parse_onchain_benchmark_call_artifact(
     value: &serde_json::Value,
 ) -> OnchainBenchmarkCallArtifact {
@@ -445,8 +642,9 @@ fn parse_onchain_benchmark_call_artifact(
     }
 }
 
-fn load_onchain_call_artifacts() -> HashMap<String, OnchainBenchmarkCaseArtifact> {
-    let path = onchain_call_report_path();
+fn load_onchain_call_artifacts_from_path(
+    path: &str,
+) -> HashMap<String, OnchainBenchmarkCaseArtifact> {
     let raw = fs::read_to_string(&path).unwrap_or_else(|err| {
         panic!(
             "failed to read on-chain call artifact at {}: {}. Run `forge test --match-test test_write_rebalancer_ab_onchain_call_report -vv` first.",
@@ -508,6 +706,33 @@ fn load_onchain_call_artifacts() -> HashMap<String, OnchainBenchmarkCaseArtifact
             )
         })
         .collect()
+}
+
+fn load_onchain_call_artifacts() -> HashMap<String, OnchainBenchmarkCaseArtifact> {
+    let path = onchain_call_report_path();
+    load_onchain_call_artifacts_from_path(&path)
+}
+
+fn load_stress_onchain_call_artifacts() -> HashMap<String, OnchainBenchmarkCaseArtifact> {
+    let path = stress_onchain_call_report_path();
+    let raw = fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read stress on-chain call artifact at {}: {}. Run `forge test --match-test test_write_rebalancer_ab_stress_onchain_call_report -vv` first.",
+            path, err
+        )
+    });
+    let root: serde_json::Value =
+        serde_json::from_str(&raw).expect("stress on-chain call artifact json should decode");
+    let object = root
+        .as_object()
+        .expect("stress on-chain call artifact root should be an object");
+    if object.is_empty() {
+        panic!(
+            "stress on-chain call artifact at {} should contain at least one case",
+            path
+        );
+    }
+    load_onchain_call_artifacts_from_path(&path)
 }
 
 #[derive(Debug, Clone)]
@@ -1305,6 +1530,152 @@ fn build_random_medium_case(seed: u64) -> BuiltCase {
     )
 }
 
+fn build_boundary_profitable_case(
+    profitable_count: usize,
+    budget_scale: f64,
+    tick_regime: &'static str,
+) -> StressCaseDefinition {
+    assert!(
+        matches!(
+            tick_regime,
+            "single_tick" | "crossing_light" | "crossing_heavy"
+        ),
+        "unexpected tick regime"
+    );
+    let outcome_count = profitable_count + 2;
+    let budget_regime = budget_regime_for_cash_budget(100.0 * budget_scale);
+    let predictions: Vec<f64> = normalize_weights_to_wad(&vec![100u64; outcome_count])
+        .into_iter()
+        .map(wad_to_f64)
+        .collect();
+    let prices: Vec<f64> = predictions
+        .iter()
+        .enumerate()
+        .map(|(idx, pred)| {
+            if idx < profitable_count {
+                pred * (0.76 + 0.03 * ((idx % 4) as f64))
+            } else {
+                pred * (1.03 + 0.02 * ((idx % 3) as f64))
+            }
+        })
+        .collect();
+    let liquidities: Vec<u128> = (0..outcome_count)
+        .map(|idx| 3_500_000_000_000_000_000_000u128 + (idx as u128) * 50_000_000_000_000_000u128)
+        .collect();
+    let tick_span = match tick_regime {
+        "single_tick" => 120_000,
+        "crossing_light" => 40_000,
+        "crossing_heavy" => 28_000,
+        _ => unreachable!(),
+    };
+    let ticks = vec![vec![-tick_span, tick_span]; outcome_count];
+    let case_id = format!("boundary_profitable_{profitable_count}_{budget_regime}_{tick_regime}");
+    let built = build_explicit_case(
+        &case_id,
+        &prices,
+        &predictions,
+        &vec![true; outcome_count],
+        &vec![0.0; outcome_count],
+        &liquidities,
+        &ticks,
+        100.0 * budget_scale,
+    );
+    stress_case(
+        case_id,
+        built,
+        "boundary_cutoff",
+        budget_regime,
+        tick_regime,
+    )
+}
+
+fn build_complementary_inactive_sell_case() -> StressCaseDefinition {
+    let case_id = "preserve_frontier_inactive_sell_case".to_string();
+    let built = build_explicit_case(
+        &case_id,
+        &[0.13, 0.16, 0.34, 0.25, 0.12],
+        &[0.27, 0.24, 0.18, 0.16, 0.15],
+        &[true, true, true, true, true],
+        &[0.0, 0.0, 7.0, 4.0, 0.0],
+        &[
+            2_400_000_000_000_000_000_000u128,
+            2_300_000_000_000_000_000_000u128,
+            3_100_000_000_000_000_000_000u128,
+            2_700_000_000_000_000_000_000u128,
+            2_500_000_000_000_000_000_000u128,
+        ],
+        &[
+            vec![-120_000, 120_000],
+            vec![-120_000, 120_000],
+            vec![-120_000, 120_000],
+            vec![-120_000, 120_000],
+            vec![-120_000, 120_000],
+        ],
+        18.0,
+    );
+    stress_case(
+        case_id,
+        built,
+        "synthetic_adversarial",
+        "medium",
+        "single_tick",
+    )
+}
+
+fn build_mint_dominant_case() -> StressCaseDefinition {
+    let case_id = "mint_dominant_case".to_string();
+    let built = build_explicit_case(
+        &case_id,
+        &[0.84, 0.08, 0.08],
+        &[0.36, 0.32, 0.32],
+        &[true, true, true],
+        &[0.0, 0.0, 0.0],
+        &[
+            2_800_000_000_000_000_000_000u128,
+            2_800_000_000_000_000_000_000u128,
+            2_800_000_000_000_000_000_000u128,
+        ],
+        &[
+            vec![-180_000, 180_000],
+            vec![-180_000, 180_000],
+            vec![-180_000, 180_000],
+        ],
+        30.0,
+    );
+    stress_case(
+        case_id,
+        built,
+        "synthetic_adversarial",
+        "medium",
+        "single_tick",
+    )
+}
+
+fn build_tick_scope_cases() -> Vec<StressCaseDefinition> {
+    ["crossing_light", "crossing_heavy"]
+        .into_iter()
+        .map(|tick_regime| {
+            let boundary = build_boundary_profitable_case(8, 1.0, tick_regime);
+            stress_case(
+                boundary.case_id,
+                boundary.built,
+                "tick_scope",
+                boundary.metadata.budget_regime,
+                tick_regime,
+            )
+        })
+        .collect()
+}
+
+fn shared_single_tick_onchain_stress_cases() -> Vec<StressCaseDefinition> {
+    vec![
+        build_complementary_inactive_sell_case(),
+        build_mint_dominant_case(),
+        build_boundary_profitable_case(16, 1.0, "single_tick"),
+        build_boundary_profitable_case(20, 0.05, "single_tick"),
+    ]
+}
+
 fn cases_from_fixture() -> Vec<BenchmarkCase> {
     let rows: HashMap<String, BenchmarkCaseRow> = serde_json::from_str(include_str!(
         "../../../test/fixtures/rebalancer_ab_cases.json"
@@ -1443,6 +1814,462 @@ fn benchmark_ev_non_decreasing_vs_fixture() {
             full_rebalance_only_ev
         );
         let _ = action_count;
+    }
+}
+
+#[test]
+fn shared_snapshot_metadata_classifies_committed_fixtures() {
+    let mut saw_crossing_light = false;
+    let mut saw_release_fixture = false;
+
+    for case in cases_from_fixture() {
+        let built = build_case(&case);
+        let metadata = fixture_case_row_metadata(&case, &built, 1.0);
+
+        assert_eq!(metadata.outcome_count, built.slot0_results.len());
+        assert_eq!(
+            metadata.profitable_count_bucket,
+            profitable_count_bucket(metadata.profitable_count)
+        );
+        assert_eq!(
+            metadata.budget_regime,
+            budget_regime_for_cash_budget(built.cash_budget)
+        );
+        if metadata.tick_regime == "crossing_light" {
+            saw_crossing_light = true;
+        }
+        if metadata.scenario_family == "release_fixture" {
+            saw_release_fixture = true;
+        }
+    }
+
+    assert!(
+        saw_crossing_light,
+        "expected at least one crossing-light fixture"
+    );
+    assert!(saw_release_fixture, "expected at least one release fixture");
+}
+
+#[test]
+fn offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_committed_cases() {
+    const NET_EV_TOL: f64 = 1e-9;
+
+    let onchain_artifacts = load_onchain_call_artifacts();
+    for case in cases_from_fixture() {
+        let built = build_case(&case);
+        let force_mint_available = !case.direct_only_reference;
+        let onchain = onchain_artifacts
+            .get(&case.case_id)
+            .unwrap_or_else(|| panic!("missing on-chain artifact for {}", case.case_id));
+
+        for fee_multiplier in [0.5, 1.0, 2.0] {
+            let gas_assumptions = scaled_benchmark_gas_assumptions(fee_multiplier);
+            let fee_inputs = benchmark_fee_inputs_with_multiplier(fee_multiplier);
+            let metadata = fixture_case_row_metadata(&case, &built, fee_multiplier);
+            let summary = rebalance_with_custom_predictions_selected_plan_with_pricing_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                &gas_assumptions,
+                BENCHMARK_OP_GAS_PRICE_ETH * fee_multiplier,
+                BENCHMARK_OP_ETH_USD,
+            );
+            let offchain_net_ev = summary
+                .estimated_net_ev
+                .expect("off-chain benchmark plan should have modeled net EV under fee sweep");
+            let onchain_exact_net_ev = wad_to_f64(onchain.exact.raw_ev_wei)
+                - modeled_total_fee_susd_for_onchain_artifact(
+                    &onchain.exact,
+                    &gas_assumptions,
+                    fee_inputs,
+                    BENCHMARK_OP_ETH_USD,
+                );
+            let onchain_mixed_net_ev = wad_to_f64(onchain.mixed.raw_ev_wei)
+                - modeled_total_fee_susd_for_onchain_artifact(
+                    &onchain.mixed,
+                    &gas_assumptions,
+                    fee_inputs,
+                    BENCHMARK_OP_ETH_USD,
+                );
+
+            assert_eq!(metadata.fee_regime, fee_regime_label(fee_multiplier));
+            assert!(
+                offchain_net_ev + NET_EV_TOL >= onchain_exact_net_ev,
+                "{} {} off-chain net EV lost to on-chain exact: offchain={} onchain_exact={} summary={:?}",
+                case.case_id,
+                metadata.fee_regime,
+                offchain_net_ev,
+                onchain_exact_net_ev,
+                summary
+            );
+            assert!(
+                offchain_net_ev + NET_EV_TOL >= onchain_mixed_net_ev,
+                "{} {} off-chain net EV lost to on-chain mixed: offchain={} onchain_mixed={} summary={:?}",
+                case.case_id,
+                metadata.fee_regime,
+                offchain_net_ev,
+                onchain_mixed_net_ev,
+                summary
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "heavy release validation; run explicitly with --release"]
+fn offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_shared_single_tick_stress_cases()
+ {
+    const NET_EV_TOL: f64 = 1e-9;
+
+    let onchain_artifacts = load_stress_onchain_call_artifacts();
+    for stress in shared_single_tick_onchain_stress_cases() {
+        let onchain = onchain_artifacts
+            .get(&stress.case_id)
+            .unwrap_or_else(|| panic!("missing stress on-chain artifact for {}", stress.case_id));
+
+        for fee_multiplier in [0.5, 1.0, 2.0] {
+            let gas_assumptions = scaled_benchmark_gas_assumptions(fee_multiplier);
+            let fee_inputs = benchmark_fee_inputs_with_multiplier(fee_multiplier);
+            let metadata = case_row_metadata(
+                &stress.built,
+                stress.metadata.scenario_family,
+                stress.metadata.budget_regime,
+                fee_regime_label(fee_multiplier),
+                stress.metadata.tick_regime,
+            );
+            let summary = rebalance_with_custom_predictions_selected_plan_with_pricing_for_test(
+                &stress.built.balances_view,
+                stress.built.cash_budget,
+                &stress.built.slot0_results,
+                &stress.built.predictions,
+                stress.force_mint_available,
+                &gas_assumptions,
+                BENCHMARK_OP_GAS_PRICE_ETH * fee_multiplier,
+                BENCHMARK_OP_ETH_USD,
+            );
+            let offchain_net_ev = summary
+                .estimated_net_ev
+                .expect("off-chain stress plan should have modeled net EV under fee sweep");
+            let onchain_exact_net_ev = wad_to_f64(onchain.exact.raw_ev_wei)
+                - modeled_total_fee_susd_for_onchain_artifact(
+                    &onchain.exact,
+                    &gas_assumptions,
+                    fee_inputs,
+                    BENCHMARK_OP_ETH_USD,
+                );
+            let onchain_mixed_net_ev = wad_to_f64(onchain.mixed.raw_ev_wei)
+                - modeled_total_fee_susd_for_onchain_artifact(
+                    &onchain.mixed,
+                    &gas_assumptions,
+                    fee_inputs,
+                    BENCHMARK_OP_ETH_USD,
+                );
+
+            assert_eq!(metadata.tick_regime, "single_tick");
+            assert_eq!(metadata.fee_regime, fee_regime_label(fee_multiplier));
+            assert_ne!(
+                summary.fee_estimate_source, "unavailable",
+                "{} {} should retain modeled fee coverage",
+                stress.case_id, metadata.fee_regime
+            );
+            assert!(
+                offchain_net_ev + NET_EV_TOL >= onchain_exact_net_ev,
+                "{} {} off-chain net EV lost to on-chain exact: offchain={} onchain_exact={} summary={:?}",
+                stress.case_id,
+                metadata.fee_regime,
+                offchain_net_ev,
+                onchain_exact_net_ev,
+                summary
+            );
+            assert!(
+                offchain_net_ev + NET_EV_TOL >= onchain_mixed_net_ev,
+                "{} {} off-chain net EV lost to on-chain mixed: offchain={} onchain_mixed={} summary={:?}",
+                stress.case_id,
+                metadata.fee_regime,
+                offchain_net_ev,
+                onchain_mixed_net_ev,
+                summary
+            );
+        }
+    }
+}
+
+#[test]
+fn complementary_inactive_sell_case_never_loses_to_direct_only_or_rebalance_only() {
+    let stress = build_complementary_inactive_sell_case();
+    let selected = rebalance_with_custom_predictions_selected_plan_for_test(
+        &stress.built.balances_view,
+        stress.built.cash_budget,
+        &stress.built.slot0_results,
+        &stress.built.predictions,
+        stress.force_mint_available,
+    );
+    let direct_only = rebalance_with_custom_predictions_selected_plan_for_test(
+        &stress.built.balances_view,
+        stress.built.cash_budget,
+        &stress.built.slot0_results,
+        &stress.built.predictions,
+        false,
+    );
+    let rebalance_only_actions = rebalance_with_custom_predictions_rebalance_only_for_test(
+        &stress.built.balances_view,
+        stress.built.cash_budget,
+        &stress.built.slot0_results,
+        &stress.built.predictions,
+        stress.force_mint_available,
+    );
+    let rebalance_only = estimate_plan_economics_for_test(
+        &rebalance_only_actions,
+        &stress.built.balances_view,
+        stress.built.cash_budget,
+        &stress.built.slot0_results,
+        &stress.built.predictions,
+    );
+
+    assert_eq!(stress.metadata.scenario_family, "synthetic_adversarial");
+    assert!(
+        selected.direct_sell_count > 0,
+        "{} should exercise inactive-sell recovery: {:?}",
+        stress.case_id,
+        selected
+    );
+    assert!(
+        selected.estimated_net_ev.unwrap_or(f64::NEG_INFINITY) + 1e-9
+            >= direct_only.estimated_net_ev.unwrap_or(f64::NEG_INFINITY),
+        "{} selected plan should not lose to direct-only on net EV: selected={:?} direct_only={:?}",
+        stress.case_id,
+        selected,
+        direct_only
+    );
+    assert!(
+        selected.estimated_net_ev.unwrap_or(f64::NEG_INFINITY) + 1e-9
+            >= rebalance_only.estimated_net_ev.unwrap_or(f64::NEG_INFINITY),
+        "{} selected plan should not lose to rebalance-only on net EV: selected={:?} rebalance_only={:?}",
+        stress.case_id,
+        selected,
+        rebalance_only
+    );
+}
+
+#[test]
+fn boundary_cutoff_smoke_suite_stays_net_ev_non_regressive() {
+    assert_boundary_cutoff_suite_non_regressive(&[16], &[1.0]);
+}
+
+#[test]
+#[ignore = "heavy deterministic cutoff sweep; run explicitly"]
+fn boundary_cutoff_full_sweep_stays_net_ev_non_regressive() {
+    assert_boundary_cutoff_suite_non_regressive(&[14, 16, 18, 20, 24, 32], &[0.05, 0.25, 1.0]);
+}
+
+#[test]
+#[ignore = "heavy release validation; run explicitly with --release"]
+fn shared_single_tick_stress_cases_do_not_require_staged_reference() {
+    assert_stress_cases_do_not_require_staged_reference(&shared_single_tick_onchain_stress_cases());
+}
+
+#[test]
+#[ignore = "heavy deterministic cutoff staged comparison; run explicitly"]
+fn boundary_cutoff_full_sweep_does_not_require_staged_reference() {
+    let cases: Vec<StressCaseDefinition> = [14usize, 16, 18, 20, 24, 32]
+        .into_iter()
+        .flat_map(|profitable_count| {
+            [0.05, 0.25, 1.0].into_iter().map(move |budget_scale| {
+                build_boundary_profitable_case(profitable_count, budget_scale, "single_tick")
+            })
+        })
+        .collect();
+    assert_stress_cases_do_not_require_staged_reference(&cases);
+}
+
+fn assert_boundary_cutoff_suite_non_regressive(profitable_counts: &[usize], budget_scales: &[f64]) {
+    let mut checked = 0usize;
+
+    for &profitable_count in profitable_counts {
+        for &budget_scale in budget_scales {
+            let stress =
+                build_boundary_profitable_case(profitable_count, budget_scale, "single_tick");
+            let selected = rebalance_with_custom_predictions_selected_plan_for_test(
+                &stress.built.balances_view,
+                stress.built.cash_budget,
+                &stress.built.slot0_results,
+                &stress.built.predictions,
+                stress.force_mint_available,
+            );
+            let direct_only = rebalance_with_custom_predictions_selected_plan_for_test(
+                &stress.built.balances_view,
+                stress.built.cash_budget,
+                &stress.built.slot0_results,
+                &stress.built.predictions,
+                false,
+            );
+
+            assert_eq!(
+                stress.metadata.profitable_count_bucket,
+                profitable_count_bucket(profitable_count)
+            );
+            assert_eq!(
+                stress.metadata.budget_regime,
+                budget_regime_for_cash_budget(stress.built.cash_budget)
+            );
+            assert_ne!(
+                selected.fee_estimate_source, "unavailable",
+                "{} should retain modeled fee coverage",
+                stress.case_id
+            );
+            assert!(
+                selected.estimated_net_ev.unwrap_or(f64::NEG_INFINITY) + 1e-9
+                    >= direct_only.estimated_net_ev.unwrap_or(f64::NEG_INFINITY),
+                "{} selected plan should not lose to direct-only: selected={:?} direct_only={:?}",
+                stress.case_id,
+                selected,
+                direct_only
+            );
+            if let Some(constant_l) = compile_constant_l_mixed_selected_plan_for_test(
+                &stress.built.balances_view,
+                stress.built.cash_budget,
+                &stress.built.slot0_results,
+                &stress.built.predictions,
+                None,
+            ) {
+                assert!(
+                    selected.estimated_net_ev.unwrap_or(f64::NEG_INFINITY) + 1e-9
+                        >= constant_l.estimated_net_ev.unwrap_or(f64::NEG_INFINITY),
+                    "{} selected plan should not lose to its native constant-L candidate: selected={:?} constant_l={:?}",
+                    stress.case_id,
+                    selected,
+                    constant_l
+                );
+            }
+            checked += 1;
+        }
+    }
+
+    assert_eq!(
+        checked,
+        profitable_counts.len() * budget_scales.len(),
+        "boundary budget sweep should cover all requested cases"
+    );
+}
+
+fn assert_stress_cases_do_not_require_staged_reference(cases: &[StressCaseDefinition]) {
+    for stress in cases {
+        let ultimate_actions = rebalance_with_custom_predictions_for_test(
+            &stress.built.balances_view,
+            stress.built.cash_budget,
+            &stress.built.slot0_results,
+            &stress.built.predictions,
+            stress.force_mint_available,
+        );
+        let staged_actions = rebalance_with_custom_predictions_staged_reference_for_test(
+            &stress.built.balances_view,
+            stress.built.cash_budget,
+            &stress.built.slot0_results,
+            &stress.built.predictions,
+            stress.force_mint_available,
+        );
+        let ultimate_economics = estimate_plan_economics_for_test(
+            &ultimate_actions,
+            &stress.built.balances_view,
+            stress.built.cash_budget,
+            &stress.built.slot0_results,
+            &stress.built.predictions,
+        );
+        let staged_economics = estimate_plan_economics_for_test(
+            &staged_actions,
+            &stress.built.balances_view,
+            stress.built.cash_budget,
+            &stress.built.slot0_results,
+            &stress.built.predictions,
+        );
+        assert!(
+            ultimate_economics
+                .estimated_net_ev
+                .unwrap_or(f64::NEG_INFINITY)
+                + 1e-9
+                >= staged_economics
+                    .estimated_net_ev
+                    .unwrap_or(f64::NEG_INFINITY),
+            "{} staged reference still beats the default solver: ultimate={:?} staged={:?}",
+            stress.case_id,
+            ultimate_economics,
+            staged_economics
+        );
+    }
+}
+
+#[test]
+fn explicit_mint_dominant_case_prefers_mint_frontier() {
+    let stress = build_mint_dominant_case();
+    let summary = compile_constant_l_mixed_selected_plan_for_test(
+        &stress.built.balances_view,
+        stress.built.cash_budget,
+        &stress.built.slot0_results,
+        &stress.built.predictions,
+        None,
+    )
+    .expect("mint dominant case should compile a constant-L candidate");
+    let direct_only = rebalance_with_custom_predictions_selected_plan_for_test(
+        &stress.built.balances_view,
+        stress.built.cash_budget,
+        &stress.built.slot0_results,
+        &stress.built.predictions,
+        false,
+    );
+
+    assert_eq!(stress.metadata.scenario_family, "synthetic_adversarial");
+    assert!(
+        summary.mint_count > 0 && summary.direct_sell_count > 0,
+        "{} should retain a mint-dominant mixed frontier: {:?}",
+        stress.case_id,
+        summary
+    );
+    assert_eq!(
+        summary.compiler_variant, "constant_l_mixed",
+        "{} should remain in the native constant-L path: {:?}",
+        stress.case_id, summary
+    );
+    assert!(
+        summary.direct_buy_count <= 2,
+        "{} should only need a small residual direct-buy tail: {:?}",
+        stress.case_id,
+        summary
+    );
+    assert!(
+        summary.estimated_net_ev.unwrap_or(f64::NEG_INFINITY) + 1e-9
+            >= direct_only.estimated_net_ev.unwrap_or(f64::NEG_INFINITY),
+        "{} mint-dominant plan should not lose to direct-only: summary={:?} direct_only={:?}",
+        stress.case_id,
+        summary,
+        direct_only
+    );
+}
+
+#[test]
+fn tick_scope_cases_remain_finite_and_are_marked_noncanonical() {
+    for stress in build_tick_scope_cases() {
+        let selected = rebalance_with_custom_predictions_selected_plan_for_test(
+            &stress.built.balances_view,
+            stress.built.cash_budget,
+            &stress.built.slot0_results,
+            &stress.built.predictions,
+            stress.force_mint_available,
+        );
+
+        assert_eq!(stress.metadata.scenario_family, "tick_scope");
+        assert_ne!(stress.metadata.tick_regime, "single_tick");
+        assert!(
+            selected.raw_ev.is_finite(),
+            "{} raw EV should stay finite",
+            stress.case_id
+        );
+        assert!(
+            selected.estimated_net_ev.is_some(),
+            "{} should keep modeled net EV even in tick-scope stress",
+            stress.case_id
+        );
     }
 }
 
@@ -1774,6 +2601,7 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
 
     for case in cases_from_fixture() {
         let built = build_case(&case);
+        let shared_metadata = fixture_case_row_metadata(&case, &built, 1.0);
         let force_mint_available = !case.direct_only_reference;
 
         let offchain_direct_actions = rebalance_with_custom_predictions_for_test(
@@ -1826,6 +2654,13 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
             serde_json::to_string(&SharedSnapshotSolverRow {
                 case_id: case.case_id.clone(),
                 flavor: "offchain_direct".to_string(),
+                scenario_family: shared_metadata.scenario_family.to_string(),
+                outcome_count: shared_metadata.outcome_count,
+                profitable_count: shared_metadata.profitable_count,
+                profitable_count_bucket: shared_metadata.profitable_count_bucket.to_string(),
+                budget_regime: shared_metadata.budget_regime.to_string(),
+                fee_regime: shared_metadata.fee_regime.to_string(),
+                tick_regime: shared_metadata.tick_regime.to_string(),
                 raw_ev_wei: direct_raw_ev_wei.to_string(),
                 raw_ev_susd: direct_raw_ev_susd,
                 total_fee_susd: direct_fee_susd,
@@ -1876,6 +2711,13 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
             serde_json::to_string(&SharedSnapshotSolverRow {
                 case_id: case.case_id.clone(),
                 flavor: "offchain_default".to_string(),
+                scenario_family: shared_metadata.scenario_family.to_string(),
+                outcome_count: shared_metadata.outcome_count,
+                profitable_count: shared_metadata.profitable_count,
+                profitable_count_bucket: shared_metadata.profitable_count_bucket.to_string(),
+                budget_regime: shared_metadata.budget_regime.to_string(),
+                fee_regime: shared_metadata.fee_regime.to_string(),
+                tick_regime: shared_metadata.tick_regime.to_string(),
                 raw_ev_wei: default_raw_ev_wei.to_string(),
                 raw_ev_susd: default_raw_ev_susd,
                 total_fee_susd: default_fee_susd,
@@ -1932,6 +2774,13 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
                 serde_json::to_string(&SharedSnapshotSolverRow {
                     case_id: case.case_id.clone(),
                     flavor: flavor.to_string(),
+                    scenario_family: shared_metadata.scenario_family.to_string(),
+                    outcome_count: shared_metadata.outcome_count,
+                    profitable_count: shared_metadata.profitable_count,
+                    profitable_count_bucket: shared_metadata.profitable_count_bucket.to_string(),
+                    budget_regime: shared_metadata.budget_regime.to_string(),
+                    fee_regime: shared_metadata.fee_regime.to_string(),
+                    tick_regime: shared_metadata.tick_regime.to_string(),
                     raw_ev_wei: artifact.raw_ev_wei.to_string(),
                     raw_ev_susd,
                     total_fee_susd,
@@ -1977,6 +2826,8 @@ async fn print_shared_op_snapshot_onchain_benchmark_rows_jsonl() {
     let onchain_artifacts = load_onchain_call_artifacts();
 
     for case in cases_from_fixture() {
+        let built = build_case(&case);
+        let shared_metadata = fixture_case_row_metadata(&case, &built, 1.0);
         let onchain = onchain_artifacts
             .get(&case.case_id)
             .unwrap_or_else(|| panic!("missing on-chain artifact for {}", case.case_id));
@@ -2002,6 +2853,13 @@ async fn print_shared_op_snapshot_onchain_benchmark_rows_jsonl() {
                 serde_json::to_string(&SharedSnapshotSolverRow {
                     case_id: case.case_id.clone(),
                     flavor: flavor.to_string(),
+                    scenario_family: shared_metadata.scenario_family.to_string(),
+                    outcome_count: shared_metadata.outcome_count,
+                    profitable_count: shared_metadata.profitable_count,
+                    profitable_count_bucket: shared_metadata.profitable_count_bucket.to_string(),
+                    budget_regime: shared_metadata.budget_regime.to_string(),
+                    fee_regime: shared_metadata.fee_regime.to_string(),
+                    tick_regime: shared_metadata.tick_regime.to_string(),
                     raw_ev_wei: artifact.raw_ev_wei.to_string(),
                     raw_ev_susd,
                     total_fee_susd,
@@ -2039,6 +2897,7 @@ async fn print_shared_op_snapshot_onchain_benchmark_rows_jsonl() {
 async fn print_shared_op_snapshot_offchain_selected_rows_jsonl() {
     for case in cases_from_fixture() {
         let built = build_case(&case);
+        let shared_metadata = fixture_case_row_metadata(&case, &built, 1.0);
         let force_mint_available = !case.direct_only_reference;
         let k1_teacher_diagnostics = k1_teacher_row_diagnostics_for_built_case(&built);
         for (flavor, force_mint) in [
@@ -2072,6 +2931,13 @@ async fn print_shared_op_snapshot_offchain_selected_rows_jsonl() {
                 serde_json::to_string(&SharedSnapshotSolverRow {
                     case_id: case.case_id.clone(),
                     flavor: flavor.to_string(),
+                    scenario_family: shared_metadata.scenario_family.to_string(),
+                    outcome_count: shared_metadata.outcome_count,
+                    profitable_count: shared_metadata.profitable_count,
+                    profitable_count_bucket: shared_metadata.profitable_count_bucket.to_string(),
+                    budget_regime: shared_metadata.budget_regime.to_string(),
+                    fee_regime: shared_metadata.fee_regime.to_string(),
+                    tick_regime: shared_metadata.tick_regime.to_string(),
                     raw_ev_wei: raw_ev_wei.to_string(),
                     raw_ev_susd,
                     total_fee_susd,

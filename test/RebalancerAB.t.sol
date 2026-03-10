@@ -147,7 +147,11 @@ contract BenchmarkRouter {
         configs[outcomeToken] = Config({pool: pool, isToken1: isToken1, enabled: true});
     }
 
-    function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata params) external payable returns (uint256 amountOut) {
+    function exactInputSingle(IV3SwapRouter.ExactInputSingleParams calldata params)
+        external
+        payable
+        returns (uint256 amountOut)
+    {
         address outcomeToken = configs[params.tokenOut].enabled ? params.tokenOut : params.tokenIn;
         Config memory config = configs[outcomeToken];
         require(config.enabled, "unsupported benchmark route");
@@ -168,10 +172,10 @@ contract BenchmarkRouter {
         revert("unused");
     }
 
-    function _buyToken1WithToken0(
-        IV3SwapRouter.ExactInputSingleParams calldata params,
-        BenchmarkPool pool
-    ) internal returns (uint256 amountOut) {
+    function _buyToken1WithToken0(IV3SwapRouter.ExactInputSingleParams calldata params, BenchmarkPool pool)
+        internal
+        returns (uint256 amountOut)
+    {
         (uint160 start,,,,,,) = pool.slot0();
         uint128 liquidity = pool.liquidity();
         uint160 end;
@@ -192,23 +196,23 @@ contract BenchmarkRouter {
             end = endFromInput < target ? target : endFromInput;
             if (end > start) end = start;
             uint256 priceDelta = uint256(start) > uint256(end) ? uint256(start) - uint256(end) : 0;
-            uint256 noFeeIn = priceDelta == 0
-                ? 0
-                : _mulDivRoundingUp(lq96, priceDelta, uint256(start) * uint256(end));
+            uint256 noFeeIn = priceDelta == 0 ? 0 : _mulDivRoundingUp(lq96, priceDelta, uint256(start) * uint256(end));
             actualIn = feeComp == 0 ? 0 : _mulDivRoundingUp(noFeeIn, FEE_UNITS, feeComp);
             if (actualIn > params.amountIn) actualIn = params.amountIn;
             amountOut = priceDelta == 0 ? 0 : FullMath.mulDiv(uint256(liquidity), priceDelta, Q96);
         }
 
-        require(BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "buy transferFrom failed");
+        require(
+            BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "buy transferFrom failed"
+        );
         BenchmarkERC20(params.tokenOut).mint(params.recipient, amountOut);
         pool.setSqrtPrice(end);
     }
 
-    function _sellToken1ForToken0(
-        IV3SwapRouter.ExactInputSingleParams calldata params,
-        BenchmarkPool pool
-    ) internal returns (uint256 amountOut) {
+    function _sellToken1ForToken0(IV3SwapRouter.ExactInputSingleParams calldata params, BenchmarkPool pool)
+        internal
+        returns (uint256 amountOut)
+    {
         (uint160 start,,,,,,) = pool.slot0();
         uint128 liquidity = pool.liquidity();
         uint160 end;
@@ -234,15 +238,17 @@ contract BenchmarkRouter {
             amountOut = priceDelta == 0 ? 0 : FullMath.mulDiv(lq96, priceDelta, uint256(end) * uint256(start));
         }
 
-        require(BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "sell transferFrom failed");
+        require(
+            BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "sell transferFrom failed"
+        );
         BenchmarkERC20(params.tokenOut).mint(params.recipient, amountOut);
         pool.setSqrtPrice(end);
     }
 
-    function _buyToken0WithToken1(
-        IV3SwapRouter.ExactInputSingleParams calldata params,
-        BenchmarkPool pool
-    ) internal returns (uint256 amountOut) {
+    function _buyToken0WithToken1(IV3SwapRouter.ExactInputSingleParams calldata params, BenchmarkPool pool)
+        internal
+        returns (uint256 amountOut)
+    {
         (uint160 start,,,,,,) = pool.slot0();
         uint128 liquidity = pool.liquidity();
         uint160 end;
@@ -268,15 +274,17 @@ contract BenchmarkRouter {
             amountOut = priceDelta == 0 ? 0 : FullMath.mulDiv(lq96, priceDelta, uint256(end) * uint256(start));
         }
 
-        require(BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "buy transferFrom failed");
+        require(
+            BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "buy transferFrom failed"
+        );
         BenchmarkERC20(params.tokenOut).mint(params.recipient, amountOut);
         pool.setSqrtPrice(end);
     }
 
-    function _sellToken0ForToken1(
-        IV3SwapRouter.ExactInputSingleParams calldata params,
-        BenchmarkPool pool
-    ) internal returns (uint256 amountOut) {
+    function _sellToken0ForToken1(IV3SwapRouter.ExactInputSingleParams calldata params, BenchmarkPool pool)
+        internal
+        returns (uint256 amountOut)
+    {
         (uint160 start,,,,,,) = pool.slot0();
         uint128 liquidity = pool.liquidity();
         uint160 end;
@@ -297,15 +305,15 @@ contract BenchmarkRouter {
             end = endFromInput < target ? target : endFromInput;
             if (end > start) end = start;
             uint256 priceDelta = uint256(start) > uint256(end) ? uint256(start) - uint256(end) : 0;
-            uint256 noFeeIn = priceDelta == 0
-                ? 0
-                : _mulDivRoundingUp(lq96, priceDelta, uint256(start) * uint256(end));
+            uint256 noFeeIn = priceDelta == 0 ? 0 : _mulDivRoundingUp(lq96, priceDelta, uint256(start) * uint256(end));
             actualIn = feeComp == 0 ? 0 : _mulDivRoundingUp(noFeeIn, FEE_UNITS, feeComp);
             if (actualIn > params.amountIn) actualIn = params.amountIn;
             amountOut = priceDelta == 0 ? 0 : FullMath.mulDiv(uint256(liquidity), priceDelta, Q96);
         }
 
-        require(BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "sell transferFrom failed");
+        require(
+            BenchmarkERC20(params.tokenIn).transferFrom(msg.sender, address(this), actualIn), "sell transferFrom failed"
+        );
         BenchmarkERC20(params.tokenOut).mint(params.recipient, amountOut);
         pool.setSqrtPrice(end);
     }
@@ -397,37 +405,16 @@ contract RebalancerABTest is Test {
         uint24 feeTier = uint24(json.readUint(".fee_tier"));
         uint256 cashWad = json.readUint(".initial_cash_budget_wad");
 
-        Scenario memory constantScenario = _buildScenario(
-            pricesWad,
-            predsWad,
-            holdingsWad,
-            liquidities,
-            isToken1,
-            cashWad,
-            feeTier
-        );
+        Scenario memory constantScenario =
+            _buildScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
         constantScenario.rebalancer.rebalance(constantScenario.params);
-        uint256 constantEv = _portfolioEvWad(
-            constantScenario.collateral,
-            constantScenario.tokens,
-            constantScenario.predictionsWad
-        );
+        uint256 constantEv =
+            _portfolioEvWad(constantScenario.collateral, constantScenario.tokens, constantScenario.predictionsWad);
 
-        Scenario memory exactScenario = _buildScenario(
-            pricesWad,
-            predsWad,
-            holdingsWad,
-            liquidities,
-            isToken1,
-            cashWad,
-            feeTier
-        );
+        Scenario memory exactScenario =
+            _buildScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
         exactScenario.rebalancer.rebalanceExact(exactScenario.params, 24, 4);
-        uint256 exactEv = _portfolioEvWad(
-            exactScenario.collateral,
-            exactScenario.tokens,
-            exactScenario.predictionsWad
-        );
+        uint256 exactEv = _portfolioEvWad(exactScenario.collateral, exactScenario.tokens, exactScenario.predictionsWad);
 
         uint256 directTol = _evParityTol(offchainDirect, constantEv);
         uint256 fullTol = _evParityTol(offchainFullRebalanceOnly, constantEv);
@@ -439,8 +426,7 @@ contract RebalancerABTest is Test {
         emit log_named_uint("onchain_exact_ev", exactEv);
         emit log_named_int("constant_minus_offchain_direct", int256(constantEv) - int256(offchainDirect));
         emit log_named_int(
-            "offchain_full_minus_onchain_constant",
-            int256(offchainFullRebalanceOnly) - int256(constantEv)
+            "offchain_full_minus_onchain_constant", int256(offchainFullRebalanceOnly) - int256(constantEv)
         );
 
         assertTrue(
@@ -455,10 +441,7 @@ contract RebalancerABTest is Test {
             offchainFullRebalanceOnly + fullTol >= constantEv,
             string.concat(caseId, ": offchain full rebalance-only underperformed onchain constant")
         );
-        assertTrue(
-            exactEv + fullTol >= constantEv,
-            string.concat(caseId, ": exact path underperformed constant path")
-        );
+        assertTrue(exactEv + fullTol >= constantEv, string.concat(caseId, ": exact path underperformed constant path"));
     }
 
     function test_rebalancer_vs_mixed_apples_to_apples_report() external {
@@ -522,6 +505,38 @@ contract RebalancerABTest is Test {
         vm.writeJson(rootJson, _onchainCallReportPath());
     }
 
+    function test_write_rebalancer_ab_stress_onchain_call_report() external {
+        string[] memory caseIds = _stressCaseIds();
+        string memory rootKey = "rebalancer_ab_stress_onchain_call_report";
+        string memory rootJson = "";
+
+        for (uint256 i = 0; i < caseIds.length; i++) {
+            string memory caseId = caseIds[i];
+            OnchainBenchmarkCallArtifact memory exact = _buildExactStressArtifact(caseId);
+            OnchainBenchmarkCallArtifact memory mixed = _buildMixedStressArtifact(caseId);
+
+            string memory exactKey = string.concat(caseId, "_exact");
+            string memory exactJson = vm.serializeAddress(exactKey, "target", exact.target);
+            exactJson = vm.serializeBytes(exactKey, "calldata", exact.calldataBytes);
+            exactJson = vm.serializeUint(exactKey, "gas_units", exact.gasUnits);
+            exactJson = vm.serializeString(exactKey, "raw_ev_wei", vm.toString(exact.rawEvWei));
+
+            string memory mixedKey = string.concat(caseId, "_mixed");
+            string memory mixedJson = vm.serializeAddress(mixedKey, "target", mixed.target);
+            mixedJson = vm.serializeBytes(mixedKey, "calldata", mixed.calldataBytes);
+            mixedJson = vm.serializeUint(mixedKey, "gas_units", mixed.gasUnits);
+            mixedJson = vm.serializeString(mixedKey, "raw_ev_wei", vm.toString(mixed.rawEvWei));
+
+            string memory caseKey = string.concat(caseId, "_case");
+            string memory caseJson = vm.serializeString(caseKey, "case_id", caseId);
+            caseJson = vm.serializeString(caseKey, "exact", exactJson);
+            caseJson = vm.serializeString(caseKey, "mixed", mixedJson);
+            rootJson = vm.serializeString(rootKey, caseId, caseJson);
+        }
+
+        vm.writeJson(rootJson, _stressOnchainCallReportPath());
+    }
+
     function _checkDirectParity(string memory caseId) internal returns (string memory failure) {
         (uint256 offchainDirect,,,,) = _expectedRow(caseId);
         (uint256 constantEv, uint256 exactEv) = _runCase(caseId);
@@ -559,8 +574,7 @@ contract RebalancerABTest is Test {
         emit log_named_uint("onchain_exact_ev", exactEv);
         emit log_named_int("constant_minus_offchain_direct", int256(constantEv) - int256(offchainDirect));
         emit log_named_int(
-            "offchain_full_minus_onchain_constant",
-            int256(offchainFullRebalanceOnly) - int256(constantEv)
+            "offchain_full_minus_onchain_constant", int256(offchainFullRebalanceOnly) - int256(constantEv)
         );
 
         if (offchainDirect + directTol < constantEv) {
@@ -582,19 +596,12 @@ contract RebalancerABTest is Test {
     function _runCase(string memory caseId) internal returns (uint256 constantEv, uint256 exactEv) {
         Scenario memory constantScenario = _buildCase(caseId);
         constantScenario.rebalancer.rebalance(constantScenario.params);
-        constantEv = _portfolioEvWad(
-            constantScenario.collateral,
-            constantScenario.tokens,
-            constantScenario.predictionsWad
-        );
+        constantEv =
+            _portfolioEvWad(constantScenario.collateral, constantScenario.tokens, constantScenario.predictionsWad);
 
         Scenario memory exactScenario = _buildCase(caseId);
         exactScenario.rebalancer.rebalanceExact(exactScenario.params, 24, 4);
-        exactEv = _portfolioEvWad(
-            exactScenario.collateral,
-            exactScenario.tokens,
-            exactScenario.predictionsWad
-        );
+        exactEv = _portfolioEvWad(exactScenario.collateral, exactScenario.tokens, exactScenario.predictionsWad);
     }
 
     function _runRebalancerVsMixedCase(string memory caseId) internal returns (MixedComparisonResult memory r) {
@@ -602,27 +609,17 @@ contract RebalancerABTest is Test {
         uint256 gasStartConstant = gasleft();
         constantScenario.rebalancer.rebalance(constantScenario.params);
         r.rebalancerGas = gasStartConstant - gasleft();
-        r.rebalancerEv = _portfolioEvWad(
-            constantScenario.collateral,
-            constantScenario.tokens,
-            constantScenario.predictionsWad
-        );
+        r.rebalancerEv =
+            _portfolioEvWad(constantScenario.collateral, constantScenario.tokens, constantScenario.predictionsWad);
 
         MixedScenario memory mixedScenario = _buildMixedCase(caseId);
         uint256 gasStartMixed = gasleft();
-        mixedScenario.rebalancerMixed.rebalanceMixedConstantL(
-            mixedScenario.params,
-            BENCHMARK_MARKET,
-            BENCHMARK_MAX_OUTER_ITERS,
-            BENCHMARK_MAX_INNER_ITERS,
-            0
-        );
+        mixedScenario.rebalancerMixed
+            .rebalanceMixedConstantL(
+                mixedScenario.params, BENCHMARK_MARKET, BENCHMARK_MAX_OUTER_ITERS, BENCHMARK_MAX_INNER_ITERS, 0
+            );
         r.mixedGas = gasStartMixed - gasleft();
-        r.mixedEv = _portfolioEvWad(
-            mixedScenario.collateral,
-            mixedScenario.tokens,
-            mixedScenario.predictionsWad
-        );
+        r.mixedEv = _portfolioEvWad(mixedScenario.collateral, mixedScenario.tokens, mixedScenario.predictionsWad);
 
         r.evDiff = _signedDiff(r.mixedEv, r.rebalancerEv);
         r.gasDiff = _signedDiff(r.mixedGas, r.rebalancerGas);
@@ -633,18 +630,12 @@ contract RebalancerABTest is Test {
     function _buildExactArtifact(string memory caseId) internal returns (OnchainBenchmarkCallArtifact memory artifact) {
         Scenario memory exactScenario = _buildCase(caseId);
         artifact.target = address(exactScenario.rebalancer);
-        artifact.calldataBytes = abi.encodeCall(
-            exactScenario.rebalancer.rebalanceExact,
-            (exactScenario.params, 24, 4)
-        );
+        artifact.calldataBytes = abi.encodeCall(exactScenario.rebalancer.rebalanceExact, (exactScenario.params, 24, 4));
         uint256 gasStart = gasleft();
         exactScenario.rebalancer.rebalanceExact(exactScenario.params, 24, 4);
         artifact.gasUnits = gasStart - gasleft();
-        artifact.rawEvWei = _portfolioEvWad(
-            exactScenario.collateral,
-            exactScenario.tokens,
-            exactScenario.predictionsWad
-        );
+        artifact.rawEvWei =
+            _portfolioEvWad(exactScenario.collateral, exactScenario.tokens, exactScenario.predictionsWad);
     }
 
     function _buildMixedArtifact(string memory caseId) internal returns (OnchainBenchmarkCallArtifact memory artifact) {
@@ -652,28 +643,50 @@ contract RebalancerABTest is Test {
         artifact.target = address(mixedScenario.rebalancerMixed);
         artifact.calldataBytes = abi.encodeCall(
             mixedScenario.rebalancerMixed.rebalanceMixedConstantL,
-            (
-                mixedScenario.params,
-                BENCHMARK_MARKET,
-                BENCHMARK_MAX_OUTER_ITERS,
-                BENCHMARK_MAX_INNER_ITERS,
-                0
-            )
+            (mixedScenario.params, BENCHMARK_MARKET, BENCHMARK_MAX_OUTER_ITERS, BENCHMARK_MAX_INNER_ITERS, 0)
         );
         uint256 gasStart = gasleft();
-        mixedScenario.rebalancerMixed.rebalanceMixedConstantL(
-            mixedScenario.params,
-            BENCHMARK_MARKET,
-            BENCHMARK_MAX_OUTER_ITERS,
-            BENCHMARK_MAX_INNER_ITERS,
-            0
-        );
+        mixedScenario.rebalancerMixed
+            .rebalanceMixedConstantL(
+                mixedScenario.params, BENCHMARK_MARKET, BENCHMARK_MAX_OUTER_ITERS, BENCHMARK_MAX_INNER_ITERS, 0
+            );
         artifact.gasUnits = gasStart - gasleft();
-        artifact.rawEvWei = _portfolioEvWad(
-            mixedScenario.collateral,
-            mixedScenario.tokens,
-            mixedScenario.predictionsWad
+        artifact.rawEvWei =
+            _portfolioEvWad(mixedScenario.collateral, mixedScenario.tokens, mixedScenario.predictionsWad);
+    }
+
+    function _buildExactStressArtifact(string memory caseId)
+        internal
+        returns (OnchainBenchmarkCallArtifact memory artifact)
+    {
+        Scenario memory exactScenario = _buildStressCase(caseId);
+        artifact.target = address(exactScenario.rebalancer);
+        artifact.calldataBytes = abi.encodeCall(exactScenario.rebalancer.rebalanceExact, (exactScenario.params, 24, 4));
+        uint256 gasStart = gasleft();
+        exactScenario.rebalancer.rebalanceExact(exactScenario.params, 24, 4);
+        artifact.gasUnits = gasStart - gasleft();
+        artifact.rawEvWei =
+            _portfolioEvWad(exactScenario.collateral, exactScenario.tokens, exactScenario.predictionsWad);
+    }
+
+    function _buildMixedStressArtifact(string memory caseId)
+        internal
+        returns (OnchainBenchmarkCallArtifact memory artifact)
+    {
+        MixedScenario memory mixedScenario = _buildMixedStressCase(caseId);
+        artifact.target = address(mixedScenario.rebalancerMixed);
+        artifact.calldataBytes = abi.encodeCall(
+            mixedScenario.rebalancerMixed.rebalanceMixedConstantL,
+            (mixedScenario.params, BENCHMARK_MARKET, BENCHMARK_MAX_OUTER_ITERS, BENCHMARK_MAX_INNER_ITERS, 0)
         );
+        uint256 gasStart = gasleft();
+        mixedScenario.rebalancerMixed
+            .rebalanceMixedConstantL(
+                mixedScenario.params, BENCHMARK_MARKET, BENCHMARK_MAX_OUTER_ITERS, BENCHMARK_MAX_INNER_ITERS, 0
+            );
+        artifact.gasUnits = gasStart - gasleft();
+        artifact.rawEvWei =
+            _portfolioEvWad(mixedScenario.collateral, mixedScenario.tokens, mixedScenario.predictionsWad);
     }
 
     function _buildCase(string memory caseId) internal returns (Scenario memory scenario) {
@@ -720,6 +733,175 @@ contract RebalancerABTest is Test {
         return _buildMixedScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
     }
 
+    function _buildStressCase(string memory caseId) internal returns (Scenario memory scenario) {
+        if (_stressCaseIdMatches(caseId, "preserve_frontier_inactive_sell_case")) {
+            uint256[] memory pricesWad = new uint256[](5);
+            uint256[] memory predsWad = new uint256[](5);
+            uint256[] memory holdingsWad = new uint256[](5);
+            uint256[] memory liquidities = new uint256[](5);
+            bool[] memory isToken1 = new bool[](5);
+
+            pricesWad[0] = 13e16;
+            pricesWad[1] = 16e16;
+            pricesWad[2] = 34e16;
+            pricesWad[3] = 25e16;
+            pricesWad[4] = 12e16;
+            predsWad[0] = 27e16;
+            predsWad[1] = 24e16;
+            predsWad[2] = 18e16;
+            predsWad[3] = 16e16;
+            predsWad[4] = 15e16;
+            holdingsWad[2] = 7e18;
+            holdingsWad[3] = 4e18;
+            liquidities[0] = 2_400_000_000_000_000_000_000;
+            liquidities[1] = 2_300_000_000_000_000_000_000;
+            liquidities[2] = 3_100_000_000_000_000_000_000;
+            liquidities[3] = 2_700_000_000_000_000_000_000;
+            liquidities[4] = 2_500_000_000_000_000_000_000;
+            for (uint256 i = 0; i < 5; i++) {
+                isToken1[i] = true;
+            }
+            return _buildScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, 18e18, 100);
+        }
+        if (_stressCaseIdMatches(caseId, "mint_dominant_case")) {
+            uint256[] memory pricesWad = new uint256[](3);
+            uint256[] memory predsWad = new uint256[](3);
+            uint256[] memory holdingsWad = new uint256[](3);
+            uint256[] memory liquidities = new uint256[](3);
+            bool[] memory isToken1 = new bool[](3);
+
+            pricesWad[0] = 84e16;
+            pricesWad[1] = 8e16;
+            pricesWad[2] = 8e16;
+            predsWad[0] = 36e16;
+            predsWad[1] = 32e16;
+            predsWad[2] = 32e16;
+            liquidities[0] = 2_800_000_000_000_000_000_000;
+            liquidities[1] = 2_800_000_000_000_000_000_000;
+            liquidities[2] = 2_800_000_000_000_000_000_000;
+            for (uint256 i = 0; i < 3; i++) {
+                isToken1[i] = true;
+            }
+            return _buildScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, 30e18, 100);
+        }
+        if (_stressCaseIdMatches(caseId, "boundary_profitable_16_full_single_tick")) {
+            return _buildBoundaryStressScenario(16, 100e18);
+        }
+        if (_stressCaseIdMatches(caseId, "boundary_profitable_20_tiny_single_tick")) {
+            return _buildBoundaryStressScenario(20, 5e18);
+        }
+        revert("unknown stress case");
+    }
+
+    function _buildMixedStressCase(string memory caseId) internal returns (MixedScenario memory scenario) {
+        if (_stressCaseIdMatches(caseId, "preserve_frontier_inactive_sell_case")) {
+            uint256[] memory pricesWad = new uint256[](5);
+            uint256[] memory predsWad = new uint256[](5);
+            uint256[] memory holdingsWad = new uint256[](5);
+            uint256[] memory liquidities = new uint256[](5);
+            bool[] memory isToken1 = new bool[](5);
+
+            pricesWad[0] = 13e16;
+            pricesWad[1] = 16e16;
+            pricesWad[2] = 34e16;
+            pricesWad[3] = 25e16;
+            pricesWad[4] = 12e16;
+            predsWad[0] = 27e16;
+            predsWad[1] = 24e16;
+            predsWad[2] = 18e16;
+            predsWad[3] = 16e16;
+            predsWad[4] = 15e16;
+            holdingsWad[2] = 7e18;
+            holdingsWad[3] = 4e18;
+            liquidities[0] = 2_400_000_000_000_000_000_000;
+            liquidities[1] = 2_300_000_000_000_000_000_000;
+            liquidities[2] = 3_100_000_000_000_000_000_000;
+            liquidities[3] = 2_700_000_000_000_000_000_000;
+            liquidities[4] = 2_500_000_000_000_000_000_000;
+            for (uint256 i = 0; i < 5; i++) {
+                isToken1[i] = true;
+            }
+            return _buildMixedScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, 18e18, 100);
+        }
+        if (_stressCaseIdMatches(caseId, "mint_dominant_case")) {
+            uint256[] memory pricesWad = new uint256[](3);
+            uint256[] memory predsWad = new uint256[](3);
+            uint256[] memory holdingsWad = new uint256[](3);
+            uint256[] memory liquidities = new uint256[](3);
+            bool[] memory isToken1 = new bool[](3);
+
+            pricesWad[0] = 84e16;
+            pricesWad[1] = 8e16;
+            pricesWad[2] = 8e16;
+            predsWad[0] = 36e16;
+            predsWad[1] = 32e16;
+            predsWad[2] = 32e16;
+            liquidities[0] = 2_800_000_000_000_000_000_000;
+            liquidities[1] = 2_800_000_000_000_000_000_000;
+            liquidities[2] = 2_800_000_000_000_000_000_000;
+            for (uint256 i = 0; i < 3; i++) {
+                isToken1[i] = true;
+            }
+            return _buildMixedScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, 30e18, 100);
+        }
+        if (_stressCaseIdMatches(caseId, "boundary_profitable_16_full_single_tick")) {
+            return _buildMixedBoundaryStressScenario(16, 100e18);
+        }
+        if (_stressCaseIdMatches(caseId, "boundary_profitable_20_tiny_single_tick")) {
+            return _buildMixedBoundaryStressScenario(20, 5e18);
+        }
+        revert("unknown stress case");
+    }
+
+    function _buildBoundaryStressScenario(uint256 profitableCount, uint256 cashWad) internal returns (Scenario memory) {
+        uint256 outcomeCount = profitableCount + 2;
+        uint256[] memory pricesWad = new uint256[](outcomeCount);
+        uint256[] memory predsWad = new uint256[](outcomeCount);
+        uint256[] memory holdingsWad = new uint256[](outcomeCount);
+        uint256[] memory liquidities = new uint256[](outcomeCount);
+        bool[] memory isToken1 = new bool[](outcomeCount);
+        uint256 basePred = WAD / outcomeCount;
+        uint256 remainder = WAD - basePred * outcomeCount;
+
+        for (uint256 i = 0; i < outcomeCount; i++) {
+            uint256 pred = basePred;
+            if (i == 0) pred += remainder;
+            predsWad[i] = pred;
+            uint256 priceBps = i < profitableCount ? 7600 + 300 * (i % 4) : 10300 + 200 * ((i - profitableCount) % 3);
+            pricesWad[i] = pred * priceBps / 10_000;
+            liquidities[i] = 3_500_000_000_000_000_000_000 + i * 50_000_000_000_000_000;
+            isToken1[i] = true;
+        }
+
+        return _buildScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, 100);
+    }
+
+    function _buildMixedBoundaryStressScenario(uint256 profitableCount, uint256 cashWad)
+        internal
+        returns (MixedScenario memory)
+    {
+        uint256 outcomeCount = profitableCount + 2;
+        uint256[] memory pricesWad = new uint256[](outcomeCount);
+        uint256[] memory predsWad = new uint256[](outcomeCount);
+        uint256[] memory holdingsWad = new uint256[](outcomeCount);
+        uint256[] memory liquidities = new uint256[](outcomeCount);
+        bool[] memory isToken1 = new bool[](outcomeCount);
+        uint256 basePred = WAD / outcomeCount;
+        uint256 remainder = WAD - basePred * outcomeCount;
+
+        for (uint256 i = 0; i < outcomeCount; i++) {
+            uint256 pred = basePred;
+            if (i == 0) pred += remainder;
+            predsWad[i] = pred;
+            uint256 priceBps = i < profitableCount ? 7600 + 300 * (i % 4) : 10300 + 200 * ((i - profitableCount) % 3);
+            pricesWad[i] = pred * priceBps / 10_000;
+            liquidities[i] = 3_500_000_000_000_000_000_000 + i * 50_000_000_000_000_000;
+            isToken1[i] = true;
+        }
+
+        return _buildMixedScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, 100);
+    }
+
     function _buildScenario(
         uint256[] memory pricesWad,
         uint256[] memory predsWad,
@@ -731,10 +913,7 @@ contract RebalancerABTest is Test {
     ) internal returns (Scenario memory scenario) {
         uint256 n = pricesWad.length;
         require(
-            n == predsWad.length &&
-            n == holdingsWad.length &&
-            n == liquidities.length &&
-            n == isToken1.length,
+            n == predsWad.length && n == holdingsWad.length && n == liquidities.length && n == isToken1.length,
             "length mismatch"
         );
 
@@ -748,10 +927,8 @@ contract RebalancerABTest is Test {
 
         for (uint256 i = 0; i < n; i++) {
             BenchmarkERC20 token = new BenchmarkERC20();
-            BenchmarkPool pool = new BenchmarkPool(
-                _priceWadToSqrtX96(pricesWad[i], isToken1[i]),
-                uint128(liquidities[i])
-            );
+            BenchmarkPool pool =
+                new BenchmarkPool(_priceWadToSqrtX96(pricesWad[i], isToken1[i]), uint128(liquidities[i]));
             pool.setTick(0);
 
             scenario.tokens[i] = token;
@@ -825,10 +1002,7 @@ contract RebalancerABTest is Test {
     ) internal returns (MixedScenario memory scenario) {
         uint256 n = pricesWad.length;
         require(
-            n == predsWad.length &&
-            n == holdingsWad.length &&
-            n == liquidities.length &&
-            n == isToken1.length,
+            n == predsWad.length && n == holdingsWad.length && n == liquidities.length && n == isToken1.length,
             "length mismatch"
         );
 
@@ -843,10 +1017,8 @@ contract RebalancerABTest is Test {
 
         for (uint256 i = 0; i < n; i++) {
             BenchmarkERC20 token = new BenchmarkERC20();
-            BenchmarkPool pool = new BenchmarkPool(
-                _priceWadToSqrtX96(pricesWad[i], isToken1[i]),
-                uint128(liquidities[i])
-            );
+            BenchmarkPool pool =
+                new BenchmarkPool(_priceWadToSqrtX96(pricesWad[i], isToken1[i]), uint128(liquidities[i]));
             pool.setTick(0);
 
             scenario.tokens[i] = token;
@@ -918,11 +1090,11 @@ contract RebalancerABTest is Test {
         arrays.sqrtPredX96 = new uint160[](n);
     }
 
-    function _portfolioEvWad(
-        BenchmarkERC20 collateral,
-        BenchmarkERC20[] memory tokens,
-        uint256[] memory predictionsWad
-    ) internal view returns (uint256 evWad) {
+    function _portfolioEvWad(BenchmarkERC20 collateral, BenchmarkERC20[] memory tokens, uint256[] memory predictionsWad)
+        internal
+        view
+        returns (uint256 evWad)
+    {
         evWad = collateral.balanceOf(address(this));
         for (uint256 i = 0; i < tokens.length; i++) {
             evWad += FullMath.mulDiv(tokens[i].balanceOf(address(this)), predictionsWad[i], WAD);
@@ -982,6 +1154,18 @@ contract RebalancerABTest is Test {
         return vm.readFile(string.concat(vm.projectRoot(), "/test/fixtures/rebalancer_ab_cases.json"));
     }
 
+    function _stressCaseIds() internal pure returns (string[] memory caseIds) {
+        caseIds = new string[](4);
+        caseIds[0] = "preserve_frontier_inactive_sell_case";
+        caseIds[1] = "mint_dominant_case";
+        caseIds[2] = "boundary_profitable_16_full_single_tick";
+        caseIds[3] = "boundary_profitable_20_tiny_single_tick";
+    }
+
+    function _stressCaseIdMatches(string memory left, string memory right) internal pure returns (bool) {
+        return keccak256(bytes(left)) == keccak256(bytes(right));
+    }
+
     function _expectedJson() internal view returns (string memory) {
         return vm.readFile(string.concat(vm.projectRoot(), "/test/fixtures/rebalancer_ab_expected.json"));
     }
@@ -994,12 +1178,15 @@ contract RebalancerABTest is Test {
         return string.concat(vm.projectRoot(), "/test/fixtures/rebalancer_ab_onchain_call_report.json");
     }
 
+    function _stressOnchainCallReportPath() internal view returns (string memory) {
+        return string.concat(vm.projectRoot(), "/test/fixtures/rebalancer_ab_stress_onchain_call_report.json");
+    }
+
     function _priceWadToSqrtX96(uint256 priceWad, bool isToken1Outcome) internal pure returns (uint160) {
         require(priceWad > 0, "price=0");
         uint256 two192 = uint256(1) << 192;
-        uint256 scaled = isToken1Outcome
-            ? FullMath.mulDiv(two192, WAD, priceWad)
-            : FullMath.mulDiv(two192, priceWad, WAD);
+        uint256 scaled =
+            isToken1Outcome ? FullMath.mulDiv(two192, WAD, priceWad) : FullMath.mulDiv(two192, priceWad, WAD);
         return uint160(_sqrt(scaled));
     }
 
@@ -1012,5 +1199,4 @@ contract RebalancerABTest is Test {
             y = (x / z + z) / 2;
         }
     }
-
 }

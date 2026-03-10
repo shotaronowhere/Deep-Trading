@@ -60,13 +60,20 @@ const MAX_ONLINE_PRESERVE_CANDIDATES: usize = 4;
 const MAX_DISTILLED_PRESERVE_SET_SIZE: usize = 5;
 const MAX_DISTILLED_EXTRA_PROPOSAL_SETS: usize = 3;
 const ARB_OPERATOR_EV_REL_TOL: f64 = 1e-10;
+#[cfg(test)]
 const MAX_META_SOLVER_INVOCATIONS: usize = 192;
 const MAX_PRESERVE_SEARCH_CANDIDATES: usize = 12;
+#[cfg(test)]
 const MAX_EXACT_PRESERVE_SUBSET_CANDIDATES: usize = 6;
+#[cfg(test)]
 const MAX_PRESERVE_LOCAL_SEARCH_ROUNDS: usize = 2;
+#[cfg(test)]
 const RESERVED_FIRST_FRONTIER_BRANCH_INVOCATIONS: usize = 2;
+#[cfg(test)]
 const MAX_CYCLIC_LATE_ARB_CYCLES: usize = 8;
+#[cfg(test)]
 const MAX_CYCLIC_LATE_ARB_INVOCATIONS: usize = MAX_CYCLIC_LATE_ARB_CYCLES * 2;
+#[cfg(test)]
 const CYCLIC_LATE_ARB_EV_REL_TOL: f64 = 1e-10;
 const DEFAULT_GATE_BUFFER_FRAC: f64 = 0.20;
 const DEFAULT_GATE_BUFFER_MIN_SUSD: f64 = 0.25;
@@ -142,17 +149,6 @@ struct PlanCostEstimate {
     source: FeeEstimateSource,
 }
 
-fn staged_fallback_enabled() -> bool {
-    match std::env::var("REBALANCE_ENABLE_STAGED_FALLBACK")
-        .ok()
-        .map(|raw| raw.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("1" | "true" | "yes" | "on" | "enabled") => true,
-        _ => false,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebalanceMode {
     Full,
@@ -164,6 +160,7 @@ pub struct RebalanceFlags {
     pub enable_ev_guarded_greedy_churn_pruning: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhaseOrderVariant {
     ArbFirst,
@@ -172,6 +169,7 @@ enum PhaseOrderVariant {
     CyclicLateArb,
 }
 
+#[cfg(test)]
 impl PhaseOrderVariant {
     const STATIC_ALL: [Self; 3] = [Self::ArbFirst, Self::ArbLast, Self::NoArb];
 
@@ -219,11 +217,13 @@ fn first_frontier_family_stable_rank(family: Option<BundleRouteKind>) -> usize {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct MetaSearchBudget {
     remaining: usize,
 }
 
+#[cfg(test)]
 impl MetaSearchBudget {
     fn new(remaining: usize) -> Self {
         Self { remaining }
@@ -238,6 +238,7 @@ impl MetaSearchBudget {
     }
 }
 
+#[cfg(test)]
 fn with_budget_slice<T>(
     meta_budget: &mut MetaSearchBudget,
     allowance: usize,
@@ -251,6 +252,7 @@ fn with_budget_slice<T>(
     result
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CandidateResult {
@@ -266,6 +268,7 @@ struct CandidateResult {
     forced_first_frontier_family: Option<BundleRouteKind>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct PhaseOrderVariantEvaluation {
     baseline: CandidateResult,
@@ -273,6 +276,7 @@ struct PhaseOrderVariantEvaluation {
     preserve_candidates: Vec<&'static str>,
 }
 
+#[cfg(test)]
 impl PhaseOrderVariantEvaluation {
     fn best_candidate(&self) -> &CandidateResult {
         if candidate_is_better(&self.greedy_best, &self.baseline) {
@@ -291,6 +295,7 @@ impl PhaseOrderVariantEvaluation {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct RefinedCandidateResult {
     candidate: CandidateResult,
@@ -680,6 +685,20 @@ fn benchmark_planner_cost_config_for_test() -> PlannerCostConfig {
         BENCHMARK_OP_GAS_PRICE_ETH,
         BENCHMARK_OP_ETH_USD,
         "benchmark_snapshot_op_2026_03_08_fixed_l1",
+    )
+}
+
+#[cfg(test)]
+fn benchmark_planner_cost_config_with_pricing_for_test(
+    gas_assumptions: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+) -> PlannerCostConfig {
+    planner_cost_config_with_pricing(
+        gas_assumptions,
+        gas_price_eth,
+        eth_usd,
+        "benchmark_test_explicit_pricing",
     )
 }
 
@@ -2122,6 +2141,7 @@ fn with_mixed_certificates(
     plan
 }
 
+#[cfg(test)]
 fn build_candidate_result(
     starting_state: &SolverStateSnapshot,
     actions: Vec<Action>,
@@ -2229,6 +2249,7 @@ fn collect_mint_sell_preserve_candidate_scores(
     candidates
 }
 
+#[cfg(test)]
 fn collect_mint_sell_preserve_candidates(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -2248,6 +2269,7 @@ fn collect_mint_sell_preserve_candidates(
     .collect()
 }
 
+#[cfg(test)]
 fn action_plan_expected_value(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -5961,50 +5983,6 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         best = arb_primed;
     }
 
-    let use_staged_fallback = staged_fallback_enabled();
-    if use_staged_fallback {
-        let staged_reference_actions = rebalance_full_with_predictions_staged_reference(
-            balances,
-            susds_balance,
-            slot0_results,
-            predictions,
-            expected_count,
-            route_gates,
-            cost_config,
-            RebalanceFlags::default(),
-            force_mint_available,
-            verify_internal_state,
-        );
-        let staged_reference_ev = action_plan_expected_value(
-            &staged_reference_actions,
-            slot0_results,
-            balances,
-            susds_balance,
-            predictions,
-        );
-        if let Some(staged_terminal_state) =
-            apply_actions_to_solver_state(&initial_state, &staged_reference_actions, predictions)
-        {
-            let staged_reference = build_plan_result(
-                &initial_state,
-                staged_terminal_state,
-                staged_reference_actions,
-                staged_reference_ev,
-                None,
-                Vec::new(),
-                SolverFamily::Plain,
-                cost_config,
-                PlanCompilerVariant::NoOp,
-                None,
-                None,
-                None,
-            );
-            if plan_result_is_better(&staged_reference, &best) {
-                best = staged_reference;
-            }
-        }
-    }
-
     tracing::info!(
         chosen_family = best.family.as_str(),
         chosen_frontier_family = first_frontier_family_label(best.frontier_family),
@@ -6025,13 +6003,13 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         arb_operator_evals = stats.arb_operator_evals,
         arb_primed_root_taken = stats.arb_primed_root_taken,
         fee_estimate_unavailable_results = stats.fee_estimate_unavailable_results,
-        staged_fallback_enabled = use_staged_fallback,
         "ultimate solver result"
     );
 
     (best, stats)
 }
 
+#[cfg(test)]
 fn candidate_is_better(candidate: &CandidateResult, incumbent: &CandidateResult) -> bool {
     let economic_cmp = net_ev_cmp(
         candidate.estimated_net_ev,
@@ -6076,6 +6054,7 @@ fn candidate_is_better(candidate: &CandidateResult, incumbent: &CandidateResult)
     candidate.raw_ev.total_cmp(&incumbent.raw_ev).is_gt()
 }
 
+#[cfg(test)]
 fn candidate_cmp(left: &CandidateResult, right: &CandidateResult) -> Ordering {
     if candidate_is_better(left, right) {
         Ordering::Less
@@ -6086,6 +6065,7 @@ fn candidate_cmp(left: &CandidateResult, right: &CandidateResult) -> Ordering {
     }
 }
 
+#[cfg(test)]
 fn candidate_uses_mint(candidate: &CandidateResult) -> bool {
     candidate
         .actions
@@ -6093,6 +6073,7 @@ fn candidate_uses_mint(candidate: &CandidateResult) -> bool {
         .any(|action| matches!(action, Action::Mint { .. }))
 }
 
+#[cfg(test)]
 fn run_rebalance_full_variant_candidate(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -6154,6 +6135,7 @@ fn run_rebalance_full_variant_candidate(
     ))
 }
 
+#[cfg(test)]
 fn phase_order_evaluations(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -6260,6 +6242,7 @@ fn phase_order_evaluations(
     evaluations
 }
 
+#[cfg(test)]
 fn greedy_preserve_candidate(
     baseline: &CandidateResult,
     balances: &HashMap<&str, f64>,
@@ -6316,6 +6299,7 @@ fn greedy_preserve_candidate(
     Some((greedy_best, preserve_candidates))
 }
 
+#[cfg(test)]
 fn exact_preserve_subset_candidate(
     baseline: &CandidateResult,
     incumbent: CandidateResult,
@@ -6384,6 +6368,7 @@ fn exact_preserve_subset_candidate(
     best
 }
 
+#[cfg(test)]
 fn preserve_local_search_candidate(
     baseline: &CandidateResult,
     greedy_start: CandidateResult,
@@ -6500,6 +6485,7 @@ fn preserve_local_search_candidate(
     best
 }
 
+#[cfg(test)]
 fn first_frontier_branch_candidate(
     base: &CandidateResult,
     balances: &HashMap<&str, f64>,
@@ -6531,6 +6517,7 @@ fn first_frontier_branch_candidate(
     )
 }
 
+#[cfg(test)]
 fn run_arb_only_candidate(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -6627,6 +6614,7 @@ fn replay_actions_to_market_state_with_predictions(
     )
 }
 
+#[cfg(test)]
 fn apply_actions_to_cyclic_state(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -6649,6 +6637,7 @@ fn apply_actions_to_cyclic_state(
     Some((next_slot0, next_balances, next_cash))
 }
 
+#[cfg(test)]
 fn cyclic_late_arb_candidate(
     seed: &CandidateResult,
     balances: &HashMap<&str, f64>,
@@ -6800,6 +6789,7 @@ fn cyclic_late_arb_candidate(
     ))
 }
 
+#[cfg(test)]
 fn refine_phase_order_candidate(
     evaluation: &PhaseOrderVariantEvaluation,
     balances: &HashMap<&str, f64>,
@@ -6886,6 +6876,7 @@ fn refine_phase_order_candidate(
     }
 }
 
+#[cfg(test)]
 fn preserve_candidates_for_candidate(
     candidate: &CandidateResult,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -6901,6 +6892,7 @@ fn preserve_candidates_for_candidate(
     )
 }
 
+#[cfg(test)]
 fn rebalance_full_with_predictions_and_budget_candidate(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -7152,6 +7144,7 @@ fn rebalance_full_with_predictions_and_budget_candidate(
     Some(best)
 }
 
+#[cfg(test)]
 fn rebalance_full_with_predictions_and_budget(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -7201,6 +7194,7 @@ fn rebalance_full_with_predictions_and_budget(
     best.actions
 }
 
+#[cfg(test)]
 fn rebalance_full_with_predictions_staged_reference(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -7641,6 +7635,37 @@ pub(super) fn rebalance_with_custom_predictions_selected_plan_for_test(
     force_mint_available: bool,
 ) -> TestSelectedPlanSummary {
     let cost_config = benchmark_planner_cost_config_for_test();
+    let (plan, _stats) = rebalance_full_ultimate_with_predictions_and_stats(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        cost_config,
+        RebalanceFlags::default(),
+        Some(force_mint_available),
+        false,
+    );
+    selected_plan_summary_from_plan_for_test(&plan, cost_config)
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_selected_plan_with_pricing_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    gas_assumptions: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+) -> TestSelectedPlanSummary {
+    let cost_config = benchmark_planner_cost_config_with_pricing_for_test(
+        gas_assumptions,
+        gas_price_eth,
+        eth_usd,
+    );
     let (plan, _stats) = rebalance_full_ultimate_with_predictions_and_stats(
         balances,
         susds_balance,

@@ -1,6 +1,6 @@
 # Off-Chain EV Optimization Log
 
-Last updated: 2026-03-09
+Last updated: 2026-03-10
 
 ## Purpose
 
@@ -152,11 +152,16 @@ Interpretation:
 
 ## Runtime measurements
 
-The pre-packing release measurements are now historical only.
+Current packed-path release measurements:
 
-- current packed default-path release perf has not been rerun yet
-- use `docs/solver_benchmark_matrix.md` as the source of truth
-- until the packed release harness is rerun, runtime values should be treated as `n/a` rather than inferred from the older staged-default numbers
+- `test_rebalance_perf_full_l1`: `12.002361733s`
+- `test_rebalance_perf_full_l1_with_gas_pricing`: `5.117809954s`
+
+Current process:
+
+- use `docs/solver_benchmark_matrix.md` as the release-facing source of truth
+- keep the heavy single-tick release suite in the nightly workflow, not default CI
+- keep live-L1 reports, JSONL printers, and large teacher diagnostics manual-only
 
 ## Gas-aware evaluation status
 
@@ -238,7 +243,7 @@ Default-path keep/cut decisions:
   - mixed-route capability
   - `R_exact` over `{default, direct, mint}`
   - `Plain` and `ArbPrimed` whole-plan families
-  - staged fallback, as the last retained complexity layer pending the net-EV-era release benchmark refresh
+- staged reference only as a test teacher while the nightly single-tick validation lane remains active
 - Remove from default path:
   - runtime distilled-proposal layer
   - late arb-correction tail
@@ -287,8 +292,9 @@ Engineering decision:
 
 - replace fragmented subgroup pricing with packed execution-program compilation
 - make the packed operator solver the default hot path
-- keep staged reference only as an opt-in rollout comparison via `REBALANCE_ENABLE_STAGED_FALLBACK=1`
-- remove runtime distilled proposals from the default path
+- keep staged reference only in `#[cfg(test)]` diagnostics and parity assertions
+- keep only the legacy distilled preserve/frontier proposal layer in the default path
+- keep the newer preserve/frontier V2 proposal gated for diagnostics via `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1`
 - remove the late arb-correction tail from the default path
 - do not add another online search dimension on top of this phase
 - if EV work resumes, it should be teacher-to-student proposal distillation only
@@ -314,22 +320,24 @@ Conclusion:
 - v1 default path is now the packed execution-program solver
 - reason:
   - packing fixed the main fragmentation failure mode without adding another online search dimension
-  - the staged reference remains available only as an opt-in rollout comparison via `REBALANCE_ENABLE_STAGED_FALLBACK=1`
+  - deterministic synthetic single-tick parity now clears without the runtime staged reference
+  - the staged reference remains available only in test diagnostics, not as a runtime branch
 - v1 default path keeps:
   - mixed-route capability
   - `R_exact` over `{default, direct, mint}`
   - `Plain` and `ArbPrimed`
+  - legacy distilled preserve/frontier proposals
   - packed-vs-strict execution-program compilation
   - net-EV ranking with gas-aware gating
 - v1 default path prunes:
-  - runtime distilled proposals
+  - staged-fallback selection from the runtime
+  - proposal-V2 promotion into the default path
   - late arb-correction tail
-  - default staged-fallback selection
   - any further online search expansion
 - explicitly deferred post-release:
-  - packed-path release perf rerun
+- keep the nightly single-tick release-validation lane green
   - any teacher-distilled preserve/frontier codebook beyond offline diagnostics
-  - any additional route/search improvement needed to close the residual on-chain gap on heterogeneous and mixed-route favorable cases
+  - any additional route/search improvement needed to close any remaining single-tick discrete-choice gap after the packed `constant_l_mixed` lift
 - the canonical release-facing solver comparison table now lives in `docs/solver_benchmark_matrix.md`
 
 ## Explored ideas and status
@@ -411,22 +419,22 @@ Only resume online EV work from this list:
    - Do not recompute full per-variant exact subsets online unless evidence forces it.
 
 3. Remove staged fallback after proposal parity.
-   - Once the proposal heuristic matches staged on the hard cases, delete the fallback and remeasure release performance.
+   - Once the proposal heuristic is clearly unnecessary on the validated single-tick suite, delete the remaining test-only staged teacher and remeasure release performance if the diagnostic surface changes materially.
 
 ## Current stop condition status
 
 The final simplification stop condition is not reached yet:
 
 - benchmark-layer gas replay works on the committed benchmark fixture
-- the default solver still has the staged fallback in the hot path
-- the staged fallback still passes the keep rule on committed mixed cases
-- fallback removal would materially improve runtime, but it would also give up meaningful benchmark EV/net-EV on the current committed mixed fixture
+- the default solver no longer has staged fallback in the hot path
+- the staged path still exists only as a `#[cfg(test)]` reference teacher
+- deleting that reference teacher would simplify the diagnostic surface, but the deletion decision should follow the expanded deterministic stress suite rather than the old pre-packing benchmark evidence
 
 So the correct status is:
 
 - EV-search expansion: stopped
 - complexity pruning: mostly done
-- final fallback removal: deferred until a cheaper preserve/frontier proposal heuristic can recover the same committed mixed frontier
+- final staged-teacher removal: deferred until the deterministic stress suite says the remaining `#[cfg(test)]` reference is no longer buying anything the default path needs
 
 ## Stop conditions
 

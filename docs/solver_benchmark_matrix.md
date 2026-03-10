@@ -1,6 +1,6 @@
 # Solver Benchmark Matrix
 
-Last updated: 2026-03-09
+Last updated: 2026-03-10
 
 ## Purpose
 
@@ -20,17 +20,29 @@ It answers, in one place:
 - on-chain calldata artifact:
   - `forge test --match-test test_write_rebalancer_ab_onchain_call_report -vv`
   - output: `test/fixtures/rebalancer_ab_onchain_call_report.json`
+- synthetic stress on-chain calldata artifact:
+  - `forge test --match-test test_write_rebalancer_ab_stress_onchain_call_report -vv`
+  - output: `test/fixtures/rebalancer_ab_stress_onchain_call_report.json`
 - shared-snapshot on-chain pricing under the benchmark OP snapshot:
   - `cargo test print_shared_op_snapshot_onchain_benchmark_rows_jsonl -- --ignored --nocapture`
 - shared-snapshot off-chain selected-plan pricing under the benchmark OP snapshot:
   - `cargo test print_shared_op_snapshot_offchain_selected_rows_jsonl -- --ignored --nocapture`
   - note: this uses the current solver-selected modeled fee estimate from the planner summary
-  - current selected benchmark cases are still using the structural packed fallback estimator
+  - current committed benchmark rows are on replay-packed-program estimates; structural fallback remains contingency-only
+- deterministic stress coverage:
+  - `cargo test shared_snapshot_metadata_classifies_committed_fixtures -- --nocapture --test-threads=1`
+  - `cargo test offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_committed_cases -- --nocapture --test-threads=1`
+  - `cargo test complementary_inactive_sell_case_never_loses_to_direct_only_or_rebalance_only -- --nocapture --test-threads=1`
+  - `cargo test explicit_mint_dominant_case_prefers_mint_frontier -- --nocapture --test-threads=1`
+  - `cargo test boundary_cutoff_smoke_suite_stays_net_ev_non_regressive -- --nocapture --test-threads=1`
+  - `cargo test boundary_cutoff_full_sweep_stays_net_ev_non_regressive -- --ignored --nocapture --test-threads=1`
+  - `cargo test tick_scope_cases_remain_finite_and_are_marked_noncanonical -- --nocapture --test-threads=1`
+  - `cargo test --release offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_shared_single_tick_stress_cases -- --ignored --nocapture --test-threads=1`
+  - `cargo test --release shared_single_tick_stress_cases_do_not_require_staged_reference -- --ignored --nocapture --test-threads=1`
+  - nightly workflow: `.github/workflows/nightly-single-tick-release-validation.yml`
 - release speed checks:
-  - `cargo test --release portfolio::core::tests::execution::test_rebalance_perf_full_l1 -- --exact --nocapture`
-  - `cargo test --release portfolio::core::tests::execution::test_rebalance_perf_full_l1_with_gas_pricing -- --exact --nocapture`
-  - `REBALANCE_ENABLE_STAGED_FALLBACK=1 cargo test --release portfolio::core::tests::execution::test_rebalance_perf_full_l1 -- --exact --nocapture`
-  - `REBALANCE_ENABLE_STAGED_FALLBACK=1 cargo test --release portfolio::core::tests::execution::test_rebalance_perf_full_l1_with_gas_pricing -- --exact --nocapture`
+  - `cargo test --release portfolio::core::tests::execution::test_rebalance_perf_full_l1 -- --ignored --exact --nocapture`
+  - `cargo test --release portfolio::core::tests::execution::test_rebalance_perf_full_l1_with_gas_pricing -- --ignored --exact --nocapture`
 
 ## Conventions
 
@@ -65,6 +77,7 @@ Availability notes:
 
 - `n/a` means the metric is not available or not measured in a trustworthy way for that row
 - literal `0` means the selected plan genuinely no-ops or the measured value is exactly zero under the shared-snapshot model
+- explicit `crossing_light` / `crossing_heavy` synthetic cases are validation-only scope tests today; they are not part of the release-facing “matches/beats on-chain” claim until multi-tick-aware economics are modeled end-to-end
 
 ## Solver Flavors
 
@@ -75,7 +88,7 @@ Availability notes:
 | Off-chain full-rebalance-only | Raw benchmark row without the full mixed fallback behavior | Benchmark row only | `docs/portfolio.md` |
 | On-chain exact direct | `Rebalancer.rebalanceExact(...)` atomic direct solve | Production reference | `docs/rebalancer.md` |
 | On-chain mixed constant-`L` | `RebalancerMixed.rebalanceMixedConstantL(...)` atomic mixed-route solve | Experimental on-chain reference | `docs/rebalancer_mixed.md` |
-| Off-chain staged reference enabled | Same packed solver with `REBALANCE_ENABLE_STAGED_FALLBACK=1` reference comparison | Rollout / validation only | `docs/portfolio.md` |
+| Staged reference diagnostics | Test-only legacy reference solve used for parity assertions; not compiled into the shipped runtime path | Test-only | `docs/portfolio.md` |
 
 ## Central 98-Outcome L1-Like Case
 
@@ -166,14 +179,13 @@ Release perf was rerun after the teacher/memoization pass. These numbers are rel
 
 | Runtime mode | `test_rebalance_perf_full_l1` | `test_rebalance_perf_full_l1_with_gas_pricing` | Meaning |
 |---|---:|---:|---|
-| Default packed path | `11.167825412s` | `4.829752766s` | Current shipped hot path after packing |
-| Packed path + staged reference (`REBALANCE_ENABLE_STAGED_FALLBACK=1`) | `12.359121054s` | `4.840933383s` | Rollout / validation path only |
+| Default packed path | `12.002361733s` | `5.117809954s` | Current shipped hot path after packing |
 
 Interpretation:
 
 - the gas-aware packed path is materially faster than the ungated full-L1 path
-- enabling the staged reference still adds measurable overhead on the raw full-L1 perf path, but almost none on the gas-priced path
-- the structural economics table above and the speed table here now reflect the same post-packing solver generation
+- the structural economics table above and the speed table here now reflect the same post-packing solver generation with no runtime staged-reference branch
+- the heavy single-tick release validations now belong in the nightly workflow, not default CI
 
 ## Gas Calibration Snapshot
 
@@ -203,5 +215,9 @@ Current fallback calibration decision:
   - exact small oracle
   - exact medium oracle
   - large-case best-known comparison
+- deterministic stress coverage now also includes:
+  - fee-sweep net-EV parity checks against on-chain exact and on-chain mixed on every committed fixture at `0.5x`, `1.0x`, and `2.0x` the pinned OP fee snapshot
+  - explicit inactive-sell, mint-dominant, and cutoff-boundary synthetic cases
+  - explicit `crossing_light` / `crossing_heavy` scope tests that stay finite but remain outside the release parity claim
 - runtime `K=2` remains heuristic; the exact `K=2` teacher is currently a validation tool, not a shipped optimization layer
 - raw-EV benchmark history still matters for understanding search behavior, but `net EV` is now the primary economic metric for the shipped off-chain solver

@@ -1,0 +1,83 @@
+name: Nightly Single-Tick Release Validation
+
+on:
+  schedule:
+    - cron: "35 0 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: nightly-single-tick-release-validation
+  cancel-in-progress: false
+
+jobs:
+  release-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prepare log directory
+        run: mkdir -p nightly-single-tick-release-validation
+
+      - name: Committed fixture fee-sweep parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release 'portfolio::core::tests::rebalancer_contract_ab::offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_committed_cases' -- --exact --nocapture | tee nightly-single-tick-release-validation/committed-fee-sweep.log
+
+      - name: Shared stress fee-sweep parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release 'portfolio::core::tests::rebalancer_contract_ab::offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_shared_single_tick_stress_cases' -- --ignored --exact --nocapture | tee nightly-single-tick-release-validation/shared-stress-fee-sweep.log
+
+      - name: Shared stress staged-reference dominance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release 'portfolio::core::tests::rebalancer_contract_ab::shared_single_tick_stress_cases_do_not_require_staged_reference' -- --ignored --exact --nocapture | tee nightly-single-tick-release-validation/shared-stress-staged-dominance.log
+
+      - name: Boundary cutoff full sweep
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release 'portfolio::core::tests::rebalancer_contract_ab::boundary_cutoff_full_sweep_stays_net_ev_non_regressive' -- --ignored --exact --nocapture | tee nightly-single-tick-release-validation/boundary-cutoff-full-sweep.log
+
+      - name: Boundary cutoff staged-reference dominance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release 'portfolio::core::tests::rebalancer_contract_ab::boundary_cutoff_full_sweep_does_not_require_staged_reference' -- --ignored --exact --nocapture | tee nightly-single-tick-release-validation/boundary-cutoff-staged-dominance.log
+
+      - name: Committed staged-reference dominance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release 'portfolio::core::tests::rebalancer_contract_ab::ultimate_solver_mixed_ev_dominates_staged_reference' -- --exact --nocapture | tee nightly-single-tick-release-validation/committed-staged-dominance.log
+
+      - name: Release perf full L1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release 'portfolio::core::tests::execution::test_rebalance_perf_full_l1' -- --ignored --exact --nocapture | tee nightly-single-tick-release-validation/perf-full-l1.log
+
+      - name: Release perf full L1 with gas pricing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release 'portfolio::core::tests::execution::test_rebalance_perf_full_l1_with_gas_pricing' -- --ignored --exact --nocapture | tee nightly-single-tick-release-validation/perf-full-l1-with-gas-pricing.log
+
+      - name: Upload release validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-single-tick-release-validation-logs
+          path: nightly-single-tick-release-validation/
