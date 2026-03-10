@@ -153,6 +153,64 @@ fn staged_fallback_enabled() -> bool {
     }
 }
 
+fn distilled_proposal_v2_enabled() -> bool {
+    match std::env::var("REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2")
+        .ok()
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "on" | "enabled") => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DistilledProposalConfig {
+    include_legacy: bool,
+    include_v2: bool,
+}
+
+impl DistilledProposalConfig {
+    fn runtime_default() -> Self {
+        Self {
+            include_legacy: true,
+            include_v2: distilled_proposal_v2_enabled(),
+        }
+    }
+
+    #[cfg(test)]
+    fn none() -> Self {
+        Self {
+            include_legacy: false,
+            include_v2: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn legacy_only() -> Self {
+        Self {
+            include_legacy: true,
+            include_v2: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn v2_only() -> Self {
+        Self {
+            include_legacy: false,
+            include_v2: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn legacy_and_v2() -> Self {
+        Self {
+            include_legacy: true,
+            include_v2: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebalanceMode {
     Full,
@@ -475,6 +533,8 @@ pub(super) struct SolverRunStats {
     pub(super) exact_rebalance_candidate_evals: usize,
     pub(super) distilled_proposal_sets: usize,
     pub(super) distilled_proposal_candidate_evals: usize,
+    pub(super) distilled_proposal_v2_sets: usize,
+    pub(super) distilled_proposal_v2_candidate_evals: usize,
     pub(super) arb_operator_evals: usize,
     pub(super) arb_primed_root_taken: bool,
     pub(super) fee_estimate_unavailable_results: usize,
@@ -499,6 +559,8 @@ struct DistilledMarketFeature {
     mint_profitability: f64,
     hold_through_mint_value: f64,
 }
+
+type DistilledProposalTask = (Option<BundleRouteKind>, Vec<&'static str>);
 
 #[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
@@ -565,11 +627,22 @@ pub(super) struct TestSelectedPlanSummary {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TestK1PrefixDistanceClass {
+    Prefix,
+    OneMove,
+    TwoMoves,
+    BeyondTwoMoves,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct TestK1OracleComparison {
     pub(super) runtime_best: TestSelectedPlanSummary,
     pub(super) oracle_best: TestSelectedPlanSummary,
     pub(super) oracle_best_is_direct_prefix: bool,
+    pub(super) oracle_best_prefix_distance_class: TestK1PrefixDistanceClass,
     pub(super) oracle_best_active_set_size: Option<usize>,
     pub(super) runtime_k1_gap_net_ev: Option<f64>,
     pub(super) runtime_k1_gap_raw_ev: Option<f64>,
@@ -5224,6 +5297,33 @@ fn capped_top_markets_by_score(
         .collect()
 }
 
+fn proposal_eligible_distilled_features(
+    features: &[DistilledMarketFeature],
+) -> Vec<&DistilledMarketFeature> {
+    features
+        .iter()
+        .filter(|feature| {
+            feature.holding > EPS
+                && (feature.churn_amount > EPS
+                    || feature.direct_profitability > 0.0
+                    || feature.hold_through_mint_value > 0.0)
+        })
+        .collect()
+}
+
+fn push_distilled_preserve_proposal(
+    proposals: &mut Vec<Vec<&'static str>>,
+    preserve_markets: Vec<&'static str>,
+) {
+    if preserve_markets.is_empty() {
+        return;
+    }
+    let preserve_markets = sorted_preserve_markets(&preserve_markets);
+    if !proposals.contains(&preserve_markets) {
+        proposals.push(preserve_markets);
+    }
+}
+
 fn choose_distilled_frontier_family(
     features: &[DistilledMarketFeature],
     preserve_markets: &[&'static str],
@@ -5252,7 +5352,9 @@ fn choose_distilled_frontier_family(
     }
 }
 
-fn distilled_preserve_proposals(features: &[DistilledMarketFeature]) -> Vec<Vec<&'static str>> {
+fn legacy_distilled_preserve_proposals(
+    features: &[DistilledMarketFeature],
+) -> Vec<Vec<&'static str>> {
     if features.is_empty() {
         return Vec::new();
     }
@@ -5323,13 +5425,10 @@ fn distilled_preserve_proposals(features: &[DistilledMarketFeature]) -> Vec<Vec<
 
     let mut proposals = Vec::new();
     if !p1.is_empty() {
-        proposals.push(sorted_preserve_markets(&p1));
+        push_distilled_preserve_proposal(&mut proposals, p1.clone());
     }
     if !p2.is_empty() {
-        let proposal = sorted_preserve_markets(&p2);
-        if !proposals.contains(&proposal) {
-            proposals.push(proposal);
-        }
+        push_distilled_preserve_proposal(&mut proposals, p2.clone());
     }
 
     let p1_set: HashSet<&'static str> = p1.iter().copied().collect();
@@ -5366,10 +5465,7 @@ fn distilled_preserve_proposals(features: &[DistilledMarketFeature]) -> Vec<Vec<
             p1_rank.max(p2_rank) + feature.holding.max(0.0)
         });
         if !union.is_empty() {
-            let union = sorted_preserve_markets(&union);
-            if !proposals.contains(&union) {
-                proposals.push(union);
-            }
+            push_distilled_preserve_proposal(&mut proposals, union);
         }
     }
 
@@ -5377,11 +5473,124 @@ fn distilled_preserve_proposals(features: &[DistilledMarketFeature]) -> Vec<Vec<
     proposals
 }
 
-fn distilled_proposal_tasks(
+fn legacy_distilled_proposal_tasks(
     features: &[DistilledMarketFeature],
-) -> Vec<(Option<BundleRouteKind>, Vec<&'static str>)> {
+) -> Vec<DistilledProposalTask> {
     let mut tasks = Vec::new();
-    for preserve_markets in distilled_preserve_proposals(features) {
+    for preserve_markets in legacy_distilled_preserve_proposals(features) {
+        tasks.push((None, preserve_markets.clone()));
+        if let Some(frontier_family) = choose_distilled_frontier_family(features, &preserve_markets)
+        {
+            tasks.push((Some(frontier_family), preserve_markets));
+        }
+    }
+    tasks
+}
+
+fn proposal_v2_preserve_proposals(features: &[DistilledMarketFeature]) -> Vec<Vec<&'static str>> {
+    let mut eligible = proposal_eligible_distilled_features(features);
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+
+    eligible.sort_by(|left, right| {
+        right
+            .churn_amount
+            .total_cmp(&left.churn_amount)
+            .then_with(|| right.sold_amount.total_cmp(&left.sold_amount))
+            .then_with(|| right.holding.total_cmp(&left.holding))
+            .then_with(|| left.market_name.cmp(right.market_name))
+    });
+    let churn_core: Vec<&'static str> = eligible
+        .iter()
+        .take(4)
+        .map(|feature| feature.market_name)
+        .collect();
+
+    eligible.sort_by(|left, right| {
+        right
+            .hold_through_mint_value
+            .total_cmp(&left.hold_through_mint_value)
+            .then_with(|| right.mint_profitability.total_cmp(&left.mint_profitability))
+            .then_with(|| right.holding.total_cmp(&left.holding))
+            .then_with(|| right.churn_amount.total_cmp(&left.churn_amount))
+            .then_with(|| left.market_name.cmp(right.market_name))
+    });
+    let mint_hold_core: Vec<&'static str> = eligible
+        .iter()
+        .take(4)
+        .map(|feature| feature.market_name)
+        .collect();
+
+    let churn_len = churn_core.len().max(1) as f64;
+    let mint_hold_len = mint_hold_core.len().max(1) as f64;
+    let churn_rank_map: HashMap<&'static str, f64> = churn_core
+        .iter()
+        .enumerate()
+        .map(|(rank, market_name)| (*market_name, (rank + 1) as f64 / churn_len))
+        .collect();
+    let mint_hold_rank_map: HashMap<&'static str, f64> = mint_hold_core
+        .iter()
+        .enumerate()
+        .map(|(rank, market_name)| (*market_name, (rank + 1) as f64 / mint_hold_len))
+        .collect();
+    let feature_map: HashMap<&'static str, &DistilledMarketFeature> = features
+        .iter()
+        .map(|feature| (feature.market_name, feature))
+        .collect();
+    let mut union_core = churn_core.clone();
+    for market_name in &mint_hold_core {
+        if !union_core.contains(market_name) {
+            union_core.push(*market_name);
+        }
+    }
+    union_core.sort_by(|left, right| {
+        let left_rank = churn_rank_map
+            .get(left)
+            .copied()
+            .unwrap_or(f64::INFINITY)
+            .min(
+                mint_hold_rank_map
+                    .get(left)
+                    .copied()
+                    .unwrap_or(f64::INFINITY),
+            );
+        let right_rank = churn_rank_map
+            .get(right)
+            .copied()
+            .unwrap_or(f64::INFINITY)
+            .min(
+                mint_hold_rank_map
+                    .get(right)
+                    .copied()
+                    .unwrap_or(f64::INFINITY),
+            );
+        let left_holding = feature_map
+            .get(left)
+            .map(|feature| feature.holding)
+            .unwrap_or_default();
+        let right_holding = feature_map
+            .get(right)
+            .map(|feature| feature.holding)
+            .unwrap_or_default();
+        left_rank
+            .total_cmp(&right_rank)
+            .then_with(|| right_holding.total_cmp(&left_holding))
+            .then_with(|| left.cmp(right))
+    });
+    union_core.truncate(MAX_DISTILLED_PRESERVE_SET_SIZE);
+
+    let mut proposals = Vec::new();
+    push_distilled_preserve_proposal(&mut proposals, churn_core);
+    push_distilled_preserve_proposal(&mut proposals, mint_hold_core);
+    push_distilled_preserve_proposal(&mut proposals, union_core);
+    proposals.truncate(MAX_DISTILLED_EXTRA_PROPOSAL_SETS);
+    proposals
+}
+
+fn proposal_v2_tasks(features: &[DistilledMarketFeature]) -> Vec<DistilledProposalTask> {
+    let mut tasks = Vec::new();
+    for preserve_markets in proposal_v2_preserve_proposals(features) {
         tasks.push((None, preserve_markets.clone()));
         if let Some(frontier_family) = choose_distilled_frontier_family(features, &preserve_markets)
         {
@@ -5496,7 +5705,8 @@ fn collect_no_preserve_frontier_seed_plans(
     seed_plans
 }
 
-fn enumerate_exact_no_arb_candidates_with_options(
+fn merged_preserve_candidate_scores_from_seed_plans(
+    seed_plans: &[PlanResult],
     state: &SolverStateSnapshot,
     predictions: &HashMap<String, f64>,
     expected_outcome_count: usize,
@@ -5505,43 +5715,10 @@ fn enumerate_exact_no_arb_candidates_with_options(
     verify_internal_state: bool,
     run_phase0_in_polish: bool,
     family: SolverFamily,
-    extra_preserve_seed_states: &[SolverStateSnapshot],
-    online_preserve_cap: usize,
-    include_distilled_proposals: bool,
     stats: &mut SolverRunStats,
     cost_config: PlannerCostConfig,
-) -> (Vec<PlanResult>, usize) {
-    stats.exact_rebalance_calls += 1;
-
-    let candidates = collect_no_preserve_frontier_seed_plans(
-        state,
-        predictions,
-        expected_outcome_count,
-        route_gates,
-        force_mint_available,
-        verify_internal_state,
-        run_phase0_in_polish,
-        family,
-        stats,
-        cost_config,
-    );
-    let mut seed_plans = candidates.clone();
-    for seed_state in extra_preserve_seed_states {
-        seed_plans.extend(collect_no_preserve_frontier_seed_plans(
-            seed_state,
-            predictions,
-            expected_outcome_count,
-            route_gates,
-            force_mint_available,
-            verify_internal_state,
-            run_phase0_in_polish,
-            family,
-            stats,
-            cost_config,
-        ));
-    }
-
-    let seed_scores = aggregate_preserve_candidate_scores(&seed_plans, state);
+) -> Vec<PreserveCandidateScore> {
+    let seed_scores = aggregate_preserve_candidate_scores(seed_plans, state);
     let expansion_seed_universe =
         cap_preserve_candidate_universe(seed_scores.clone(), MAX_PRESERVE_SEARCH_CANDIDATES);
     let mut preserve_score_sets = vec![seed_scores];
@@ -5582,7 +5759,99 @@ fn enumerate_exact_no_arb_candidates_with_options(
             ));
         }
     }
-    let merged_preserve_scores = merge_preserve_candidate_scores(&preserve_score_sets);
+    merge_preserve_candidate_scores(&preserve_score_sets)
+}
+
+fn evaluate_distilled_proposal_tasks(
+    state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    expected_outcome_count: usize,
+    route_gates: RouteGateThresholds,
+    force_mint_available: Option<bool>,
+    verify_internal_state: bool,
+    run_phase0_in_polish: bool,
+    family: SolverFamily,
+    proposal_tasks: Vec<DistilledProposalTask>,
+    cost_config: PlannerCostConfig,
+) -> Vec<PlanResult> {
+    proposal_tasks
+        .into_par_iter()
+        .filter_map(|(frontier_family, preserve_markets)| {
+            run_no_arb_rebalance_plan_from_state(
+                state,
+                predictions,
+                expected_outcome_count,
+                route_gates,
+                &preserve_markets,
+                frontier_family,
+                force_mint_available,
+                verify_internal_state,
+                run_phase0_in_polish,
+                family,
+                cost_config,
+            )
+        })
+        .collect()
+}
+
+fn enumerate_exact_no_arb_candidates_with_options(
+    state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    expected_outcome_count: usize,
+    route_gates: RouteGateThresholds,
+    force_mint_available: Option<bool>,
+    verify_internal_state: bool,
+    run_phase0_in_polish: bool,
+    family: SolverFamily,
+    extra_preserve_seed_states: &[SolverStateSnapshot],
+    online_preserve_cap: usize,
+    distilled_proposal_config: DistilledProposalConfig,
+    stats: &mut SolverRunStats,
+    cost_config: PlannerCostConfig,
+) -> (Vec<PlanResult>, usize) {
+    stats.exact_rebalance_calls += 1;
+
+    let candidates = collect_no_preserve_frontier_seed_plans(
+        state,
+        predictions,
+        expected_outcome_count,
+        route_gates,
+        force_mint_available,
+        verify_internal_state,
+        run_phase0_in_polish,
+        family,
+        stats,
+        cost_config,
+    );
+    let mut seed_plans = candidates.clone();
+    for seed_state in extra_preserve_seed_states {
+        seed_plans.extend(collect_no_preserve_frontier_seed_plans(
+            seed_state,
+            predictions,
+            expected_outcome_count,
+            route_gates,
+            force_mint_available,
+            verify_internal_state,
+            run_phase0_in_polish,
+            family,
+            stats,
+            cost_config,
+        ));
+    }
+
+    let merged_preserve_scores = merged_preserve_candidate_scores_from_seed_plans(
+        &seed_plans,
+        state,
+        predictions,
+        expected_outcome_count,
+        route_gates,
+        force_mint_available,
+        verify_internal_state,
+        run_phase0_in_polish,
+        family,
+        stats,
+        cost_config,
+    );
     let preserve_universe =
         cap_preserve_candidate_universe(merged_preserve_scores.clone(), online_preserve_cap);
     let mut candidates = enumerate_exact_no_arb_candidates_over_preserve_universe(
@@ -5600,32 +5869,47 @@ fn enumerate_exact_no_arb_candidates_with_options(
         cost_config,
     );
 
-    if include_distilled_proposals {
+    if distilled_proposal_config.include_legacy || distilled_proposal_config.include_v2 {
         let features =
             collect_distilled_market_features(state, predictions, &merged_preserve_scores);
-        let proposal_tasks = distilled_proposal_tasks(&features);
-        stats.distilled_proposal_sets += proposal_tasks.len();
-        stats.distilled_proposal_candidate_evals += proposal_tasks.len();
-        let mut proposal_candidates: Vec<PlanResult> = proposal_tasks
-            .into_par_iter()
-            .filter_map(|(frontier_family, preserve_markets)| {
-                run_no_arb_rebalance_plan_from_state(
-                    state,
-                    predictions,
-                    expected_outcome_count,
-                    route_gates,
-                    &preserve_markets,
-                    frontier_family,
-                    force_mint_available,
-                    verify_internal_state,
-                    run_phase0_in_polish,
-                    family,
-                    cost_config,
-                )
-            })
-            .collect();
-        stats.exact_rebalance_candidate_evals += proposal_candidates.len();
-        candidates.append(&mut proposal_candidates);
+        if distilled_proposal_config.include_legacy {
+            let proposal_tasks = legacy_distilled_proposal_tasks(&features);
+            stats.distilled_proposal_sets += proposal_tasks.len();
+            stats.distilled_proposal_candidate_evals += proposal_tasks.len();
+            let mut proposal_candidates = evaluate_distilled_proposal_tasks(
+                state,
+                predictions,
+                expected_outcome_count,
+                route_gates,
+                force_mint_available,
+                verify_internal_state,
+                run_phase0_in_polish,
+                family,
+                proposal_tasks,
+                cost_config,
+            );
+            stats.exact_rebalance_candidate_evals += proposal_candidates.len();
+            candidates.append(&mut proposal_candidates);
+        }
+        if distilled_proposal_config.include_v2 {
+            let proposal_tasks = proposal_v2_tasks(&features);
+            stats.distilled_proposal_v2_sets += proposal_tasks.len();
+            stats.distilled_proposal_v2_candidate_evals += proposal_tasks.len();
+            let mut proposal_candidates = evaluate_distilled_proposal_tasks(
+                state,
+                predictions,
+                expected_outcome_count,
+                route_gates,
+                force_mint_available,
+                verify_internal_state,
+                run_phase0_in_polish,
+                family,
+                proposal_tasks,
+                cost_config,
+            );
+            stats.exact_rebalance_candidate_evals += proposal_candidates.len();
+            candidates.append(&mut proposal_candidates);
+        }
         candidates.sort_by(plan_result_cmp);
     }
 
@@ -5680,35 +5964,6 @@ fn enumerate_exact_no_arb_candidates_with_options(
     (candidates, preserve_universe.len())
 }
 
-fn enumerate_exact_no_arb_candidates(
-    state: &SolverStateSnapshot,
-    predictions: &HashMap<String, f64>,
-    expected_outcome_count: usize,
-    route_gates: RouteGateThresholds,
-    force_mint_available: Option<bool>,
-    verify_internal_state: bool,
-    run_phase0_in_polish: bool,
-    family: SolverFamily,
-    stats: &mut SolverRunStats,
-    cost_config: PlannerCostConfig,
-) -> (Vec<PlanResult>, usize) {
-    enumerate_exact_no_arb_candidates_with_options(
-        state,
-        predictions,
-        expected_outcome_count,
-        route_gates,
-        force_mint_available,
-        verify_internal_state,
-        run_phase0_in_polish,
-        family,
-        &[],
-        MAX_ONLINE_PRESERVE_CANDIDATES,
-        true,
-        stats,
-        cost_config,
-    )
-}
-
 #[cfg(test)]
 fn run_exact_no_arb_plan_with_options(
     state: &SolverStateSnapshot,
@@ -5721,7 +5976,7 @@ fn run_exact_no_arb_plan_with_options(
     family: SolverFamily,
     extra_preserve_seed_states: &[SolverStateSnapshot],
     online_preserve_cap: usize,
-    include_distilled_proposals: bool,
+    distilled_proposal_config: DistilledProposalConfig,
     stats: &mut SolverRunStats,
     cost_config: PlannerCostConfig,
 ) -> PlanResult {
@@ -5742,7 +5997,7 @@ fn run_exact_no_arb_plan_with_options(
         family,
         extra_preserve_seed_states,
         online_preserve_cap,
-        include_distilled_proposals,
+        distilled_proposal_config,
         stats,
         cost_config,
     );
@@ -5756,6 +6011,10 @@ fn run_exact_no_arb_plan_with_options(
         family = family.as_str(),
         exact_rebalance_calls = stats.exact_rebalance_calls,
         exact_rebalance_candidate_evals = stats.exact_rebalance_candidate_evals,
+        distilled_proposal_sets = stats.distilled_proposal_sets,
+        distilled_proposal_candidate_evals = stats.distilled_proposal_candidate_evals,
+        distilled_proposal_v2_sets = stats.distilled_proposal_v2_sets,
+        distilled_proposal_v2_candidate_evals = stats.distilled_proposal_v2_candidate_evals,
         preserve_universe_size,
         best_raw_ev = best.raw_ev,
         best_estimated_net_ev = best.estimated_net_ev,
@@ -5802,7 +6061,7 @@ fn run_exact_no_arb_plan(
         family,
         &[],
         MAX_ONLINE_PRESERVE_CANDIDATES,
-        false,
+        DistilledProposalConfig::none(),
         stats,
         cost_config,
     )
@@ -5815,6 +6074,7 @@ fn run_plain_family_plan(
     route_gates: RouteGateThresholds,
     force_mint_available: Option<bool>,
     verify_internal_state: bool,
+    distilled_proposal_config: DistilledProposalConfig,
     stats: &mut SolverRunStats,
     cost_config: PlannerCostConfig,
 ) -> PlanResult {
@@ -5824,7 +6084,7 @@ fn run_plain_family_plan(
         state_snapshot_expected_value(initial_state, predictions),
         cost_config,
     );
-    let (base_candidates, _) = enumerate_exact_no_arb_candidates(
+    let (base_candidates, _) = enumerate_exact_no_arb_candidates_with_options(
         initial_state,
         predictions,
         expected_outcome_count,
@@ -5833,6 +6093,9 @@ fn run_plain_family_plan(
         verify_internal_state,
         false,
         SolverFamily::Plain,
+        &[],
+        MAX_ONLINE_PRESERVE_CANDIDATES,
+        distilled_proposal_config,
         stats,
         cost_config,
     );
@@ -5851,6 +6114,7 @@ fn run_arb_primed_family_plan(
     route_gates: RouteGateThresholds,
     force_mint_available: Option<bool>,
     verify_internal_state: bool,
+    distilled_proposal_config: DistilledProposalConfig,
     stats: &mut SolverRunStats,
     cost_config: PlannerCostConfig,
 ) -> Option<PlanResult> {
@@ -5867,7 +6131,7 @@ fn run_arb_primed_family_plan(
     stats.arb_primed_root_taken = true;
 
     let mut best = root_arb.clone();
-    let (exact_rebalance_candidates, _) = enumerate_exact_no_arb_candidates(
+    let (exact_rebalance_candidates, _) = enumerate_exact_no_arb_candidates_with_options(
         &root_arb.terminal_state,
         predictions,
         expected_outcome_count,
@@ -5876,6 +6140,9 @@ fn run_arb_primed_family_plan(
         verify_internal_state,
         true,
         SolverFamily::ArbPrimed,
+        &[],
+        MAX_ONLINE_PRESERVE_CANDIDATES,
+        distilled_proposal_config,
         stats,
         cost_config,
     );
@@ -5899,7 +6166,7 @@ fn run_arb_primed_family_plan(
     Some(best)
 }
 
-fn rebalance_full_ultimate_with_predictions_and_stats(
+fn rebalance_full_ultimate_with_predictions_and_stats_with_distilled_proposal_config(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -5910,6 +6177,7 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
     _flags: RebalanceFlags,
     force_mint_available: Option<bool>,
     verify_internal_state: bool,
+    distilled_proposal_config: DistilledProposalConfig,
 ) -> (PlanResult, SolverRunStats) {
     let _ = _flags.enable_ev_guarded_greedy_churn_pruning;
     let mut stats = SolverRunStats::default();
@@ -5944,6 +6212,7 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         route_gates,
         force_mint_available,
         verify_internal_state,
+        distilled_proposal_config,
         &mut stats,
         cost_config,
     );
@@ -5954,6 +6223,7 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         route_gates,
         force_mint_available,
         verify_internal_state,
+        distilled_proposal_config,
         &mut stats,
         cost_config,
     ) && plan_result_is_better(&arb_primed, &best)
@@ -6022,6 +6292,10 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         final_actions = best.actions.len(),
         exact_rebalance_calls = stats.exact_rebalance_calls,
         exact_rebalance_candidate_evals = stats.exact_rebalance_candidate_evals,
+        distilled_proposal_sets = stats.distilled_proposal_sets,
+        distilled_proposal_candidate_evals = stats.distilled_proposal_candidate_evals,
+        distilled_proposal_v2_sets = stats.distilled_proposal_v2_sets,
+        distilled_proposal_v2_candidate_evals = stats.distilled_proposal_v2_candidate_evals,
         arb_operator_evals = stats.arb_operator_evals,
         arb_primed_root_taken = stats.arb_primed_root_taken,
         fee_estimate_unavailable_results = stats.fee_estimate_unavailable_results,
@@ -6030,6 +6304,33 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
     );
 
     (best, stats)
+}
+
+fn rebalance_full_ultimate_with_predictions_and_stats(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    expected_count: usize,
+    route_gates: RouteGateThresholds,
+    cost_config: PlannerCostConfig,
+    flags: RebalanceFlags,
+    force_mint_available: Option<bool>,
+    verify_internal_state: bool,
+) -> (PlanResult, SolverRunStats) {
+    rebalance_full_ultimate_with_predictions_and_stats_with_distilled_proposal_config(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        expected_count,
+        route_gates,
+        cost_config,
+        flags,
+        force_mint_available,
+        verify_internal_state,
+        DistilledProposalConfig::runtime_default(),
+    )
 }
 
 fn candidate_is_better(candidate: &CandidateResult, incumbent: &CandidateResult) -> bool {
@@ -7290,7 +7591,40 @@ pub(super) enum TestPhaseOrderVariant {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TestDistilledProposalMode {
+    None,
+    LegacyOnly,
+    V2Only,
+    LegacyAndV2,
+}
+
+#[cfg(test)]
+impl From<TestDistilledProposalMode> for DistilledProposalConfig {
+    fn from(value: TestDistilledProposalMode) -> Self {
+        match value {
+            TestDistilledProposalMode::None => Self::none(),
+            TestDistilledProposalMode::LegacyOnly => Self::legacy_only(),
+            TestDistilledProposalMode::V2Only => Self::v2_only(),
+            TestDistilledProposalMode::LegacyAndV2 => Self::legacy_and_v2(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestDistilledProposalMode {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LegacyOnly => "legacy_distilled",
+            Self::V2Only => "proposal_v2",
+            Self::LegacyAndV2 => "legacy_plus_v2",
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StagedReferenceChoice {
     pub(super) variant_label: &'static str,
     pub(super) frontier_family: Option<BundleRouteKind>,
@@ -7309,14 +7643,15 @@ impl From<TestPhaseOrderVariant> for PhaseOrderVariant {
 }
 
 #[cfg(test)]
-pub(super) fn rebalance_with_custom_predictions_for_test(
+fn rebalance_with_custom_predictions_plan_and_stats_with_distilled_proposal_mode_for_test(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     predictions: &HashMap<String, f64>,
     force_mint_available: bool,
-) -> Vec<Action> {
-    rebalance_full_with_predictions(
+    proposal_mode: TestDistilledProposalMode,
+) -> (PlanResult, SolverRunStats) {
+    rebalance_full_ultimate_with_predictions_and_stats_with_distilled_proposal_config(
         balances,
         susds_balance,
         slot0_results,
@@ -7327,6 +7662,46 @@ pub(super) fn rebalance_with_custom_predictions_for_test(
         RebalanceFlags::default(),
         Some(force_mint_available),
         false,
+        proposal_mode.into(),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_with_distilled_proposal_mode_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    proposal_mode: TestDistilledProposalMode,
+) -> Vec<Action> {
+    rebalance_with_custom_predictions_plan_and_stats_with_distilled_proposal_mode_for_test(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        force_mint_available,
+        proposal_mode,
+    )
+    .0
+    .actions
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    rebalance_with_custom_predictions_with_distilled_proposal_mode_for_test(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        force_mint_available,
+        TestDistilledProposalMode::LegacyOnly,
     )
 }
 
@@ -7338,18 +7713,15 @@ pub(super) fn rebalance_with_custom_predictions_and_stats_for_test(
     predictions: &HashMap<String, f64>,
     force_mint_available: bool,
 ) -> (Vec<Action>, SolverRunStats) {
-    let (plan, stats) = rebalance_full_ultimate_with_predictions_and_stats(
-        balances,
-        susds_balance,
-        slot0_results,
-        predictions,
-        slot0_results.len(),
-        RouteGateThresholds::disabled(),
-        benchmark_planner_cost_config_for_test(),
-        RebalanceFlags::default(),
-        Some(force_mint_available),
-        false,
-    );
+    let (plan, stats) =
+        rebalance_with_custom_predictions_plan_and_stats_with_distilled_proposal_mode_for_test(
+            balances,
+            susds_balance,
+            slot0_results,
+            predictions,
+            force_mint_available,
+            TestDistilledProposalMode::LegacyOnly,
+        );
     (plan.actions, stats)
 }
 
@@ -7633,6 +8005,28 @@ fn selected_plan_summary_from_plan_for_test(
 }
 
 #[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_selected_plan_with_distilled_proposal_mode_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    proposal_mode: TestDistilledProposalMode,
+) -> TestSelectedPlanSummary {
+    let cost_config = benchmark_planner_cost_config_for_test();
+    let (plan, _stats) =
+        rebalance_with_custom_predictions_plan_and_stats_with_distilled_proposal_mode_for_test(
+            balances,
+            susds_balance,
+            slot0_results,
+            predictions,
+            force_mint_available,
+            proposal_mode,
+        );
+    selected_plan_summary_from_plan_for_test(&plan, cost_config)
+}
+
+#[cfg(test)]
 pub(super) fn rebalance_with_custom_predictions_selected_plan_for_test(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -7640,20 +8034,14 @@ pub(super) fn rebalance_with_custom_predictions_selected_plan_for_test(
     predictions: &HashMap<String, f64>,
     force_mint_available: bool,
 ) -> TestSelectedPlanSummary {
-    let cost_config = benchmark_planner_cost_config_for_test();
-    let (plan, _stats) = rebalance_full_ultimate_with_predictions_and_stats(
+    rebalance_with_custom_predictions_selected_plan_with_distilled_proposal_mode_for_test(
         balances,
         susds_balance,
         slot0_results,
         predictions,
-        slot0_results.len(),
-        RouteGateThresholds::disabled(),
-        cost_config,
-        RebalanceFlags::default(),
-        Some(force_mint_available),
-        false,
-    );
-    selected_plan_summary_from_plan_for_test(&plan, cost_config)
+        force_mint_available,
+        TestDistilledProposalMode::LegacyOnly,
+    )
 }
 
 #[cfg(test)]
@@ -7698,6 +8086,153 @@ fn active_mask_is_direct_profitability_prefix_for_test(
         }
     }
     Some(false)
+}
+
+#[cfg(test)]
+fn compile_constant_l_mixed_best_direct_prefix_plan_for_test(
+    starting_state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    budget_cap: f64,
+    cost_config: PlannerCostConfig,
+) -> Option<PlanResult> {
+    let profitable = sorted_profitable_direct_prefixes(starting_state, predictions)?;
+    let mut cache = ConstantLMixedSolveCache::default();
+    let mut best = None;
+
+    for prefix_len in 1..=profitable.len() {
+        let mut active_mask = vec![false; starting_state.slot0_results.len()];
+        for (idx, _) in profitable.iter().take(prefix_len) {
+            if let Some(slot) = active_mask.get_mut(*idx) {
+                *slot = true;
+            }
+        }
+        let Some(candidate) =
+            compile_constant_l_mixed_candidate_for_active_mask_with_budget_cap_cached(
+                &mut cache,
+                starting_state,
+                predictions,
+                None,
+                Vec::new(),
+                SolverFamily::Plain,
+                cost_config,
+                budget_cap,
+                &active_mask,
+            )
+        else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|incumbent| plan_result_is_better(&candidate, incumbent))
+        {
+            best = Some(candidate);
+        }
+    }
+
+    best
+}
+
+#[cfg(test)]
+fn constant_l_local_search_neighbor_masks_for_test(
+    current_mask: &[bool],
+    profitable_indices: &[usize],
+) -> Vec<Vec<bool>> {
+    let active_indices: Vec<usize> = current_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, active)| active.then_some(idx))
+        .collect();
+    let inactive_profitable: Vec<usize> = profitable_indices
+        .iter()
+        .copied()
+        .filter(|idx| !current_mask[*idx])
+        .collect();
+    let mut neighbors = Vec::new();
+
+    for idx in &inactive_profitable {
+        let mut neighbor = current_mask.to_vec();
+        neighbor[*idx] = true;
+        neighbors.push(neighbor);
+    }
+
+    if active_indices.len() > 1 {
+        for idx in &active_indices {
+            let mut neighbor = current_mask.to_vec();
+            neighbor[*idx] = false;
+            neighbors.push(neighbor);
+        }
+    }
+
+    for drop_idx in &active_indices {
+        for add_idx in &inactive_profitable {
+            let mut neighbor = current_mask.to_vec();
+            neighbor[*drop_idx] = false;
+            neighbor[*add_idx] = true;
+            neighbors.push(neighbor);
+        }
+    }
+
+    dedup_active_masks(neighbors)
+}
+
+#[cfg(test)]
+fn classify_constant_l_mask_distance_from_best_prefix_for_test(
+    starting_state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    budget_cap: f64,
+    cost_config: PlannerCostConfig,
+    target_mask: &[bool],
+) -> TestK1PrefixDistanceClass {
+    let Some(best_prefix) = compile_constant_l_mixed_best_direct_prefix_plan_for_test(
+        starting_state,
+        predictions,
+        budget_cap,
+        cost_config,
+    ) else {
+        return TestK1PrefixDistanceClass::BeyondTwoMoves;
+    };
+    let best_prefix_mask =
+        active_mask_from_plan_result(&best_prefix, &starting_state.slot0_results);
+    if best_prefix_mask == target_mask {
+        return TestK1PrefixDistanceClass::Prefix;
+    }
+
+    let profitable_indices: Vec<usize> =
+        sorted_profitable_direct_prefixes(starting_state, predictions)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect();
+    if profitable_indices.is_empty() {
+        return TestK1PrefixDistanceClass::BeyondTwoMoves;
+    }
+
+    let mut visited = HashSet::new();
+    visited.insert(best_prefix_mask.clone());
+    let mut frontier = vec![best_prefix_mask];
+    for depth in 1..=2 {
+        let mut next_frontier = Vec::new();
+        for current_mask in frontier {
+            for neighbor in
+                constant_l_local_search_neighbor_masks_for_test(&current_mask, &profitable_indices)
+            {
+                if !visited.insert(neighbor.clone()) {
+                    continue;
+                }
+                if neighbor == target_mask {
+                    return if depth == 1 {
+                        TestK1PrefixDistanceClass::OneMove
+                    } else {
+                        TestK1PrefixDistanceClass::TwoMoves
+                    };
+                }
+                next_frontier.push(neighbor);
+            }
+        }
+        frontier = next_frontier;
+    }
+
+    TestK1PrefixDistanceClass::BeyondTwoMoves
 }
 
 #[cfg(test)]
@@ -7852,12 +8387,26 @@ fn compare_constant_l_runtime_vs_oracle_with_limit_for_test(
             )
         })
         .unwrap_or(false);
+    let oracle_best_prefix_distance_class = oracle_best
+        .mixed_certificates
+        .first()
+        .map(|certificate| {
+            classify_constant_l_mask_distance_from_best_prefix_for_test(
+                &starting_state,
+                predictions,
+                budget_cap,
+                cost_config,
+                &certificate.active_mask,
+            )
+        })
+        .unwrap_or(TestK1PrefixDistanceClass::BeyondTwoMoves);
     let runtime_summary = selected_plan_summary_from_plan_for_test(&runtime_best, cost_config);
     let oracle_summary = selected_plan_summary_from_plan_for_test(&oracle_best, cost_config);
     Some(TestK1OracleComparison {
         runtime_best: runtime_summary,
         oracle_best: oracle_summary,
         oracle_best_is_direct_prefix,
+        oracle_best_prefix_distance_class,
         oracle_best_active_set_size: oracle_best.selected_active_set_size,
         runtime_k1_gap_net_ev: test_selected_plan_gap_net_ev(&runtime_best, &oracle_best),
         runtime_k1_gap_raw_ev: test_selected_plan_gap_raw_ev(&runtime_best, &oracle_best),
@@ -8130,6 +8679,187 @@ pub(super) fn phase_order_exact_subset_choice_for_test(
 }
 
 #[cfg(test)]
+fn distilled_proposal_features_for_exact_no_arb_for_test(
+    state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    expected_outcome_count: usize,
+    force_mint_available: bool,
+    stats: &mut SolverRunStats,
+    cost_config: PlannerCostConfig,
+) -> Vec<DistilledMarketFeature> {
+    let seed_plans = collect_no_preserve_frontier_seed_plans(
+        state,
+        predictions,
+        expected_outcome_count,
+        RouteGateThresholds::disabled(),
+        Some(force_mint_available),
+        false,
+        false,
+        SolverFamily::Plain,
+        stats,
+        cost_config,
+    );
+    let merged_preserve_scores = merged_preserve_candidate_scores_from_seed_plans(
+        &seed_plans,
+        state,
+        predictions,
+        expected_outcome_count,
+        RouteGateThresholds::disabled(),
+        Some(force_mint_available),
+        false,
+        false,
+        SolverFamily::Plain,
+        stats,
+        cost_config,
+    );
+    collect_distilled_market_features(state, predictions, &merged_preserve_scores)
+}
+
+#[cfg(test)]
+fn distilled_proposal_tasks_for_test(
+    features: &[DistilledMarketFeature],
+    proposal_mode: TestDistilledProposalMode,
+) -> Vec<DistilledProposalTask> {
+    let mut tasks = Vec::new();
+    if matches!(
+        proposal_mode,
+        TestDistilledProposalMode::LegacyOnly | TestDistilledProposalMode::LegacyAndV2
+    ) {
+        tasks.extend(legacy_distilled_proposal_tasks(features));
+    }
+    if matches!(
+        proposal_mode,
+        TestDistilledProposalMode::V2Only | TestDistilledProposalMode::LegacyAndV2
+    ) {
+        tasks.extend(proposal_v2_tasks(features));
+    }
+    tasks
+}
+
+#[cfg(test)]
+pub(super) fn exact_no_arb_distilled_proposal_tasks_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    proposal_mode: TestDistilledProposalMode,
+) -> Vec<StagedReferenceChoice> {
+    if proposal_mode == TestDistilledProposalMode::None {
+        return Vec::new();
+    }
+    let state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    let cost_config = benchmark_planner_cost_config_for_test();
+    let mut stats = SolverRunStats::default();
+    let features = distilled_proposal_features_for_exact_no_arb_for_test(
+        &state,
+        predictions,
+        slot0_results.len(),
+        force_mint_available,
+        &mut stats,
+        cost_config,
+    );
+    distilled_proposal_tasks_for_test(&features, proposal_mode)
+        .into_iter()
+        .map(
+            |(frontier_family, preserve_markets)| StagedReferenceChoice {
+                variant_label: proposal_mode.as_label(),
+                frontier_family,
+                preserve_markets: sorted_preserve_markets(&preserve_markets),
+            },
+        )
+        .collect()
+}
+
+#[cfg(test)]
+pub(super) fn exact_no_arb_distilled_proposal_choice_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    proposal_mode: TestDistilledProposalMode,
+) -> Option<StagedReferenceChoice> {
+    if proposal_mode == TestDistilledProposalMode::None {
+        return None;
+    }
+    let state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    let cost_config = benchmark_planner_cost_config_for_test();
+    let mut stats = SolverRunStats::default();
+    let features = distilled_proposal_features_for_exact_no_arb_for_test(
+        &state,
+        predictions,
+        slot0_results.len(),
+        force_mint_available,
+        &mut stats,
+        cost_config,
+    );
+    let mut best_choice = None;
+    let mut best_plan = None;
+    for (frontier_family, preserve_markets) in
+        distilled_proposal_tasks_for_test(&features, proposal_mode)
+    {
+        let Some(candidate) = run_no_arb_rebalance_plan_from_state(
+            &state,
+            predictions,
+            slot0_results.len(),
+            RouteGateThresholds::disabled(),
+            &preserve_markets,
+            frontier_family,
+            Some(force_mint_available),
+            false,
+            false,
+            SolverFamily::Plain,
+            cost_config,
+        ) else {
+            continue;
+        };
+        if best_plan
+            .as_ref()
+            .is_none_or(|incumbent| plan_result_is_better(&candidate, incumbent))
+        {
+            best_choice = Some(StagedReferenceChoice {
+                variant_label: proposal_mode.as_label(),
+                frontier_family,
+                preserve_markets: sorted_preserve_markets(&preserve_markets),
+            });
+            best_plan = Some(candidate);
+        }
+    }
+    best_choice
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_distilled_proposal_mode_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    proposal_mode: TestDistilledProposalMode,
+) -> Vec<Action> {
+    let state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    let cost_config = benchmark_planner_cost_config_for_test();
+    let mut stats = SolverRunStats::default();
+    run_exact_no_arb_plan_with_options(
+        &state,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        Some(force_mint_available),
+        false,
+        false,
+        SolverFamily::Plain,
+        &[],
+        MAX_ONLINE_PRESERVE_CANDIDATES,
+        proposal_mode.into(),
+        &mut stats,
+        cost_config,
+    )
+    .actions
+}
+
+#[cfg(test)]
 pub(super) fn rebalance_with_custom_predictions_exact_no_arb_for_test(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -8163,25 +8893,50 @@ pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_distilled_prop
     predictions: &HashMap<String, f64>,
     force_mint_available: bool,
 ) -> Vec<Action> {
-    let state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
-    let cost_config = benchmark_planner_cost_config_for_test();
-    let mut stats = SolverRunStats::default();
-    run_exact_no_arb_plan_with_options(
-        &state,
+    rebalance_with_custom_predictions_exact_no_arb_with_distilled_proposal_mode_for_test(
+        balances,
+        susds_balance,
+        slot0_results,
         predictions,
-        slot0_results.len(),
-        RouteGateThresholds::disabled(),
-        Some(force_mint_available),
-        false,
-        false,
-        SolverFamily::Plain,
-        &[],
-        MAX_ONLINE_PRESERVE_CANDIDATES,
-        true,
-        &mut stats,
-        cost_config,
+        force_mint_available,
+        TestDistilledProposalMode::LegacyOnly,
     )
-    .actions
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_proposal_v2_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    rebalance_with_custom_predictions_exact_no_arb_with_distilled_proposal_mode_for_test(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        force_mint_available,
+        TestDistilledProposalMode::V2Only,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_legacy_and_proposal_v2_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> Vec<Action> {
+    rebalance_with_custom_predictions_exact_no_arb_with_distilled_proposal_mode_for_test(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        force_mint_available,
+        TestDistilledProposalMode::LegacyAndV2,
+    )
 }
 
 #[cfg(test)]
@@ -8253,7 +9008,7 @@ pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_search_config_
         SolverFamily::Plain,
         &extra_seed_states,
         online_preserve_cap,
-        false,
+        DistilledProposalConfig::none(),
         &mut stats,
         cost_config,
     )
@@ -8329,6 +9084,7 @@ pub(super) fn rebalance_with_custom_predictions_plain_family_for_test(
         RouteGateThresholds::disabled(),
         Some(force_mint_available),
         false,
+        DistilledProposalConfig::legacy_only(),
         &mut stats,
         cost_config,
     )
@@ -8353,6 +9109,7 @@ pub(super) fn rebalance_with_custom_predictions_arb_primed_family_for_test(
         RouteGateThresholds::disabled(),
         Some(force_mint_available),
         false,
+        DistilledProposalConfig::legacy_only(),
         &mut stats,
         cost_config,
     )
@@ -8377,6 +9134,7 @@ pub(super) fn rebalance_with_custom_predictions_operator_only_for_test(
         RouteGateThresholds::disabled(),
         Some(force_mint_available),
         false,
+        DistilledProposalConfig::legacy_only(),
         &mut stats,
         cost_config,
     );
@@ -8387,6 +9145,7 @@ pub(super) fn rebalance_with_custom_predictions_operator_only_for_test(
         RouteGateThresholds::disabled(),
         Some(force_mint_available),
         false,
+        DistilledProposalConfig::legacy_only(),
         &mut stats,
         cost_config,
     ) && plan_result_is_better(&arb_primed, &best)

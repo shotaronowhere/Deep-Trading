@@ -103,6 +103,7 @@ Important boundaries:
   - `coupled_mixed` solves profitable direct prefixes as a continuous mixed frontier candidate and keeps the result only if it beats the other compact forms on net EV
   - `direct_only` is the mandatory no-mint/no-merge net-EV guard
 - First-frontier-family forcing is bounded to the first Phase-2 frontier choice only. After that, the waterfall returns to its existing deterministic frontier logic.
+- `R_exact` still evaluates the legacy distilled preserve/frontier proposals by default. `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1` adds a second bounded proposal family on top of those legacy proposals; it does not replace them.
 - Execution is now optimized over packed tx chunks, not priced as one tx per replay subgroup.
 - The staged meta-solver remains compiled as a reference path during rollout, but it is no longer part of the default hot-path objective.
 - `RebalanceFlags.enable_ev_guarded_greedy_churn_pruning` remains for compatibility but does not change default full-mode behavior.

@@ -6,14 +6,17 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use super::super::rebalancer::{
-    TestPhaseOrderVariant, arb_only_with_custom_predictions_for_test,
+    TestDistilledProposalMode, TestK1PrefixDistanceClass, TestPhaseOrderVariant,
+    TestSelectedPlanSummary, arb_only_with_custom_predictions_for_test,
     benchmark_gas_assumptions_for_test, collect_mint_sell_preserve_candidates_for_test,
     compare_constant_l_runtime_vs_best_known_for_test,
     compare_constant_l_runtime_vs_k2_oracle_for_test,
     compare_constant_l_runtime_vs_medium_oracle_for_test,
     compare_constant_l_runtime_vs_oracle_for_test, compile_constant_l_mixed_selected_plan_for_test,
     compile_target_delta_actions_for_test, estimate_plan_economics_for_test,
-    phase_order_exact_subset_choice_for_test, rebalance_with_custom_predictions_and_stats_for_test,
+    exact_no_arb_distilled_proposal_choice_for_test,
+    exact_no_arb_distilled_proposal_tasks_for_test, phase_order_exact_subset_choice_for_test,
+    rebalance_with_custom_predictions_and_stats_for_test,
     rebalance_with_custom_predictions_arb_first_for_test,
     rebalance_with_custom_predictions_arb_last_for_test,
     rebalance_with_custom_predictions_arb_primed_family_for_test,
@@ -21,6 +24,8 @@ use super::super::rebalancer::{
     rebalance_with_custom_predictions_exact_no_arb_with_distilled_proposals_for_test,
     rebalance_with_custom_predictions_exact_no_arb_with_explicit_choice_for_test,
     rebalance_with_custom_predictions_exact_no_arb_with_explicit_preserve_universe_for_test,
+    rebalance_with_custom_predictions_exact_no_arb_with_legacy_and_proposal_v2_for_test,
+    rebalance_with_custom_predictions_exact_no_arb_with_proposal_v2_for_test,
     rebalance_with_custom_predictions_exact_no_arb_with_search_config_for_test,
     rebalance_with_custom_predictions_for_test,
     rebalance_with_custom_predictions_operator_only_for_test,
@@ -28,8 +33,10 @@ use super::super::rebalancer::{
     rebalance_with_custom_predictions_rebalance_only_for_test,
     rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test,
     rebalance_with_custom_predictions_selected_plan_for_test,
-    rebalance_with_custom_predictions_staged_reference_for_test, staged_reference_choice_for_test,
-    staged_teacher_snapshot_for_test,
+    rebalance_with_custom_predictions_selected_plan_with_distilled_proposal_mode_for_test,
+    rebalance_with_custom_predictions_staged_reference_for_test,
+    rebalance_with_custom_predictions_with_distilled_proposal_mode_for_test,
+    staged_reference_choice_for_test, staged_teacher_snapshot_for_test,
 };
 use super::fixtures::mock_slot0_market_with_orientation_liquidity_and_ticks;
 use super::replay_actions_to_state;
@@ -199,6 +206,36 @@ struct K1TeacherRowDiagnostics {
     runtime_k1_gap_raw_ev: Option<f64>,
     oracle_best_is_direct_prefix: Option<bool>,
     oracle_best_active_set_size: Option<usize>,
+}
+
+fn selected_summary_modeled_net_ev(summary: &TestSelectedPlanSummary) -> f64 {
+    summary.estimated_net_ev.unwrap_or(summary.raw_ev)
+}
+
+fn selected_plan_summaries_match(
+    left: &TestSelectedPlanSummary,
+    right: &TestSelectedPlanSummary,
+) -> bool {
+    left.family == right.family
+        && left.frontier_family == right.frontier_family
+        && left.compiler_variant == right.compiler_variant
+        && left.selected_common_shift == right.selected_common_shift
+        && left.selected_mixed_lambda == right.selected_mixed_lambda
+        && left.selected_active_set_size == right.selected_active_set_size
+        && left.selected_stage_count == right.selected_stage_count
+        && left.selected_stage1_budget_fraction == right.selected_stage1_budget_fraction
+        && left.raw_ev == right.raw_ev
+        && left.estimated_total_fee_susd == right.estimated_total_fee_susd
+        && left.estimated_net_ev == right.estimated_net_ev
+        && left.estimated_group_count == right.estimated_group_count
+        && left.estimated_tx_count == right.estimated_tx_count
+        && left.fee_estimate_source == right.fee_estimate_source
+        && left.action_count == right.action_count
+        && left.direct_buy_count == right.direct_buy_count
+        && left.direct_sell_count == right.direct_sell_count
+        && left.mint_count == right.mint_count
+        && left.merge_count == right.merge_count
+        && left.total_calldata_bytes == right.total_calldata_bytes
 }
 
 fn k1_teacher_row_diagnostics_for_built_case(built: &BuiltCase) -> K1TeacherRowDiagnostics {
@@ -2124,6 +2161,99 @@ async fn print_shared_op_snapshot_offchain_selected_rows_jsonl() {
     }
 }
 
+#[tokio::test]
+#[ignore = "debug helper; run explicitly"]
+async fn print_shared_op_snapshot_offchain_selected_rows_with_proposal_v2_jsonl() {
+    for case in cases_from_fixture() {
+        let built = build_case(&case);
+        let force_mint_available = !case.direct_only_reference;
+        let k1_teacher_diagnostics = k1_teacher_row_diagnostics_for_built_case(&built);
+        for (flavor, force_mint) in [
+            ("offchain_direct_v2_gate", false),
+            ("offchain_default_v2_gate", force_mint_available),
+        ] {
+            let started = std::time::Instant::now();
+            let actions = rebalance_with_custom_predictions_with_distilled_proposal_mode_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint,
+                TestDistilledProposalMode::LegacyAndV2,
+            );
+            let summary =
+                rebalance_with_custom_predictions_selected_plan_with_distilled_proposal_mode_for_test(
+                    &built.balances_view,
+                    built.cash_budget,
+                    &built.slot0_results,
+                    &built.predictions,
+                    force_mint,
+                    TestDistilledProposalMode::LegacyAndV2,
+                );
+            let runtime_millis = started.elapsed().as_millis();
+            let raw_ev_wei = benchmark_ev_wei(&actions, &built);
+            let raw_ev_susd = wad_to_f64(raw_ev_wei);
+            let total_fee_susd = summary
+                .estimated_total_fee_susd
+                .expect("selected benchmark plan should have a modeled fee estimate");
+            let group_or_tx_count = summary.estimated_tx_count.unwrap_or(0);
+            println!(
+                "{}",
+                serde_json::to_string(&SharedSnapshotSolverRow {
+                    case_id: case.case_id.clone(),
+                    flavor: flavor.to_string(),
+                    raw_ev_wei: raw_ev_wei.to_string(),
+                    raw_ev_susd,
+                    total_fee_susd,
+                    net_ev_susd: raw_ev_susd - total_fee_susd,
+                    action_count: actions.len(),
+                    group_or_tx_count,
+                    runtime_millis: Some(runtime_millis),
+                    fee_source: summary.fee_estimate_source.to_string(),
+                    family: Some(summary.family.to_string()),
+                    compiler_variant: Some(summary.compiler_variant.to_string()),
+                    selected_common_shift: summary.selected_common_shift,
+                    selected_mixed_lambda: summary.selected_mixed_lambda,
+                    selected_active_set_size: summary.selected_active_set_size,
+                    selected_stage_count: summary.selected_stage_count,
+                    selected_stage1_budget_fraction: summary.selected_stage1_budget_fraction,
+                    k1_teacher_source: if flavor == "offchain_default_v2_gate" {
+                        k1_teacher_diagnostics.k1_teacher_source.clone()
+                    } else {
+                        None
+                    },
+                    runtime_k1_gap_net_ev: if flavor == "offchain_default_v2_gate" {
+                        k1_teacher_diagnostics.runtime_k1_gap_net_ev
+                    } else {
+                        None
+                    },
+                    runtime_k1_gap_raw_ev: if flavor == "offchain_default_v2_gate" {
+                        k1_teacher_diagnostics.runtime_k1_gap_raw_ev
+                    } else {
+                        None
+                    },
+                    oracle_best_is_direct_prefix: if flavor == "offchain_default_v2_gate" {
+                        k1_teacher_diagnostics.oracle_best_is_direct_prefix
+                    } else {
+                        None
+                    },
+                    oracle_best_active_set_size: if flavor == "offchain_default_v2_gate" {
+                        k1_teacher_diagnostics.oracle_best_active_set_size
+                    } else {
+                        None
+                    },
+                    direct_buy_count: Some(summary.direct_buy_count),
+                    direct_sell_count: Some(summary.direct_sell_count),
+                    mint_count: Some(summary.mint_count),
+                    merge_count: Some(summary.merge_count),
+                    total_calldata_bytes: summary.total_calldata_bytes,
+                })
+                .expect("shared snapshot row should serialize")
+            );
+        }
+    }
+}
+
 #[test]
 fn arb_primed_root_is_only_taken_when_start_arb_is_positive() {
     let cases = cases_from_fixture();
@@ -2561,6 +2691,248 @@ fn constant_l_random_corpus_exercises_self_financing_budget_accounting() {
 }
 
 #[test]
+fn proposal_v2_generation_is_stable_deduped_and_capped() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "heterogeneous_ninety_eight_outcome_l1_like_case")
+        .expect("fixture should include heterogeneous_ninety_eight_outcome_l1_like_case");
+    let built = build_case(&case);
+    let first = exact_no_arb_distilled_proposal_tasks_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        true,
+        TestDistilledProposalMode::V2Only,
+    );
+    let second = exact_no_arb_distilled_proposal_tasks_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        true,
+        TestDistilledProposalMode::V2Only,
+    );
+
+    assert_eq!(
+        first, second,
+        "V2 proposal generation should be deterministic"
+    );
+    assert!(
+        !first.is_empty(),
+        "V2 proposal generation should produce at least one preserve/frontier task on the heterogeneous benchmark case"
+    );
+    assert!(
+        first.len() <= 6,
+        "V2 proposal tasks must remain hard-bounded to six tasks: {:?}",
+        first
+    );
+
+    let mut unique_preserve_sets = Vec::new();
+    for choice in &first {
+        let mut sorted = choice.preserve_markets.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            choice.preserve_markets, sorted,
+            "proposal preserve markets should already be sorted for stable dedupe: {:?}",
+            choice
+        );
+        if !unique_preserve_sets.contains(&choice.preserve_markets) {
+            unique_preserve_sets.push(choice.preserve_markets.clone());
+        }
+    }
+    assert!(
+        unique_preserve_sets.len() <= 3,
+        "V2 preserve proposals must stay capped at three unique preserve sets: {:?}",
+        first
+    );
+
+    for (idx, left) in first.iter().enumerate() {
+        for right in first.iter().skip(idx + 1) {
+            assert!(
+                left != right,
+                "V2 proposal tasks should be deduped by frontier family and preserve set: left={:?} right={:?}",
+                left,
+                right
+            );
+        }
+    }
+}
+
+#[test]
+fn ungated_selected_plan_matches_explicit_legacy_mode_on_committed_fixture_cases() {
+    for case in cases_from_fixture() {
+        let built = build_case(&case);
+        let force_mint_available = !case.direct_only_reference;
+        let default_actions = rebalance_with_custom_predictions_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let explicit_legacy_actions =
+            rebalance_with_custom_predictions_with_distilled_proposal_mode_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                TestDistilledProposalMode::LegacyOnly,
+            );
+        let default_summary = rebalance_with_custom_predictions_selected_plan_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+        let explicit_legacy_summary =
+            rebalance_with_custom_predictions_selected_plan_with_distilled_proposal_mode_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                TestDistilledProposalMode::LegacyOnly,
+            );
+
+        assert_eq!(
+            default_actions, explicit_legacy_actions,
+            "explicit legacy-only proposal mode should preserve the default ungated action plan on case {}",
+            case.case_id
+        );
+        assert!(
+            selected_plan_summaries_match(&default_summary, &explicit_legacy_summary),
+            "explicit legacy-only proposal mode should preserve the default ungated selected plan on case {}: default={:?} explicit={:?}",
+            case.case_id,
+            default_summary,
+            explicit_legacy_summary
+        );
+    }
+}
+
+#[test]
+fn proposal_v2_gate_leaves_direct_only_cases_identical() {
+    for case in cases_from_fixture() {
+        if !case.direct_only_reference {
+            continue;
+        }
+        let built = build_case(&case);
+        let default_actions = rebalance_with_custom_predictions_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            false,
+        );
+        let v2_actions = rebalance_with_custom_predictions_with_distilled_proposal_mode_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            false,
+            TestDistilledProposalMode::LegacyAndV2,
+        );
+        let default_summary = rebalance_with_custom_predictions_selected_plan_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            false,
+        );
+        let v2_summary =
+            rebalance_with_custom_predictions_selected_plan_with_distilled_proposal_mode_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                false,
+                TestDistilledProposalMode::LegacyAndV2,
+            );
+
+        assert_eq!(
+            default_actions, v2_actions,
+            "V2 gate should not change direct-only action plans on case {}",
+            case.case_id
+        );
+        assert!(
+            selected_plan_summaries_match(&default_summary, &v2_summary),
+            "V2 gate should not change direct-only selected plan summaries on case {}: default={:?} v2={:?}",
+            case.case_id,
+            default_summary,
+            v2_summary
+        );
+    }
+}
+
+#[test]
+fn proposal_v2_gate_never_regresses_mixed_route_favorable_case_net_ev() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "mixed_route_favorable_synthetic_case")
+        .expect("fixture should include mixed_route_favorable_synthetic_case");
+    let built = build_case(&case);
+    let default_summary = rebalance_with_custom_predictions_selected_plan_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        true,
+    );
+    let v2_summary =
+        rebalance_with_custom_predictions_selected_plan_with_distilled_proposal_mode_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            true,
+            TestDistilledProposalMode::LegacyAndV2,
+        );
+
+    assert!(
+        selected_summary_modeled_net_ev(&v2_summary) + 1e-12
+            >= selected_summary_modeled_net_ev(&default_summary),
+        "V2 gate should not regress modeled net EV on the mixed-route favorable case: default={:?} v2={:?}",
+        default_summary,
+        v2_summary
+    );
+}
+
+#[test]
+fn proposal_v2_gate_never_regresses_heterogeneous_case_net_ev() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "heterogeneous_ninety_eight_outcome_l1_like_case")
+        .expect("fixture should include heterogeneous_ninety_eight_outcome_l1_like_case");
+    let built = build_case(&case);
+    let default_summary = rebalance_with_custom_predictions_selected_plan_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        true,
+    );
+    let v2_summary =
+        rebalance_with_custom_predictions_selected_plan_with_distilled_proposal_mode_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            true,
+            TestDistilledProposalMode::LegacyAndV2,
+        );
+
+    assert!(
+        selected_summary_modeled_net_ev(&v2_summary) + 1e-12
+            >= selected_summary_modeled_net_ev(&default_summary),
+        "V2 gate should not regress modeled net EV on the heterogeneous benchmark case: default={:?} v2={:?}",
+        default_summary,
+        v2_summary
+    );
+}
+
+#[test]
 fn constant_l_runtime_search_matches_oracle_on_committed_small_mixed_cases() {
     let mut checked = 0usize;
     for case in cases_from_fixture() {
@@ -2715,6 +3087,107 @@ fn constant_l_oracle_random_corpus_finds_non_prefix_optima() {
     assert!(
         found.is_some(),
         "expected the deterministic oracle corpus to contain at least one non-prefix K=1 optimum"
+    );
+}
+
+#[test]
+fn constant_l_oracle_prefix_distance_classification_never_mislabels_non_prefix_optima() {
+    let mut found_non_prefix = false;
+    for seed in 1..=96u64 {
+        let built = build_random_small_case(seed);
+        let Some(comparison) = compare_constant_l_runtime_vs_oracle_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            None,
+        ) else {
+            continue;
+        };
+        if comparison.oracle_best_is_direct_prefix {
+            continue;
+        }
+        found_non_prefix = true;
+        assert_ne!(
+            comparison.oracle_best_prefix_distance_class,
+            TestK1PrefixDistanceClass::Prefix,
+            "non-prefix oracle optimum was mislabeled as a direct-prefix optimum: seed={} comparison={:?}",
+            seed,
+            comparison
+        );
+    }
+
+    assert!(
+        found_non_prefix,
+        "expected the deterministic oracle corpus to contain at least one non-prefix K=1 optimum"
+    );
+}
+
+#[test]
+#[ignore = "teacher-only diagnostic; run explicitly"]
+fn print_constant_l_prefix_distance_histogram() {
+    let mut prefix = 0usize;
+    let mut one_move = 0usize;
+    let mut two_moves = 0usize;
+    let mut beyond_two_moves = 0usize;
+
+    for case in cases_from_fixture() {
+        if case.direct_only_reference || case.uniform_count > 0 || case.predictions_wad.len() > 12 {
+            continue;
+        }
+        let built = build_case(&case);
+        let Some(comparison) = compare_constant_l_runtime_vs_oracle_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            None,
+        ) else {
+            continue;
+        };
+        match comparison.oracle_best_prefix_distance_class {
+            TestK1PrefixDistanceClass::Prefix => prefix += 1,
+            TestK1PrefixDistanceClass::OneMove => one_move += 1,
+            TestK1PrefixDistanceClass::TwoMoves => two_moves += 1,
+            TestK1PrefixDistanceClass::BeyondTwoMoves => beyond_two_moves += 1,
+        }
+        println!(
+            "fixture_case={} prefix_distance={:?} is_prefix={} gap_net_ev={:?}",
+            case.case_id,
+            comparison.oracle_best_prefix_distance_class,
+            comparison.oracle_best_is_direct_prefix,
+            comparison.runtime_k1_gap_net_ev
+        );
+    }
+
+    for seed in 1..=3u64 {
+        let built = build_random_medium_case(seed);
+        let comparison = compare_constant_l_runtime_vs_medium_oracle_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            None,
+        )
+        .expect("medium deterministic K=1 oracle comparison should exist");
+        match comparison.oracle_best_prefix_distance_class {
+            TestK1PrefixDistanceClass::Prefix => prefix += 1,
+            TestK1PrefixDistanceClass::OneMove => one_move += 1,
+            TestK1PrefixDistanceClass::TwoMoves => two_moves += 1,
+            TestK1PrefixDistanceClass::BeyondTwoMoves => beyond_two_moves += 1,
+        }
+        println!(
+            "medium_seed={} prefix_distance={:?} is_prefix={} gap_net_ev={:?}",
+            seed,
+            comparison.oracle_best_prefix_distance_class,
+            comparison.oracle_best_is_direct_prefix,
+            comparison.runtime_k1_gap_net_ev
+        );
+    }
+
+    println!(
+        "prefix_distance_histogram prefix={} one_move={} two_moves={} beyond_two_moves={}",
+        prefix, one_move, two_moves, beyond_two_moves
     );
 }
 
@@ -3010,6 +3483,130 @@ fn print_heterogeneous_ninety_eight_exact_preserve_oracle_breakdown() {
         exact_staged_seed_k8_ev >= exact_k4_ev,
         "staged-derived preserve universe should not underperform the baseline k4 exact solver on the heterogeneous oracle case"
     );
+}
+
+#[test]
+#[ignore = "debug helper; run explicitly"]
+fn print_heterogeneous_ninety_eight_proposal_v2_breakdown() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "heterogeneous_ninety_eight_outcome_l1_like_case")
+        .expect("heterogeneous benchmark case should exist");
+    let built = build_case(&case);
+    let force_mint_available = !case.direct_only_reference;
+
+    let staged_actions = rebalance_with_custom_predictions_staged_reference_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let staged_choice = staged_reference_choice_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    )
+    .expect("staged reference should produce a candidate on the heterogeneous benchmark case");
+    let staged_choice_replay =
+        rebalance_with_custom_predictions_exact_no_arb_with_explicit_choice_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+            &staged_choice.preserve_markets,
+            staged_choice.frontier_family,
+        );
+    println!(
+        "staged variant={} frontier={:?} preserve={:?} staged_ev={} staged_actions={} exact_no_arb_replay_ev={} exact_no_arb_replay_actions={}",
+        staged_choice.variant_label,
+        staged_choice.frontier_family,
+        staged_choice.preserve_markets,
+        benchmark_ev_wei(&staged_actions, &built),
+        staged_actions.len(),
+        benchmark_ev_wei(&staged_choice_replay, &built),
+        staged_choice_replay.len()
+    );
+
+    let legacy_actions =
+        rebalance_with_custom_predictions_exact_no_arb_with_distilled_proposals_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+    let v2_actions = rebalance_with_custom_predictions_exact_no_arb_with_proposal_v2_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let combined_actions =
+        rebalance_with_custom_predictions_exact_no_arb_with_legacy_and_proposal_v2_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+        );
+    println!(
+        "exact_no_arb legacy_ev={} legacy_actions={} v2_ev={} v2_actions={} combined_ev={} combined_actions={}",
+        benchmark_ev_wei(&legacy_actions, &built),
+        legacy_actions.len(),
+        benchmark_ev_wei(&v2_actions, &built),
+        v2_actions.len(),
+        benchmark_ev_wei(&combined_actions, &built),
+        combined_actions.len()
+    );
+
+    for mode in [
+        TestDistilledProposalMode::LegacyOnly,
+        TestDistilledProposalMode::V2Only,
+        TestDistilledProposalMode::LegacyAndV2,
+    ] {
+        let tasks = exact_no_arb_distilled_proposal_tasks_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+            mode,
+        );
+        let choice = exact_no_arb_distilled_proposal_choice_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+            mode,
+        );
+        println!("mode={:?} proposal_tasks={:?}", mode, tasks);
+        if let Some(choice) = choice {
+            let replayed =
+                rebalance_with_custom_predictions_exact_no_arb_with_explicit_choice_for_test(
+                    &built.balances_view,
+                    built.cash_budget,
+                    &built.slot0_results,
+                    &built.predictions,
+                    force_mint_available,
+                    &choice.preserve_markets,
+                    choice.frontier_family,
+                );
+            println!(
+                "mode={:?} choice_frontier={:?} choice_preserve={:?} choice_replay_ev={} choice_replay_actions={}",
+                mode,
+                choice.frontier_family,
+                choice.preserve_markets,
+                benchmark_ev_wei(&replayed, &built),
+                replayed.len()
+            );
+        }
+    }
 }
 
 #[test]

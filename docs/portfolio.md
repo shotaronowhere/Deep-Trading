@@ -129,6 +129,8 @@ Reference fallback:
 Compatibility note:
 
 - `RebalanceFlags.enable_ev_guarded_greedy_churn_pruning` remains in the public API for compatibility, but it no longer changes default full-mode behavior
+- the default exact-no-arb path still evaluates the legacy distilled preserve/frontier proposals
+- `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1` adds a second bounded proposal family on top of the legacy proposals; that gate is non-default and additive only in the current rollout
 
 Operational diagnostics:
 

@@ -87,6 +87,31 @@ Archived note:
 
 - the earlier “near saturation after `coupled_mixed`” conclusion belongs to the pre-`constant_l_mixed` / pre-oracle era and should not be used to block new work
 
+## 2026-03-10: gated proposal V2 and prefix-distance diagnostics
+
+Current state:
+
+- the default exact-no-arb path still keeps the legacy distilled preserve/frontier proposals
+- `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1` adds a second bounded proposal family on top of the legacy proposals; it is additive and non-default in this milestone
+- the bounded V2 family is intentionally tiny:
+  - at most 3 preserve sets
+  - at most 6 extra exact-no-arb proposal tasks
+- the new `K=1` teacher diagnostic does not change runtime search; it classifies the oracle-best active mask relative to the best direct-profitability prefix seed as `prefix`, `one_move`, `two_moves`, or `beyond_two_moves`
+
+Promotion gate:
+
+- keep the ungated runtime behavior unchanged
+- require non-regression on direct-only committed cases
+- require non-regression on `mixed_route_favorable_synthetic_case`
+- require non-regression on `heterogeneous_ninety_eight_outcome_l1_like_case`
+- only after that should V2 be considered for default promotion or legacy-proposal replacement
+
+Ignored diagnostics added for this phase:
+
+- `cargo test print_constant_l_prefix_distance_histogram -- --ignored --nocapture`
+- `cargo test print_heterogeneous_ninety_eight_proposal_v2_breakdown -- --ignored --nocapture`
+- `cargo test print_shared_op_snapshot_offchain_selected_rows_with_proposal_v2_jsonl -- --ignored --nocapture --test-threads=1`
+
 ## Historical raw-EV benchmark frontier
 
 Sources:
@@ -238,9 +263,11 @@ Default-path keep/cut decisions:
   - mixed-route capability
   - `R_exact` over `{default, direct, mint}`
   - `Plain` and `ArbPrimed` whole-plan families
+  - legacy distilled preserve/frontier proposals inside `R_exact`
   - staged fallback, as the last retained complexity layer pending the net-EV-era release benchmark refresh
+- Gate behind env only:
+  - bounded preserve/frontier proposal V2 via `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1`
 - Remove from default path:
-  - runtime distilled-proposal layer
   - late arb-correction tail
 - Do not add:
   - larger preserve enumeration
@@ -288,7 +315,7 @@ Engineering decision:
 - replace fragmented subgroup pricing with packed execution-program compilation
 - make the packed operator solver the default hot path
 - keep staged reference only as an opt-in rollout comparison via `REBALANCE_ENABLE_STAGED_FALLBACK=1`
-- remove runtime distilled proposals from the default path
+- keep the legacy distilled proposals in the default path and add any new proposal family only behind an explicit gate
 - remove the late arb-correction tail from the default path
 - do not add another online search dimension on top of this phase
 - if EV work resumes, it should be teacher-to-student proposal distillation only
@@ -319,13 +346,15 @@ Conclusion:
   - mixed-route capability
   - `R_exact` over `{default, direct, mint}`
   - `Plain` and `ArbPrimed`
+  - legacy distilled preserve/frontier proposals
   - packed-vs-strict execution-program compilation
   - net-EV ranking with gas-aware gating
 - v1 default path prunes:
-  - runtime distilled proposals
   - late arb-correction tail
   - default staged-fallback selection
   - any further online search expansion
+- v1 optional gated additions:
+  - bounded preserve/frontier proposal V2 via `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1`
 - explicitly deferred post-release:
   - packed-path release perf rerun
   - any teacher-distilled preserve/frontier codebook beyond offline diagnostics
@@ -341,6 +370,7 @@ Conclusion:
 | Mixed-route capability | Keep | Real EV uplift on the mixed cases |
 | `R_exact` over `{default, direct, mint}` frontier families | Keep | Cheap exactness over the right continuous core |
 | Small preserve-set search | Keep | Preserve choice is a real EV lever |
+| Legacy distilled preserve/frontier proposals | Keep | Cheap discrete-choice hints inside `R_exact` and still part of the ungated default path |
 | `Plain` and `ArbPrimed` operator families | Keep | They are the simplified operator-level default search |
 
 ### Keep only as temporary safety net
@@ -356,7 +386,7 @@ Conclusion:
 | Larger online `2^K` preserve enumeration (`K > 4`) | Reject | Improves EV, but runtime cost is too high and still does not fully close the gap |
 | Positive root-arb seed for preserve discovery | Reject | No measurable benefit on the hard case |
 | Staged-action churn seeding | Reject | Still misses the staged winner |
-| Tiny distilled preserve/frontier proposals in the default path | Reject | Non-regressive, but no committed-benchmark lift after gas-aware pruning |
+| Promoting any new preserve/frontier proposal family to the default path without teacher parity | Reject | Keep legacy proposals; leave V2 gated until the hard cases clear |
 | Late arb-correction tail in the default path | Reject | Removed after gas-aware pruning; no committed-benchmark lift beyond the operator core |
 | Online per-variant exact-subset preserve proposals | Reject | Recovers most of the residual hard-case gap, but runtime cost is too high for the remaining dust-sized EV |
 | Preserve local search / pair-add / pairwise probes | Reject | Added complexity without moving the hard case |
