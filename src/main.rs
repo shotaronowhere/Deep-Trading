@@ -16,7 +16,30 @@ use deep_trading_bot::execution::runtime::{
     DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
 };
 use deep_trading_bot::pools;
-use deep_trading_bot::portfolio::{self, RebalanceFlags, RebalanceMode, TraceConfig};
+use deep_trading_bot::portfolio::{
+    self, RebalanceFlags, RebalanceMode, RebalanceSolver, TraceConfig,
+};
+
+struct ForecastFlowsShutdownGuard {
+    enabled: bool,
+}
+
+impl ForecastFlowsShutdownGuard {
+    fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+}
+
+impl Drop for ForecastFlowsShutdownGuard {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if let Err(err) = portfolio::shutdown_forecastflows_worker() {
+            tracing::warn!(error = %err, "failed to shut down ForecastFlows worker");
+        }
+    }
+}
 
 fn parse_rebalance_mode() -> RebalanceMode {
     match std::env::var("REBALANCE_MODE")
@@ -27,6 +50,10 @@ fn parse_rebalance_mode() -> RebalanceMode {
         Some("arb") | Some("arb_only") | Some("arbonly") => RebalanceMode::ArbOnly,
         _ => RebalanceMode::Full,
     }
+}
+
+fn parse_rebalance_solver() -> RebalanceSolver {
+    RebalanceSolver::from_env()
 }
 
 fn parse_starting_susd() -> f64 {
@@ -100,6 +127,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mode = parse_rebalance_mode();
+    let solver = parse_rebalance_solver();
+    let _forecastflows_shutdown_guard =
+        ForecastFlowsShutdownGuard::new(mode == RebalanceMode::Full && solver.uses_forecastflows());
     let eth_usd = parse_eth_usd();
     let enable_greedy_churn_pruning = parse_enable_greedy_churn_pruning();
     let conservative_execution = ConservativeExecutionConfig {
@@ -120,6 +150,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         deep_trading_bot::execution::gas::GasAssumptions::default()
     };
 
+    if mode == RebalanceMode::Full && solver.uses_forecastflows() {
+        if let Err(err) = portfolio::warm_forecastflows_worker() {
+            tracing::warn!(error = %err, "ForecastFlows worker warmup failed; native fallback remains enabled");
+        }
+    }
+
     let (initial_susd, balances_owned): (f64, HashMap<&'static str, f64>) =
         if let Ok(wallet_raw) = std::env::var("WALLET") {
             let wallet = Address::from_str(wallet_raw.trim())?;
@@ -139,11 +175,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|(market, units)| (*market as &str, *units))
         .collect();
 
-    let actions = portfolio::rebalance_with_gas_pricing_and_flags(
+    let actions = portfolio::rebalance_with_solver_and_gas_pricing_and_flags(
         &balances_view,
         initial_susd,
         &slot0_results,
         mode,
+        solver,
         &gas_assumptions,
         1e-9,
         eth_usd,
@@ -191,6 +228,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     tracing::info!(
         mode = ?mode,
+        solver = solver.as_str(),
         eth_usd,
         enable_greedy_churn_pruning,
         markets = slot0_results.len(),

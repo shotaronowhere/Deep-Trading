@@ -26,7 +26,28 @@ use deep_trading_bot::execution::runtime::{
 use deep_trading_bot::execution::tx_builder::build_trade_executor_calls;
 use deep_trading_bot::execution::{ExecutionMode, ITradeExecutor, SUSD_DECIMALS};
 use deep_trading_bot::pools;
-use deep_trading_bot::portfolio::{self, RebalanceFlags, RebalanceMode};
+use deep_trading_bot::portfolio::{self, RebalanceFlags, RebalanceMode, RebalanceSolver};
+
+struct ForecastFlowsShutdownGuard {
+    enabled: bool,
+}
+
+impl ForecastFlowsShutdownGuard {
+    fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+}
+
+impl Drop for ForecastFlowsShutdownGuard {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if let Err(err) = portfolio::shutdown_forecastflows_worker() {
+            tracing::warn!(error = %err, "failed to shut down ForecastFlows worker");
+        }
+    }
+}
 
 fn parse_rebalance_mode() -> RebalanceMode {
     match std::env::var("REBALANCE_MODE")
@@ -37,6 +58,10 @@ fn parse_rebalance_mode() -> RebalanceMode {
         Some("arb") | Some("arb_only") | Some("arbonly") => RebalanceMode::ArbOnly,
         _ => RebalanceMode::Full,
     }
+}
+
+fn parse_rebalance_solver() -> RebalanceSolver {
+    RebalanceSolver::from_env()
 }
 
 fn parse_eth_usd() -> f64 {
@@ -66,6 +91,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = ExecutionRuntimeConfig::from_env()?;
     let mode = parse_rebalance_mode();
+    let solver = parse_rebalance_solver();
+    let _forecastflows_shutdown_guard =
+        ForecastFlowsShutdownGuard::new(mode == RebalanceMode::Full && solver.uses_forecastflows());
     let eth_usd = parse_eth_usd();
     let enable_greedy_churn_pruning = parse_enable_greedy_churn_pruning();
     let conservative_execution = ConservativeExecutionConfig {
@@ -141,6 +169,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    if mode == RebalanceMode::Full && solver.uses_forecastflows() {
+        if let Err(err) = portfolio::warm_forecastflows_worker() {
+            tracing::warn!(error = %err, "ForecastFlows worker warmup failed; native fallback remains enabled");
+        }
+    }
+
     let mut steps = 0usize;
     while steps < config.execution_max_steps {
         steps += 1;
@@ -159,11 +193,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map(|(market, units)| (*market as &str, *units))
             .collect();
 
-        let actions = portfolio::rebalance_with_gas_pricing_and_flags(
+        let actions = portfolio::rebalance_with_solver_and_gas_pricing_and_flags(
             &balances_view,
             susds_balance,
             &slot0_results,
             mode,
+            solver,
             &gas_assumptions,
             1e-9,
             eth_usd,

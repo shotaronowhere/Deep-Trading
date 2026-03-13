@@ -3,6 +3,7 @@
 ## Overview
 
 Rust prediction market portfolio balancing bot for Seer PM on Optimism. Uses compile-time code generation to embed market data.
+The production full-mode runtime now defaults to a head-to-head solver race between the native Rust planner and a worker-backed ForecastFlows family, with Rust retaining execution authority and final plan ranking.
 
 ## Data Flow
 
@@ -44,7 +45,10 @@ API (deep.seer.pm)
 - **src/bin/regenerate/markets.rs**: JSON parsing, multicall address resolution, and `markets.rs` generation
 - **src/bin/regenerate/common.rs**: Shared codegen helper(s) (e.g., formatting generated outputs)
 - **src/lib.rs**: API client, fetches market data from Seer PM endpoints
-- **src/main.rs**: Runtime planning entrypoint using HTTP JSON-RPC provider wiring, mode selection (`full`/`arb_only`), gas-assumption hydration, and diagnostics output
+- **src/main.rs**: Runtime planning entrypoint using HTTP JSON-RPC provider wiring, mode selection (`full`/`arb_only`), solver selection (`REBALANCE_SOLVER`), gas-assumption hydration, and diagnostics output
+- **src/bin/plan_preview.rs**: Runtime snapshot planner / execution preview entrypoint
+- **src/bin/execute.rs**: Runtime execution loop entrypoint
+- **src/bin/forecastflows_doctor.rs**: Operator diagnostic entrypoint for Julia path/version, worker health, sysimage status, and representative compare timings
 - **src/markets.rs**: Generated static market data arrays
 - **src/predictions.rs**: Generated prediction weights from CSVs
 - **src/pools.rs**: Facade/re-exports for pool utilities
@@ -54,6 +58,7 @@ API (deep.seer.pm)
 - **src/pools/rpc.rs**: On-chain pool + balance multicall queries
 - **src/pools/cache.rs**: Local balance cache serialization and staleness checks
 - **docs/README.md**: Canonical documentation index and precedence rules
+- **docs/forecastflows_worker.md**: ForecastFlows worker boundary, runtime ownership split, and local replay acceptance contract
 - **docs/rebalancer_approaches_playbook.md**: Canonical cross-approach strategy playbook and live validation protocol
 - **docs/batch_swap_router.md**: Canonical BatchSwapRouter API and coverage reference
 - **src/execution/bounds.rs**: Profitability-step-aware strict-subgroup planning, strict gating, and prefix-safe execution-plan orchestration
@@ -64,6 +69,8 @@ API (deep.seer.pm)
 - **src/execution/grouping.rs**: Strict action grouping, profitability-step formation, and route-shape validation (`Mint->Sell+`, `Buy+->Merge`)
 - **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
 - **src/portfolio/core/mod.rs**: Portfolio core aggregation module
+- **src/portfolio/core/forecastflows/client.rs**: ForecastFlows worker lifecycle, launch config/sysimage validation, NDJSON request/response handling, warmup, cooldown/backoff, stderr diagnostics, and doctor workload generation
+- **src/portfolio/core/forecastflows/translate.rs**: L1 snapshot -> ForecastFlows problem mapping and worker response -> local `Action` translation
 - **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers
 - **src/portfolio/core/planning.rs**: Bundle-step planning for the live waterfall path; legacy route-level planning helpers are retained under `#[cfg(test)]` for oracle parity tests
 - **src/portfolio/core/solver.rs**: Bundle mint-route cost helpers for production planning; the older per-route Newton solver is retained under `#[cfg(test)]` for regression tests

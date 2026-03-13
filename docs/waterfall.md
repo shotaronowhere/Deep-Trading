@@ -17,6 +17,12 @@ Source-of-truth code paths:
 ```rust
 pub fn rebalance(...) -> Vec<Action>
 pub fn rebalance_with_mode(..., mode: RebalanceMode) -> Vec<Action>
+pub fn rebalance_with_solver_and_flags(
+    ...,
+    mode: RebalanceMode,
+    solver: RebalanceSolver,
+    flags: RebalanceFlags,
+) -> Vec<Action>
 pub fn rebalance_with_gas(..., mode: RebalanceMode, gas: &GasAssumptions) -> Vec<Action>
 pub fn rebalance_with_gas_pricing(
     ...,
@@ -25,9 +31,20 @@ pub fn rebalance_with_gas_pricing(
     gas_price_eth: f64,
     eth_usd: f64,
 ) -> Vec<Action>
+pub fn rebalance_with_solver_and_gas_pricing_and_flags(
+    ...,
+    mode: RebalanceMode,
+    solver: RebalanceSolver,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+    flags: RebalanceFlags,
+) -> Vec<Action>
 ```
 
 - `rebalance(...)` is equivalent to `rebalance_with_mode(..., RebalanceMode::Full)`.
+- The legacy solver-less library wrappers stay native-only for deterministic compatibility.
+- Operator-facing binaries (`src/main.rs`, `src/bin/plan_preview.rs`, `src/bin/execute.rs`) now default `REBALANCE_SOLVER=head_to_head`, which races native full-mode planning against ForecastFlows in `Full` mode only.
 - `rebalance_with_mode(...)` uses conservative default pricing inputs, not zero gas thresholds.
 - In zero-threshold compatibility mode, full-mode phase-0 uses legacy one-sided complete-set arb (`buy-all -> merge` only when `sum(prices) < 1`).
 - `rebalance_with_gas_pricing(...)` computes per-route thresholds from runtime gas assumptions and also supplies the shared pricing snapshot used for net-EV ranking.
@@ -87,18 +104,27 @@ Current runtime behavior:
      - `direct_only`
      - `noop`
    - score the resulting compact plans by estimated net EV and reduce deterministically
-2. Evaluate two bounded whole-plan families:
+2. Evaluate the bounded whole-plan families:
    - `Plain`: `R_exact`
    - `ArbPrimed`: positive root `A`, then `R_exact`
-3. Compile the chosen action plan into an execution program:
+   - `ForecastFlows`: worker-backed `compare_prediction_market_families` on the same initial state, translated into local `Action`s and replayed locally before it is allowed into the ranking set
+3. In `HeadToHead`, rank the native winner vs the ForecastFlows winner with the existing `PlanResult` comparator:
+   - Rust remains the source of truth for raw EV, estimated fees, tx count, and tie-break ordering
+   - worker-reported EV and terminal balances are informational only and are not trusted for acceptance
+   - invalid, uncertified, malformed, timed-out, or locally unreplayable ForecastFlows results fail open to the native path
+4. If `RebalanceSolver::ForecastFlows` is requested explicitly, try the external family first and fall back to the native full solver only when no valid external candidate survives acceptance.
+5. Compile the chosen action plan into an execution program:
    - `Strict`: one tx per strict subgroup
    - `Packed`: greedily pack consecutive strict subgroups into gas-capped tx chunks (`< 40_000_000` estimated L2 gas)
    - rank those execution programs by net EV and keep the better one
-4. Execute the packed program by default; strict execution remains the safety fallback when a chunk cannot be safely assembled.
+5. Execute the packed program by default; strict execution remains the safety fallback when a chunk cannot be safely assembled.
 
 Important boundaries:
 
 - The inner waterfall is still the continuous optimizer; the online exactness is only over the chosen discrete block around it.
+- ForecastFlows is a third whole-plan family, not an inner branch of `R_exact`.
+- ForecastFlows currently only participates for full L1 snapshots under the current single-range replay model; partial/incomplete snapshots and `ArbOnly` stay native-only.
+- If the current active single-range geometry cannot be derived from live tick/liquidity state, ForecastFlows treats the snapshot as unsupported and fails open to the native path instead of approximating with coarse bounds.
 - The current compact normal forms are target-holdings-based, not chronological-trace-based:
   - `target_delta` re-emits the rich terminal holdings as one common-shift action plus residual direct buys/sells when that raises net EV
   - `analytic_mixed` solves directly for a compact common-shift-plus-residual frontier target without matching the rich trace holdings exactly
@@ -106,6 +132,8 @@ Important boundaries:
   - `direct_only` is the mandatory no-mint/no-merge net-EV guard
 - First-frontier-family forcing is bounded to the first Phase-2 frontier choice only. After that, the waterfall returns to its existing deterministic frontier logic.
 - Execution is now optimized over packed tx chunks, not priced as one tx per replay subgroup.
+- ForecastFlows output is accepted only after local Rust replay proves the translated actions are feasible and execution-group-compatible (`Mint -> Sell+`, `Buy+ -> Merge`, or direct-only).
+- `direct_only` and `mixed_enabled` are admitted independently; one malformed certified ForecastFlows branch does not discard the other valid branch.
 - The staged meta-solver remains compiled only in `#[cfg(test)]` as a reference teacher; it is not part of the runtime objective.
 - Release-facing parity claims are single-tick only; `crossing_light` and `crossing_heavy` synthetic cases remain validation-only scope tests.
 - Legacy distilled preserve/frontier proposals remain in the default exact-no-arb path; the newer V2 proposal path is diagnostic-only behind `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1`.

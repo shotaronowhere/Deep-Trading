@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use std::thread;
 
 use rayon::prelude::*;
 #[cfg(test)]
@@ -33,6 +34,7 @@ use crate::pools::{Slot0Result, prediction_to_sqrt_price_x96};
 
 use super::Action;
 use super::bundle::BundleRouteKind;
+use super::forecastflows::{self, ForecastFlowsCandidateVariant, ForecastFlowsFamilyCandidate};
 use super::merge::action_contract_pair;
 use super::sim::{
     DUST, EPS, PoolSim, SimBuildError, alt_price, build_sims, build_sims_without_predictions,
@@ -153,6 +155,41 @@ struct PlanCostEstimate {
 pub enum RebalanceMode {
     Full,
     ArbOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebalanceSolver {
+    Native,
+    ForecastFlows,
+    HeadToHead,
+}
+
+impl RebalanceSolver {
+    pub fn from_env() -> Self {
+        match std::env::var("REBALANCE_SOLVER")
+            .ok()
+            .map(|raw| raw.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("native") => Self::Native,
+            Some("forecastflows") | Some("forecast_flows") | Some("forecast") => {
+                Self::ForecastFlows
+            }
+            _ => Self::HeadToHead,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::ForecastFlows => "forecastflows",
+            Self::HeadToHead => "head_to_head",
+        }
+    }
+
+    pub fn uses_forecastflows(self) -> bool {
+        matches!(self, Self::ForecastFlows | Self::HeadToHead)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -306,6 +343,7 @@ struct RefinedCandidateResult {
 enum SolverFamily {
     Plain,
     ArbPrimed,
+    ForecastFlows,
 }
 
 impl SolverFamily {
@@ -313,6 +351,7 @@ impl SolverFamily {
         match self {
             Self::Plain => 0,
             Self::ArbPrimed => 1,
+            Self::ForecastFlows => 2,
         }
     }
 
@@ -320,6 +359,7 @@ impl SolverFamily {
         match self {
             Self::Plain => "plain",
             Self::ArbPrimed => "arb_primed",
+            Self::ForecastFlows => "forecastflows",
         }
     }
 }
@@ -333,6 +373,8 @@ enum PlanCompilerVariant {
     CoupledMixed,
     StagedConstantLMixed2,
     DirectOnly,
+    ForecastFlowsDirect,
+    ForecastFlowsMixed,
     NoOp,
 }
 
@@ -346,7 +388,9 @@ impl PlanCompilerVariant {
             Self::CoupledMixed => 4,
             Self::StagedConstantLMixed2 => 5,
             Self::DirectOnly => 6,
-            Self::NoOp => 7,
+            Self::ForecastFlowsDirect => 7,
+            Self::ForecastFlowsMixed => 8,
+            Self::NoOp => 9,
         }
     }
 
@@ -359,6 +403,8 @@ impl PlanCompilerVariant {
             Self::CoupledMixed => "coupled_mixed",
             Self::StagedConstantLMixed2 => "staged_constant_l_2",
             Self::DirectOnly => "direct_only",
+            Self::ForecastFlowsDirect => "forecastflows_direct",
+            Self::ForecastFlowsMixed => "forecastflows_mixed",
             Self::NoOp => "noop",
         }
     }
@@ -483,6 +529,10 @@ pub(super) struct SolverRunStats {
     pub(super) arb_operator_evals: usize,
     pub(super) arb_primed_root_taken: bool,
     pub(super) fee_estimate_unavailable_results: usize,
+    pub(super) forecastflows_requests: usize,
+    pub(super) forecastflows_worker_available: bool,
+    pub(super) forecastflows_fallback_reason: Option<&'static str>,
+    pub(super) forecastflows_winning_variant: Option<ForecastFlowsCandidateVariant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4911,6 +4961,19 @@ fn plan_result_cmp(left: &PlanResult, right: &PlanResult) -> Ordering {
     }
 }
 
+fn choose_head_to_head_plan_result(
+    native: PlanResult,
+    forecastflows: Option<PlanResult>,
+) -> PlanResult {
+    let mut chosen = native;
+    if let Some(forecastflows) = forecastflows
+        && plan_result_is_better(&forecastflows, &chosen)
+    {
+        chosen = forecastflows;
+    }
+    chosen
+}
+
 fn compose_rebalance_step(
     starting_state: &SolverStateSnapshot,
     prefix_actions: &[Action],
@@ -5921,6 +5984,109 @@ fn run_arb_primed_family_plan(
     Some(best)
 }
 
+fn build_forecastflows_plan_result(
+    initial_state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    candidate: ForecastFlowsFamilyCandidate,
+    cost_config: PlannerCostConfig,
+) -> Option<PlanResult> {
+    if estimate_plan_cost_from_replay(
+        &candidate.actions,
+        &initial_state.slot0_results,
+        cost_config,
+    )
+    .is_none()
+    {
+        return None;
+    }
+    let terminal_state =
+        apply_actions_to_solver_state(initial_state, &candidate.actions, predictions)?;
+    let raw_ev = state_snapshot_expected_value(&terminal_state, predictions);
+    Some(build_plan_result(
+        initial_state,
+        terminal_state,
+        candidate.actions,
+        raw_ev,
+        None,
+        Vec::new(),
+        SolverFamily::ForecastFlows,
+        cost_config,
+        match candidate.variant {
+            ForecastFlowsCandidateVariant::Direct => PlanCompilerVariant::ForecastFlowsDirect,
+            ForecastFlowsCandidateVariant::Mixed => PlanCompilerVariant::ForecastFlowsMixed,
+        },
+        None,
+        None,
+        None,
+    ))
+}
+
+fn apply_forecastflows_run_stats(combined: &mut SolverRunStats, forecastflows: SolverRunStats) {
+    combined.forecastflows_requests = forecastflows.forecastflows_requests;
+    combined.forecastflows_worker_available = forecastflows.forecastflows_worker_available;
+    combined.forecastflows_fallback_reason = forecastflows.forecastflows_fallback_reason;
+    combined.forecastflows_winning_variant = forecastflows.forecastflows_winning_variant;
+}
+
+fn run_forecastflows_family_plan(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    expected_count: usize,
+    cost_config: PlannerCostConfig,
+) -> (Option<PlanResult>, SolverRunStats) {
+    let initial_state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    let mut stats = SolverRunStats {
+        forecastflows_worker_available: false,
+        ..SolverRunStats::default()
+    };
+    let report = match forecastflows::solve_family_candidates(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        expected_count,
+    ) {
+        Ok(report) => report,
+        Err(err) => {
+            stats.forecastflows_requests = err.request_count();
+            stats.forecastflows_worker_available = err.worker_available();
+            stats.forecastflows_fallback_reason = Some(err.fallback_reason());
+            tracing::warn!(error = %err, "ForecastFlows candidate unavailable; falling back to native planner");
+            return (None, stats);
+        }
+    };
+    stats.forecastflows_requests = report.request_count;
+    stats.forecastflows_worker_available = true;
+
+    if report.candidates.is_empty() {
+        stats.forecastflows_fallback_reason = Some("no_certified_candidate");
+        return (None, stats);
+    }
+
+    let mut best: Option<PlanResult> = None;
+    for candidate in report.candidates {
+        let Some(plan) =
+            build_forecastflows_plan_result(&initial_state, predictions, candidate, cost_config)
+        else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|incumbent| plan_result_is_better(&plan, incumbent))
+        {
+            best = Some(plan);
+        }
+    }
+
+    if best.is_none() {
+        stats.forecastflows_fallback_reason = Some("no_replayable_candidate");
+    }
+
+    (best, stats)
+}
+
 fn rebalance_full_ultimate_with_predictions_and_stats(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -5929,6 +6095,7 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
     expected_count: usize,
     route_gates: RouteGateThresholds,
     cost_config: PlannerCostConfig,
+    solver: RebalanceSolver,
     _flags: RebalanceFlags,
     force_mint_available: Option<bool>,
     verify_internal_state: bool,
@@ -5959,31 +6126,96 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
     }
 
     let initial_state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
-    let mut best = run_plain_family_plan(
-        &initial_state,
-        predictions,
-        expected_count,
-        route_gates,
-        force_mint_available,
-        verify_internal_state,
-        &mut stats,
-        cost_config,
-    );
-    if let Some(arb_primed) = run_arb_primed_family_plan(
-        &initial_state,
-        predictions,
-        expected_count,
-        route_gates,
-        force_mint_available,
-        verify_internal_state,
-        &mut stats,
-        cost_config,
-    ) && plan_result_is_better(&arb_primed, &best)
+    let solve_native = || {
+        let mut native_stats = SolverRunStats::default();
+        let mut best = run_plain_family_plan(
+            &initial_state,
+            predictions,
+            expected_count,
+            route_gates,
+            force_mint_available,
+            verify_internal_state,
+            &mut native_stats,
+            cost_config,
+        );
+        if let Some(arb_primed) = run_arb_primed_family_plan(
+            &initial_state,
+            predictions,
+            expected_count,
+            route_gates,
+            force_mint_available,
+            verify_internal_state,
+            &mut native_stats,
+            cost_config,
+        ) && plan_result_is_better(&arb_primed, &best)
+        {
+            best = arb_primed;
+        }
+        (best, native_stats)
+    };
+
+    let (best, native_stats) = match solver {
+        RebalanceSolver::Native => solve_native(),
+        RebalanceSolver::ForecastFlows => {
+            let (forecastflows, forecastflows_stats) = run_forecastflows_family_plan(
+                balances,
+                susds_balance,
+                slot0_results,
+                predictions,
+                expected_count,
+                cost_config,
+            );
+            if let Some(plan) = forecastflows {
+                (plan, forecastflows_stats)
+            } else {
+                let native = solve_native();
+                let mut combined = native.1;
+                apply_forecastflows_run_stats(&mut combined, forecastflows_stats);
+                (native.0, combined)
+            }
+        }
+        RebalanceSolver::HeadToHead => {
+            let (native, forecastflows) = thread::scope(|scope| {
+                let forecastflows = scope.spawn(|| {
+                    run_forecastflows_family_plan(
+                        balances,
+                        susds_balance,
+                        slot0_results,
+                        predictions,
+                        expected_count,
+                        cost_config,
+                    )
+                });
+                let native = solve_native();
+                let forecastflows = forecastflows
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (native, forecastflows)
+            });
+            let mut combined = native.1;
+            apply_forecastflows_run_stats(&mut combined, forecastflows.1);
+            let chosen = choose_head_to_head_plan_result(native.0, forecastflows.0);
+            (chosen, combined)
+        }
+    };
+    stats = native_stats;
+
+    stats.forecastflows_winning_variant = match best.compiler_variant {
+        PlanCompilerVariant::ForecastFlowsDirect => Some(ForecastFlowsCandidateVariant::Direct),
+        PlanCompilerVariant::ForecastFlowsMixed => Some(ForecastFlowsCandidateVariant::Mixed),
+        _ => None,
+    };
+
+    if matches!(solver, RebalanceSolver::ForecastFlows)
+        && best.family != SolverFamily::ForecastFlows
     {
-        best = arb_primed;
+        tracing::warn!(
+            "ForecastFlows solver requested but no valid external candidate was available; using native plan"
+        );
     }
 
     tracing::info!(
+        requested_solver = solver.as_str(),
         chosen_family = best.family.as_str(),
         chosen_frontier_family = first_frontier_family_label(best.frontier_family),
         chosen_compiler_variant = best.compiler_variant.as_str(),
@@ -6003,6 +6235,13 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         arb_operator_evals = stats.arb_operator_evals,
         arb_primed_root_taken = stats.arb_primed_root_taken,
         fee_estimate_unavailable_results = stats.fee_estimate_unavailable_results,
+        forecastflows_requests = stats.forecastflows_requests,
+        forecastflows_worker_available = stats.forecastflows_worker_available,
+        forecastflows_fallback_reason = stats.forecastflows_fallback_reason.unwrap_or("none"),
+        forecastflows_winning_variant = stats
+            .forecastflows_winning_variant
+            .map(ForecastFlowsCandidateVariant::as_str)
+            .unwrap_or("none"),
         "ultimate solver result"
     );
 
@@ -7229,6 +7468,7 @@ fn rebalance_full_with_predictions(
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     predictions: &HashMap<String, f64>,
     expected_count: usize,
+    solver: RebalanceSolver,
     route_gates: RouteGateThresholds,
     cost_config: PlannerCostConfig,
     flags: RebalanceFlags,
@@ -7243,6 +7483,7 @@ fn rebalance_full_with_predictions(
         expected_count,
         route_gates,
         cost_config,
+        solver,
         flags,
         force_mint_available,
         verify_internal_state,
@@ -7255,6 +7496,7 @@ fn rebalance_full(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    solver: RebalanceSolver,
     route_gates: RouteGateThresholds,
     cost_config: PlannerCostConfig,
     flags: RebalanceFlags,
@@ -7267,6 +7509,7 @@ fn rebalance_full(
         slot0_results,
         &preds,
         expected_count,
+        solver,
         route_gates,
         cost_config,
         flags,
@@ -7310,12 +7553,32 @@ pub(super) fn rebalance_with_custom_predictions_for_test(
     predictions: &HashMap<String, f64>,
     force_mint_available: bool,
 ) -> Vec<Action> {
+    rebalance_with_custom_predictions_and_solver_for_test(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        force_mint_available,
+        RebalanceSolver::Native,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_and_solver_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    solver: RebalanceSolver,
+) -> Vec<Action> {
     rebalance_full_with_predictions(
         balances,
         susds_balance,
         slot0_results,
         predictions,
         slot0_results.len(),
+        solver,
         RouteGateThresholds::disabled(),
         benchmark_planner_cost_config_for_test(),
         RebalanceFlags::default(),
@@ -7332,6 +7595,25 @@ pub(super) fn rebalance_with_custom_predictions_and_stats_for_test(
     predictions: &HashMap<String, f64>,
     force_mint_available: bool,
 ) -> (Vec<Action>, SolverRunStats) {
+    rebalance_with_custom_predictions_and_solver_and_stats_for_test(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        force_mint_available,
+        RebalanceSolver::Native,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_and_solver_and_stats_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    solver: RebalanceSolver,
+) -> (Vec<Action>, SolverRunStats) {
     let (plan, stats) = rebalance_full_ultimate_with_predictions_and_stats(
         balances,
         susds_balance,
@@ -7340,6 +7622,7 @@ pub(super) fn rebalance_with_custom_predictions_and_stats_for_test(
         slot0_results.len(),
         RouteGateThresholds::disabled(),
         benchmark_planner_cost_config_for_test(),
+        solver,
         RebalanceFlags::default(),
         Some(force_mint_available),
         false,
@@ -7643,6 +7926,7 @@ pub(super) fn rebalance_with_custom_predictions_selected_plan_for_test(
         slot0_results.len(),
         RouteGateThresholds::disabled(),
         cost_config,
+        RebalanceSolver::Native,
         RebalanceFlags::default(),
         Some(force_mint_available),
         false,
@@ -7674,6 +7958,7 @@ pub(super) fn rebalance_with_custom_predictions_selected_plan_with_pricing_for_t
         slot0_results.len(),
         RouteGateThresholds::disabled(),
         cost_config,
+        RebalanceSolver::Native,
         RebalanceFlags::default(),
         Some(force_mint_available),
         false,
@@ -9060,22 +9345,44 @@ pub fn rebalance_with_mode_and_flags(
     mode: RebalanceMode,
     flags: RebalanceFlags,
 ) -> Vec<Action> {
-    rebalance_with_mode_and_thresholds(
+    rebalance_with_solver_and_thresholds(
         balances,
         susds_balance,
         slot0_results,
         mode,
+        RebalanceSolver::Native,
         RouteGateThresholds::disabled(),
         default_planner_cost_config(),
         flags,
     )
 }
 
-fn rebalance_with_mode_and_thresholds(
+pub fn rebalance_with_solver_and_flags(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     mode: RebalanceMode,
+    solver: RebalanceSolver,
+    flags: RebalanceFlags,
+) -> Vec<Action> {
+    rebalance_with_solver_and_thresholds(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        solver,
+        RouteGateThresholds::disabled(),
+        default_planner_cost_config(),
+        flags,
+    )
+}
+
+fn rebalance_with_solver_and_thresholds(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    solver: RebalanceSolver,
     route_gates: RouteGateThresholds,
     cost_config: PlannerCostConfig,
     flags: RebalanceFlags,
@@ -9085,6 +9392,7 @@ fn rebalance_with_mode_and_thresholds(
             balances,
             susds_balance,
             slot0_results,
+            solver,
             route_gates,
             cost_config,
             flags,
@@ -9229,19 +9537,56 @@ pub fn rebalance_with_gas_pricing_and_flags(
     eth_usd: f64,
     flags: RebalanceFlags,
 ) -> Vec<Action> {
-    let n_sims = slot0_results.len();
-    let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
-    let cost_config =
-        planner_cost_config_with_pricing(gas, gas_price_eth, eth_usd, "explicit_gas_pricing");
-    rebalance_with_mode_and_thresholds(
+    rebalance_with_solver_and_gas_pricing_and_flags(
         balances,
         susds_balance,
         slot0_results,
         mode,
+        RebalanceSolver::Native,
+        gas,
+        gas_price_eth,
+        eth_usd,
+        flags,
+    )
+}
+
+pub fn rebalance_with_solver_and_gas_pricing_and_flags(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    solver: RebalanceSolver,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+    flags: RebalanceFlags,
+) -> Vec<Action> {
+    let n_sims = slot0_results.len();
+    let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
+    let cost_config =
+        planner_cost_config_with_pricing(gas, gas_price_eth, eth_usd, "explicit_gas_pricing");
+    rebalance_with_solver_and_thresholds(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        solver,
         route_gates,
         cost_config,
         flags,
     )
+}
+
+pub fn warm_forecastflows_worker() -> Result<(), String> {
+    forecastflows::warm_worker().map_err(|err| err.to_string())
+}
+
+pub fn shutdown_forecastflows_worker() -> Result<(), String> {
+    forecastflows::shutdown_worker().map_err(|err| err.to_string())
+}
+
+pub fn forecastflows_doctor_report() -> Result<forecastflows::ForecastFlowsDoctorReport, String> {
+    forecastflows::doctor_report().map_err(|err| err.to_string())
 }
 
 /// Computes optimal rebalancing trades for L1 markets.
@@ -9270,6 +9615,35 @@ mod tests {
             slot0_results: Vec::new(),
             holdings: BalanceMap::new(),
             cash: 0.0,
+        }
+    }
+
+    fn dummy_plan_result(
+        family: SolverFamily,
+        compiler_variant: PlanCompilerVariant,
+        raw_ev: f64,
+        estimated_net_ev: Option<f64>,
+        actions: Vec<Action>,
+    ) -> PlanResult {
+        PlanResult {
+            actions,
+            terminal_state: dummy_state(),
+            raw_ev,
+            estimated_total_fee_susd: estimated_net_ev.map(|net| (raw_ev - net).max(0.0)),
+            estimated_net_ev,
+            estimated_group_count: Some(1),
+            estimated_tx_count: Some(1),
+            fee_estimate_source: FeeEstimateSource::StructuralFallback,
+            frontier_family: None,
+            preserve_markets: Vec::new(),
+            family,
+            compiler_variant,
+            selected_common_shift: None,
+            selected_mixed_lambda: None,
+            selected_active_set_size: None,
+            selected_stage_count: None,
+            selected_stage1_budget_fraction: None,
+            mixed_certificates: Vec::new(),
         }
     }
 
@@ -9331,6 +9705,111 @@ mod tests {
             &lower_raw_higher_net,
             &higher_raw_lower_net
         ));
+    }
+
+    #[test]
+    fn forecastflows_head_to_head_helper_prefers_native_when_forecastflows_is_absent_or_worse() {
+        let native = dummy_plan_result(
+            SolverFamily::Plain,
+            PlanCompilerVariant::BaselineStepPrune,
+            10.0,
+            Some(9.0),
+            vec![Action::Mint {
+                contract_1: "",
+                contract_2: "",
+                amount: 1.0,
+                target_market: "native",
+            }],
+        );
+        let worse_forecastflows = dummy_plan_result(
+            SolverFamily::ForecastFlows,
+            PlanCompilerVariant::ForecastFlowsDirect,
+            10.0,
+            Some(8.0),
+            vec![Action::Mint {
+                contract_1: "",
+                contract_2: "",
+                amount: 1.0,
+                target_market: "forecastflows",
+            }],
+        );
+
+        let chosen_with_worse =
+            choose_head_to_head_plan_result(native.clone(), Some(worse_forecastflows));
+        assert_eq!(chosen_with_worse.family, SolverFamily::Plain);
+
+        let chosen_without_external = choose_head_to_head_plan_result(native.clone(), None);
+        assert_eq!(chosen_without_external.family, SolverFamily::Plain);
+    }
+
+    #[test]
+    fn forecastflows_head_to_head_helper_prefers_forecastflows_when_local_net_ev_is_better() {
+        let native = dummy_plan_result(
+            SolverFamily::Plain,
+            PlanCompilerVariant::BaselineStepPrune,
+            10.0,
+            Some(9.0),
+            vec![Action::Mint {
+                contract_1: "",
+                contract_2: "",
+                amount: 1.0,
+                target_market: "native",
+            }],
+        );
+        let forecastflows = dummy_plan_result(
+            SolverFamily::ForecastFlows,
+            PlanCompilerVariant::ForecastFlowsMixed,
+            10.0,
+            Some(9.5),
+            vec![Action::Mint {
+                contract_1: "",
+                contract_2: "",
+                amount: 1.0,
+                target_market: "forecastflows",
+            }],
+        );
+
+        let chosen = choose_head_to_head_plan_result(native, Some(forecastflows));
+        assert_eq!(chosen.family, SolverFamily::ForecastFlows);
+        assert_eq!(
+            chosen.compiler_variant,
+            PlanCompilerVariant::ForecastFlowsMixed
+        );
+    }
+
+    #[test]
+    fn forecastflows_head_to_head_helper_keeps_native_on_tie_via_existing_stable_order() {
+        let native = dummy_plan_result(
+            SolverFamily::Plain,
+            PlanCompilerVariant::BaselineStepPrune,
+            10.0,
+            Some(9.0),
+            vec![Action::Mint {
+                contract_1: "",
+                contract_2: "",
+                amount: 1.0,
+                target_market: "native",
+            }],
+        );
+        let forecastflows = dummy_plan_result(
+            SolverFamily::ForecastFlows,
+            PlanCompilerVariant::ForecastFlowsDirect,
+            10.0,
+            Some(9.0),
+            vec![Action::Mint {
+                contract_1: "",
+                contract_2: "",
+                amount: 1.0,
+                target_market: "forecastflows",
+            }],
+        );
+
+        let chosen = choose_head_to_head_plan_result(native, Some(forecastflows));
+        assert_eq!(chosen.family, SolverFamily::Plain);
+        assert_eq!(
+            chosen.compiler_variant,
+            PlanCompilerVariant::BaselineStepPrune
+        );
     }
 
     #[test]

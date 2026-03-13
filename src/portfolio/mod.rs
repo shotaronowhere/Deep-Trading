@@ -5,7 +5,10 @@ pub use core::diagnostics::{
     replay_actions_to_portfolio_state,
 };
 pub use core::{
-    Action, RebalanceFlags, RebalanceMode, rebalance, rebalance_with_gas,
-    rebalance_with_gas_and_flags, rebalance_with_gas_pricing, rebalance_with_gas_pricing_and_flags,
-    rebalance_with_mode, rebalance_with_mode_and_flags,
+    Action, ForecastFlowsDoctorReport, RebalanceFlags, RebalanceMode, RebalanceSolver,
+    forecastflows_doctor_report, rebalance, rebalance_with_gas, rebalance_with_gas_and_flags,
+    rebalance_with_gas_pricing, rebalance_with_gas_pricing_and_flags, rebalance_with_mode,
+    rebalance_with_mode_and_flags, rebalance_with_solver_and_flags,
+    rebalance_with_solver_and_gas_pricing_and_flags, shutdown_forecastflows_worker,
+    warm_forecastflows_worker,
 };

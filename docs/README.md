@@ -20,6 +20,7 @@ If documents conflict, follow this precedence:
 - `docs/rebalancer_policy_metrics_template.json`: metrics row template (JSON).
 - `docs/model.md`: mathematical derivations used by the off-chain solver.
 - `docs/architecture.md`: system architecture and source map.
+- `docs/forecastflows_worker.md`: ForecastFlows worker boundary, Julia environment, sysimage workflow, doctor tool, replay acceptance, and fallback policy.
 
 ## Operational runbooks
 
@@ -35,6 +36,7 @@ If documents conflict, follow this precedence:
 - `docs/portfolio.md`: portfolio module surface, diagnostics, and test map.
 - `docs/solver_benchmark_matrix.md`: central release-facing EV / gas / speed comparison across solver flavors.
 - `docs/gas_model.md`: gas threshold assumptions.
+- `docs/forecastflows_worker.md`: external solver worker lifecycle, doctor workflow, and translation contract.
 - `docs/rebalance_test_ev_trace.md`: EV trace instrumentation.
 - `docs/monte_carlo_rebalance_validation.md`: Monte Carlo EV validation harness.
 
