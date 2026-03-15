@@ -47,8 +47,8 @@ API (deep.seer.pm)
 - **src/lib.rs**: API client, fetches market data from Seer PM endpoints
 - **src/main.rs**: Runtime planning entrypoint using HTTP JSON-RPC provider wiring, mode selection (`full`/`arb_only`), solver selection (`REBALANCE_SOLVER`), gas-assumption hydration, and diagnostics output
 - **src/bin/plan_preview.rs**: Runtime snapshot planner / execution preview entrypoint
-- **src/bin/execute.rs**: Runtime execution loop entrypoint
-- **src/bin/forecastflows_doctor.rs**: Operator diagnostic entrypoint for Julia path/version, worker health, sysimage status, and representative compare timings
+- **src/bin/execute.rs**: Block-triggered runtime execution loop with snapshot-fingerprint skips, stale-block dropping, and optional background native audits for the ForecastFlows live lane
+- **src/bin/forecastflows_doctor.rs**: Operator diagnostic entrypoint for Julia path/version, manifest pin, live solve tuning, worker health, sysimage status, and representative compare timings
 - **src/markets.rs**: Generated static market data arrays
 - **src/predictions.rs**: Generated prediction weights from CSVs
 - **src/pools.rs**: Facade/re-exports for pool utilities

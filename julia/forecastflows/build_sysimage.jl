@@ -7,6 +7,7 @@ Pkg.precompile()
 using JSON3
 using PackageCompiler
 using SHA
+using StructTypes
 
 const PRECOMPILE_WORKLOAD = joinpath(@__DIR__, "precompile_workload.jl")
 
@@ -22,7 +23,7 @@ function write_metadata(sysimage_path::String)
     metadata = Dict(
         "julia_major_minor" => "$(VERSION.major).$(VERSION.minor)",
         "manifest_sha256" => manifest_sha256,
-        "built_at_unix_secs" => Int(time()),
+        "built_at_unix_secs" => floor(Int, time()),
     )
     open(metadata_path, "w") do io
         JSON3.write(io, metadata)
@@ -34,7 +35,7 @@ sysimage_path = get(ENV, "FORECASTFLOWS_SYSIMAGE_OUTPUT", default_sysimage_path(
 mkpath(dirname(sysimage_path))
 
 create_sysimage(
-    [:ForecastFlows, :JSON3];
+    [:ForecastFlows, :JSON3, :StructTypes];
     project=@__DIR__,
     sysimage_path=sysimage_path,
     precompile_execution_file=PRECOMPILE_WORKLOAD,

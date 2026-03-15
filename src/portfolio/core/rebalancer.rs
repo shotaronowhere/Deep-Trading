@@ -34,7 +34,9 @@ use crate::pools::{Slot0Result, prediction_to_sqrt_price_x96};
 
 use super::Action;
 use super::bundle::BundleRouteKind;
-use super::forecastflows::{self, ForecastFlowsCandidateVariant, ForecastFlowsFamilyCandidate};
+use super::forecastflows::{
+    self, ForecastFlowsCandidateVariant, ForecastFlowsFamilyCandidate, ForecastFlowsTelemetry,
+};
 use super::merge::action_contract_pair;
 use super::sim::{
     DUST, EPS, PoolSim, SimBuildError, alt_price, build_sims, build_sims_without_predictions,
@@ -105,18 +107,18 @@ const BENCHMARK_L1_DATA_FEE_FLOOR_SUSD: f64 = 0.0;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-struct PlannerPricingSnapshot {
-    gas_price_eth: f64,
-    eth_usd: f64,
-    l1_fee_per_byte_wei: f64,
-    source_label: &'static str,
+pub(super) struct PlannerPricingSnapshot {
+    pub(super) gas_price_eth: f64,
+    pub(super) eth_usd: f64,
+    pub(super) l1_fee_per_byte_wei: f64,
+    pub(super) source_label: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PlannerCostConfig {
-    gas_assumptions: GasAssumptions,
-    pricing: PlannerPricingSnapshot,
-    conservative_execution: ConservativeExecutionConfig,
+pub(super) struct PlannerCostConfig {
+    pub(super) gas_assumptions: GasAssumptions,
+    pub(super) pricing: PlannerPricingSnapshot,
+    pub(super) conservative_execution: ConservativeExecutionConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +151,52 @@ struct PlanCostEstimate {
     l1_fee_susd: f64,
     total_fee_susd: f64,
     source: FeeEstimateSource,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ForecastFlowsLocalTimingTotals {
+    candidate_build_ms: u128,
+    step_prune_ms: u128,
+    route_prune_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+struct ForecastFlowsEvaluatedActionSet {
+    actions: Vec<Action>,
+    terminal_state: SolverStateSnapshot,
+    raw_ev: f64,
+    plan_cost: PlanCostEstimate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ForecastFlowsActionKey {
+    Mint {
+        contract_1: &'static str,
+        contract_2: &'static str,
+        amount_bits: u64,
+        target_market: &'static str,
+    },
+    Buy {
+        market_name: &'static str,
+        amount_bits: u64,
+        cost_bits: u64,
+    },
+    Sell {
+        market_name: &'static str,
+        amount_bits: u64,
+        proceeds_bits: u64,
+    },
+    Merge {
+        contract_1: &'static str,
+        contract_2: &'static str,
+        amount_bits: u64,
+        source_market: &'static str,
+    },
+}
+
+#[derive(Debug, Default)]
+struct ForecastFlowsActionEvaluationCache {
+    evaluations: HashMap<Vec<ForecastFlowsActionKey>, Option<ForecastFlowsEvaluatedActionSet>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +243,53 @@ impl RebalanceSolver {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RebalanceFlags {
     pub enable_ev_guarded_greedy_churn_pruning: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ForecastFlowsRunTelemetry {
+    pub strategy: Option<String>,
+    pub worker_roundtrip_ms: Option<u128>,
+    pub driver_overhead_ms: Option<u128>,
+    pub translation_replay_ms: Option<u128>,
+    pub local_candidate_build_ms: Option<u128>,
+    pub local_step_prune_ms: Option<u128>,
+    pub local_route_prune_ms: Option<u128>,
+    pub workspace_reused: bool,
+    pub direct_solver_time_ms: Option<u128>,
+    pub mixed_solver_time_ms: Option<u128>,
+    pub estimated_execution_cost_susd: Option<f64>,
+    pub estimated_net_ev_susd: Option<f64>,
+    pub validated_total_fee_susd: Option<f64>,
+    pub validated_net_ev_susd: Option<f64>,
+    pub fee_estimate_error_susd: Option<f64>,
+    pub validation_only: bool,
+    pub solve_tuning: Option<String>,
+    pub sysimage_status: Option<String>,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RebalancePlanSummary {
+    pub raw_ev: f64,
+    pub estimated_total_fee_susd: Option<f64>,
+    pub estimated_net_ev: Option<f64>,
+    pub estimated_group_count: Option<usize>,
+    pub estimated_tx_count: Option<usize>,
+    pub action_count: usize,
+    pub forecastflows_telemetry: ForecastFlowsRunTelemetry,
+    family_stable_rank: usize,
+    frontier_family_stable_rank: usize,
+    preserve_markets: Vec<String>,
+    compiler_variant_stable_rank: usize,
+    selected_common_shift: Option<f64>,
+    selected_mixed_lambda: Option<f64>,
+    selected_active_set_size: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RebalancePlanDecision {
+    pub actions: Vec<Action>,
+    pub summary: RebalancePlanSummary,
 }
 
 #[cfg(test)]
@@ -520,7 +615,7 @@ struct PlanResult {
     mixed_certificates: Vec<MixedCertificate>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct SolverRunStats {
     pub(super) exact_rebalance_calls: usize,
     pub(super) exact_rebalance_candidate_evals: usize,
@@ -532,6 +627,7 @@ pub(super) struct SolverRunStats {
     pub(super) forecastflows_requests: usize,
     pub(super) forecastflows_worker_available: bool,
     pub(super) forecastflows_fallback_reason: Option<&'static str>,
+    pub(super) forecastflows_telemetry: ForecastFlowsTelemetry,
     pub(super) forecastflows_winning_variant: Option<ForecastFlowsCandidateVariant>,
 }
 
@@ -617,6 +713,15 @@ pub(super) struct TestSelectedPlanSummary {
     pub(super) merge_count: usize,
     pub(super) total_calldata_bytes: Option<usize>,
     pub(super) mixed_certificates: Vec<MixedCertificate>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct TestForecastFlowsPlanVariants {
+    pub(super) raw: TestSelectedPlanSummary,
+    pub(super) polished: TestSelectedPlanSummary,
+    pub(super) raw_replayable: bool,
+    pub(super) polished_replayable: bool,
 }
 
 #[cfg(test)]
@@ -729,7 +834,7 @@ pub(super) fn benchmark_gas_assumptions_for_test() -> GasAssumptions {
 }
 
 #[cfg(test)]
-fn benchmark_planner_cost_config_for_test() -> PlannerCostConfig {
+pub(super) fn benchmark_planner_cost_config_for_test() -> PlannerCostConfig {
     planner_cost_config_with_pricing(
         &benchmark_gas_assumptions_for_test(),
         BENCHMARK_OP_GAS_PRICE_ETH,
@@ -1046,17 +1151,31 @@ fn plan_cost_fields(
     bool,
 ) {
     if let Some(cost) = estimate_plan_cost(actions, slot0_results, cost_config) {
-        return (
-            Some(cost.total_fee_susd),
-            Some(raw_ev - cost.total_fee_susd),
-            Some(cost.group_count),
-            Some(cost.tx_count),
-            cost.source,
-            false,
-        );
+        return plan_cost_fields_from_estimate(raw_ev, cost);
     }
 
     (None, None, None, None, FeeEstimateSource::Unavailable, true)
+}
+
+fn plan_cost_fields_from_estimate(
+    raw_ev: f64,
+    cost: PlanCostEstimate,
+) -> (
+    Option<f64>,
+    Option<f64>,
+    Option<usize>,
+    Option<usize>,
+    FeeEstimateSource,
+    bool,
+) {
+    (
+        Some(cost.total_fee_susd),
+        Some(raw_ev - cost.total_fee_susd),
+        Some(cost.group_count),
+        Some(cost.tx_count),
+        cost.source,
+        false,
+    )
 }
 
 fn raw_value_tol(left: f64, right: f64) -> f64 {
@@ -2468,6 +2587,22 @@ fn solver_identity_plan(
     raw_ev: f64,
     cost_config: PlannerCostConfig,
 ) -> PlanResult {
+    solver_identity_plan_with_variant(
+        state,
+        family,
+        raw_ev,
+        cost_config,
+        PlanCompilerVariant::NoOp,
+    )
+}
+
+fn solver_identity_plan_with_variant(
+    state: &SolverStateSnapshot,
+    family: SolverFamily,
+    raw_ev: f64,
+    cost_config: PlannerCostConfig,
+    compiler_variant: PlanCompilerVariant,
+) -> PlanResult {
     build_plan_result(
         state,
         state.clone(),
@@ -2477,7 +2612,7 @@ fn solver_identity_plan(
         Vec::new(),
         family,
         cost_config,
-        PlanCompilerVariant::NoOp,
+        compiler_variant,
         None,
         None,
         None,
@@ -4643,15 +4778,17 @@ fn baseline_step_prune_candidate_for_program_net_ev(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
     initial_actions: Vec<Action>,
+    compiler_variant: PlanCompilerVariant,
 ) -> PlanResult {
     let Some(initial_terminal_state) =
         apply_actions_to_solver_state(starting_state, &initial_actions, predictions)
     else {
-        return solver_identity_plan(
+        return solver_identity_plan_with_variant(
             starting_state,
             family,
             state_snapshot_expected_value(starting_state, predictions),
             cost_config,
+            compiler_variant,
         );
     };
     let initial_raw_ev = state_snapshot_expected_value(&initial_terminal_state, predictions);
@@ -4664,7 +4801,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
         preserve_markets,
         family,
         cost_config,
-        PlanCompilerVariant::BaselineStepPrune,
+        compiler_variant,
         None,
         None,
         None,
@@ -4702,7 +4839,97 @@ fn baseline_step_prune_candidate_for_program_net_ev(
                 best.preserve_markets.clone(),
                 family,
                 cost_config,
-                PlanCompilerVariant::BaselineStepPrune,
+                compiler_variant,
+                None,
+                None,
+                None,
+            );
+            if plan_result_is_better(&candidate, &best) {
+                best = candidate;
+                improved = true;
+                break;
+            }
+        }
+
+        if !improved {
+            break;
+        }
+    }
+
+    best
+}
+
+#[allow(dead_code)]
+fn route_group_prune_candidate_for_program_net_ev(
+    starting_state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    frontier_family: Option<BundleRouteKind>,
+    preserve_markets: Vec<&'static str>,
+    family: SolverFamily,
+    cost_config: PlannerCostConfig,
+    initial_actions: Vec<Action>,
+    compiler_variant: PlanCompilerVariant,
+) -> PlanResult {
+    let Some(initial_terminal_state) =
+        apply_actions_to_solver_state(starting_state, &initial_actions, predictions)
+    else {
+        return solver_identity_plan_with_variant(
+            starting_state,
+            family,
+            state_snapshot_expected_value(starting_state, predictions),
+            cost_config,
+            compiler_variant,
+        );
+    };
+    let initial_raw_ev = state_snapshot_expected_value(&initial_terminal_state, predictions);
+    let mut best = build_plan_result(
+        starting_state,
+        initial_terminal_state,
+        initial_actions,
+        initial_raw_ev,
+        frontier_family,
+        preserve_markets,
+        family,
+        cost_config,
+        compiler_variant,
+        None,
+        None,
+        None,
+    );
+
+    loop {
+        let Ok(route_groups) = group_execution_actions(&best.actions) else {
+            break;
+        };
+        if route_groups.is_empty() {
+            break;
+        }
+
+        let mut improved = false;
+        for route_group in route_groups.iter().rev() {
+            let mut keep_actions = Vec::with_capacity(best.actions.len());
+            for (action_index, action) in best.actions.iter().enumerate() {
+                if !route_group.action_indices.contains(&action_index) {
+                    keep_actions.push(action.clone());
+                }
+            }
+            let Some(candidate_terminal_state) =
+                apply_actions_to_solver_state(starting_state, &keep_actions, predictions)
+            else {
+                continue;
+            };
+            let candidate_raw_ev =
+                state_snapshot_expected_value(&candidate_terminal_state, predictions);
+            let candidate = build_plan_result(
+                starting_state,
+                candidate_terminal_state,
+                keep_actions,
+                candidate_raw_ev,
+                frontier_family,
+                best.preserve_markets.clone(),
+                family,
+                cost_config,
+                compiler_variant,
                 None,
                 None,
                 None,
@@ -4747,6 +4974,7 @@ fn compact_raw_no_arb_plan_for_program_net_ev(
         family,
         cost_config,
         initial_actions.clone(),
+        PlanCompilerVariant::BaselineStepPrune,
     );
     let mut best = baseline;
     let constant_l_candidate = allow_common_shift
@@ -4959,6 +5187,145 @@ fn plan_result_cmp(left: &PlanResult, right: &PlanResult) -> Ordering {
     } else {
         Ordering::Equal
     }
+}
+
+fn public_forecastflows_run_telemetry(
+    telemetry: &ForecastFlowsTelemetry,
+    fallback_reason: Option<&'static str>,
+) -> ForecastFlowsRunTelemetry {
+    ForecastFlowsRunTelemetry {
+        strategy: telemetry.strategy.clone(),
+        worker_roundtrip_ms: telemetry.worker_roundtrip_ms,
+        driver_overhead_ms: telemetry.driver_overhead_ms,
+        translation_replay_ms: telemetry.translation_replay_ms,
+        local_candidate_build_ms: telemetry.local_candidate_build_ms,
+        local_step_prune_ms: telemetry.local_step_prune_ms,
+        local_route_prune_ms: telemetry.local_route_prune_ms,
+        workspace_reused: telemetry.workspace_reused,
+        direct_solver_time_ms: telemetry.direct_solver_time_ms,
+        mixed_solver_time_ms: telemetry.mixed_solver_time_ms,
+        estimated_execution_cost_susd: telemetry.estimated_execution_cost_susd,
+        estimated_net_ev_susd: telemetry.estimated_net_ev_susd,
+        validated_total_fee_susd: telemetry.validated_total_fee_susd,
+        validated_net_ev_susd: telemetry.validated_net_ev_susd,
+        fee_estimate_error_susd: telemetry.fee_estimate_error_susd,
+        validation_only: telemetry.validation_only,
+        solve_tuning: telemetry.solve_tuning.clone(),
+        sysimage_status: telemetry.sysimage_status.clone(),
+        fallback_reason: fallback_reason.map(str::to_string),
+    }
+}
+
+fn summary_from_plan_result(plan: &PlanResult, stats: &SolverRunStats) -> RebalancePlanSummary {
+    RebalancePlanSummary {
+        raw_ev: plan.raw_ev,
+        estimated_total_fee_susd: plan.estimated_total_fee_susd,
+        estimated_net_ev: plan.estimated_net_ev,
+        estimated_group_count: plan.estimated_group_count,
+        estimated_tx_count: plan.estimated_tx_count,
+        action_count: plan.actions.len(),
+        forecastflows_telemetry: public_forecastflows_run_telemetry(
+            &stats.forecastflows_telemetry,
+            stats.forecastflows_fallback_reason,
+        ),
+        family_stable_rank: plan.family.stable_rank(),
+        frontier_family_stable_rank: first_frontier_family_stable_rank(plan.frontier_family),
+        preserve_markets: plan
+            .preserve_markets
+            .iter()
+            .map(|market| (*market).to_string())
+            .collect(),
+        compiler_variant_stable_rank: plan.compiler_variant.stable_rank(),
+        selected_common_shift: plan.selected_common_shift,
+        selected_mixed_lambda: plan.selected_mixed_lambda,
+        selected_active_set_size: plan.selected_active_set_size,
+    }
+}
+
+fn decision_from_plan_result(plan: PlanResult, stats: &SolverRunStats) -> RebalancePlanDecision {
+    let summary = summary_from_plan_result(&plan, stats);
+    RebalancePlanDecision {
+        actions: plan.actions,
+        summary,
+    }
+}
+
+pub fn compare_rebalance_plan_decisions(
+    left: &RebalancePlanDecision,
+    right: &RebalancePlanDecision,
+) -> Ordering {
+    let economic_cmp = net_ev_cmp(
+        left.summary.estimated_net_ev,
+        right.summary.estimated_net_ev,
+        left.summary.raw_ev,
+        right.summary.raw_ev,
+    );
+    if !economic_cmp.is_eq() {
+        return economic_cmp;
+    }
+    if left.summary.estimated_tx_count != right.summary.estimated_tx_count {
+        return left
+            .summary
+            .estimated_tx_count
+            .unwrap_or(usize::MAX)
+            .cmp(&right.summary.estimated_tx_count.unwrap_or(usize::MAX));
+    }
+    if left.summary.action_count != right.summary.action_count {
+        return left.summary.action_count.cmp(&right.summary.action_count);
+    }
+    if left.summary.family_stable_rank != right.summary.family_stable_rank {
+        return left
+            .summary
+            .family_stable_rank
+            .cmp(&right.summary.family_stable_rank);
+    }
+    if left.summary.frontier_family_stable_rank != right.summary.frontier_family_stable_rank {
+        return left
+            .summary
+            .frontier_family_stable_rank
+            .cmp(&right.summary.frontier_family_stable_rank);
+    }
+    if left.summary.preserve_markets.len() != right.summary.preserve_markets.len() {
+        return left
+            .summary
+            .preserve_markets
+            .len()
+            .cmp(&right.summary.preserve_markets.len());
+    }
+    if left.summary.preserve_markets != right.summary.preserve_markets {
+        return left
+            .summary
+            .preserve_markets
+            .cmp(&right.summary.preserve_markets);
+    }
+    if left.summary.compiler_variant_stable_rank != right.summary.compiler_variant_stable_rank {
+        return left
+            .summary
+            .compiler_variant_stable_rank
+            .cmp(&right.summary.compiler_variant_stable_rank);
+    }
+    if left.summary.selected_common_shift != right.summary.selected_common_shift {
+        return left
+            .summary
+            .selected_common_shift
+            .unwrap_or(0.0)
+            .total_cmp(&right.summary.selected_common_shift.unwrap_or(0.0));
+    }
+    if left.summary.selected_mixed_lambda != right.summary.selected_mixed_lambda {
+        return left
+            .summary
+            .selected_mixed_lambda
+            .unwrap_or(0.0)
+            .total_cmp(&right.summary.selected_mixed_lambda.unwrap_or(0.0));
+    }
+    if left.summary.selected_active_set_size != right.summary.selected_active_set_size {
+        return left
+            .summary
+            .selected_active_set_size
+            .unwrap_or(usize::MAX)
+            .cmp(&right.summary.selected_active_set_size.unwrap_or(usize::MAX));
+    }
+    actions_cmp(&left.actions, &right.actions)
 }
 
 fn choose_head_to_head_plan_result(
@@ -5984,48 +6351,358 @@ fn run_arb_primed_family_plan(
     Some(best)
 }
 
-fn build_forecastflows_plan_result(
+fn forecastflows_plan_compiler_variant(
+    variant: ForecastFlowsCandidateVariant,
+) -> PlanCompilerVariant {
+    match variant {
+        ForecastFlowsCandidateVariant::Direct => PlanCompilerVariant::ForecastFlowsDirect,
+        ForecastFlowsCandidateVariant::Mixed => PlanCompilerVariant::ForecastFlowsMixed,
+    }
+}
+
+fn forecastflows_action_set_key(actions: &[Action]) -> Vec<ForecastFlowsActionKey> {
+    actions
+        .iter()
+        .map(|action| match action {
+            Action::Mint {
+                contract_1,
+                contract_2,
+                amount,
+                target_market,
+            } => ForecastFlowsActionKey::Mint {
+                contract_1: *contract_1,
+                contract_2: *contract_2,
+                amount_bits: amount.to_bits(),
+                target_market: *target_market,
+            },
+            Action::Buy {
+                market_name,
+                amount,
+                cost,
+            } => ForecastFlowsActionKey::Buy {
+                market_name: *market_name,
+                amount_bits: amount.to_bits(),
+                cost_bits: cost.to_bits(),
+            },
+            Action::Sell {
+                market_name,
+                amount,
+                proceeds,
+            } => ForecastFlowsActionKey::Sell {
+                market_name: *market_name,
+                amount_bits: amount.to_bits(),
+                proceeds_bits: proceeds.to_bits(),
+            },
+            Action::Merge {
+                contract_1,
+                contract_2,
+                amount,
+                source_market,
+            } => ForecastFlowsActionKey::Merge {
+                contract_1: *contract_1,
+                contract_2: *contract_2,
+                amount_bits: amount.to_bits(),
+                source_market: *source_market,
+            },
+        })
+        .collect()
+}
+
+fn evaluate_forecastflows_action_set(
+    starting_state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    actions: Vec<Action>,
+    cost_config: PlannerCostConfig,
+    evaluation_cache: &mut ForecastFlowsActionEvaluationCache,
+) -> Option<ForecastFlowsEvaluatedActionSet> {
+    let key = forecastflows_action_set_key(&actions);
+    if let Some(cached) = evaluation_cache.evaluations.get(&key) {
+        return cached.clone();
+    }
+
+    let evaluated =
+        estimate_plan_cost_from_replay(&actions, &starting_state.slot0_results, cost_config)
+            .and_then(|plan_cost| {
+                let terminal_state =
+                    apply_actions_to_solver_state(starting_state, &actions, predictions)?;
+                let raw_ev = state_snapshot_expected_value(&terminal_state, predictions);
+                Some(ForecastFlowsEvaluatedActionSet {
+                    actions,
+                    terminal_state,
+                    raw_ev,
+                    plan_cost,
+                })
+            });
+    evaluation_cache.evaluations.insert(key, evaluated.clone());
+    evaluated
+}
+
+fn build_plan_result_from_forecastflows_evaluation(
+    evaluated: ForecastFlowsEvaluatedActionSet,
+    frontier_family: Option<BundleRouteKind>,
+    preserve_markets: Vec<&'static str>,
+    compiler_variant: PlanCompilerVariant,
+) -> PlanResult {
+    let (
+        estimated_total_fee_susd,
+        estimated_net_ev,
+        estimated_group_count,
+        estimated_tx_count,
+        fee_estimate_source,
+        _fee_estimate_unavailable,
+    ) = plan_cost_fields_from_estimate(evaluated.raw_ev, evaluated.plan_cost);
+    PlanResult {
+        actions: evaluated.actions,
+        terminal_state: evaluated.terminal_state,
+        raw_ev: evaluated.raw_ev,
+        estimated_total_fee_susd,
+        estimated_net_ev,
+        estimated_group_count,
+        estimated_tx_count,
+        fee_estimate_source,
+        frontier_family,
+        preserve_markets,
+        family: SolverFamily::ForecastFlows,
+        compiler_variant,
+        selected_common_shift: None,
+        selected_mixed_lambda: None,
+        selected_active_set_size: None,
+        selected_stage_count: None,
+        selected_stage1_budget_fraction: None,
+        mixed_certificates: Vec::new(),
+    }
+}
+
+fn build_forecastflows_raw_plan_result(
     initial_state: &SolverStateSnapshot,
     predictions: &HashMap<String, f64>,
     candidate: ForecastFlowsFamilyCandidate,
     cost_config: PlannerCostConfig,
+    evaluation_cache: &mut ForecastFlowsActionEvaluationCache,
 ) -> Option<PlanResult> {
-    if estimate_plan_cost_from_replay(
-        &candidate.actions,
-        &initial_state.slot0_results,
-        cost_config,
-    )
-    .is_none()
-    {
-        return None;
-    }
-    let terminal_state =
-        apply_actions_to_solver_state(initial_state, &candidate.actions, predictions)?;
-    let raw_ev = state_snapshot_expected_value(&terminal_state, predictions);
-    Some(build_plan_result(
+    let evaluated = evaluate_forecastflows_action_set(
         initial_state,
-        terminal_state,
+        predictions,
         candidate.actions,
-        raw_ev,
+        cost_config,
+        evaluation_cache,
+    )?;
+    Some(build_plan_result_from_forecastflows_evaluation(
+        evaluated,
         None,
         Vec::new(),
-        SolverFamily::ForecastFlows,
-        cost_config,
-        match candidate.variant {
-            ForecastFlowsCandidateVariant::Direct => PlanCompilerVariant::ForecastFlowsDirect,
-            ForecastFlowsCandidateVariant::Mixed => PlanCompilerVariant::ForecastFlowsMixed,
-        },
-        None,
-        None,
-        None,
+        forecastflows_plan_compiler_variant(candidate.variant),
     ))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn baseline_step_prune_forecastflows_candidate_for_program_net_ev(
+    initial_state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    cost_config: PlannerCostConfig,
+    initial_actions: Vec<Action>,
+    frontier_family: Option<BundleRouteKind>,
+    preserve_markets: Vec<&'static str>,
+    compiler_variant: PlanCompilerVariant,
+    evaluation_cache: &mut ForecastFlowsActionEvaluationCache,
+) -> PlanResult {
+    let Some(initial_evaluated) = evaluate_forecastflows_action_set(
+        initial_state,
+        predictions,
+        initial_actions,
+        cost_config,
+        evaluation_cache,
+    ) else {
+        return solver_identity_plan_with_variant(
+            initial_state,
+            SolverFamily::ForecastFlows,
+            state_snapshot_expected_value(initial_state, predictions),
+            cost_config,
+            compiler_variant,
+        );
+    };
+    let mut best = build_plan_result_from_forecastflows_evaluation(
+        initial_evaluated,
+        frontier_family,
+        preserve_markets.clone(),
+        compiler_variant,
+    );
+
+    loop {
+        let Ok(step_groups) = group_execution_actions_by_profitability_step(&best.actions) else {
+            break;
+        };
+        if step_groups.is_empty() {
+            break;
+        }
+
+        let mut improved = false;
+        for step_group in step_groups.iter().rev() {
+            let mut keep_actions = Vec::with_capacity(best.actions.len());
+            for (action_index, action) in best.actions.iter().enumerate() {
+                if !step_group.action_indices.contains(&action_index) {
+                    keep_actions.push(action.clone());
+                }
+            }
+            let Some(candidate_evaluated) = evaluate_forecastflows_action_set(
+                initial_state,
+                predictions,
+                keep_actions,
+                cost_config,
+                evaluation_cache,
+            ) else {
+                continue;
+            };
+            let candidate = build_plan_result_from_forecastflows_evaluation(
+                candidate_evaluated,
+                frontier_family,
+                preserve_markets.clone(),
+                compiler_variant,
+            );
+            if plan_result_is_better(&candidate, &best) {
+                best = candidate;
+                improved = true;
+                break;
+            }
+        }
+
+        if !improved {
+            break;
+        }
+    }
+
+    best
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn route_group_prune_forecastflows_candidate_for_program_net_ev(
+    initial_state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    cost_config: PlannerCostConfig,
+    initial_actions: Vec<Action>,
+    frontier_family: Option<BundleRouteKind>,
+    preserve_markets: Vec<&'static str>,
+    compiler_variant: PlanCompilerVariant,
+    evaluation_cache: &mut ForecastFlowsActionEvaluationCache,
+) -> PlanResult {
+    let Some(initial_evaluated) = evaluate_forecastflows_action_set(
+        initial_state,
+        predictions,
+        initial_actions,
+        cost_config,
+        evaluation_cache,
+    ) else {
+        return solver_identity_plan_with_variant(
+            initial_state,
+            SolverFamily::ForecastFlows,
+            state_snapshot_expected_value(initial_state, predictions),
+            cost_config,
+            compiler_variant,
+        );
+    };
+    let mut best = build_plan_result_from_forecastflows_evaluation(
+        initial_evaluated,
+        frontier_family,
+        preserve_markets.clone(),
+        compiler_variant,
+    );
+
+    loop {
+        let Ok(route_groups) = group_execution_actions(&best.actions) else {
+            break;
+        };
+        if route_groups.is_empty() {
+            break;
+        }
+
+        let mut improved = false;
+        for route_group in route_groups.iter().rev() {
+            let mut keep_actions = Vec::with_capacity(best.actions.len());
+            for (action_index, action) in best.actions.iter().enumerate() {
+                if !route_group.action_indices.contains(&action_index) {
+                    keep_actions.push(action.clone());
+                }
+            }
+            let Some(candidate_evaluated) = evaluate_forecastflows_action_set(
+                initial_state,
+                predictions,
+                keep_actions,
+                cost_config,
+                evaluation_cache,
+            ) else {
+                continue;
+            };
+            let candidate = build_plan_result_from_forecastflows_evaluation(
+                candidate_evaluated,
+                frontier_family,
+                preserve_markets.clone(),
+                compiler_variant,
+            );
+            if plan_result_is_better(&candidate, &best) {
+                best = candidate;
+                improved = true;
+                break;
+            }
+        }
+
+        if !improved {
+            break;
+        }
+    }
+
+    best
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn prune_forecastflows_plan_for_program_net_ev(
+    initial_state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    raw: &PlanResult,
+    cost_config: PlannerCostConfig,
+    evaluation_cache: &mut ForecastFlowsActionEvaluationCache,
+    local_timing: &mut ForecastFlowsLocalTimingTotals,
+) -> PlanResult {
+    let step_prune_started = std::time::Instant::now();
+    let step_pruned = baseline_step_prune_forecastflows_candidate_for_program_net_ev(
+        initial_state,
+        predictions,
+        cost_config,
+        raw.actions.clone(),
+        raw.frontier_family,
+        raw.preserve_markets.clone(),
+        raw.compiler_variant,
+        evaluation_cache,
+    );
+    local_timing.step_prune_ms += step_prune_started.elapsed().as_millis();
+    let route_prune_started = std::time::Instant::now();
+    let route_pruned = route_group_prune_forecastflows_candidate_for_program_net_ev(
+        initial_state,
+        predictions,
+        cost_config,
+        step_pruned.actions.clone(),
+        step_pruned.frontier_family,
+        step_pruned.preserve_markets.clone(),
+        step_pruned.compiler_variant,
+        evaluation_cache,
+    );
+    local_timing.route_prune_ms += route_prune_started.elapsed().as_millis();
+    if plan_result_is_better(&route_pruned, &step_pruned) {
+        route_pruned
+    } else {
+        step_pruned
+    }
 }
 
 fn apply_forecastflows_run_stats(combined: &mut SolverRunStats, forecastflows: SolverRunStats) {
     combined.forecastflows_requests = forecastflows.forecastflows_requests;
     combined.forecastflows_worker_available = forecastflows.forecastflows_worker_available;
     combined.forecastflows_fallback_reason = forecastflows.forecastflows_fallback_reason;
+    combined.forecastflows_telemetry = forecastflows.forecastflows_telemetry;
     combined.forecastflows_winning_variant = forecastflows.forecastflows_winning_variant;
+}
+
+fn apply_forecastflows_telemetry(stats: &mut SolverRunStats, telemetry: &ForecastFlowsTelemetry) {
+    stats.forecastflows_telemetry = telemetry.clone();
 }
 
 fn run_forecastflows_family_plan(
@@ -6041,17 +6718,22 @@ fn run_forecastflows_family_plan(
         forecastflows_worker_available: false,
         ..SolverRunStats::default()
     };
+    stats.forecastflows_telemetry.strategy = Some("rust_prune".to_string());
     let report = match forecastflows::solve_family_candidates(
         balances,
         susds_balance,
         slot0_results,
         predictions,
         expected_count,
+        cost_config,
     ) {
         Ok(report) => report,
         Err(err) => {
             stats.forecastflows_requests = err.request_count();
             stats.forecastflows_worker_available = err.worker_available();
+            if let Some(telemetry) = err.telemetry() {
+                apply_forecastflows_telemetry(&mut stats, telemetry);
+            }
             stats.forecastflows_fallback_reason = Some(err.fallback_reason());
             tracing::warn!(error = %err, "ForecastFlows candidate unavailable; falling back to native planner");
             return (None, stats);
@@ -6059,6 +6741,9 @@ fn run_forecastflows_family_plan(
     };
     stats.forecastflows_requests = report.request_count;
     stats.forecastflows_worker_available = true;
+    apply_forecastflows_telemetry(&mut stats, &report.telemetry);
+    stats.forecastflows_telemetry.local_candidate_build_ms = Some(0);
+    stats.forecastflows_telemetry.validation_only = false;
 
     if report.candidates.is_empty() {
         stats.forecastflows_fallback_reason = Some("no_certified_candidate");
@@ -6066,19 +6751,52 @@ fn run_forecastflows_family_plan(
     }
 
     let mut best: Option<PlanResult> = None;
+    let mut local_timing = ForecastFlowsLocalTimingTotals::default();
     for candidate in report.candidates {
-        let Some(plan) =
-            build_forecastflows_plan_result(&initial_state, predictions, candidate, cost_config)
-        else {
+        let estimated_execution_cost_susd = candidate.estimated_execution_cost_susd;
+        let estimated_net_ev_susd = candidate.estimated_net_ev_susd;
+        let mut evaluation_cache = ForecastFlowsActionEvaluationCache::default();
+        let candidate_build_started = std::time::Instant::now();
+        let Some(raw_plan) = build_forecastflows_raw_plan_result(
+            &initial_state,
+            predictions,
+            candidate,
+            cost_config,
+            &mut evaluation_cache,
+        ) else {
             continue;
         };
+        local_timing.candidate_build_ms += candidate_build_started.elapsed().as_millis();
+        let plan = prune_forecastflows_plan_for_program_net_ev(
+            &initial_state,
+            predictions,
+            &raw_plan,
+            cost_config,
+            &mut evaluation_cache,
+            &mut local_timing,
+        );
         if best
             .as_ref()
             .is_none_or(|incumbent| plan_result_is_better(&plan, incumbent))
         {
+            stats.forecastflows_telemetry.estimated_execution_cost_susd =
+                estimated_execution_cost_susd;
+            stats.forecastflows_telemetry.estimated_net_ev_susd = estimated_net_ev_susd;
+            stats.forecastflows_telemetry.validated_total_fee_susd = plan.estimated_total_fee_susd;
+            stats.forecastflows_telemetry.validated_net_ev_susd = plan.estimated_net_ev;
+            stats.forecastflows_telemetry.fee_estimate_error_susd =
+                match (plan.estimated_total_fee_susd, estimated_execution_cost_susd) {
+                    (Some(validated_total_fee_susd), Some(estimated_execution_cost_susd)) => {
+                        Some(validated_total_fee_susd - estimated_execution_cost_susd)
+                    }
+                    _ => None,
+                };
             best = Some(plan);
         }
     }
+    stats.forecastflows_telemetry.local_candidate_build_ms = Some(local_timing.candidate_build_ms);
+    stats.forecastflows_telemetry.local_step_prune_ms = Some(local_timing.step_prune_ms);
+    stats.forecastflows_telemetry.local_route_prune_ms = Some(local_timing.route_prune_ms);
 
     if best.is_none() {
         stats.forecastflows_fallback_reason = Some("no_replayable_candidate");
@@ -6237,7 +6955,68 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         fee_estimate_unavailable_results = stats.fee_estimate_unavailable_results,
         forecastflows_requests = stats.forecastflows_requests,
         forecastflows_worker_available = stats.forecastflows_worker_available,
+        forecastflows_worker_roundtrip_ms = stats.forecastflows_telemetry.worker_roundtrip_ms,
+        forecastflows_driver_overhead_ms = stats.forecastflows_telemetry.driver_overhead_ms,
+        forecastflows_strategy = stats
+            .forecastflows_telemetry
+            .strategy
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_translation_replay_ms = stats.forecastflows_telemetry.translation_replay_ms,
+        forecastflows_local_candidate_build_ms =
+            stats.forecastflows_telemetry.local_candidate_build_ms,
+        forecastflows_local_step_prune_ms = stats.forecastflows_telemetry.local_step_prune_ms,
+        forecastflows_local_route_prune_ms = stats.forecastflows_telemetry.local_route_prune_ms,
+        forecastflows_estimated_execution_cost_susd =
+            stats.forecastflows_telemetry.estimated_execution_cost_susd,
+        forecastflows_estimated_net_ev_susd = stats.forecastflows_telemetry.estimated_net_ev_susd,
+        forecastflows_validated_total_fee_susd =
+            stats.forecastflows_telemetry.validated_total_fee_susd,
+        forecastflows_validated_net_ev_susd = stats.forecastflows_telemetry.validated_net_ev_susd,
+        forecastflows_fee_estimate_error_susd =
+            stats.forecastflows_telemetry.fee_estimate_error_susd,
+        forecastflows_validation_only = stats.forecastflows_telemetry.validation_only,
+        forecastflows_workspace_reused = stats.forecastflows_telemetry.workspace_reused,
         forecastflows_fallback_reason = stats.forecastflows_fallback_reason.unwrap_or("none"),
+        forecastflows_direct_status = stats
+            .forecastflows_telemetry
+            .direct_status
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_mixed_status = stats
+            .forecastflows_telemetry
+            .mixed_status
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_direct_solver_time_ms = stats.forecastflows_telemetry.direct_solver_time_ms,
+        forecastflows_mixed_solver_time_ms = stats.forecastflows_telemetry.mixed_solver_time_ms,
+        forecastflows_certified_drop_reason = stats
+            .forecastflows_telemetry
+            .certified_drop_reason
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_replay_drop_reason = stats
+            .forecastflows_telemetry
+            .replay_drop_reason
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_replay_tolerance_clamp_used =
+            stats.forecastflows_telemetry.replay_tolerance_clamp_used,
+        forecastflows_sysimage_status = stats
+            .forecastflows_telemetry
+            .sysimage_status
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_julia_threads = stats
+            .forecastflows_telemetry
+            .julia_threads
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_solve_tuning = stats
+            .forecastflows_telemetry
+            .solve_tuning
+            .as_deref()
+            .unwrap_or("none"),
         forecastflows_winning_variant = stats
             .forecastflows_winning_variant
             .map(ForecastFlowsCandidateVariant::as_str)
@@ -7462,6 +8241,7 @@ fn rebalance_full_with_predictions_staged_reference(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn rebalance_full_with_predictions(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -7492,6 +8272,7 @@ fn rebalance_full_with_predictions(
     .actions
 }
 
+#[allow(dead_code)]
 fn rebalance_full(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
@@ -7910,15 +8691,57 @@ fn selected_plan_summary_from_plan_for_test(
 }
 
 #[cfg(test)]
-pub(super) fn rebalance_with_custom_predictions_selected_plan_for_test(
+pub(super) fn forecastflows_candidate_plan_variants_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    candidate: ForecastFlowsFamilyCandidate,
+) -> Option<TestForecastFlowsPlanVariants> {
+    let initial_state = build_solver_state_snapshot(balances, susds_balance, slot0_results);
+    let cost_config = benchmark_planner_cost_config_for_test();
+    let mut evaluation_cache = ForecastFlowsActionEvaluationCache::default();
+    let mut local_timing = ForecastFlowsLocalTimingTotals::default();
+    let raw = build_forecastflows_raw_plan_result(
+        &initial_state,
+        predictions,
+        candidate,
+        cost_config,
+        &mut evaluation_cache,
+    )?;
+    let polished = prune_forecastflows_plan_for_program_net_ev(
+        &initial_state,
+        predictions,
+        &raw,
+        cost_config,
+        &mut evaluation_cache,
+        &mut local_timing,
+    );
+    Some(TestForecastFlowsPlanVariants {
+        raw_replayable: estimate_plan_cost_from_replay(&raw.actions, slot0_results, cost_config)
+            .is_some(),
+        polished_replayable: estimate_plan_cost_from_replay(
+            &polished.actions,
+            slot0_results,
+            cost_config,
+        )
+        .is_some(),
+        raw: selected_plan_summary_from_plan_for_test(&raw, cost_config),
+        polished: selected_plan_summary_from_plan_for_test(&polished, cost_config),
+    })
+}
+
+#[cfg(test)]
+pub(super) fn selected_plan_run_with_solver_for_test(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     predictions: &HashMap<String, f64>,
     force_mint_available: bool,
-) -> TestSelectedPlanSummary {
+    solver: RebalanceSolver,
+) -> (Vec<Action>, TestSelectedPlanSummary, SolverRunStats) {
     let cost_config = benchmark_planner_cost_config_for_test();
-    let (plan, _stats) = rebalance_full_ultimate_with_predictions_and_stats(
+    let (plan, stats) = rebalance_full_ultimate_with_predictions_and_stats(
         balances,
         susds_balance,
         slot0_results,
@@ -7926,12 +8749,68 @@ pub(super) fn rebalance_with_custom_predictions_selected_plan_for_test(
         slot0_results.len(),
         RouteGateThresholds::disabled(),
         cost_config,
-        RebalanceSolver::Native,
+        solver,
         RebalanceFlags::default(),
         Some(force_mint_available),
         false,
     );
-    selected_plan_summary_from_plan_for_test(&plan, cost_config)
+    let actions = plan.actions.clone();
+    let summary = selected_plan_summary_from_plan_for_test(&plan, cost_config);
+    (actions, summary, stats)
+}
+
+#[cfg(test)]
+pub(super) fn selected_plan_run_with_solver_and_pricing_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+    solver: RebalanceSolver,
+    gas_assumptions: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+) -> (Vec<Action>, TestSelectedPlanSummary, SolverRunStats) {
+    let cost_config = benchmark_planner_cost_config_with_pricing_for_test(
+        gas_assumptions,
+        gas_price_eth,
+        eth_usd,
+    );
+    let (plan, stats) = rebalance_full_ultimate_with_predictions_and_stats(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+        RouteGateThresholds::disabled(),
+        cost_config,
+        solver,
+        RebalanceFlags::default(),
+        Some(force_mint_available),
+        false,
+    );
+    let actions = plan.actions.clone();
+    let summary = selected_plan_summary_from_plan_for_test(&plan, cost_config);
+    (actions, summary, stats)
+}
+
+#[cfg(test)]
+pub(super) fn rebalance_with_custom_predictions_selected_plan_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    force_mint_available: bool,
+) -> TestSelectedPlanSummary {
+    selected_plan_run_with_solver_for_test(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        force_mint_available,
+        RebalanceSolver::Native,
+    )
+    .1
 }
 
 #[cfg(test)]
@@ -7945,25 +8824,18 @@ pub(super) fn rebalance_with_custom_predictions_selected_plan_with_pricing_for_t
     gas_price_eth: f64,
     eth_usd: f64,
 ) -> TestSelectedPlanSummary {
-    let cost_config = benchmark_planner_cost_config_with_pricing_for_test(
-        gas_assumptions,
-        gas_price_eth,
-        eth_usd,
-    );
-    let (plan, _stats) = rebalance_full_ultimate_with_predictions_and_stats(
+    selected_plan_run_with_solver_and_pricing_for_test(
         balances,
         susds_balance,
         slot0_results,
         predictions,
-        slot0_results.len(),
-        RouteGateThresholds::disabled(),
-        cost_config,
+        force_mint_available,
         RebalanceSolver::Native,
-        RebalanceFlags::default(),
-        Some(force_mint_available),
-        false,
-    );
-    selected_plan_summary_from_plan_for_test(&plan, cost_config)
+        gas_assumptions,
+        gas_price_eth,
+        eth_usd,
+    )
+    .1
 }
 
 #[cfg(test)]
@@ -9387,17 +10259,70 @@ fn rebalance_with_solver_and_thresholds(
     cost_config: PlannerCostConfig,
     flags: RebalanceFlags,
 ) -> Vec<Action> {
+    rebalance_decision_with_solver_and_thresholds(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        solver,
+        route_gates,
+        cost_config,
+        flags,
+    )
+    .actions
+}
+
+fn rebalance_decision_with_solver_and_thresholds(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    solver: RebalanceSolver,
+    route_gates: RouteGateThresholds,
+    cost_config: PlannerCostConfig,
+    flags: RebalanceFlags,
+) -> RebalancePlanDecision {
     match mode {
-        RebalanceMode::Full => rebalance_full(
-            balances,
-            susds_balance,
-            slot0_results,
-            solver,
-            route_gates,
-            cost_config,
-            flags,
-        ),
-        RebalanceMode::ArbOnly => rebalance_arb_only(balances, susds_balance, slot0_results),
+        RebalanceMode::Full => {
+            let predictions = crate::pools::prediction_map();
+            let expected_count = crate::predictions::PREDICTIONS_L1.len();
+            let (plan, stats) = rebalance_full_ultimate_with_predictions_and_stats(
+                balances,
+                susds_balance,
+                slot0_results,
+                predictions,
+                expected_count,
+                route_gates,
+                cost_config,
+                solver,
+                flags,
+                None,
+                false,
+            );
+            decision_from_plan_result(plan, &stats)
+        }
+        RebalanceMode::ArbOnly => {
+            let actions = rebalance_arb_only(balances, susds_balance, slot0_results);
+            RebalancePlanDecision {
+                summary: RebalancePlanSummary {
+                    raw_ev: 0.0,
+                    estimated_total_fee_susd: None,
+                    estimated_net_ev: None,
+                    estimated_group_count: None,
+                    estimated_tx_count: None,
+                    action_count: actions.len(),
+                    forecastflows_telemetry: ForecastFlowsRunTelemetry::default(),
+                    family_stable_rank: 0,
+                    frontier_family_stable_rank: 0,
+                    preserve_markets: Vec::new(),
+                    compiler_variant_stable_rank: 0,
+                    selected_common_shift: None,
+                    selected_mixed_lambda: None,
+                    selected_active_set_size: None,
+                },
+                actions,
+            }
+        }
     }
 }
 
@@ -9565,7 +10490,35 @@ pub fn rebalance_with_solver_and_gas_pricing_and_flags(
     let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
     let cost_config =
         planner_cost_config_with_pricing(gas, gas_price_eth, eth_usd, "explicit_gas_pricing");
-    rebalance_with_solver_and_thresholds(
+    rebalance_decision_with_solver_and_thresholds(
+        balances,
+        susds_balance,
+        slot0_results,
+        mode,
+        solver,
+        route_gates,
+        cost_config,
+        flags,
+    )
+    .actions
+}
+
+pub fn rebalance_with_solver_and_gas_pricing_and_flags_and_decision(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    mode: RebalanceMode,
+    solver: RebalanceSolver,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+    flags: RebalanceFlags,
+) -> RebalancePlanDecision {
+    let n_sims = slot0_results.len();
+    let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
+    let cost_config =
+        planner_cost_config_with_pricing(gas, gas_price_eth, eth_usd, "explicit_gas_pricing");
+    rebalance_decision_with_solver_and_thresholds(
         balances,
         susds_balance,
         slot0_results,

@@ -8,8 +8,12 @@ extract_field() {
 
 health_response() {
     request_id="$1"
+    execution_model="stateless NDJSON; one request at a time per worker process"
+    if [ "$scenario" = "cached_reuse" ]; then
+        execution_model="cached NDJSON; one request at a time per worker process; compatible compare requests reuse a workspace"
+    fi
     cat <<EOF
-{"protocol_version":2,"request_id":"$request_id","ok":true,"command":"health","result":{"status":"ok","supported_commands":["health","solve_prediction_market","compare_prediction_market_families"],"supported_modes":["direct_only","mixed_enabled"],"execution_model":"stateless NDJSON; one request at a time per worker process"}}
+{"protocol_version":2,"request_id":"$request_id","ok":true,"command":"health","result":{"status":"ok","supported_commands":["health","solve_prediction_market","compare_prediction_market_families"],"supported_modes":["direct_only","mixed_enabled"],"execution_model":"$execution_model"}}
 EOF
 }
 
@@ -21,10 +25,39 @@ compare_response() {
 {"protocol_version":2,"request_id":"$request_id","ok":true,"command":"compare_prediction_market_families","result":{"direct_only":{"status":"certified","mode":"direct_only","certificate":{"passed":true},"trades":[{"market_id":"M1","outcome_id":"0x1111111111111111111111111111111111111111","collateral_delta":-0.01,"outcome_delta":0.05}],"split_merge":{"mint":0.0,"merge":0.0},"final_ev":999999.0},"mixed_enabled":{"status":"uncertified","mode":"mixed_enabled","certificate":{"passed":false},"trades":[],"split_merge":{"mint":0.0,"merge":0.0},"final_ev":0.0}}}
 EOF
             ;;
+        cached_reuse)
+            compare_count=$((compare_count + 1))
+            workspace_reused=false
+            if [ "$compare_count" -gt 1 ]; then
+                workspace_reused=true
+            fi
+            cat <<EOF
+{"protocol_version":2,"request_id":"$request_id","ok":true,"command":"compare_prediction_market_families","result":{"direct_only":{"status":"certified","mode":"direct_only","certificate":{"passed":true},"trades":[{"market_id":"M1","outcome_id":"0x1111111111111111111111111111111111111111","collateral_delta":-0.01,"outcome_delta":0.05}],"split_merge":{"mint":0.0,"merge":0.0},"final_ev":999999.0},"mixed_enabled":{"status":"uncertified","mode":"mixed_enabled","certificate":{"passed":false},"trades":[],"split_merge":{"mint":0.0,"merge":0.0},"final_ev":0.0},"workspace_reused":$workspace_reused}}
+EOF
+            ;;
         healthy_mixed)
             cat <<EOF
 {"protocol_version":2,"request_id":"$request_id","ok":true,"command":"compare_prediction_market_families","result":{"direct_only":{"status":"uncertified","mode":"direct_only","certificate":{"passed":false},"trades":[],"split_merge":{"mint":0.0,"merge":0.0}},"mixed_enabled":{"status":"certified","mode":"mixed_enabled","certificate":{"passed":true},"trades":[{"market_id":"M2","outcome_id":"0x2222222222222222222222222222222222222222","collateral_delta":0.12,"outcome_delta":-0.2},{"market_id":"M1","outcome_id":"0x1111111111111111111111111111111111111111","collateral_delta":-0.03,"outcome_delta":0.04}],"split_merge":{"mint":0.2,"merge":0.0},"final_ev":1.0}}}
 EOF
+            ;;
+        benchmark_warmup_only)
+            case "$request_id" in
+                warmup*)
+                    case "$line" in
+                        *"\"max_iter\":10000"*)
+                            cat <<EOF
+{"protocol_version":2,"request_id":"$request_id","ok":true,"command":"compare_prediction_market_families","result":{"direct_only":{"status":"certified","mode":"direct_only","certificate":{"passed":true},"trades":[{"market_id":"M1","outcome_id":"0x1111111111111111111111111111111111111111","collateral_delta":-0.01,"outcome_delta":0.05}],"split_merge":{"mint":0.0,"merge":0.0},"final_ev":999999.0},"mixed_enabled":{"status":"uncertified","mode":"mixed_enabled","certificate":{"passed":false},"trades":[],"split_merge":{"mint":0.0,"merge":0.0},"final_ev":0.0}}}
+EOF
+                            ;;
+                        *)
+                            exit 0
+                            ;;
+                    esac
+                    ;;
+                *)
+                    exit 0
+                    ;;
+            esac
             ;;
         no_op_huge_ev)
             cat <<EOF
@@ -67,6 +100,8 @@ EOF
             ;;
     esac
 }
+
+compare_count=0
 
 while IFS= read -r line; do
     command=$(extract_field "$line" command)

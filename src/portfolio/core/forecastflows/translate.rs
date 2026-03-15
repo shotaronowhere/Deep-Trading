@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
+#[cfg(test)]
+use uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio;
 
 use crate::markets::MarketData;
 use crate::pools::{FEE_PIPS, Slot0Result, normalize_market_name, sqrt_price_x96_to_price_outcome};
@@ -17,22 +19,45 @@ use super::super::merge::action_contract_pair;
 use super::super::sim::{DUST, EPS, build_sims};
 use super::super::types::{BalanceMap, lookup_balance};
 
+const REPLAY_AMOUNT_REL_TOL: f64 = 1e-6;
+const REPLAY_AMOUNT_ABS_TOL: f64 = 1e-9;
+const MAX_ROUTE_REPLAY_ROUNDS: usize = 256;
+
 #[derive(Debug)]
 pub(super) enum ForecastFlowsTranslationError {
     UnsupportedSnapshot(String),
-    InvalidResponse(String),
+    InvalidCertifiedResponse(String),
+    InvalidReplayResponse(String),
 }
 
 impl fmt::Display for ForecastFlowsTranslationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedSnapshot(message) => write!(f, "{message}"),
-            Self::InvalidResponse(message) => write!(f, "{message}"),
+            Self::InvalidCertifiedResponse(message) => write!(f, "{message}"),
+            Self::InvalidReplayResponse(message) => write!(f, "{message}"),
         }
     }
 }
 
 impl std::error::Error for ForecastFlowsTranslationError {}
+
+impl ForecastFlowsTranslationError {
+    fn invalid_response(message: impl Into<String>) -> Self {
+        Self::InvalidCertifiedResponse(message.into())
+    }
+
+    fn invalid_replay(message: impl Into<String>) -> Self {
+        Self::InvalidReplayResponse(message.into())
+    }
+
+    fn drop_stage(&self) -> VariantDropStage {
+        match self {
+            Self::InvalidReplayResponse(_) => VariantDropStage::Replay,
+            _ => VariantDropStage::Certified,
+        }
+    }
+}
 
 pub(super) fn build_problem_request(
     balances: &HashMap<&str, f64>,
@@ -65,22 +90,6 @@ pub(super) fn build_problem_request(
             ))
         })?;
         let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
-        let (active_liquidity, tick_lo, tick_hi) = current_single_tick_geometry(slot0, market)
-            .ok_or_else(|| {
-                ForecastFlowsTranslationError::UnsupportedSnapshot(format!(
-                    "market {} does not have replayable single-range geometry",
-                    market.name
-                ))
-            })?;
-        let (buy_limit_price, sell_limit_price) =
-            single_tick_limit_prices(market, is_token1_outcome, tick_lo, tick_hi).ok_or_else(
-                || {
-                    ForecastFlowsTranslationError::UnsupportedSnapshot(format!(
-                        "failed to derive active-range prices for market {}",
-                        market.name
-                    ))
-                },
-            )?;
         let current_price =
             sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)
                 .and_then(|value| u128::try_from(value).ok())
@@ -91,6 +100,12 @@ pub(super) fn build_problem_request(
                         market.name
                     ))
                 })?;
+        let bands = build_univ3_liquidity_bands(slot0, market).ok_or_else(|| {
+            ForecastFlowsTranslationError::UnsupportedSnapshot(format!(
+                "market {} does not have replayable contiguous liquidity ladder geometry",
+                market.name
+            ))
+        })?;
 
         outcomes.push(OutcomeSpecRequest {
             outcome_id: market.outcome_token.to_string(),
@@ -101,16 +116,7 @@ pub(super) fn build_problem_request(
             market_id: market.name.to_string(),
             outcome_id: market.outcome_token.to_string(),
             current_price,
-            bands: vec![
-                UniV3LiquidityBandRequest {
-                    lower_price: buy_limit_price,
-                    liquidity_l: active_liquidity as f64 / 1e18,
-                },
-                UniV3LiquidityBandRequest {
-                    lower_price: sell_limit_price,
-                    liquidity_l: 0.0,
-                },
-            ],
+            bands,
             fee_multiplier: 1.0 - (FEE_PIPS as f64 / 1_000_000.0),
         });
     }
@@ -131,24 +137,82 @@ pub(super) fn translate_compare_result(
     predictions: &HashMap<String, f64>,
     compare: CompareResult,
 ) -> Result<Vec<ForecastFlowsFamilyCandidate>, ForecastFlowsTranslationError> {
-    Ok(translate_compare_result_report(
+    let report = translate_compare_result_report(
         balances,
         susds_balance,
         slot0_results,
         predictions,
         compare,
-    )?
-    .candidates)
+    );
+    if let Some(message) = report.all_certified_candidates_dropped_message() {
+        return Err(ForecastFlowsTranslationError::invalid_response(message));
+    }
+    Ok(report.candidates)
 }
 
 pub(super) struct CompareTranslationReport {
     pub(super) candidates: Vec<ForecastFlowsFamilyCandidate>,
-    pub(super) certified_drop_reasons: Vec<VariantDropReason>,
+    pub(super) drop_reasons: Vec<VariantDropReason>,
+    pub(super) replay_tolerance_clamp_used: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VariantDropStage {
+    Certified,
+    Replay,
+}
+
+impl VariantDropStage {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Certified => "certified",
+            Self::Replay => "replay",
+        }
+    }
 }
 
 pub(super) struct VariantDropReason {
     pub(super) variant: ForecastFlowsCandidateVariant,
+    pub(super) stage: VariantDropStage,
     pub(super) reason: String,
+}
+
+impl CompareTranslationReport {
+    pub(super) fn first_non_replay_drop_reason(&self) -> Option<String> {
+        self.drop_reasons
+            .iter()
+            .find(|drop| drop.stage == VariantDropStage::Certified)
+            .map(|drop| format!("{}: {}", drop.variant.as_str(), drop.reason))
+    }
+
+    pub(super) fn first_replay_drop_reason(&self) -> Option<String> {
+        self.drop_reasons
+            .iter()
+            .find(|drop| drop.stage == VariantDropStage::Replay)
+            .map(|drop| format!("{}: {}", drop.variant.as_str(), drop.reason))
+    }
+
+    pub(super) fn all_certified_candidates_dropped_message(&self) -> Option<String> {
+        if !self.candidates.is_empty() || self.drop_reasons.is_empty() {
+            return None;
+        }
+        let joined = self
+            .drop_reasons
+            .iter()
+            .map(|drop| {
+                format!(
+                    "{}({}): {}",
+                    drop.variant.as_str(),
+                    drop.stage.as_str(),
+                    drop.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(format!(
+            "all certified ForecastFlows candidates were dropped during translation: {joined}"
+        ))
+    }
 }
 
 pub(super) fn translate_compare_result_report(
@@ -157,13 +221,15 @@ pub(super) fn translate_compare_result_report(
     slot0_results: &[(Slot0Result, &'static MarketData)],
     predictions: &HashMap<String, f64>,
     compare: CompareResult,
-) -> Result<CompareTranslationReport, ForecastFlowsTranslationError> {
+) -> CompareTranslationReport {
     let mut candidates = Vec::new();
-    let mut certified_drop_reasons = Vec::new();
+    let mut drop_reasons = Vec::new();
+    let mut replay_tolerance_clamp_used = false;
 
     collect_variant_translation(
         &mut candidates,
-        &mut certified_drop_reasons,
+        &mut drop_reasons,
+        &mut replay_tolerance_clamp_used,
         balances,
         susds_balance,
         slot0_results,
@@ -173,7 +239,8 @@ pub(super) fn translate_compare_result_report(
     );
     collect_variant_translation(
         &mut candidates,
-        &mut certified_drop_reasons,
+        &mut drop_reasons,
+        &mut replay_tolerance_clamp_used,
         balances,
         susds_balance,
         slot0_results,
@@ -182,26 +249,17 @@ pub(super) fn translate_compare_result_report(
         ForecastFlowsCandidateVariant::Mixed,
     );
 
-    if candidates.is_empty() && !certified_drop_reasons.is_empty() {
-        let joined = certified_drop_reasons
-            .iter()
-            .map(|drop| format!("{}: {}", drop.variant.as_str(), drop.reason))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
-            "all certified ForecastFlows candidates were dropped during translation: {joined}"
-        )));
-    }
-
-    Ok(CompareTranslationReport {
+    CompareTranslationReport {
         candidates,
-        certified_drop_reasons,
-    })
+        drop_reasons,
+        replay_tolerance_clamp_used,
+    }
 }
 
 fn collect_variant_translation(
     candidates: &mut Vec<ForecastFlowsFamilyCandidate>,
-    certified_drop_reasons: &mut Vec<VariantDropReason>,
+    drop_reasons: &mut Vec<VariantDropReason>,
+    replay_tolerance_clamp_used: &mut bool,
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static MarketData)],
@@ -216,13 +274,15 @@ fn collect_variant_translation(
         predictions,
         result,
         variant,
+        replay_tolerance_clamp_used,
     ) {
         Ok(Some(candidate)) => candidates.push(candidate),
         Ok(None) => {}
         Err(err) => {
             if result.is_certified() {
-                certified_drop_reasons.push(VariantDropReason {
+                drop_reasons.push(VariantDropReason {
                     variant,
+                    stage: err.drop_stage(),
                     reason: err.to_string(),
                 });
             }
@@ -237,19 +297,20 @@ fn translate_solve_result(
     predictions: &HashMap<String, f64>,
     result: &PredictionMarketSolveResult,
     variant: ForecastFlowsCandidateVariant,
+    replay_tolerance_clamp_used: &mut bool,
 ) -> Result<Option<ForecastFlowsFamilyCandidate>, ForecastFlowsTranslationError> {
     if !result.is_certified() {
         return Ok(None);
     }
     match variant {
         ForecastFlowsCandidateVariant::Direct if result.mode != "direct_only" => {
-            return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+            return Err(ForecastFlowsTranslationError::invalid_response(format!(
                 "direct candidate returned unexpected mode {}",
                 result.mode
             )));
         }
         ForecastFlowsCandidateVariant::Mixed if result.mode != "mixed_enabled" => {
-            return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+            return Err(ForecastFlowsTranslationError::invalid_response(format!(
                 "mixed candidate returned unexpected mode {}",
                 result.mode
             )));
@@ -262,7 +323,7 @@ fn translate_solve_result(
     let mint_amount = sanitize_nonnegative(result.split_merge.mint, "split_merge.mint")?;
     let merge_amount = sanitize_nonnegative(result.split_merge.merge, "split_merge.merge")?;
     if mint_amount > DUST && merge_amount > DUST {
-        return Err(ForecastFlowsTranslationError::InvalidResponse(
+        return Err(ForecastFlowsTranslationError::invalid_response(
             "mixed result cannot mint and merge in the same candidate".to_string(),
         ));
     }
@@ -287,102 +348,69 @@ fn translate_solve_result(
     let (contract_1, contract_2) = action_contract_pair(&sims);
     let mut actions = Vec::new();
 
-    if mint_amount > DUST {
-        if cash + EPS < mint_amount {
-            return Err(ForecastFlowsTranslationError::InvalidResponse(
-                "local replay rejected mint amount due to insufficient cash".to_string(),
-            ));
-        }
-        cash -= mint_amount;
-        for (_, market) in slot0_results {
-            *sim_balances.entry(market.name).or_insert(0.0) += mint_amount;
-        }
-        actions.push(Action::Mint {
-            contract_1,
-            contract_2,
-            amount: mint_amount,
-            target_market: representative_market,
-        });
-    }
+    let mut ordered_route = ordered_trade_route(slot0_results, &net_trades);
+    let mut merge_remaining = merge_amount;
 
-    let mut sells = net_trades.sells;
-    sells.sort_by_key(|trade| trade.market_name);
-    let mut buys = net_trades.buys;
-    buys.sort_by_key(|trade| trade.market_name);
+    replay_direct_sells(
+        &mut sims,
+        &sim_idx_by_market,
+        &mut sim_balances,
+        &mut cash,
+        &mut actions,
+        &mut ordered_route,
+        replay_tolerance_clamp_used,
+    )?;
+    replay_direct_merges(
+        &mut sim_balances,
+        &mut cash,
+        &mut actions,
+        &ordered_route,
+        &mut merge_remaining,
+        contract_1,
+        contract_2,
+        representative_market,
+    )?;
+    replay_mint_rounds(
+        slot0_results,
+        &mut sims,
+        &sim_idx_by_market,
+        &mut sim_balances,
+        &mut cash,
+        &mut actions,
+        &mut ordered_route,
+        mint_amount,
+        contract_1,
+        contract_2,
+        representative_market,
+        replay_tolerance_clamp_used,
+    )?;
+    replay_buy_merge_rounds(
+        &mut sims,
+        &sim_idx_by_market,
+        &mut sim_balances,
+        &mut cash,
+        &mut actions,
+        &mut ordered_route,
+        &mut merge_remaining,
+        contract_1,
+        contract_2,
+        representative_market,
+    )?;
+    replay_remaining_buys(
+        &mut sims,
+        &sim_idx_by_market,
+        &mut sim_balances,
+        &mut cash,
+        &mut actions,
+        &mut ordered_route,
+    )?;
 
-    if merge_amount <= DUST {
-        for trade in &sells {
-            replay_sell(
-                &mut sims,
-                &sim_idx_by_market,
-                &mut sim_balances,
-                &mut cash,
-                &mut actions,
-                trade.market_name,
-                trade.amount,
-            )?;
-        }
-        for trade in &buys {
-            replay_buy(
-                &mut sims,
-                &sim_idx_by_market,
-                &mut sim_balances,
-                &mut cash,
-                &mut actions,
-                trade.market_name,
-                trade.amount,
-            )?;
-        }
-    } else {
-        for trade in &buys {
-            replay_buy(
-                &mut sims,
-                &sim_idx_by_market,
-                &mut sim_balances,
-                &mut cash,
-                &mut actions,
-                trade.market_name,
-                trade.amount,
-            )?;
-        }
-        for (_, market) in slot0_results {
-            let holding = sim_balances
-                .get(market.name)
-                .copied()
-                .unwrap_or(0.0)
-                .max(0.0);
-            if holding + EPS < merge_amount {
-                return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
-                    "local replay rejected merge amount due to insufficient holdings for {}",
-                    market.name
-                )));
-            }
-        }
-        for (_, market) in slot0_results {
-            let holding = sim_balances.entry(market.name).or_insert(0.0);
-            *holding = (*holding - merge_amount).max(0.0);
-        }
-        cash += merge_amount;
-        actions.push(Action::Merge {
-            contract_1,
-            contract_2,
-            amount: merge_amount,
-            source_market: representative_market,
-        });
-        for trade in &sells {
-            replay_sell(
-                &mut sims,
-                &sim_idx_by_market,
-                &mut sim_balances,
-                &mut cash,
-                &mut actions,
-                trade.market_name,
-                trade.amount,
-            )?;
-        }
-    }
-
-    Ok(Some(ForecastFlowsFamilyCandidate { actions, variant }))
+    Ok(Some(ForecastFlowsFamilyCandidate {
+        actions,
+        variant,
+        estimated_execution_cost_susd: result.estimated_execution_cost,
+        estimated_net_ev_susd: result.net_ev,
+    }))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -397,6 +425,12 @@ struct NettedTrades {
     sells: Vec<TradeAmount>,
 }
 
+struct OrderedTradeRoute {
+    market_name: &'static str,
+    buy_remaining: f64,
+    sell_remaining: f64,
+}
+
 fn build_market_catalog(
     slot0_results: &[(Slot0Result, &'static MarketData)],
 ) -> HashMap<&'static str, &'static str> {
@@ -407,6 +441,497 @@ fn build_market_catalog(
     market_catalog
 }
 
+fn ordered_trade_route(
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    net_trades: &NettedTrades,
+) -> Vec<OrderedTradeRoute> {
+    let buy_by_market = net_trades
+        .buys
+        .iter()
+        .map(|trade| (trade.market_name, trade.amount))
+        .collect::<HashMap<_, _>>();
+    let sell_by_market = net_trades
+        .sells
+        .iter()
+        .map(|trade| (trade.market_name, trade.amount))
+        .collect::<HashMap<_, _>>();
+
+    slot0_results
+        .iter()
+        .map(|(_, market)| OrderedTradeRoute {
+            market_name: market.name,
+            buy_remaining: buy_by_market.get(market.name).copied().unwrap_or(0.0),
+            sell_remaining: sell_by_market.get(market.name).copied().unwrap_or(0.0),
+        })
+        .collect()
+}
+
+fn replay_direct_sells(
+    sims: &mut [super::super::sim::PoolSim],
+    sim_idx_by_market: &HashMap<&'static str, usize>,
+    sim_balances: &mut BalanceMap,
+    cash: &mut f64,
+    actions: &mut Vec<Action>,
+    ordered_route: &mut [OrderedTradeRoute],
+    replay_tolerance_clamp_used: &mut bool,
+) -> Result<(), ForecastFlowsTranslationError> {
+    for route in ordered_route {
+        let desired = route.sell_remaining;
+        if desired <= DUST || amounts_match_within_replay_tolerance(desired, 0.0) {
+            continue;
+        }
+        let idx = *sim_idx_by_market.get(route.market_name).ok_or_else(|| {
+            ForecastFlowsTranslationError::invalid_response(format!(
+                "missing sim for market {}",
+                route.market_name
+            ))
+        })?;
+        let available = sim_balances
+            .get(route.market_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        let feasible = desired
+            .min(available)
+            .min(sims[idx].max_sell_tokens().max(0.0));
+        if feasible <= DUST || amounts_match_within_replay_tolerance(feasible, 0.0) {
+            continue;
+        }
+        let requested = if amounts_match_within_replay_tolerance(desired, feasible) {
+            desired
+        } else {
+            feasible
+        };
+        replay_sell(
+            sims,
+            sim_idx_by_market,
+            sim_balances,
+            cash,
+            actions,
+            route.market_name,
+            requested,
+            replay_tolerance_clamp_used,
+        )?;
+        route.sell_remaining = (route.sell_remaining - feasible).max(0.0);
+    }
+    Ok(())
+}
+
+fn replay_direct_merges(
+    sim_balances: &mut BalanceMap,
+    cash: &mut f64,
+    actions: &mut Vec<Action>,
+    ordered_route: &[OrderedTradeRoute],
+    merge_remaining: &mut f64,
+    contract_1: &'static str,
+    contract_2: &'static str,
+    representative_market: &'static str,
+) -> Result<(), ForecastFlowsTranslationError> {
+    for _ in 0..MAX_ROUTE_REPLAY_ROUNDS {
+        if *merge_remaining <= DUST || amounts_match_within_replay_tolerance(*merge_remaining, 0.0)
+        {
+            return Ok(());
+        }
+        let direct_merge = ordered_route
+            .iter()
+            .map(|route| {
+                sim_balances
+                    .get(route.market_name)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(0.0)
+            })
+            .fold(*merge_remaining, f64::min);
+        if direct_merge <= DUST || amounts_match_within_replay_tolerance(direct_merge, 0.0) {
+            return Ok(());
+        }
+        replay_merge(
+            sim_balances,
+            cash,
+            actions,
+            ordered_route.iter().map(|route| route.market_name),
+            direct_merge,
+            contract_1,
+            contract_2,
+            representative_market,
+        )?;
+        *merge_remaining = (*merge_remaining - direct_merge).max(0.0);
+    }
+
+    Err(ForecastFlowsTranslationError::invalid_replay(
+        "local replay exceeded direct merge round limit".to_string(),
+    ))
+}
+
+fn replay_mint_rounds(
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    sims: &mut [super::super::sim::PoolSim],
+    sim_idx_by_market: &HashMap<&'static str, usize>,
+    sim_balances: &mut BalanceMap,
+    cash: &mut f64,
+    actions: &mut Vec<Action>,
+    ordered_route: &mut [OrderedTradeRoute],
+    mint_amount: f64,
+    contract_1: &'static str,
+    contract_2: &'static str,
+    representative_market: &'static str,
+    replay_tolerance_clamp_used: &mut bool,
+) -> Result<(), ForecastFlowsTranslationError> {
+    let mut mint_remaining = mint_amount;
+    for _ in 0..MAX_ROUTE_REPLAY_ROUNDS {
+        if mint_remaining <= DUST
+            || amounts_match_within_replay_tolerance(mint_remaining, 0.0)
+            || *cash <= DUST
+        {
+            return Ok(());
+        }
+        let round_amount = mint_remaining.min((*cash).max(0.0));
+        if round_amount <= DUST || amounts_match_within_replay_tolerance(round_amount, 0.0) {
+            return Ok(());
+        }
+        replay_mint(
+            slot0_results,
+            sim_balances,
+            cash,
+            actions,
+            round_amount,
+            contract_1,
+            contract_2,
+            representative_market,
+        )?;
+        mint_remaining = (mint_remaining - round_amount).max(0.0);
+
+        for route in ordered_route.iter_mut() {
+            let desired = route.sell_remaining.min(round_amount);
+            if desired <= DUST || amounts_match_within_replay_tolerance(desired, 0.0) {
+                continue;
+            }
+            let idx = *sim_idx_by_market.get(route.market_name).ok_or_else(|| {
+                ForecastFlowsTranslationError::invalid_response(format!(
+                    "missing sim for market {}",
+                    route.market_name
+                ))
+            })?;
+            let available = sim_balances
+                .get(route.market_name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0);
+            let feasible = desired
+                .min(available)
+                .min(sims[idx].max_sell_tokens().max(0.0));
+            if feasible <= DUST || amounts_match_within_replay_tolerance(feasible, 0.0) {
+                continue;
+            }
+            let requested = if amounts_match_within_replay_tolerance(desired, feasible) {
+                desired
+            } else {
+                feasible
+            };
+            replay_sell(
+                sims,
+                sim_idx_by_market,
+                sim_balances,
+                cash,
+                actions,
+                route.market_name,
+                requested,
+                replay_tolerance_clamp_used,
+            )?;
+            route.sell_remaining = (route.sell_remaining - feasible).max(0.0);
+        }
+    }
+
+    Err(ForecastFlowsTranslationError::invalid_replay(
+        "local replay exceeded mint round limit".to_string(),
+    ))
+}
+
+fn replay_buy_merge_rounds(
+    sims: &mut [super::super::sim::PoolSim],
+    sim_idx_by_market: &HashMap<&'static str, usize>,
+    sim_balances: &mut BalanceMap,
+    cash: &mut f64,
+    actions: &mut Vec<Action>,
+    ordered_route: &mut [OrderedTradeRoute],
+    merge_remaining: &mut f64,
+    contract_1: &'static str,
+    contract_2: &'static str,
+    representative_market: &'static str,
+) -> Result<(), ForecastFlowsTranslationError> {
+    for _ in 0..MAX_ROUTE_REPLAY_ROUNDS {
+        if *merge_remaining <= DUST || amounts_match_within_replay_tolerance(*merge_remaining, 0.0)
+        {
+            return Ok(());
+        }
+        let round_amount = affordable_merge_round(
+            sims,
+            sim_idx_by_market,
+            sim_balances,
+            ordered_route,
+            *merge_remaining,
+            *cash,
+        )?;
+        if round_amount <= DUST || amounts_match_within_replay_tolerance(round_amount, 0.0) {
+            return Ok(());
+        }
+
+        for route in ordered_route.iter_mut() {
+            let holding = sim_balances
+                .get(route.market_name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0);
+            let shortfall = (round_amount - holding).max(0.0);
+            if shortfall <= DUST || amounts_match_within_replay_tolerance(shortfall, 0.0) {
+                continue;
+            }
+            replay_buy(
+                sims,
+                sim_idx_by_market,
+                sim_balances,
+                cash,
+                actions,
+                route.market_name,
+                shortfall,
+            )?;
+            route.buy_remaining = (route.buy_remaining - shortfall).max(0.0);
+        }
+
+        replay_merge(
+            sim_balances,
+            cash,
+            actions,
+            ordered_route.iter().map(|route| route.market_name),
+            round_amount,
+            contract_1,
+            contract_2,
+            representative_market,
+        )?;
+        *merge_remaining = (*merge_remaining - round_amount).max(0.0);
+    }
+
+    Err(ForecastFlowsTranslationError::invalid_replay(
+        "local replay exceeded buy-merge round limit".to_string(),
+    ))
+}
+
+fn replay_remaining_buys(
+    sims: &mut [super::super::sim::PoolSim],
+    sim_idx_by_market: &HashMap<&'static str, usize>,
+    sim_balances: &mut BalanceMap,
+    cash: &mut f64,
+    actions: &mut Vec<Action>,
+    ordered_route: &mut [OrderedTradeRoute],
+) -> Result<(), ForecastFlowsTranslationError> {
+    for route in ordered_route {
+        let desired = route.buy_remaining;
+        if desired <= DUST || amounts_match_within_replay_tolerance(desired, 0.0) {
+            continue;
+        }
+        let idx = *sim_idx_by_market.get(route.market_name).ok_or_else(|| {
+            ForecastFlowsTranslationError::invalid_response(format!(
+                "missing sim for market {}",
+                route.market_name
+            ))
+        })?;
+        let feasible = affordable_buy_amount(&sims[idx], desired, *cash);
+        if feasible <= DUST || amounts_match_within_replay_tolerance(feasible, 0.0) {
+            continue;
+        }
+        replay_buy(
+            sims,
+            sim_idx_by_market,
+            sim_balances,
+            cash,
+            actions,
+            route.market_name,
+            feasible,
+        )?;
+        route.buy_remaining = (route.buy_remaining - feasible).max(0.0);
+    }
+    Ok(())
+}
+
+fn replay_mint(
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+    sim_balances: &mut BalanceMap,
+    cash: &mut f64,
+    actions: &mut Vec<Action>,
+    amount: f64,
+    contract_1: &'static str,
+    contract_2: &'static str,
+    representative_market: &'static str,
+) -> Result<(), ForecastFlowsTranslationError> {
+    if *cash + EPS < amount {
+        return Err(ForecastFlowsTranslationError::invalid_replay(
+            "local replay rejected mint amount due to insufficient cash".to_string(),
+        ));
+    }
+    *cash -= amount;
+    for (_, market) in slot0_results {
+        *sim_balances.entry(market.name).or_insert(0.0) += amount;
+    }
+    actions.push(Action::Mint {
+        contract_1,
+        contract_2,
+        amount,
+        target_market: representative_market,
+    });
+    Ok(())
+}
+
+fn replay_merge(
+    sim_balances: &mut BalanceMap,
+    cash: &mut f64,
+    actions: &mut Vec<Action>,
+    market_names: impl IntoIterator<Item = &'static str>,
+    amount: f64,
+    contract_1: &'static str,
+    contract_2: &'static str,
+    representative_market: &'static str,
+) -> Result<(), ForecastFlowsTranslationError> {
+    let market_names = market_names.into_iter().collect::<Vec<_>>();
+    for market_name in &market_names {
+        let holding = sim_balances
+            .get(market_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        if holding + EPS < amount {
+            return Err(ForecastFlowsTranslationError::invalid_replay(format!(
+                "local replay rejected merge amount due to insufficient holdings for {}",
+                market_name
+            )));
+        }
+    }
+    for market_name in market_names {
+        let holding = sim_balances.entry(market_name).or_insert(0.0);
+        *holding = (*holding - amount).max(0.0);
+    }
+    *cash += amount;
+    actions.push(Action::Merge {
+        contract_1,
+        contract_2,
+        amount,
+        source_market: representative_market,
+    });
+    Ok(())
+}
+
+fn affordable_buy_amount(sim: &super::super::sim::PoolSim, desired: f64, cash: f64) -> f64 {
+    let upper = desired.min(sim.max_buy_tokens().max(0.0));
+    if upper <= DUST || amounts_match_within_replay_tolerance(upper, 0.0) {
+        return 0.0;
+    }
+    if let Some((bought, cost, _)) = sim.buy_exact(upper)
+        && bought + EPS >= upper
+        && cost <= cash + EPS
+    {
+        return upper;
+    }
+
+    let mut lo = 0.0;
+    let mut hi = upper;
+    for _ in 0..64 {
+        let mid = (lo + hi) / 2.0;
+        let affordable = sim
+            .buy_exact(mid)
+            .is_some_and(|(bought, cost, _)| bought + EPS >= mid && cost <= cash + EPS);
+        if affordable {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn merge_round_buy_cost(
+    sims: &[super::super::sim::PoolSim],
+    sim_idx_by_market: &HashMap<&'static str, usize>,
+    sim_balances: &BalanceMap,
+    ordered_route: &[OrderedTradeRoute],
+    amount: f64,
+) -> Result<f64, ForecastFlowsTranslationError> {
+    let mut total = 0.0;
+    for route in ordered_route {
+        let holding = sim_balances
+            .get(route.market_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        let shortfall = (amount - holding).max(0.0);
+        if shortfall <= DUST || amounts_match_within_replay_tolerance(shortfall, 0.0) {
+            continue;
+        }
+        let idx = *sim_idx_by_market.get(route.market_name).ok_or_else(|| {
+            ForecastFlowsTranslationError::invalid_response(format!(
+                "missing sim for market {}",
+                route.market_name
+            ))
+        })?;
+        let Some((bought, cost, _)) = sims[idx].buy_exact(shortfall) else {
+            return Ok(f64::INFINITY);
+        };
+        if bought + EPS < shortfall {
+            return Ok(f64::INFINITY);
+        }
+        total += cost;
+    }
+    Ok(total)
+}
+
+fn affordable_merge_round(
+    sims: &[super::super::sim::PoolSim],
+    sim_idx_by_market: &HashMap<&'static str, usize>,
+    sim_balances: &BalanceMap,
+    ordered_route: &[OrderedTradeRoute],
+    merge_remaining: f64,
+    cash: f64,
+) -> Result<f64, ForecastFlowsTranslationError> {
+    let mut upper = merge_remaining;
+    for route in ordered_route {
+        let idx = *sim_idx_by_market.get(route.market_name).ok_or_else(|| {
+            ForecastFlowsTranslationError::invalid_response(format!(
+                "missing sim for market {}",
+                route.market_name
+            ))
+        })?;
+        let holding = sim_balances
+            .get(route.market_name)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0);
+        upper = upper
+            .min(holding + route.buy_remaining)
+            .min(holding + sims[idx].max_buy_tokens().max(0.0));
+    }
+    if upper <= DUST || amounts_match_within_replay_tolerance(upper, 0.0) {
+        return Ok(0.0);
+    }
+
+    if merge_round_buy_cost(sims, sim_idx_by_market, sim_balances, ordered_route, upper)?
+        <= cash + EPS
+    {
+        return Ok(upper);
+    }
+
+    let mut lo = 0.0;
+    let mut hi = upper;
+    for _ in 0..64 {
+        let mid = (lo + hi) / 2.0;
+        if merge_round_buy_cost(sims, sim_idx_by_market, sim_balances, ordered_route, mid)?
+            <= cash + EPS
+        {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
 fn net_worker_trades(
     market_catalog: &HashMap<&'static str, &'static str>,
     trades: &[PredictionMarketTrade],
@@ -414,7 +939,7 @@ fn net_worker_trades(
     let mut net_by_market: HashMap<&'static str, (f64, f64)> = HashMap::new();
     for trade in trades {
         if !trade.collateral_delta.is_finite() || !trade.outcome_delta.is_finite() {
-            return Err(ForecastFlowsTranslationError::InvalidResponse(
+            return Err(ForecastFlowsTranslationError::invalid_response(
                 "worker returned a non-finite trade delta".to_string(),
             ));
         }
@@ -422,13 +947,13 @@ fn net_worker_trades(
             .iter()
             .find(|(market_name, _)| **market_name == trade.market_id)
         else {
-            return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+            return Err(ForecastFlowsTranslationError::invalid_response(format!(
                 "worker returned unknown market_id {}",
                 trade.market_id
             )));
         };
         if outcome_id != trade.outcome_id {
-            return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+            return Err(ForecastFlowsTranslationError::invalid_response(format!(
                 "worker outcome_id {} does not match market {}",
                 trade.outcome_id, trade.market_id
             )));
@@ -454,7 +979,7 @@ fn net_worker_trades(
                 amount: -outcome_delta,
             });
         } else {
-            return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+            return Err(ForecastFlowsTranslationError::invalid_response(format!(
                 "worker returned inconsistent trade signs for market {}",
                 market_name
             )));
@@ -484,29 +1009,29 @@ fn replay_buy(
     market_name: &'static str,
     amount: f64,
 ) -> Result<(), ForecastFlowsTranslationError> {
-    if amount <= DUST {
+    if amount <= DUST || amounts_match_within_replay_tolerance(amount, 0.0) {
         return Ok(());
     }
     let idx = *sim_idx_by_market.get(market_name).ok_or_else(|| {
-        ForecastFlowsTranslationError::InvalidResponse(format!(
+        ForecastFlowsTranslationError::invalid_response(format!(
             "missing sim for market {}",
             market_name
         ))
     })?;
     let (bought, cost, new_price) = sims[idx].buy_exact(amount).ok_or_else(|| {
-        ForecastFlowsTranslationError::InvalidResponse(format!(
+        ForecastFlowsTranslationError::invalid_replay(format!(
             "local replay buy failed for market {}",
             market_name
         ))
     })?;
     if bought + EPS < amount || bought <= DUST || !cost.is_finite() || !new_price.is_finite() {
-        return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+        return Err(ForecastFlowsTranslationError::invalid_replay(format!(
             "local replay buy was infeasible for market {}",
             market_name
         )));
     }
     if *cash + EPS < cost {
-        return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+        return Err(ForecastFlowsTranslationError::invalid_replay(format!(
             "local replay rejected buy due to insufficient cash for market {}",
             market_name
         )));
@@ -530,8 +1055,9 @@ fn replay_sell(
     actions: &mut Vec<Action>,
     market_name: &'static str,
     amount: f64,
+    replay_tolerance_clamp_used: &mut bool,
 ) -> Result<(), ForecastFlowsTranslationError> {
-    if amount <= DUST {
+    if amount <= DUST || amounts_match_within_replay_tolerance(amount, 0.0) {
         return Ok(());
     }
     let available = sim_balances
@@ -539,28 +1065,45 @@ fn replay_sell(
         .copied()
         .unwrap_or(0.0)
         .max(0.0);
-    if available + EPS < amount {
-        return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
-            "local replay rejected sell due to insufficient holdings for market {}",
-            market_name
-        )));
-    }
+    let requested_amount = if available + EPS < amount {
+        if amounts_match_within_replay_tolerance(amount, available) {
+            *replay_tolerance_clamp_used = true;
+            available
+        } else {
+            return Err(ForecastFlowsTranslationError::invalid_replay(format!(
+                "local replay rejected sell due to insufficient holdings for market {} (requested={}, available={})",
+                market_name, amount, available
+            )));
+        }
+    } else {
+        amount
+    };
     let idx = *sim_idx_by_market.get(market_name).ok_or_else(|| {
-        ForecastFlowsTranslationError::InvalidResponse(format!(
+        ForecastFlowsTranslationError::invalid_response(format!(
             "missing sim for market {}",
             market_name
         ))
     })?;
-    let (sold, proceeds, new_price) = sims[idx].sell_exact(amount).ok_or_else(|| {
-        ForecastFlowsTranslationError::InvalidResponse(format!(
+    let (sold, proceeds, new_price) = sims[idx].sell_exact(requested_amount).ok_or_else(|| {
+        ForecastFlowsTranslationError::invalid_replay(format!(
             "local replay sell failed for market {}",
             market_name
         ))
     })?;
-    if sold + EPS < amount || sold <= DUST || !proceeds.is_finite() || !new_price.is_finite() {
-        return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
-            "local replay sell was infeasible for market {}",
-            market_name
+    if sold + EPS < requested_amount {
+        if amounts_match_within_replay_tolerance(sold, requested_amount) {
+            *replay_tolerance_clamp_used = true;
+        } else {
+            return Err(ForecastFlowsTranslationError::invalid_replay(format!(
+                "local replay sell was infeasible for market {} (requested={}, replayed={})",
+                market_name, requested_amount, sold
+            )));
+        }
+    }
+    if sold <= DUST || !proceeds.is_finite() || !new_price.is_finite() {
+        return Err(ForecastFlowsTranslationError::invalid_replay(format!(
+            "local replay sell was infeasible for market {} (requested={}, replayed={})",
+            market_name, requested_amount, sold
         )));
     }
     sims[idx].set_price(new_price);
@@ -577,16 +1120,24 @@ fn replay_sell(
 
 fn sanitize_nonnegative(value: f64, field: &str) -> Result<f64, ForecastFlowsTranslationError> {
     if !value.is_finite() {
-        return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+        return Err(ForecastFlowsTranslationError::invalid_response(format!(
             "{field} is not finite"
         )));
     }
     if value < -EPS {
-        return Err(ForecastFlowsTranslationError::InvalidResponse(format!(
+        return Err(ForecastFlowsTranslationError::invalid_response(format!(
             "{field} must be nonnegative"
         )));
     }
     Ok(value.max(0.0))
+}
+
+fn replay_amount_tolerance(lhs: f64, rhs: f64) -> f64 {
+    REPLAY_AMOUNT_ABS_TOL.max(REPLAY_AMOUNT_REL_TOL * lhs.abs().max(rhs.abs()).max(1.0))
+}
+
+fn amounts_match_within_replay_tolerance(lhs: f64, rhs: f64) -> bool {
+    (lhs - rhs).abs() <= replay_amount_tolerance(lhs, rhs)
 }
 
 fn representative_complete_set_market(
@@ -600,57 +1151,172 @@ fn representative_complete_set_market(
     markets.first().copied()
 }
 
-fn current_single_tick_geometry(
-    slot0: &Slot0Result,
-    market: &'static MarketData,
-) -> Option<(u128, i32, i32)> {
-    let pool = market.pool.as_ref()?;
-    let mut tick_lo = None;
-    let mut tick_hi = None;
-    let mut active_liquidity = 0i128;
-
-    for tick in pool.ticks {
-        if tick.tick_idx <= slot0.tick {
-            active_liquidity = active_liquidity.checked_add(tick.liquidity_net)?;
-            if tick_lo.is_none_or(|best| tick.tick_idx > best) {
-                tick_lo = Some(tick.tick_idx);
-            }
-        } else if tick_hi.is_none_or(|best| tick.tick_idx < best) {
-            tick_hi = Some(tick.tick_idx);
-        }
-    }
-
-    if let (Some(lo), Some(hi)) = (tick_lo, tick_hi)
-        && active_liquidity > 0
-        && lo < hi
-    {
-        return Some((active_liquidity as u128, lo, hi));
-    }
-    None
+#[derive(Debug, Clone, Copy)]
+struct DerivedLiquidityInterval {
+    top_price: f64,
+    bottom_price: f64,
+    liquidity: u128,
 }
 
-fn single_tick_limit_prices(
+fn build_univ3_liquidity_bands(
+    slot0: &Slot0Result,
     market: &'static MarketData,
+) -> Option<Vec<UniV3LiquidityBandRequest>> {
+    let is_token1_outcome = market
+        .pool
+        .as_ref()?
+        .token1
+        .eq_ignore_ascii_case(market.outcome_token);
+    let current_price = sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)
+        .and_then(|value| u128::try_from(value).ok())
+        .map(|wad| wad as f64 / 1e18)?;
+    let intervals = derive_contiguous_liquidity_intervals(slot0, market, current_price)?;
+    let mut bands = intervals
+        .iter()
+        .map(|interval| UniV3LiquidityBandRequest {
+            lower_price: interval.top_price,
+            liquidity_l: interval.liquidity as f64 / 1e18,
+        })
+        .collect::<Vec<_>>();
+    bands.push(UniV3LiquidityBandRequest {
+        lower_price: intervals.last()?.bottom_price,
+        liquidity_l: 0.0,
+    });
+    Some(bands)
+}
+
+fn derive_contiguous_liquidity_intervals(
+    _slot0: &Slot0Result,
+    market: &'static MarketData,
+    current_price: f64,
+) -> Option<Vec<DerivedLiquidityInterval>> {
+    let pool = market.pool.as_ref()?;
+    let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
+    let mut collapsed_ticks = pool
+        .ticks
+        .iter()
+        .map(|tick| (tick.tick_idx, tick.liquidity_net))
+        .collect::<Vec<_>>();
+    collapsed_ticks.sort_unstable_by_key(|(tick_idx, _)| *tick_idx);
+    let mut deduped_ticks: Vec<(i32, i128)> = Vec::with_capacity(collapsed_ticks.len());
+    for (tick_idx, liquidity_net) in collapsed_ticks {
+        if let Some((last_tick_idx, last_liquidity_net)) = deduped_ticks.last_mut()
+            && *last_tick_idx == tick_idx
+        {
+            *last_liquidity_net = last_liquidity_net.checked_add(liquidity_net)?;
+        } else {
+            deduped_ticks.push((tick_idx, liquidity_net));
+        }
+    }
+    if deduped_ticks.len() < 2 {
+        return None;
+    }
+
+    let mut active_liquidity = 0i128;
+    let mut intervals = Vec::new();
+    let mut seen_positive_interval = false;
+    let mut saw_zero_gap_after_positive = false;
+    let mut current_price_is_covered = false;
+
+    for idx in 0..deduped_ticks.len().saturating_sub(1) {
+        let (tick_lo, liquidity_net) = deduped_ticks[idx];
+        let tick_hi = deduped_ticks[idx + 1].0;
+        if tick_lo >= tick_hi {
+            return None;
+        }
+        active_liquidity = active_liquidity.checked_add(liquidity_net)?;
+        if active_liquidity < 0 {
+            return None;
+        }
+        if active_liquidity == 0 {
+            if seen_positive_interval {
+                saw_zero_gap_after_positive = true;
+            }
+            continue;
+        }
+        if saw_zero_gap_after_positive {
+            return None;
+        }
+        seen_positive_interval = true;
+        let (top_price, bottom_price) = interval_price_bounds(is_token1_outcome, tick_lo, tick_hi)?;
+        if interval_contains_price(current_price, bottom_price, top_price) {
+            current_price_is_covered = true;
+        }
+        intervals.push(DerivedLiquidityInterval {
+            top_price,
+            bottom_price,
+            liquidity: active_liquidity as u128,
+        });
+    }
+
+    if intervals.is_empty() || !current_price_is_covered {
+        #[cfg(test)]
+        if let Some(intervals) = fallback_single_tick_intervals(_slot0, market) {
+            return Some(intervals);
+        }
+        return None;
+    }
+
+    intervals.sort_by(|left, right| right.top_price.total_cmp(&left.top_price));
+    if !intervals_are_contiguous(&intervals) {
+        return None;
+    }
+    Some(intervals)
+}
+
+fn interval_price_bounds(
     is_token1_outcome: bool,
     tick_lo: i32,
     tick_hi: i32,
 ) -> Option<(f64, f64)> {
+    let sqrt_lo = get_sqrt_ratio_at_tick(tick_lo).ok()?;
+    let sqrt_hi = get_sqrt_ratio_at_tick(tick_hi).ok()?;
+    let price_lo = sqrt_price_x96_to_price_outcome(sqrt_lo, is_token1_outcome)
+        .and_then(|value| u128::try_from(value).ok())
+        .map(|wad| wad as f64 / 1e18)?;
+    let price_hi = sqrt_price_x96_to_price_outcome(sqrt_hi, is_token1_outcome)
+        .and_then(|value| u128::try_from(value).ok())
+        .map(|wad| wad as f64 / 1e18)?;
+    if !price_lo.is_finite() || !price_hi.is_finite() || price_lo <= 0.0 || price_hi <= 0.0 {
+        return None;
+    }
+    Some((price_lo.max(price_hi), price_lo.min(price_hi)))
+}
+
+fn interval_contains_price(current_price: f64, bottom_price: f64, top_price: f64) -> bool {
+    let tolerance = 1e-9 * (1.0 + current_price.abs().max(top_price.abs()));
+    current_price + tolerance >= bottom_price && current_price <= top_price + tolerance
+}
+
+fn intervals_are_contiguous(intervals: &[DerivedLiquidityInterval]) -> bool {
+    intervals.windows(2).all(|pair| {
+        let upper = pair[0].bottom_price;
+        let lower = pair[1].top_price;
+        let tolerance = 1e-9 * (1.0 + upper.abs().max(lower.abs()));
+        (upper - lower).abs() <= tolerance
+    })
+}
+
+#[cfg(test)]
+fn fallback_single_tick_intervals(
+    slot0: &Slot0Result,
+    market: &'static MarketData,
+) -> Option<Vec<DerivedLiquidityInterval>> {
     let pool = market.pool.as_ref()?;
-    let zero_for_one_buy = pool.token0.eq_ignore_ascii_case(market.quote_token);
-    let sqrt_lo = get_sqrt_ratio_at_tick(tick_lo.min(tick_hi)).ok()?;
-    let sqrt_hi = get_sqrt_ratio_at_tick(tick_lo.max(tick_hi)).ok()?;
-    let (buy_limit_sqrt, sell_limit_sqrt) = if zero_for_one_buy {
-        (sqrt_lo, sqrt_hi)
-    } else {
-        (sqrt_hi, sqrt_lo)
-    };
-    let buy_limit_price = sqrt_price_x96_to_price_outcome(buy_limit_sqrt, is_token1_outcome)
-        .and_then(|value| u128::try_from(value).ok())
-        .map(|wad| wad as f64 / 1e18)?;
-    let sell_limit_price = sqrt_price_x96_to_price_outcome(sell_limit_sqrt, is_token1_outcome)
-        .and_then(|value| u128::try_from(value).ok())
-        .map(|wad| wad as f64 / 1e18)?;
-    Some((buy_limit_price, sell_limit_price))
+    let liquidity = pool.liquidity.parse::<u128>().ok()?;
+    let tick_lo = pool.ticks.iter().map(|tick| tick.tick_idx).min()?;
+    let tick_hi = pool.ticks.iter().map(|tick| tick.tick_idx).max()?;
+    let current_tick = get_tick_at_sqrt_ratio(slot0.sqrt_price_x96).ok()?;
+    if liquidity == 0 || tick_lo >= tick_hi || current_tick < tick_lo || current_tick >= tick_hi {
+        return None;
+    }
+    let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
+    let (top_price, bottom_price) = interval_price_bounds(is_token1_outcome, tick_lo, tick_hi)?;
+    Some(vec![DerivedLiquidityInterval {
+        top_price,
+        bottom_price,
+        liquidity,
+    }])
 }
 
 #[cfg(test)]
@@ -714,6 +1380,54 @@ mod tests {
         (slot0, market)
     }
 
+    fn mock_slot0_market_with_tick_ladder(
+        name: &'static str,
+        outcome_token: &'static str,
+        price_fraction: f64,
+        liquidity: u128,
+        ticks: &[(i32, i128)],
+    ) -> (Slot0Result, &'static MarketData) {
+        let tick_slice = Box::leak(
+            ticks
+                .iter()
+                .map(|(tick_idx, liquidity_net)| Tick {
+                    tick_idx: *tick_idx,
+                    liquidity_net: *liquidity_net,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let liquidity_str = Box::leak(liquidity.to_string().into_boxed_str());
+        let market = leak_market(MarketData {
+            name,
+            market_id: "0xmarket-contract",
+            outcome_token,
+            pool: Some(Pool {
+                token0: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
+                token1: outcome_token,
+                pool_id: "0xpool",
+                liquidity: liquidity_str,
+                ticks: tick_slice,
+            }),
+            quote_token: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
+        });
+        let current_tick = 75;
+        let slot0 = Slot0Result {
+            pool_id: Address::ZERO,
+            sqrt_price_x96: get_sqrt_ratio_at_tick(current_tick)
+                .expect("tick ratio should exist")
+                .into(),
+            tick: current_tick,
+            observation_index: 0,
+            observation_cardinality: 0,
+            observation_cardinality_next: 0,
+            fee_protocol: 0,
+            unlocked: true,
+        };
+        let _ = price_fraction;
+        (slot0, market)
+    }
+
     fn two_market_fixture() -> (
         Vec<(Slot0Result, &'static MarketData)>,
         HashMap<&'static str, f64>,
@@ -747,6 +1461,9 @@ mod tests {
                 status: "certified".to_string(),
                 mode: "direct_only".to_string(),
                 certificate: Some(super::super::protocol::SolveCertificateSummary { passed: true }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades,
                 split_merge: super::super::protocol::SplitMergePlan::default(),
             },
@@ -756,14 +1473,18 @@ mod tests {
                 certificate: Some(super::super::protocol::SolveCertificateSummary {
                     passed: false,
                 }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades: Vec::new(),
                 split_merge: super::super::protocol::SplitMergePlan::default(),
             },
+            workspace_reused: false,
         }
     }
 
     #[test]
-    fn build_problem_request_uses_single_range_univ3_fee_mapping() {
+    fn build_problem_request_uses_contiguous_univ3_band_ladder_and_fee_mapping() {
         let (slot0_results, balances, predictions) = two_market_fixture();
         let problem = build_problem_request(&balances, 1.0, &slot0_results, &predictions, 2)
             .expect("problem request should build");
@@ -790,12 +1511,92 @@ mod tests {
     fn build_problem_request_rejects_non_derivable_active_range_geometry() {
         let (mut slot0_results, balances, predictions) = two_market_fixture();
         slot0_results[0].0.tick = 100_000;
+        slot0_results[0].0.sqrt_price_x96 = get_sqrt_ratio_at_tick(100_000)
+            .expect("tick ratio should exist")
+            .into();
         let err = build_problem_request(&balances, 1.0, &slot0_results, &predictions, 2)
             .expect_err("non-derivable active range should be rejected");
         assert!(
             err.to_string()
-                .contains("does not have replayable single-range geometry")
+                .contains("does not have replayable contiguous liquidity ladder geometry")
         );
+    }
+
+    #[test]
+    fn build_problem_request_accepts_test_fixture_with_price_derived_single_range_geometry() {
+        let (slot0_a, market_a) = mock_slot0_market_with_liquidity_and_ticks(
+            "BenchA",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0.1,
+            1_000_000_000_000_000_000_000u128,
+            16_095,
+            92_108,
+        );
+        let (slot0_b, market_b) = mock_slot0_market_with_liquidity_and_ticks(
+            "BenchB",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            0.2,
+            1_000_000_000_000_000_000_000u128,
+            16_095,
+            92_108,
+        );
+        let slot0_results = vec![(slot0_a, market_a), (slot0_b, market_b)];
+        let balances = HashMap::new();
+        let predictions =
+            HashMap::from([("bencha".to_string(), 0.12), ("benchb".to_string(), 0.25)]);
+
+        let problem = build_problem_request(&balances, 1.0, &slot0_results, &predictions, 2)
+            .expect("test fixture should derive single-range geometry from price");
+
+        assert_eq!(problem.markets.len(), 2);
+        let MarketSpecRequest::UniV3 { bands, .. } = &problem.markets[0];
+        assert_eq!(bands.len(), 2);
+        assert!(bands[0].liquidity_l > 0.0);
+    }
+
+    #[test]
+    fn build_problem_request_emits_multiple_contiguous_univ3_bands() {
+        let liq_a = 1_000_000_000_000_000_000_000u128;
+        let liq_b = 500_000_000_000_000_000_000u128;
+        let (slot0_a, market_a) = mock_slot0_market_with_tick_ladder(
+            "LadderA",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0.0,
+            liq_a + liq_b,
+            &[
+                (-100, liq_a as i128),
+                (50, liq_b as i128),
+                (100, -(liq_b as i128)),
+                (200, -(liq_a as i128)),
+            ],
+        );
+        let (slot0_b, market_b) = mock_slot0_market_with_liquidity_and_ticks(
+            "LadderB",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            0.2,
+            1_000_000_000_000_000_000_000u128,
+            16_095,
+            92_108,
+        );
+        let slot0_results = vec![(slot0_a, market_a), (slot0_b, market_b)];
+        let balances = HashMap::new();
+        let predictions =
+            HashMap::from([("laddera".to_string(), 0.12), ("ladderb".to_string(), 0.25)]);
+
+        let problem = build_problem_request(&balances, 1.0, &slot0_results, &predictions, 2)
+            .expect("multi-band ladder should translate");
+
+        let MarketSpecRequest::UniV3 { bands, .. } = &problem.markets[0];
+        assert_eq!(bands.len(), 4);
+        assert!(
+            bands
+                .windows(2)
+                .all(|pair| pair[0].lower_price > pair[1].lower_price)
+        );
+        assert!((bands[0].liquidity_l - (liq_a as f64 / 1e18)).abs() < 1e-6);
+        assert!((bands[1].liquidity_l - ((liq_a + liq_b) as f64 / 1e18)).abs() < 1e-6);
+        assert!((bands[2].liquidity_l - (liq_a as f64 / 1e18)).abs() < 1e-6);
+        assert_eq!(bands[3].liquidity_l, 0.0);
     }
 
     #[test]
@@ -847,6 +1648,9 @@ mod tests {
                 certificate: Some(super::super::protocol::SolveCertificateSummary {
                     passed: false,
                 }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades: Vec::new(),
                 split_merge: super::super::protocol::SplitMergePlan::default(),
             },
@@ -854,12 +1658,16 @@ mod tests {
                 status: "certified".to_string(),
                 mode: "mixed_enabled".to_string(),
                 certificate: Some(super::super::protocol::SolveCertificateSummary { passed: true }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades: Vec::new(),
                 split_merge: super::super::protocol::SplitMergePlan {
                     mint: 0.1,
                     merge: 0.1,
                 },
             },
+            workspace_reused: false,
         };
 
         let err = translate_compare_result(&balances, 1.0, &slot0_results, &predictions, compare)
@@ -878,6 +1686,9 @@ mod tests {
                 status: "certified".to_string(),
                 mode: "mixed_enabled".to_string(),
                 certificate: Some(super::super::protocol::SolveCertificateSummary { passed: true }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades: Vec::new(),
                 split_merge: super::super::protocol::SplitMergePlan::default(),
             },
@@ -885,6 +1696,9 @@ mod tests {
                 status: "certified".to_string(),
                 mode: "mixed_enabled".to_string(),
                 certificate: Some(super::super::protocol::SolveCertificateSummary { passed: true }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades: vec![PredictionMarketTrade {
                     market_id: "M1".to_string(),
                     outcome_id: "0x1111111111111111111111111111111111111111".to_string(),
@@ -893,6 +1707,7 @@ mod tests {
                 }],
                 split_merge: super::super::protocol::SplitMergePlan::default(),
             },
+            workspace_reused: false,
         };
 
         let candidates =
@@ -917,12 +1732,16 @@ mod tests {
                 status: "certified".to_string(),
                 mode: "mixed_enabled".to_string(),
                 certificate: Some(super::super::protocol::SolveCertificateSummary { passed: true }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades: Vec::new(),
                 split_merge: super::super::protocol::SplitMergePlan {
                     mint: 0.1,
                     merge: 0.1,
                 },
             },
+            workspace_reused: false,
         };
 
         let candidates =
@@ -933,7 +1752,67 @@ mod tests {
     }
 
     #[test]
-    fn translate_compare_result_orders_buy_merge_sell_actions() {
+    fn translate_compare_result_stages_direct_merge_before_buy_merge_rounds() {
+        let (slot0_results, _, predictions) = two_market_fixture();
+        let balances = HashMap::from([("M1", 0.02), ("M2", 0.07)]);
+        let compare = CompareResult {
+            direct_only: PredictionMarketSolveResult {
+                status: "uncertified".to_string(),
+                mode: "direct_only".to_string(),
+                certificate: Some(super::super::protocol::SolveCertificateSummary {
+                    passed: false,
+                }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
+                trades: Vec::new(),
+                split_merge: super::super::protocol::SplitMergePlan::default(),
+            },
+            mixed_enabled: PredictionMarketSolveResult {
+                status: "certified".to_string(),
+                mode: "mixed_enabled".to_string(),
+                certificate: Some(super::super::protocol::SolveCertificateSummary { passed: true }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
+                trades: vec![PredictionMarketTrade {
+                    market_id: "M1".to_string(),
+                    outcome_id: "0x1111111111111111111111111111111111111111".to_string(),
+                    collateral_delta: -0.03,
+                    outcome_delta: 0.03,
+                }],
+                split_merge: super::super::protocol::SplitMergePlan {
+                    mint: 0.0,
+                    merge: 0.05,
+                },
+            },
+            workspace_reused: false,
+        };
+
+        let candidates =
+            translate_compare_result(&balances, 1.0, &slot0_results, &predictions, compare)
+                .expect("translation should succeed");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].variant, ForecastFlowsCandidateVariant::Mixed);
+        assert!(matches!(
+            candidates[0].actions.first(),
+            Some(Action::Merge { amount, .. }) if (amount - 0.02).abs() < 1e-9
+        ));
+        assert!(matches!(
+            candidates[0].actions.get(1),
+            Some(Action::Buy {
+                market_name: "M1",
+                ..
+            })
+        ));
+        assert!(matches!(
+            candidates[0].actions.get(2),
+            Some(Action::Merge { amount, .. }) if (amount - 0.03).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn translate_compare_result_orders_sell_buy_merge_buy_for_partial_buy_merge_routes() {
         let (slot0_results, balances, predictions) = two_market_fixture();
         let compare = CompareResult {
             direct_only: PredictionMarketSolveResult {
@@ -942,6 +1821,9 @@ mod tests {
                 certificate: Some(super::super::protocol::SolveCertificateSummary {
                     passed: false,
                 }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades: Vec::new(),
                 split_merge: super::super::protocol::SplitMergePlan::default(),
             },
@@ -949,11 +1831,14 @@ mod tests {
                 status: "certified".to_string(),
                 mode: "mixed_enabled".to_string(),
                 certificate: Some(super::super::protocol::SolveCertificateSummary { passed: true }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
                 trades: vec![
                     PredictionMarketTrade {
                         market_id: "M1".to_string(),
                         outcome_id: "0x1111111111111111111111111111111111111111".to_string(),
-                        collateral_delta: -0.03,
+                        collateral_delta: -0.06,
                         outcome_delta: 0.06,
                     },
                     PredictionMarketTrade {
@@ -968,6 +1853,7 @@ mod tests {
                     merge: 0.05,
                 },
             },
+            workspace_reused: false,
         };
 
         let candidates =
@@ -977,14 +1863,92 @@ mod tests {
         assert_eq!(candidates[0].variant, ForecastFlowsCandidateVariant::Mixed);
         assert!(matches!(
             candidates[0].actions.first(),
+            Some(Action::Sell {
+                market_name: "M2",
+                ..
+            })
+        ));
+        assert!(matches!(
+            candidates[0].actions.get(1),
             Some(Action::Buy {
                 market_name: "M1",
                 ..
             })
         ));
         assert!(matches!(
+            candidates[0].actions.get(2),
+            Some(Action::Merge { amount, .. }) if (amount - 0.05).abs() < 1e-9
+        ));
+        assert!(matches!(
+            candidates[0].actions.get(3),
+            Some(Action::Buy {
+                market_name: "M1",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn translate_compare_result_stages_mint_after_initial_sells() {
+        let (slot0_results, _, predictions) = two_market_fixture();
+        let balances = HashMap::from([("M1", 0.06), ("M2", 0.0)]);
+        let compare = CompareResult {
+            direct_only: PredictionMarketSolveResult {
+                status: "uncertified".to_string(),
+                mode: "direct_only".to_string(),
+                certificate: Some(super::super::protocol::SolveCertificateSummary {
+                    passed: false,
+                }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
+                trades: Vec::new(),
+                split_merge: super::super::protocol::SplitMergePlan::default(),
+            },
+            mixed_enabled: PredictionMarketSolveResult {
+                status: "certified".to_string(),
+                mode: "mixed_enabled".to_string(),
+                certificate: Some(super::super::protocol::SolveCertificateSummary { passed: true }),
+                solver_time_sec: Some(0.001),
+                estimated_execution_cost: None,
+                net_ev: None,
+                trades: vec![
+                    PredictionMarketTrade {
+                        market_id: "M1".to_string(),
+                        outcome_id: "0x1111111111111111111111111111111111111111".to_string(),
+                        collateral_delta: 0.06,
+                        outcome_delta: -0.06,
+                    },
+                    PredictionMarketTrade {
+                        market_id: "M2".to_string(),
+                        outcome_id: "0x2222222222222222222222222222222222222222".to_string(),
+                        collateral_delta: 0.04,
+                        outcome_delta: -0.04,
+                    },
+                ],
+                split_merge: super::super::protocol::SplitMergePlan {
+                    mint: 0.04,
+                    merge: 0.0,
+                },
+            },
+            workspace_reused: false,
+        };
+
+        let candidates =
+            translate_compare_result(&balances, 1.0, &slot0_results, &predictions, compare)
+                .expect("translation should succeed");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].variant, ForecastFlowsCandidateVariant::Mixed);
+        assert!(matches!(
+            candidates[0].actions.first(),
+            Some(Action::Sell {
+                market_name: "M1",
+                ..
+            })
+        ));
+        assert!(matches!(
             candidates[0].actions.get(1),
-            Some(Action::Merge { .. })
+            Some(Action::Mint { amount, .. }) if (amount - 0.04).abs() < 1e-9
         ));
         assert!(matches!(
             candidates[0].actions.get(2),
@@ -1024,6 +1988,33 @@ mod tests {
                 market_name: "M1",
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn translate_compare_result_clamps_tiny_sell_overshoot_to_available_holdings() {
+        let (slot0_results, _, predictions) = two_market_fixture();
+        let balances = HashMap::from([("M1", 1.0), ("M2", 0.0)]);
+        let compare = certified_direct_result(vec![PredictionMarketTrade {
+            market_id: "M1".to_string(),
+            outcome_id: "0x1111111111111111111111111111111111111111".to_string(),
+            collateral_delta: 0.01,
+            outcome_delta: -1.0000003,
+        }]);
+
+        let report =
+            translate_compare_result_report(&balances, 1.0, &slot0_results, &predictions, compare);
+        assert!(report.replay_tolerance_clamp_used);
+        let candidates = report.candidates;
+
+        assert_eq!(candidates.len(), 1);
+        assert!(matches!(
+            candidates[0].actions[0],
+            Action::Sell {
+                market_name: "M1",
+                amount,
+                ..
+            } if (amount - 1.0).abs() <= 1e-12
         ));
     }
 }

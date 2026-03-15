@@ -87,6 +87,8 @@ pub(super) struct HealthResult {
 pub(super) struct CompareResult {
     pub(super) direct_only: PredictionMarketSolveResult,
     pub(super) mixed_enabled: PredictionMarketSolveResult,
+    #[serde(default)]
+    pub(super) workspace_reused: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,6 +115,12 @@ pub(super) struct PredictionMarketSolveResult {
     pub(super) status: String,
     pub(super) mode: String,
     pub(super) certificate: Option<SolveCertificateSummary>,
+    #[serde(default)]
+    pub(super) solver_time_sec: Option<f64>,
+    #[serde(default)]
+    pub(super) estimated_execution_cost: Option<f64>,
+    #[serde(default)]
+    pub(super) net_ev: Option<f64>,
     #[serde(default)]
     pub(super) trades: Vec<PredictionMarketTrade>,
     #[serde(default)]

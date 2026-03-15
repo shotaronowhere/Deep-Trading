@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "4c2396b280e9426af17db67cbfd680cd03654ce8"
+project_hash = "d028190fd93beae8f2508d67f4abab16d820c0c1"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -60,8 +60,8 @@ version = "1.11.0"
 
 [[deps.ForecastFlows]]
 deps = ["ForwardDiff", "JSON3", "LBFGSB", "LinearAlgebra", "PrecompileTools", "Printf", "StructTypes"]
-git-tree-sha1 = "037e3bb68f355f57965332298614e6203f57ec9d"
-repo-rev = "forecast"
+git-tree-sha1 = "97e60dd6532529558830de9973f67b4b191ac860"
+repo-rev = "codex/ff-public-univ3-parity"
 repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
 uuid = "9bd5dfd2-158c-4d47-bd7a-911f8b978178"
 version = "2.0.0"

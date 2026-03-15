@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -26,6 +27,9 @@ const STDERR_ERROR_CONTEXT_LIMIT: usize = 20;
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_BASE_BACKOFF_SECS: u64 = 60;
 const CIRCUIT_BREAKER_MAX_BACKOFF_SECS: u64 = 300;
+const LEGACY_WORKER_EXECUTION_MODEL: &str =
+    "stateless NDJSON; one request at a time per worker process";
+const CACHED_WORKER_EXECUTION_MODEL: &str = "cached NDJSON; one request at a time per worker process; compatible compare requests reuse a workspace";
 const REPRESENTATIVE_REPORT_SOURCE: &str =
     "embedded:test/fixtures/rebalancer_ab_live_l1_snapshot_report.json";
 const REPRESENTATIVE_REPORT_JSON: &str = include_str!(concat!(
@@ -133,6 +137,7 @@ impl ForecastFlowsClientError {
 pub(super) struct ForecastFlowsCompareFailure {
     pub(super) error: ForecastFlowsClientError,
     pub(super) request_count: usize,
+    pub(super) runtime_policy: Option<ForecastFlowsRuntimePolicy>,
 }
 
 impl fmt::Display for ForecastFlowsCompareFailure {
@@ -149,6 +154,95 @@ impl ForecastFlowsCompareFailure {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForecastFlowsRequestProfile {
+    Production,
+    Benchmark,
+    DoctorWarmup,
+    DoctorRepresentative,
+}
+
+impl ForecastFlowsRequestProfile {
+    fn request_timeout(self) -> Duration {
+        match self {
+            Self::Production => Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            Self::Benchmark | Self::DoctorWarmup | Self::DoctorRepresentative => {
+                Duration::from_secs(WARMUP_REQUEST_TIMEOUT_SECS)
+            }
+        }
+    }
+
+    fn allows_plain_julia_without_escape_hatch(self) -> bool {
+        !matches!(self, Self::Production)
+    }
+}
+
+fn worker_execution_model_supported(execution_model: &str) -> bool {
+    matches!(
+        execution_model,
+        LEGACY_WORKER_EXECUTION_MODEL | CACHED_WORKER_EXECUTION_MODEL
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForecastFlowsSolveTuning {
+    Baseline,
+    LowLatency,
+}
+
+impl ForecastFlowsSolveTuning {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::LowLatency => "low_latency",
+        }
+    }
+
+    fn solve_options(self) -> SolveOptionsRequest {
+        match self {
+            Self::Baseline => SolveOptionsRequest {
+                certify: true,
+                throw_on_fail: false,
+                max_doublings: 6,
+                pgtol: 1e-6,
+                max_iter: 10_000,
+                max_fun: 20_000,
+            },
+            Self::LowLatency => SolveOptionsRequest {
+                certify: true,
+                throw_on_fail: false,
+                max_doublings: 0,
+                pgtol: 1e-6,
+                max_iter: 2_500,
+                max_fun: 5_000,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ForecastFlowsCompareSuccess {
+    pub(super) compare: CompareResult,
+    pub(super) request_count: usize,
+    pub(super) roundtrip: Duration,
+    pub(super) runtime_policy: ForecastFlowsRuntimePolicy,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ForecastFlowsRuntimePolicy {
+    pub(super) sysimage_status: String,
+    pub(super) julia_threads: String,
+    pub(super) solve_tuning: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForecastFlowsWorkerConfig {
+    julia_threads: OsString,
+    allow_plain_julia_escape_hatch: bool,
+}
+
 #[derive(Debug, Clone)]
 struct WorkerLaunchConfig {
     program: OsString,
@@ -156,7 +250,16 @@ struct WorkerLaunchConfig {
     current_dir: PathBuf,
     project_dir: PathBuf,
     julia_version: Option<String>,
+    manifest_source: ForecastFlowsManifestSource,
     sysimage_status: SysimageStatus,
+    worker_config: ForecastFlowsWorkerConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ForecastFlowsManifestSource {
+    repo_url: Option<String>,
+    repo_rev: Option<String>,
+    git_tree_sha1: Option<String>,
 }
 
 impl WorkerLaunchConfig {
@@ -174,6 +277,34 @@ impl WorkerLaunchConfig {
 
     fn launch_args(&self) -> Vec<String> {
         self.args.iter().map(|arg| os_string_display(arg)).collect()
+    }
+
+    fn julia_threads_display(&self) -> String {
+        os_string_display(&self.worker_config.julia_threads)
+    }
+
+    fn launch_envs(&self) -> Vec<(OsString, OsString)> {
+        vec![(
+            OsString::from("JULIA_NUM_THREADS"),
+            self.worker_config.julia_threads.clone(),
+        )]
+    }
+
+    fn ensure_profile_support(
+        &self,
+        profile: ForecastFlowsRequestProfile,
+    ) -> Result<(), ForecastFlowsClientError> {
+        if matches!(self.sysimage_status, SysimageStatus::Active(_))
+            || self.worker_config.allow_plain_julia_escape_hatch
+            || profile.allows_plain_julia_without_escape_hatch()
+        {
+            return Ok(());
+        }
+        Err(ForecastFlowsClientError::Spawn(format!(
+            "ForecastFlows requires an active sysimage for {:?} requests; set FORECASTFLOWS_SYSIMAGE or override with FORECASTFLOWS_ALLOW_PLAIN_JULIA=1 ({})",
+            profile,
+            self.sysimage_status.detail()
+        )))
     }
 }
 
@@ -243,8 +374,34 @@ struct WorkerState {
     last_stderr_tail: Vec<String>,
 }
 
+#[cfg(test)]
+impl WorkerState {
+    fn harness_state(&self) -> TestWorkerHarnessState {
+        TestWorkerHarnessState {
+            process_present: self.process.is_some(),
+            warm_complete: self.warm_complete,
+            in_cooldown: WorkerService::cooldown_remaining_locked(self).is_some(),
+            stderr_tail_len: self.last_stderr_tail.len(),
+            last_failure: self.last_failure.clone(),
+        }
+    }
+}
+
 struct WorkerService {
     state: Mutex<WorkerState>,
+}
+
+impl WorkerService {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WorkerState::default()),
+        }
+    }
+}
+
+struct WorkerPool {
+    slots: Mutex<Vec<Arc<WorkerService>>>,
+    next_slot: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -253,15 +410,99 @@ struct HealthCheckOutcome {
     duration: Duration,
 }
 
-impl WorkerService {
+impl WorkerPool {
     fn global() -> &'static Self {
-        static INSTANCE: OnceLock<WorkerService> = OnceLock::new();
-        INSTANCE.get_or_init(|| WorkerService {
-            state: Mutex::new(WorkerState::default()),
+        static INSTANCE: OnceLock<WorkerPool> = OnceLock::new();
+        INSTANCE.get_or_init(|| WorkerPool {
+            slots: Mutex::new(Vec::new()),
+            next_slot: AtomicUsize::new(0),
         })
     }
 
-    fn warm_worker(&self) -> Result<(), ForecastFlowsClientError> {
+    fn warm_worker(
+        &self,
+        profile: ForecastFlowsRequestProfile,
+    ) -> Result<(), ForecastFlowsClientError> {
+        for slot in self.ensure_slots() {
+            slot.warm_worker(profile)?;
+        }
+        Ok(())
+    }
+
+    fn compare_prediction_market_families(
+        &self,
+        problem: PredictionMarketProblemRequest,
+        profile: ForecastFlowsRequestProfile,
+    ) -> Result<ForecastFlowsCompareSuccess, ForecastFlowsCompareFailure> {
+        let slots = self.ensure_slots();
+        let next = self.next_slot.fetch_add(1, Ordering::Relaxed);
+        let slot = Arc::clone(&slots[next % slots.len()]);
+        slot.compare_prediction_market_families(problem, profile)
+    }
+
+    fn doctor_report(&self) -> Result<ForecastFlowsDoctorReport, ForecastFlowsClientError> {
+        let slots = self.ensure_slots();
+        Arc::clone(&slots[0]).doctor_report()
+    }
+
+    fn shutdown_worker(&self) -> Result<(), ForecastFlowsClientError> {
+        for slot in self.current_slots() {
+            slot.shutdown_worker()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn test_harness_states(&self) -> Vec<TestWorkerHarnessState> {
+        self.current_slots()
+            .into_iter()
+            .map(|slot| {
+                let state = slot.state.lock().expect("worker service mutex");
+                state.harness_state()
+            })
+            .collect()
+    }
+
+    fn ensure_slots(&self) -> Vec<Arc<WorkerService>> {
+        let configured_size = configured_worker_pool_size();
+        let mut slots_guard = self.slots.lock().expect("worker pool mutex");
+        if slots_guard.len() == configured_size {
+            return slots_guard.clone();
+        }
+
+        let old_slots = std::mem::take(&mut *slots_guard);
+        let new_slots = (0..configured_size)
+            .map(|_| Arc::new(WorkerService::new()))
+            .collect::<Vec<_>>();
+        *slots_guard = new_slots.clone();
+        self.next_slot.store(0, Ordering::Relaxed);
+        drop(slots_guard);
+
+        for slot in old_slots {
+            let _ = slot.shutdown_worker();
+        }
+
+        new_slots
+    }
+
+    fn current_slots(&self) -> Vec<Arc<WorkerService>> {
+        self.slots.lock().expect("worker pool mutex").clone()
+    }
+
+    #[cfg(test)]
+    fn first_slot(&self) -> Arc<WorkerService> {
+        self.ensure_slots()
+            .into_iter()
+            .next()
+            .expect("worker pool must expose at least one slot")
+    }
+}
+
+impl WorkerService {
+    fn warm_worker(
+        &self,
+        profile: ForecastFlowsRequestProfile,
+    ) -> Result<(), ForecastFlowsClientError> {
         let mut state = self
             .state
             .lock()
@@ -270,7 +511,7 @@ impl WorkerService {
             return Err(err);
         }
 
-        if let Err(err) = Self::ensure_process_locked(&mut state) {
+        if let Err(err) = Self::ensure_process_locked(&mut state, profile) {
             let err = Self::record_and_reset_failure_locked(&mut state, err);
             return Err(err);
         }
@@ -285,7 +526,7 @@ impl WorkerService {
             request_id: request_id.clone(),
             command: "compare_prediction_market_families",
             problem: warm_problem,
-            solve_options: default_solve_options(),
+            solve_options: solve_options_for_profile(profile),
         };
         let warm_result: Result<CompareResult, ForecastFlowsClientError> =
             Self::send_request_locked(
@@ -293,7 +534,7 @@ impl WorkerService {
                 &request_id,
                 "compare_prediction_market_families",
                 &request,
-                Duration::from_secs(WARMUP_REQUEST_TIMEOUT_SECS),
+                request_timeout(profile),
             );
         match warm_result {
             Ok(_) => {
@@ -313,28 +554,32 @@ impl WorkerService {
     }
 
     fn compare_prediction_market_families(
-        &self,
+        self: &Arc<Self>,
         problem: PredictionMarketProblemRequest,
-    ) -> Result<(CompareResult, usize), ForecastFlowsCompareFailure> {
+        profile: ForecastFlowsRequestProfile,
+    ) -> Result<ForecastFlowsCompareSuccess, ForecastFlowsCompareFailure> {
         let mut request_count = 0usize;
 
         for attempt in 0..2 {
             let mut state = self.state.lock().map_err(|_| ForecastFlowsCompareFailure {
                 error: ForecastFlowsClientError::Closed("worker mutex poisoned".to_string()),
                 request_count,
+                runtime_policy: None,
             })?;
             if let Some(err) = Self::cooldown_error_locked(&state) {
                 return Err(ForecastFlowsCompareFailure {
                     error: err,
                     request_count,
+                    runtime_policy: runtime_policy_from_state_locked(&state, profile),
                 });
             }
-            if let Err(err) = Self::ensure_process_locked(&mut state) {
+            if let Err(err) = Self::ensure_process_locked(&mut state, profile) {
                 if attempt == 1 {
                     let err = Self::record_and_reset_failure_locked(&mut state, err);
                     return Err(ForecastFlowsCompareFailure {
                         error: err,
                         request_count,
+                        runtime_policy: runtime_policy_from_state_locked(&state, profile),
                     });
                 }
                 Self::reset_process_locked(&mut state);
@@ -346,34 +591,44 @@ impl WorkerService {
                 request_id: request_id.clone(),
                 command: "compare_prediction_market_families",
                 problem: problem.clone(),
-                solve_options: default_solve_options(),
+                solve_options: solve_options_for_profile(profile),
             };
             request_count += 1;
+            let started = Instant::now();
             match Self::send_request_locked(
                 &mut state,
                 &request_id,
                 "compare_prediction_market_families",
                 &request,
-                request_timeout(),
+                request_timeout(profile),
             ) {
                 Ok(result) => {
                     Self::note_success_locked(&mut state);
                     Self::log_launch_details_locked(&mut state);
-                    return Ok((result, request_count));
+                    let runtime_policy = runtime_policy_from_state_locked(&state, profile)
+                        .expect("spawned worker should have launch configuration");
+                    return Ok(ForecastFlowsCompareSuccess {
+                        compare: result,
+                        request_count,
+                        roundtrip: started.elapsed(),
+                        runtime_policy,
+                    });
                 }
                 Err(err) => {
                     if err.is_request_level_worker_failure() {
                         return Err(ForecastFlowsCompareFailure {
                             error: err.with_context(Self::stderr_context_locked(&state)),
                             request_count,
+                            runtime_policy: runtime_policy_from_state_locked(&state, profile),
                         });
                     }
                     if attempt == 1 {
                         let err = Self::record_and_reset_failure_locked(&mut state, err);
-                        Self::schedule_background_respawn_locked(&mut state);
+                        self.schedule_background_respawn_locked(&mut state, profile);
                         return Err(ForecastFlowsCompareFailure {
                             error: err,
                             request_count,
+                            runtime_policy: runtime_policy_from_state_locked(&state, profile),
                         });
                     }
                     Self::reset_process_locked(&mut state);
@@ -386,6 +641,7 @@ impl WorkerService {
                 "worker retries exhausted without a final error".to_string(),
             ),
             request_count,
+            runtime_policy: None,
         })
     }
 
@@ -397,12 +653,20 @@ impl WorkerService {
         Self::reset_process_locked(&mut state);
         state.launch_logged = false;
 
-        let launch = worker_launch_config()?;
+        let launch = worker_launch_config(ForecastFlowsRequestProfile::DoctorWarmup)?;
         let mut report = ForecastFlowsDoctorReport {
             julia_program: launch.program_display(),
             julia_version: launch.julia_version.clone(),
             project_dir: launch.project_dir.display().to_string(),
             launch_args: launch.launch_args(),
+            manifest_repo_url: launch.manifest_source.repo_url.clone(),
+            manifest_repo_rev: launch.manifest_source.repo_rev.clone(),
+            manifest_git_tree_sha1: launch.manifest_source.git_tree_sha1.clone(),
+            julia_threads: launch.julia_threads_display(),
+            live_solve_tuning: solve_tuning_for_profile(ForecastFlowsRequestProfile::Production)
+                .as_str()
+                .to_string(),
+            allow_plain_julia_escape_hatch: launch.worker_config.allow_plain_julia_escape_hatch,
             sysimage_status: launch.sysimage_status_label().to_string(),
             sysimage_detail: launch.sysimage_status_detail(),
             health_status: None,
@@ -411,13 +675,26 @@ impl WorkerService {
             execution_model: None,
             health_duration_ms: None,
             warmup_compare_duration_ms: None,
+            warmup_direct_status: None,
+            warmup_mixed_status: None,
+            warmup_direct_solver_time_ms: None,
+            warmup_mixed_solver_time_ms: None,
+            warmup_driver_overhead_ms: None,
             representative_compare_duration_ms: None,
+            representative_direct_status: None,
+            representative_mixed_status: None,
+            representative_direct_solver_time_ms: None,
+            representative_mixed_solver_time_ms: None,
+            representative_driver_overhead_ms: None,
             representative_fixture: REPRESENTATIVE_REPORT_SOURCE.to_string(),
             stderr_tail: Self::stderr_tail_snapshot_locked(&state),
             failure: None,
         };
 
-        let health = match Self::ensure_process_locked(&mut state) {
+        let health = match Self::ensure_process_locked(
+            &mut state,
+            ForecastFlowsRequestProfile::DoctorWarmup,
+        ) {
             Ok(Some(health)) => health,
             Ok(None) => {
                 return Err(ForecastFlowsClientError::Closed(
@@ -440,7 +717,7 @@ impl WorkerService {
             request_id: warmup_request_id.clone(),
             command: "compare_prediction_market_families",
             problem: tiny_compare_problem(),
-            solve_options: default_solve_options(),
+            solve_options: solve_options_for_profile(ForecastFlowsRequestProfile::DoctorWarmup),
         };
         let warmup_started = Instant::now();
         let warmup_result: Result<CompareResult, ForecastFlowsClientError> =
@@ -449,20 +726,32 @@ impl WorkerService {
                 &warmup_request_id,
                 "compare_prediction_market_families",
                 &warmup_request,
-                Duration::from_secs(WARMUP_REQUEST_TIMEOUT_SECS),
+                request_timeout(ForecastFlowsRequestProfile::DoctorWarmup),
             );
-        if let Err(err) = warmup_result {
-            if err.is_request_level_worker_failure() {
-                report.stderr_tail = Self::stderr_tail_snapshot_locked(&state);
-                report.failure = Some(
-                    err.with_context(Self::stderr_context_locked(&state))
-                        .to_string(),
-                );
-                return Ok(report);
+        let warmup_result = match warmup_result {
+            Ok(result) => result,
+            Err(err) => {
+                if err.is_request_level_worker_failure() {
+                    report.stderr_tail = Self::stderr_tail_snapshot_locked(&state);
+                    report.failure = Some(
+                        err.with_context(Self::stderr_context_locked(&state))
+                            .to_string(),
+                    );
+                    return Ok(report);
+                }
+                return Ok(Self::doctor_failure_report_locked(&mut state, report, err));
             }
-            return Ok(Self::doctor_failure_report_locked(&mut state, report, err));
-        }
+        };
         report.warmup_compare_duration_ms = Some(warmup_started.elapsed().as_millis());
+        set_doctor_compare_timing(
+            &mut report.warmup_direct_status,
+            &mut report.warmup_mixed_status,
+            &mut report.warmup_direct_solver_time_ms,
+            &mut report.warmup_mixed_solver_time_ms,
+            &mut report.warmup_driver_overhead_ms,
+            report.warmup_compare_duration_ms,
+            &warmup_result,
+        );
         state.warm_complete = true;
 
         let representative_problem = match representative_compare_problem() {
@@ -479,7 +768,9 @@ impl WorkerService {
             request_id: representative_request_id.clone(),
             command: "compare_prediction_market_families",
             problem: representative_problem,
-            solve_options: default_solve_options(),
+            solve_options: solve_options_for_profile(
+                ForecastFlowsRequestProfile::DoctorRepresentative,
+            ),
         };
         let representative_started = Instant::now();
         let representative_result: Result<CompareResult, ForecastFlowsClientError> =
@@ -488,21 +779,33 @@ impl WorkerService {
                 &representative_request_id,
                 "compare_prediction_market_families",
                 &representative_request,
-                Duration::from_secs(WARMUP_REQUEST_TIMEOUT_SECS),
+                request_timeout(ForecastFlowsRequestProfile::DoctorRepresentative),
             );
-        if let Err(err) = representative_result {
-            if err.is_request_level_worker_failure() {
-                report.stderr_tail = Self::stderr_tail_snapshot_locked(&state);
-                report.failure = Some(
-                    err.with_context(Self::stderr_context_locked(&state))
-                        .to_string(),
-                );
-                return Ok(report);
+        let representative_result = match representative_result {
+            Ok(result) => result,
+            Err(err) => {
+                if err.is_request_level_worker_failure() {
+                    report.stderr_tail = Self::stderr_tail_snapshot_locked(&state);
+                    report.failure = Some(
+                        err.with_context(Self::stderr_context_locked(&state))
+                            .to_string(),
+                    );
+                    return Ok(report);
+                }
+                return Ok(Self::doctor_failure_report_locked(&mut state, report, err));
             }
-            return Ok(Self::doctor_failure_report_locked(&mut state, report, err));
-        }
+        };
         report.representative_compare_duration_ms =
             Some(representative_started.elapsed().as_millis());
+        set_doctor_compare_timing(
+            &mut report.representative_direct_status,
+            &mut report.representative_mixed_status,
+            &mut report.representative_direct_solver_time_ms,
+            &mut report.representative_mixed_solver_time_ms,
+            &mut report.representative_driver_overhead_ms,
+            report.representative_compare_duration_ms,
+            &representative_result,
+        );
 
         Self::note_success_locked(&mut state);
         Self::log_launch_details_locked(&mut state);
@@ -523,12 +826,20 @@ impl WorkerService {
 
     fn ensure_process_locked(
         state: &mut WorkerState,
+        profile: ForecastFlowsRequestProfile,
     ) -> Result<Option<HealthCheckOutcome>, ForecastFlowsClientError> {
-        if state.process.is_some() {
-            return Ok(None);
+        if let Some(process) = state.process.as_ref() {
+            if process
+                .launch_config
+                .ensure_profile_support(profile)
+                .is_ok()
+            {
+                return Ok(None);
+            }
+            Self::reset_process_locked(state);
         }
 
-        let process = Self::spawn_worker_process()?;
+        let process = Self::spawn_worker_process(profile)?;
         state.process = Some(process);
         state.warm_complete = false;
         let request_id = Self::next_request_id(state, "health");
@@ -573,7 +884,7 @@ impl WorkerService {
                 "worker health response does not advertise mixed_enabled".to_string(),
             ));
         }
-        if result.execution_model != "stateless NDJSON; one request at a time per worker process" {
+        if !worker_execution_model_supported(&result.execution_model) {
             return Err(ForecastFlowsClientError::Protocol(format!(
                 "unexpected worker execution model {}",
                 result.execution_model
@@ -660,8 +971,11 @@ impl WorkerService {
         request_id
     }
 
-    fn spawn_worker_process() -> Result<WorkerProcess, ForecastFlowsClientError> {
-        let launch = worker_launch_config()?;
+    fn spawn_worker_process(
+        profile: ForecastFlowsRequestProfile,
+    ) -> Result<WorkerProcess, ForecastFlowsClientError> {
+        let launch = worker_launch_config(profile)?;
+        launch.ensure_profile_support(profile)?;
         if let SysimageStatus::Rejected { reason, .. } = &launch.sysimage_status {
             tracing::warn!(reason = %reason, sysimage = %launch.sysimage_status.detail(), "ForecastFlows sysimage disabled; falling back to plain Julia");
         }
@@ -672,6 +986,9 @@ impl WorkerService {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (key, value) in launch.launch_envs() {
+            command.env(key, value);
+        }
         let mut child = command
             .spawn()
             .map_err(|err| ForecastFlowsClientError::Spawn(err.to_string()))?;
@@ -766,14 +1083,18 @@ impl WorkerService {
         state.warm_complete = false;
     }
 
-    fn schedule_background_respawn_locked(state: &mut WorkerState) {
+    fn schedule_background_respawn_locked(
+        self: &Arc<Self>,
+        state: &mut WorkerState,
+        profile: ForecastFlowsRequestProfile,
+    ) {
         if state.respawn_scheduled || Self::cooldown_remaining_locked(state).is_some() {
             return;
         }
         state.respawn_scheduled = true;
-        let service = WorkerService::global();
+        let service = Arc::clone(self);
         thread::spawn(move || {
-            if let Err(err) = service.warm_worker() {
+            if let Err(err) = service.warm_worker(profile) {
                 tracing::warn!(error = %err, "ForecastFlows background worker respawn failed");
             }
             if let Ok(mut state) = service.state.lock() {
@@ -837,6 +1158,8 @@ impl WorkerService {
             julia_program = %process.launch_config.program_display(),
             julia_version = process.launch_config.julia_version.as_deref().unwrap_or("unknown"),
             project_dir = %process.launch_config.project_dir.display(),
+            julia_threads = %process.launch_config.julia_threads_display(),
+            allow_plain_julia_escape_hatch = process.launch_config.worker_config.allow_plain_julia_escape_hatch,
             sysimage_status = process.launch_config.sysimage_status_label(),
             sysimage_detail = %process.launch_config.sysimage_status_detail(),
             "ForecastFlows worker launch configuration"
@@ -893,6 +1216,53 @@ impl WorkerService {
     }
 }
 
+fn set_doctor_compare_timing(
+    direct_status: &mut Option<String>,
+    mixed_status: &mut Option<String>,
+    direct_solver_time_ms: &mut Option<u128>,
+    mixed_solver_time_ms: &mut Option<u128>,
+    driver_overhead_ms: &mut Option<u128>,
+    total_roundtrip_ms: Option<u128>,
+    compare: &CompareResult,
+) {
+    *direct_status = Some(compare.direct_only.status.clone());
+    *mixed_status = Some(compare.mixed_enabled.status.clone());
+    *direct_solver_time_ms = solve_result_time_ms(compare.direct_only.solver_time_sec);
+    *mixed_solver_time_ms = solve_result_time_ms(compare.mixed_enabled.solver_time_sec);
+    *driver_overhead_ms = total_roundtrip_ms.and_then(|roundtrip_ms| {
+        let solver_ms =
+            (*direct_solver_time_ms).unwrap_or(0) + (*mixed_solver_time_ms).unwrap_or(0);
+        roundtrip_ms.checked_sub(solver_ms)
+    });
+}
+
+fn solve_result_time_ms(solver_time_sec: Option<f64>) -> Option<u128> {
+    let solver_time_sec = solver_time_sec?;
+    if !solver_time_sec.is_finite() || solver_time_sec < 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(solver_time_sec).as_millis())
+}
+
+fn runtime_policy_from_state_locked(
+    state: &WorkerState,
+    profile: ForecastFlowsRequestProfile,
+) -> Option<ForecastFlowsRuntimePolicy> {
+    let launch = state.process.as_ref()?.launch_config.clone();
+    Some(runtime_policy_from_launch(&launch, profile))
+}
+
+fn runtime_policy_from_launch(
+    launch: &WorkerLaunchConfig,
+    profile: ForecastFlowsRequestProfile,
+) -> ForecastFlowsRuntimePolicy {
+    ForecastFlowsRuntimePolicy {
+        sysimage_status: launch.sysimage_status_label().to_string(),
+        julia_threads: launch.julia_threads_display(),
+        solve_tuning: solve_tuning_for_profile(profile).as_str().to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SysimageMetadata {
     julia_major_minor: String,
@@ -909,7 +1279,9 @@ struct RepresentativeSnapshotReport {
     initial_cash_budget_wad: u128,
 }
 
-fn worker_launch_config() -> Result<WorkerLaunchConfig, ForecastFlowsClientError> {
+fn worker_launch_config(
+    profile: ForecastFlowsRequestProfile,
+) -> Result<WorkerLaunchConfig, ForecastFlowsClientError> {
     #[cfg(test)]
     if let Some(config) = test_worker_launch_config() {
         return Ok(config);
@@ -918,6 +1290,7 @@ fn worker_launch_config() -> Result<WorkerLaunchConfig, ForecastFlowsClientError
         |key| std::env::var_os(key),
         PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         std::env::current_dir().ok(),
+        profile,
     )
 }
 
@@ -925,16 +1298,27 @@ fn build_worker_launch_config_from_env(
     read_env: impl Fn(&str) -> Option<OsString>,
     repo_root: PathBuf,
     current_dir: Option<PathBuf>,
+    profile: ForecastFlowsRequestProfile,
 ) -> Result<WorkerLaunchConfig, ForecastFlowsClientError> {
     let project_dir = resolve_project_dir(&read_env, &repo_root, current_dir.as_deref())?;
     let program = read_env("FORECASTFLOWS_JULIA_BIN").unwrap_or_else(|| OsString::from("julia"));
     let julia_version = probe_julia_version(program.as_os_str());
+    let worker_config = ForecastFlowsWorkerConfig {
+        julia_threads: read_env("FORECASTFLOWS_JULIA_THREADS")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| OsString::from("auto")),
+        allow_plain_julia_escape_hatch: env_flag_is_true(
+            &read_env,
+            "FORECASTFLOWS_ALLOW_PLAIN_JULIA",
+        ),
+    };
     let manifest_hash = manifest_sha256(&project_dir).ok_or_else(|| {
         ForecastFlowsClientError::Spawn(format!(
             "failed to hash ForecastFlows manifest {}",
             project_dir.join("Manifest.toml").display()
         ))
     })?;
+    let manifest_source = manifest_source(&project_dir);
     let sysimage_status = read_env("FORECASTFLOWS_SYSIMAGE")
         .map(PathBuf::from)
         .map(|path| resolve_sysimage_status(&path, julia_version.as_deref(), Some(&manifest_hash)))
@@ -962,7 +1346,13 @@ fn build_worker_launch_config_from_env(
             .unwrap_or_else(|| project_dir.clone()),
         project_dir,
         julia_version,
+        manifest_source,
         sysimage_status,
+        worker_config,
+    })
+    .and_then(|launch| {
+        launch.ensure_profile_support(profile)?;
+        Ok(launch)
     })
 }
 
@@ -1007,6 +1397,10 @@ fn resolve_project_dir(
         )));
     }
     Ok(project_dir)
+}
+
+fn env_flag_is_true(read_env: &impl Fn(&str) -> Option<OsString>, key: &str) -> bool {
+    read_env(key).as_deref() == Some(OsStr::new("1"))
 }
 
 fn project_flag_arg(project_dir: &Path) -> OsString {
@@ -1126,15 +1520,71 @@ fn manifest_sha256(project_dir: &Path) -> Option<String> {
     Some(format!("{:x}", Sha256::digest(manifest)))
 }
 
-fn default_solve_options() -> SolveOptionsRequest {
-    SolveOptionsRequest {
-        certify: true,
-        throw_on_fail: false,
-        max_doublings: 6,
-        pgtol: 1e-8,
-        max_iter: 5_000,
-        max_fun: 10_000,
+fn manifest_source(project_dir: &Path) -> ForecastFlowsManifestSource {
+    let manifest = match fs::read_to_string(project_dir.join("Manifest.toml")) {
+        Ok(manifest) => manifest,
+        Err(_) => return ForecastFlowsManifestSource::default(),
+    };
+
+    let mut source = ForecastFlowsManifestSource::default();
+    let mut in_forecastflows_entry = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[[deps.") {
+            in_forecastflows_entry = trimmed == "[[deps.ForecastFlows]]";
+            continue;
+        }
+        if !in_forecastflows_entry {
+            continue;
+        }
+        if source.repo_url.is_none() {
+            source.repo_url = manifest_string_value(trimmed, "repo-url");
+        }
+        if source.repo_rev.is_none() {
+            source.repo_rev = manifest_string_value(trimmed, "repo-rev");
+        }
+        if source.git_tree_sha1.is_none() {
+            source.git_tree_sha1 = manifest_string_value(trimmed, "git-tree-sha1");
+        }
     }
+
+    source
+}
+
+fn manifest_string_value(line: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key} = \"");
+    let remainder = line.strip_prefix(&prefix)?;
+    remainder.strip_suffix('"').map(str::to_string)
+}
+
+fn solve_tuning_for_profile(profile: ForecastFlowsRequestProfile) -> ForecastFlowsSolveTuning {
+    #[cfg(test)]
+    if let Some(tuning) = test_solve_tuning() {
+        return tuning;
+    }
+    match profile {
+        ForecastFlowsRequestProfile::Benchmark => ForecastFlowsSolveTuning::Baseline,
+        ForecastFlowsRequestProfile::Production
+        | ForecastFlowsRequestProfile::DoctorWarmup
+        | ForecastFlowsRequestProfile::DoctorRepresentative => ForecastFlowsSolveTuning::LowLatency,
+    }
+}
+
+fn solve_options_for_profile(profile: ForecastFlowsRequestProfile) -> SolveOptionsRequest {
+    solve_tuning_for_profile(profile).solve_options()
+}
+
+fn configured_worker_pool_size() -> usize {
+    #[cfg(test)]
+    if let Some(pool_size) = test_worker_pool_size() {
+        return pool_size.max(1);
+    }
+
+    std::env::var("FORECASTFLOWS_POOL_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
 }
 
 fn tiny_compare_problem() -> PredictionMarketProblemRequest {
@@ -1260,12 +1710,20 @@ fn os_string_display(value: &OsStr) -> String {
     value.to_string_lossy().into_owned()
 }
 
-fn request_timeout() -> Duration {
+fn request_profile() -> ForecastFlowsRequestProfile {
+    #[cfg(test)]
+    if let Some(profile) = test_request_profile() {
+        return profile;
+    }
+    ForecastFlowsRequestProfile::Production
+}
+
+fn request_timeout(profile: ForecastFlowsRequestProfile) -> Duration {
     #[cfg(test)]
     if let Some(timeout) = test_request_timeout() {
         return timeout;
     }
-    Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
+    profile.request_timeout()
 }
 
 fn circuit_breaker_threshold() -> u32 {
@@ -1293,21 +1751,31 @@ fn circuit_breaker_max_backoff() -> Duration {
 }
 
 pub(super) fn warm_worker() -> Result<(), ForecastFlowsClientError> {
-    WorkerService::global().warm_worker()
+    WorkerPool::global().warm_worker(request_profile())
 }
 
 pub(super) fn compare_prediction_market_families(
     problem: PredictionMarketProblemRequest,
-) -> Result<(CompareResult, usize), ForecastFlowsCompareFailure> {
-    WorkerService::global().compare_prediction_market_families(problem)
+) -> Result<ForecastFlowsCompareSuccess, ForecastFlowsCompareFailure> {
+    WorkerPool::global().compare_prediction_market_families(problem, request_profile())
 }
 
 pub(super) fn doctor_report() -> Result<ForecastFlowsDoctorReport, ForecastFlowsClientError> {
-    WorkerService::global().doctor_report()
+    WorkerPool::global().doctor_report()
 }
 
 pub(super) fn shutdown_worker() -> Result<(), ForecastFlowsClientError> {
-    WorkerService::global().shutdown_worker()
+    WorkerPool::global().shutdown_worker()
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TestWorkerHarnessState {
+    pub(super) process_present: bool,
+    pub(super) warm_complete: bool,
+    pub(super) in_cooldown: bool,
+    pub(super) stderr_tail_len: usize,
+    pub(super) last_failure: Option<String>,
 }
 
 #[cfg(test)]
@@ -1315,6 +1783,9 @@ pub(super) fn shutdown_worker() -> Result<(), ForecastFlowsClientError> {
 struct TestOverrides {
     worker_command: Option<Vec<String>>,
     request_timeout: Option<Duration>,
+    request_profile: Option<ForecastFlowsRequestProfile>,
+    solve_tuning: Option<ForecastFlowsSolveTuning>,
+    pool_size: Option<usize>,
     circuit_breaker_threshold: Option<u32>,
     circuit_breaker_base_backoff: Option<Duration>,
     circuit_breaker_max_backoff: Option<Duration>,
@@ -1345,6 +1816,24 @@ pub(super) fn set_test_request_timeout(timeout: Duration) {
 }
 
 #[cfg(test)]
+pub(super) fn set_test_request_profile(profile: ForecastFlowsRequestProfile) {
+    let mut overrides = test_overrides().lock().expect("test overrides mutex");
+    overrides.request_profile = Some(profile);
+}
+
+#[cfg(test)]
+pub(super) fn set_test_solve_tuning(tuning: ForecastFlowsSolveTuning) {
+    let mut overrides = test_overrides().lock().expect("test overrides mutex");
+    overrides.solve_tuning = Some(tuning);
+}
+
+#[cfg(test)]
+pub(super) fn set_test_worker_pool_size(pool_size: usize) {
+    let mut overrides = test_overrides().lock().expect("test overrides mutex");
+    overrides.pool_size = Some(pool_size.max(1));
+}
+
+#[cfg(test)]
 pub(super) fn set_test_circuit_breaker_config(
     threshold: u32,
     base_backoff: Duration,
@@ -1362,16 +1851,46 @@ pub(super) fn reset_test_overrides() {
         let mut overrides = test_overrides().lock().expect("test overrides mutex");
         *overrides = TestOverrides::default();
     }
-    let mut state = WorkerService::global()
-        .state
-        .lock()
-        .expect("worker service mutex");
-    WorkerService::reset_process_locked(&mut state);
-    state.consecutive_worker_failures = 0;
-    state.cooldown_until = None;
-    state.last_failure = None;
-    state.last_stderr_tail.clear();
-    state.launch_logged = false;
+    let pool = WorkerPool::global();
+    for slot in pool.current_slots() {
+        let mut state = slot.state.lock().expect("worker service mutex");
+        WorkerService::reset_process_locked(&mut state);
+        state.consecutive_worker_failures = 0;
+        state.cooldown_until = None;
+        state.last_failure = None;
+        state.last_stderr_tail.clear();
+        state.launch_logged = false;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_request_timeout_override() -> Option<Duration> {
+    test_request_timeout()
+}
+
+#[cfg(test)]
+pub(super) fn test_request_profile_override() -> Option<ForecastFlowsRequestProfile> {
+    test_request_profile()
+}
+
+#[cfg(test)]
+pub(super) fn test_worker_harness_state() -> TestWorkerHarnessState {
+    WorkerPool::global()
+        .test_harness_states()
+        .into_iter()
+        .next()
+        .unwrap_or(TestWorkerHarnessState {
+            process_present: false,
+            warm_complete: false,
+            in_cooldown: false,
+            stderr_tail_len: 0,
+            last_failure: None,
+        })
+}
+
+#[cfg(test)]
+pub(super) fn test_worker_pool_harness_states() -> Vec<TestWorkerHarnessState> {
+    WorkerPool::global().test_harness_states()
 }
 
 #[cfg(test)]
@@ -1387,7 +1906,12 @@ fn test_worker_launch_config() -> Option<WorkerLaunchConfig> {
             .join("julia")
             .join("forecastflows"),
         julia_version: None,
+        manifest_source: ForecastFlowsManifestSource::default(),
         sysimage_status: SysimageStatus::Disabled,
+        worker_config: ForecastFlowsWorkerConfig {
+            julia_threads: OsString::from("auto"),
+            allow_plain_julia_escape_hatch: true,
+        },
     })
 }
 
@@ -1395,6 +1919,24 @@ fn test_worker_launch_config() -> Option<WorkerLaunchConfig> {
 fn test_request_timeout() -> Option<Duration> {
     let overrides = test_overrides().lock().expect("test overrides mutex");
     overrides.request_timeout
+}
+
+#[cfg(test)]
+fn test_request_profile() -> Option<ForecastFlowsRequestProfile> {
+    let overrides = test_overrides().lock().expect("test overrides mutex");
+    overrides.request_profile
+}
+
+#[cfg(test)]
+fn test_solve_tuning() -> Option<ForecastFlowsSolveTuning> {
+    let overrides = test_overrides().lock().expect("test overrides mutex");
+    overrides.solve_tuning
+}
+
+#[cfg(test)]
+fn test_worker_pool_size() -> Option<usize> {
+    let overrides = test_overrides().lock().expect("test overrides mutex");
+    overrides.pool_size
 }
 
 #[cfg(test)]
@@ -1454,9 +1996,13 @@ mod tests {
         let root = unique_temp_dir("launch-flags");
         write_manifest(&root, "manifest = true\n");
 
-        let launch =
-            build_worker_launch_config_from_env(|_| None, root.clone(), Some(root.clone()))
-                .expect("launch config should build");
+        let launch = build_worker_launch_config_from_env(
+            |_| None,
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
+        )
+        .expect("launch config should build");
 
         assert_eq!(launch.program, OsString::from("julia"));
         assert_eq!(launch.args[0], OsString::from("--startup-file=no"));
@@ -1466,6 +2012,157 @@ mod tests {
         );
         assert_eq!(launch.current_dir, root.join("julia"));
         assert!(matches!(launch.sysimage_status, SysimageStatus::Disabled));
+        assert_eq!(launch.julia_threads_display(), "auto");
+        assert_eq!(
+            launch.launch_envs(),
+            vec![(OsString::from("JULIA_NUM_THREADS"), OsString::from("auto"))]
+        );
+    }
+
+    #[test]
+    fn request_profiles_map_to_expected_timeouts() {
+        assert_eq!(
+            ForecastFlowsRequestProfile::Production.request_timeout(),
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            ForecastFlowsRequestProfile::Benchmark.request_timeout(),
+            Duration::from_secs(WARMUP_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            ForecastFlowsRequestProfile::DoctorWarmup.request_timeout(),
+            Duration::from_secs(WARMUP_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            ForecastFlowsRequestProfile::DoctorRepresentative.request_timeout(),
+            Duration::from_secs(WARMUP_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn baseline_solve_tuning_uses_parity_limits() {
+        let options = ForecastFlowsSolveTuning::Baseline.solve_options();
+        assert!(options.certify);
+        assert!(!options.throw_on_fail);
+        assert_eq!(options.max_doublings, 6);
+        assert_eq!(options.pgtol, 1e-6);
+        assert_eq!(options.max_iter, 10_000);
+        assert_eq!(options.max_fun, 20_000);
+    }
+
+    #[test]
+    fn low_latency_solve_tuning_uses_expected_limits() {
+        let options = ForecastFlowsSolveTuning::LowLatency.solve_options();
+        assert!(options.certify);
+        assert!(!options.throw_on_fail);
+        assert_eq!(options.max_doublings, 0);
+        assert_eq!(options.pgtol, 1e-6);
+        assert_eq!(options.max_iter, 2_500);
+        assert_eq!(options.max_fun, 5_000);
+    }
+
+    #[test]
+    fn production_and_doctor_profiles_use_low_latency_tuning() {
+        let _guard = lock_tests();
+        assert_eq!(
+            solve_tuning_for_profile(ForecastFlowsRequestProfile::Production),
+            ForecastFlowsSolveTuning::LowLatency
+        );
+        assert_eq!(
+            solve_tuning_for_profile(ForecastFlowsRequestProfile::DoctorWarmup),
+            ForecastFlowsSolveTuning::LowLatency
+        );
+        assert_eq!(
+            solve_tuning_for_profile(ForecastFlowsRequestProfile::DoctorRepresentative),
+            ForecastFlowsSolveTuning::LowLatency
+        );
+        assert_eq!(
+            solve_tuning_for_profile(ForecastFlowsRequestProfile::Benchmark),
+            ForecastFlowsSolveTuning::Baseline
+        );
+    }
+
+    #[test]
+    fn manifest_source_extracts_forecastflows_git_metadata() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("manifest-source");
+        write_manifest(
+            &root,
+            r#"
+[[deps.ForecastFlows]]
+git-tree-sha1 = "abc123"
+repo-rev = "codex/ff-public-univ3-parity"
+repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
+"#,
+        );
+
+        let source = manifest_source(&root.join("julia").join("forecastflows"));
+        assert_eq!(
+            source.repo_url.as_deref(),
+            Some("https://github.com/shotaronowhere/ForecastFlows.jl")
+        );
+        assert_eq!(
+            source.repo_rev.as_deref(),
+            Some("codex/ff-public-univ3-parity")
+        );
+        assert_eq!(source.git_tree_sha1.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn build_worker_launch_config_honors_julia_thread_override() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("thread-override");
+        write_manifest(&root, "manifest = true\n");
+
+        let launch = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_JULIA_THREADS" => Some(OsString::from("8")),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
+        )
+        .expect("launch config should build with explicit Julia threads");
+
+        assert_eq!(launch.julia_threads_display(), "8");
+        assert_eq!(
+            launch.launch_envs(),
+            vec![(OsString::from("JULIA_NUM_THREADS"), OsString::from("8"))]
+        );
+    }
+
+    #[test]
+    fn production_profile_requires_sysimage_without_escape_hatch() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("strict-production");
+        write_manifest(&root, "manifest = true\n");
+
+        let err = build_worker_launch_config_from_env(
+            |_| None,
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Production,
+        )
+        .expect_err("production profile should reject plain Julia without an escape hatch");
+        assert!(err.to_string().contains("FORECASTFLOWS_SYSIMAGE"));
+        assert!(
+            err.to_string()
+                .contains("FORECASTFLOWS_ALLOW_PLAIN_JULIA=1")
+        );
+
+        let launch = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_ALLOW_PLAIN_JULIA" => Some(OsString::from("1")),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Production,
+        )
+        .expect("escape hatch should allow plain Julia for local production-style testing");
+        assert!(matches!(launch.sysimage_status, SysimageStatus::Disabled));
+        assert!(launch.worker_config.allow_plain_julia_escape_hatch);
     }
 
     #[test]
@@ -1498,6 +2195,7 @@ mod tests {
             },
             root.clone(),
             Some(root.clone()),
+            ForecastFlowsRequestProfile::Production,
         )
         .expect("launch config should honor override project dir");
 
@@ -1523,6 +2221,7 @@ mod tests {
             },
             root.clone(),
             Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
         )
         .expect_err("missing override project dir must fail");
         assert!(
@@ -1649,7 +2348,8 @@ mod tests {
 
         let err = warm_worker().expect_err("worker should fail");
         assert_eq!(err.fallback_reason(), "worker_closed");
-        let state = WorkerService::global().state.lock().expect("state");
+        let slot = WorkerPool::global().first_slot();
+        let state = slot.state.lock().expect("state");
         assert_eq!(state.consecutive_worker_failures, 1);
         assert!(state.cooldown_until.is_some());
         drop(state);
@@ -1670,14 +2370,42 @@ mod tests {
             "healthy_direct",
         ]);
         warm_worker().expect("healthy fake worker should warm");
-        let (_, request_count) = compare_prediction_market_families(tiny_compare_problem())
+        let compare = compare_prediction_market_families(tiny_compare_problem())
             .expect("compare should pass");
-        assert_eq!(request_count, 1);
+        assert_eq!(compare.request_count, 1);
+        assert!(compare.roundtrip > Duration::ZERO);
+        assert_eq!(compare.runtime_policy.solve_tuning, "low_latency");
+        assert!(!compare.compare.workspace_reused);
 
-        let state = WorkerService::global().state.lock().expect("state");
+        let slot = WorkerPool::global().first_slot();
+        let state = slot.state.lock().expect("state");
         assert_eq!(state.consecutive_worker_failures, 0);
         assert!(state.cooldown_until.is_none());
         drop(state);
+
+        reset_test_overrides();
+    }
+
+    #[test]
+    fn cached_execution_model_reuses_workspace_on_second_compare() {
+        let _guard = lock_tests();
+        reset_test_overrides();
+        set_test_worker_command(&[
+            "/bin/sh",
+            &format!(
+                "{}/test/bin/fake_forecastflows_worker.sh",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            "cached_reuse",
+        ]);
+
+        let first = compare_prediction_market_families(tiny_compare_problem())
+            .expect("first cached compare should pass");
+        let second = compare_prediction_market_families(tiny_compare_problem())
+            .expect("second cached compare should pass");
+
+        assert!(!first.compare.workspace_reused);
+        assert!(second.compare.workspace_reused);
 
         reset_test_overrides();
     }
@@ -1719,8 +2447,15 @@ mod tests {
             .expect_err("worker should return ok=false");
         assert_eq!(err.fallback_reason(), "worker_error_response");
         assert_eq!(err.request_count, 1);
+        assert_eq!(
+            err.runtime_policy
+                .as_ref()
+                .map(|policy| policy.solve_tuning.as_str()),
+            Some("low_latency")
+        );
 
-        let mut state = WorkerService::global().state.lock().expect("state");
+        let slot = WorkerPool::global().first_slot();
+        let mut state = slot.state.lock().expect("state");
         assert_eq!(state.consecutive_worker_failures, 0);
         assert!(state.cooldown_until.is_none());
         let process = state.process.as_mut().expect("worker should remain live");
@@ -1749,7 +2484,8 @@ mod tests {
         let err = warm_worker().expect_err("warmup compare should return ok=false");
         assert_eq!(err.fallback_reason(), "worker_error_response");
 
-        let mut state = WorkerService::global().state.lock().expect("state");
+        let slot = WorkerPool::global().first_slot();
+        let mut state = slot.state.lock().expect("state");
         assert_eq!(state.consecutive_worker_failures, 0);
         assert!(state.cooldown_until.is_none());
         assert!(!state.warm_complete);
@@ -1825,7 +2561,8 @@ mod tests {
                 .is_some_and(|message| message.contains("synthetic worker error"))
         );
 
-        let mut state = WorkerService::global().state.lock().expect("state");
+        let slot = WorkerPool::global().first_slot();
+        let mut state = slot.state.lock().expect("state");
         assert_eq!(state.consecutive_worker_failures, 0);
         assert!(state.cooldown_until.is_none());
         assert!(!state.warm_complete);
@@ -1857,17 +2594,148 @@ mod tests {
         shutdown_worker().expect("shutdown should be idempotent");
 
         {
-            let state = WorkerService::global().state.lock().expect("state");
+            let slot = WorkerPool::global().first_slot();
+            let state = slot.state.lock().expect("state");
             assert!(state.process.is_none());
             assert!(!state.warm_complete);
         }
 
         warm_worker().expect("worker should warm again after shutdown");
 
-        let state = WorkerService::global().state.lock().expect("state");
+        let slot = WorkerPool::global().first_slot();
+        let state = slot.state.lock().expect("state");
         assert!(state.process.is_some());
         assert!(state.warm_complete);
         drop(state);
+
+        reset_test_overrides();
+    }
+
+    #[test]
+    fn worker_pool_size_one_matches_singleton_behavior() {
+        let _guard = lock_tests();
+        reset_test_overrides();
+        set_test_worker_pool_size(1);
+        set_test_worker_command(&[
+            "/bin/sh",
+            &format!(
+                "{}/test/bin/fake_forecastflows_worker.sh",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            "healthy_direct",
+        ]);
+
+        warm_worker().expect("single pooled worker should warm");
+        let compare = compare_prediction_market_families(tiny_compare_problem())
+            .expect("single pooled compare should pass");
+        assert_eq!(compare.request_count, 1);
+
+        let states = test_worker_pool_harness_states();
+        assert_eq!(states.len(), 1);
+        assert!(states[0].process_present);
+        assert!(states[0].warm_complete);
+        assert!(!states[0].in_cooldown);
+
+        reset_test_overrides();
+    }
+
+    #[test]
+    fn worker_pool_keeps_cooldown_and_stderr_state_isolated_per_worker() {
+        let _guard = lock_tests();
+        reset_test_overrides();
+        set_test_worker_pool_size(2);
+        set_test_circuit_breaker_config(1, Duration::from_secs(60), Duration::from_secs(60));
+        set_test_worker_command(&[
+            "/bin/sh",
+            &format!(
+                "{}/test/bin/fake_forecastflows_worker.sh",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            "stderr_closed",
+        ]);
+
+        let first_err = compare_prediction_market_families(tiny_compare_problem())
+            .expect_err("first pool slot should fail closed after writing stderr");
+        assert_eq!(first_err.fallback_reason(), "worker_closed");
+
+        set_test_worker_command(&[
+            "/bin/sh",
+            &format!(
+                "{}/test/bin/fake_forecastflows_worker.sh",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            "healthy_direct",
+        ]);
+        let second = compare_prediction_market_families(tiny_compare_problem())
+            .expect("second pool slot should stay available");
+        assert_eq!(second.request_count, 1);
+
+        let states = test_worker_pool_harness_states();
+        assert_eq!(states.len(), 2);
+        assert!(states[0].in_cooldown);
+        assert!(states[0].stderr_tail_len >= 2);
+        assert!(
+            states[0]
+                .last_failure
+                .as_deref()
+                .is_some_and(|message| message.contains("stderr line one"))
+        );
+        assert!(states[1].process_present);
+        assert!(!states[1].in_cooldown);
+        assert_eq!(states[1].stderr_tail_len, 0);
+        assert_eq!(states[1].last_failure, None);
+
+        let third_err = compare_prediction_market_families(tiny_compare_problem())
+            .expect_err("round-robin should revisit the cooled-down first slot");
+        assert_eq!(third_err.fallback_reason(), "worker_cooldown");
+
+        reset_test_overrides();
+    }
+
+    #[test]
+    fn background_respawn_keeps_captured_request_profile() {
+        let _guard = lock_tests();
+        reset_test_overrides();
+        set_test_worker_command(&[
+            "/bin/sh",
+            &format!(
+                "{}/test/bin/fake_forecastflows_worker.sh",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            "benchmark_warmup_only",
+        ]);
+
+        let service = WorkerPool::global().first_slot();
+        let mut overrides = test_overrides().lock().expect("test overrides mutex");
+        overrides.request_profile = Some(ForecastFlowsRequestProfile::Benchmark);
+        {
+            let mut state = service.state.lock().expect("state");
+            service.schedule_background_respawn_locked(
+                &mut state,
+                ForecastFlowsRequestProfile::Benchmark,
+            );
+            assert!(state.respawn_scheduled);
+        }
+        overrides.request_profile = None;
+        drop(overrides);
+
+        let started = std::time::Instant::now();
+        loop {
+            let state = service.state.lock().expect("state");
+            if !state.respawn_scheduled {
+                assert!(
+                    state.warm_complete,
+                    "background respawn should warm successfully with the captured benchmark profile"
+                );
+                break;
+            }
+            drop(state);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "background respawn did not finish in time"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         reset_test_overrides();
     }

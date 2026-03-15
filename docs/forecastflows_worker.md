@@ -1,6 +1,6 @@
 # ForecastFlows Worker Integration
 
-Status: current as of 2026-03-13.
+Status: current as of 2026-03-15.
 Source-of-truth code paths:
 
 - `src/portfolio/core/forecastflows/client.rs`
@@ -10,18 +10,24 @@ Source-of-truth code paths:
 ## Purpose
 
 ForecastFlows is integrated as an external whole-plan solver family for `RebalanceMode::Full`.
-It does not own gas modeling, tx grouping, tx packing, or submission. Rust still owns:
+The driver now uses a single live path:
+
+- `rust_prune`: Julia route generation plus Rust replay, exact-fee pruning,
+  chunking, and final net-EV ranking
+
+ForecastFlows still does not own exact tx grouping, tx packing, or submission.
+Rust still owns:
 
 - pool-state collection
 - portfolio replay
 - execution-group validation
-- fee estimation and net-EV ranking
+- exact fee estimation, chunking, and final net-EV ranking
 - fail-open behavior
 
 ## Julia Environment
 
 - Repo-local project: `julia/forecastflows/`
-- Dependency pin: `https://github.com/shotaronowhere/ForecastFlows.jl` on branch `forecast`
+- Dependency pin: `https://github.com/shotaronowhere/ForecastFlows.jl` on branch `codex/ff-public-univ3-parity`
 - Worker command:
 
 ```bash
@@ -31,25 +37,83 @@ julia --startup-file=no --project=julia/forecastflows -e 'using ForecastFlows; F
 By default the runtime uses the repo-local `julia/forecastflows` project under `CARGO_MANIFEST_DIR`, so it does not depend on the shell cwd.
 The Julia binary may be overridden with `FORECASTFLOWS_JULIA_BIN`.
 The Julia project directory may be overridden with `FORECASTFLOWS_PROJECT_DIR`; when relative, it is resolved against the shell cwd.
+Worker threads are set explicitly with `FORECASTFLOWS_JULIA_THREADS` and default to `auto`.
+Worker pool size is controlled by `FORECASTFLOWS_POOL_SIZE` and defaults to `1`.
+
+Local upstream iteration note:
+
+- If you need to test an unmerged local `ForecastFlows.jl` checkout, use a local uncommitted Julia override such as `Pkg.develop(path="/abs/path/to/ForecastFlows.jl")` inside `julia/forecastflows/`.
+- Do not commit absolute-path `Manifest.toml` pins for that workflow.
 
 Optional cold-start optimization:
 
 - Build script: `julia --project=julia/forecastflows julia/forecastflows/build_sysimage.jl`
 - Runtime opt-in: `FORECASTFLOWS_SYSIMAGE=/abs/path/to/forecastflows_sysimage.{so,dylib,dll}`
-- The runtime only uses the sysimage when the configured path exists as a regular file and its sibling metadata file matches the current Julia major/minor version and the current `julia/forecastflows/Manifest.toml` hash; otherwise it warns and falls back to plain Julia automatically.
+- The local sysimage workload now precompiles the actual served path: `health`, direct compare protocol handling, and representative `UniV3` compare requests on both tiny and full-L1-like fixtures.
+- The runtime only uses the sysimage when the configured path exists as a regular file and its sibling metadata file matches the current Julia major/minor version and the current `julia/forecastflows/Manifest.toml` hash.
+- The sibling metadata file is written by the build script and currently records `julia_major_minor`, `manifest_sha256`, and `built_at_unix_secs`.
+- Production-style solves now require an active sysimage unless `FORECASTFLOWS_ALLOW_PLAIN_JULIA=1` is set explicitly.
+- Benchmark and doctor lanes still allow plain Julia automatically.
+- Keep sysimage validation local for now. A typical production-like local run sets `FORECASTFLOWS_SYSIMAGE` plus a fixed `FORECASTFLOWS_JULIA_THREADS` value before running `forecastflows_doctor` or the explicit ForecastFlows benchmark tests.
+
+## Runtime Profiles
+
+- Production ForecastFlows requests use the `low_latency` solve tuning.
+- `forecastflows_doctor` warmup and representative compare probes now use the same `low_latency` profile so operator timings match the live path.
+- The explicit benchmark selected-row and latency helpers still use the `baseline` tuning unless you run the dedicated tuning helper.
+- The dedicated tuning lane is:
+
+```bash
+FORECASTFLOWS_SYSIMAGE=/abs/path/to/forecastflows_sysimage.{so,dylib,dll} \
+  cargo test print_shared_op_snapshot_forecastflows_tuning_rows_jsonl -- --ignored --nocapture
+```
+
+## Known Upstream Constraints / Requests
+
+The dated maintainer handoff lives at
+`docs/archive/implementation/2026-03-13-forecastflows-maintainer-notes.md`.
+
+Short version:
+
+- the solver core looks sound
+- the main remaining upstream asks are richer branch diagnostics and a clearer executable rounding contract
+- the biggest remaining driver-side latency work is on our Rust boundary, not the solver math
+- the net-EV boundary decision lives at `docs/archive/implementation/2026-03-14-forecastflows-net-ev-boundary.md`
+
+## Deferred Pending ForecastFlows Upstream
+
+The following remain intentionally deferred on the `deep_trading` side while upstream feedback is pending:
+
+- richer branch-level diagnostics directly from the worker protocol
+- an explicit executable rounding contract for trade outputs
+- multi-session or batching protocol work beyond the current cached NDJSON worker reuse
+
+We will not fork the protocol locally to simulate these features. The dated maintainer handoff above remains the source of truth for upstream requests.
+
+## Net-EV Ownership
+
+Current benchmark rows live in `docs/solver_benchmark_matrix.md`.
+
+- Julia solves without a gas model.
+- Rust replays the returned candidate, runs the local exact-fee prune loop,
+  compiles strict and packed programs, chunks under the `< 40_000_000` gas
+  cap, and chooses the winner by validated net EV.
+- `forecastflows_strategy` remains in telemetry for continuity and is currently
+  always `rust_prune` on the live path.
 
 ## Process Model
 
-- One long-lived worker process per Rust process
+- `FORECASTFLOWS_POOL_SIZE` long-lived worker processes per Rust process
 - One request at a time per worker
 - NDJSON over stdin/stdout, protocol version `2`
+- Each worker slot keeps one cached `PredictionMarketWorkspace` and reuses it when repeated compare requests keep the same compatible market/outcome layout
 - Driver-side supervision in Rust
 
 Lifecycle:
 
 1. Spawn Julia with piped stdin/stdout/stderr.
 2. On first use, send `health`.
-3. For operator-facing binaries that request ForecastFlows, eagerly run `warm_forecastflows_worker()` at startup.
+3. For operator-facing binaries that request ForecastFlows, eagerly run `warm_forecastflows_worker()` at startup so every configured pool slot is prewarmed.
 4. Warmup sends one tiny synthetic `compare_prediction_market_families` request on a `UniV3` fixture so the production code path gets JIT-compiled before live planning.
 5. Steady-state compare requests retry once on worker-level spawn, health, transport, or protocol failure before the external candidate is abandoned for that solve.
 6. Repeated startup/transport failures trip a circuit breaker: after 3 consecutive failures, the worker enters cooldown for 60s, then exponentially backs off to a 5 minute cap until a compare succeeds.
@@ -77,12 +141,34 @@ Diagnostics:
 
 - Rust keeps the last 200 worker `stderr` lines in memory.
 - Spawn / health / timeout / protocol errors include the recent `stderr` tail.
-- `cargo run --bin forecastflows_doctor` prints Julia path/version, launch args, sysimage status, health summary, warmup timing, representative full-L1 compare timing, and recent `stderr`.
+- Compare telemetry now records `forecastflows_strategy`, `workspace_reused`,
+  local `candidate_build` timing, Julia-estimated execution cost / net EV,
+  Rust-validated total fee / net EV, and a `validation_only` flag.
+- `validation_only` is currently `false` on the live path.
+- `local_step_prune_ms` and `local_route_prune_ms` are populated for the live
+  path because Rust always owns the exact-fee prune stage.
+- `cargo run --bin forecastflows_doctor` prints Julia path/version, launch args, manifest repo URL / rev / git-tree, Julia thread config, live solve tuning, sysimage policy, health summary, warmup timing, representative full-L1 compare timing, solver-vs-driver timing splits when available, and recent `stderr`.
+- `cargo run --bin forecastflows_doctor -- --json` emits the same report as machine-readable JSON.
+- `cargo run --bin forecastflows_doctor -- --json --require-production-ready` exits nonzero unless the current production-style runtime would use an active sysimage.
 - If the doctor hits a worker or compare failure after launch, it still prints the partial report and exits nonzero with a final `failure:` line.
+
+## Rolling Execute Runtime
+
+`src/bin/execute.rs` is now the rolling live runtime for `RebalanceMode::Full`.
+
+- It polls the latest block every `EXECUTION_BLOCK_POLL_MS` milliseconds and defaults to `250`.
+- A planning cycle starts only when the latest block advances.
+- The same ForecastFlows worker pool stays warm for the full process lifetime.
+- Before solving, the runtime hashes the effective planning snapshot from current balances plus current `slot0`; if the snapshot is unchanged, it skips the solve for that block.
+- Transient ForecastFlows transport failures do not poison that snapshot cache. On an unchanged market, `execute` retries the external solve on the next block instead of pinning the native fallback result until balances move.
+- If blocks advance while a planning cycle is still busy, `execute` drops the stale backlog and replans only for the newest block once idle. It logs the skipped-block count instead of queueing every missed block.
+- When `REBALANCE_SOLVER=forecastflows`, `execute` can run a non-blocking native audit every `FORECASTFLOWS_NATIVE_AUDIT_INTERVAL_BLOCKS` blocks; the default is `12` and `0` disables audits.
+- Native audits rerun the native planner on the same snapshot as the live ForecastFlows cycle, compare the two plans with the ordinary Rust comparator, and log winner / net-EV delta / tx-count delta / action-count delta without blocking the live loop.
+- Native audit task panics or join failures are logged and ignored so best-effort telemetry cannot stop the submission loop.
 
 ## Request Mapping
 
-Current scope is the L1 single-range replay model only for runtime translation. The doctor/sysimage representative timing probe uses an embedded copy of `test/fixtures/rebalancer_ab_live_l1_snapshot_report.json` for a full-L1-like benchmark workload without adding a runtime repo-path dependency.
+Current scope is the L1 replay model only for runtime translation. The doctor/sysimage representative timing probe uses an embedded copy of `test/fixtures/rebalancer_ab_live_l1_snapshot_report.json` for a full-L1-like benchmark workload without adding a runtime repo-path dependency.
 
 Problem construction:
 
@@ -93,17 +179,25 @@ Problem construction:
 - `collateral_balance` from current sUSD cash
 - `split_bound` omitted so ForecastFlows uses its documented auto-bound / doubling behavior
 
-Markets are encoded as one-band `UniV3` venues with a trailing zero-liquidity terminal band:
+Live compare request mapping is:
+
+- Compare requests send only the translated problem and solve options.
+- Execution-gas-aware Julia request shaping is no longer part of the live
+  protocol. Exact executable economics remain a Rust-owned validation step.
+
+Markets are encoded as contiguous multi-band `UniV3` venues with a trailing zero-liquidity terminal band:
 
 - `current_price` from current `slot0`
-- positive-liquidity band at the active buy boundary
-- zero-liquidity terminal band at the exhausted sell boundary
-- `liquidity_L = active_liquidity / 1e18`
+- one positive-liquidity band per contiguous active liquidity interval
+- one zero-liquidity terminal band at the exhausted boundary
+- `liquidity_L = active_liquidity_interval / 1e18`
 - `fee_multiplier = 1 - FEE_PIPS / 1_000_000`
 
-If Rust cannot derive the current active in-range liquidity band from the live tick and cumulative
-liquidity state, the snapshot is treated as unsupported for ForecastFlows and the solve fails open
-to the native path. Rust does not approximate unsupported geometry from global min/max tick bounds.
+If Rust cannot derive a contiguous liquidity ladder that covers the current price from the live tick
+and cumulative liquidity state, the snapshot is treated as unsupported for ForecastFlows and the
+solve fails open to the native path. Rust does not approximate unsupported live geometry from
+global min/max tick bounds. The only synthetic fallback is test-only support for benchmark fixtures
+whose `slot0.tick` values are intentionally fake.
 
 ## Response Acceptance
 
@@ -121,6 +215,8 @@ Rust accepts a ForecastFlows candidate only if all of the following hold:
 - the translated action stream compiles into supported execution-group shapes
 
 Worker-reported EV, holdings, and final collateral are not used for acceptance.
+Worker-reported `estimated_execution_cost` and `net_ev` are kept only as
+diagnostics; Rust still validates the exact executable economics locally.
 `direct_only` and `mixed_enabled` are translated independently, so one malformed certified branch
 does not discard the other valid branch.
 
@@ -135,9 +231,11 @@ Sign mapping:
 
 Ordering rules:
 
-- `direct_only`: `Sell*`, then `Buy*`
-- `mixed_enabled` with `mint > 0`: `Mint`, then `Sell*`, then `Buy*`
-- `mixed_enabled` with `merge > 0`: `Buy*`, then `Merge`, then `Sell*`
+- `direct_only`: initial `Sell*`, then final `Buy*`
+- `mixed_enabled`: initial direct `Sell*`, then any direct `Merge*` rounds from existing holdings
+- `mixed_enabled` with `mint > 0`: repeated `Mint` rounds, each followed by per-market `Sell*` replays capped by the minted round amount
+- `mixed_enabled` with remaining `merge > 0`: repeated buy-to-shortfall `Buy*` rounds followed by `Merge`
+- any leftover direct `Buy*` intents are replayed last
 
 If both branches are uncertified, Rust records "no certified external candidate" and falls open to
 native. If all certified branches fail translation, Rust records a translation failure and still

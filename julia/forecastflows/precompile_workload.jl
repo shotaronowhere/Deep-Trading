@@ -62,22 +62,46 @@ function representative_problem()
     )
 end
 
+function live_solver_options()
+    return (pgtol=1e-6, max_iter=2_500, max_fun=5_000)
+end
+
+function compare_request_json(problem, request_id)
+    return JSON3.write(
+        ForecastFlows.CompareRequest(
+            problem;
+            request_id=request_id,
+            protocol_version=ForecastFlows.PREDICTION_MARKET_PROTOCOL_VERSION,
+            certify=true,
+            throw_on_fail=false,
+            max_doublings=0,
+            solver_options=live_solver_options(),
+        ),
+    )
+end
+
 function run_precompile_workload()
-    solver_options = (pgtol=1e-8, max_iter=5_000, max_fun=10_000)
+    tiny = tiny_problem()
+    representative = representative_problem()
+    solver_options = live_solver_options()
+
+    ForecastFlows.handle_protocol_json(JSON3.write(ForecastFlows.HealthRequest(request_id="precompile-health")))
     compare_prediction_market_families(
-        tiny_problem();
+        tiny;
         certify=true,
         throw_on_fail=false,
-        max_doublings=6,
+        max_doublings=0,
         solver_options=solver_options,
     )
+    ForecastFlows.handle_protocol_json(compare_request_json(tiny, "precompile-tiny"))
     compare_prediction_market_families(
-        representative_problem();
+        representative;
         certify=true,
         throw_on_fail=false,
-        max_doublings=6,
+        max_doublings=0,
         solver_options=solver_options,
     )
+    ForecastFlows.handle_protocol_json(compare_request_json(representative, "precompile-representative"))
     return nothing
 end
 

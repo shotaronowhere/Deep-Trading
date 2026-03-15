@@ -17,8 +17,10 @@ pub const DEFAULT_EXECUTE_SUBMIT: bool = false;
 pub const DEFAULT_EXECUTION_MAX_STEPS: usize = 32;
 pub const DEFAULT_EXECUTION_MAX_STALE_BLOCKS: u64 = 2;
 pub const DEFAULT_EXECUTION_DEADLINE_SECS: u64 = 20;
+pub const DEFAULT_EXECUTION_BLOCK_POLL_MS: u64 = 250;
 pub const DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS: u64 = 1;
 pub const DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK: u64 = 15;
+pub const DEFAULT_FORECASTFLOWS_NATIVE_AUDIT_INTERVAL_BLOCKS: u64 = 12;
 pub const TRADE_EXECUTOR_CACHE_PATH: &str = "cache/trade_executor.json";
 pub const TRADE_EXECUTOR_ARTIFACT_PATH: &str = "out/TradeExecutor.sol/TradeExecutor.json";
 
@@ -32,8 +34,10 @@ pub struct ExecutionRuntimeConfig {
     pub execution_max_steps: usize,
     pub execution_max_stale_blocks: u64,
     pub execution_deadline_secs: u64,
+    pub execution_block_poll_ms: u64,
     pub execution_quote_latency_blocks: u64,
     pub execution_adverse_move_bps_per_block: u64,
+    pub forecastflows_native_audit_interval_blocks: u64,
 }
 
 pub fn is_submission_deadline_exceeded(elapsed: Duration, deadline_secs: u64) -> bool {
@@ -73,6 +77,8 @@ impl ExecutionRuntimeConfig {
         )?;
         let execution_deadline_secs =
             parse_env_u64("EXECUTION_DEADLINE_SECS", DEFAULT_EXECUTION_DEADLINE_SECS)?;
+        let execution_block_poll_ms =
+            parse_env_u64("EXECUTION_BLOCK_POLL_MS", DEFAULT_EXECUTION_BLOCK_POLL_MS)?;
         let execution_quote_latency_blocks = parse_env_u64(
             "EXECUTION_QUOTE_LATENCY_BLOCKS",
             DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
@@ -80,6 +86,10 @@ impl ExecutionRuntimeConfig {
         let execution_adverse_move_bps_per_block = parse_env_u64(
             "EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK",
             DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK,
+        )?;
+        let forecastflows_native_audit_interval_blocks = parse_env_u64(
+            "FORECASTFLOWS_NATIVE_AUDIT_INTERVAL_BLOCKS",
+            DEFAULT_FORECASTFLOWS_NATIVE_AUDIT_INTERVAL_BLOCKS,
         )?;
 
         Ok(Self {
@@ -89,8 +99,10 @@ impl ExecutionRuntimeConfig {
             execution_max_steps,
             execution_max_stale_blocks,
             execution_deadline_secs,
+            execution_block_poll_ms,
             execution_quote_latency_blocks,
             execution_adverse_move_bps_per_block,
+            forecastflows_native_audit_interval_blocks,
         })
     }
 }

@@ -1,5 +1,11 @@
 # Rebalancer A/B Benchmark
 
+Status note:
+
+- This is a historical native-vs-on-chain benchmark document.
+- The current release-facing cross-solver benchmark matrix, including ForecastFlows rows and the
+  local ForecastFlows latency lane, lives in `docs/solver_benchmark_matrix.md`.
+
 This benchmark is the reference frame for comparing the off-chain Rust planner against the on-chain `Rebalancer.sol` contract on the same frozen pool snapshot.
 
 ## Goal

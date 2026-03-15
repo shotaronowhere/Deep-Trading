@@ -123,8 +123,8 @@ Important boundaries:
 
 - The inner waterfall is still the continuous optimizer; the online exactness is only over the chosen discrete block around it.
 - ForecastFlows is a third whole-plan family, not an inner branch of `R_exact`.
-- ForecastFlows currently only participates for full L1 snapshots under the current single-range replay model; partial/incomplete snapshots and `ArbOnly` stay native-only.
-- If the current active single-range geometry cannot be derived from live tick/liquidity state, ForecastFlows treats the snapshot as unsupported and fails open to the native path instead of approximating with coarse bounds.
+- ForecastFlows currently only participates for full L1 snapshots whose live tick/liquidity state can be translated into a contiguous multi-band `UniV3` ladder; partial/incomplete snapshots and `ArbOnly` stay native-only.
+- If Rust cannot derive a contiguous liquidity ladder that covers the current price from live tick/liquidity state, ForecastFlows treats the snapshot as unsupported and fails open to the native path instead of approximating with coarse bounds.
 - The current compact normal forms are target-holdings-based, not chronological-trace-based:
   - `target_delta` re-emits the rich terminal holdings as one common-shift action plus residual direct buys/sells when that raises net EV
   - `analytic_mixed` solves directly for a compact common-shift-plus-residual frontier target without matching the rich trace holdings exactly
@@ -134,6 +134,7 @@ Important boundaries:
 - Execution is now optimized over packed tx chunks, not priced as one tx per replay subgroup.
 - ForecastFlows output is accepted only after local Rust replay proves the translated actions are feasible and execution-group-compatible (`Mint -> Sell+`, `Buy+ -> Merge`, or direct-only).
 - `direct_only` and `mixed_enabled` are admitted independently; one malformed certified ForecastFlows branch does not discard the other valid branch.
+- ForecastFlows remains the gross-EV route generator only; Rust still owns replay, fee modeling, and final net-EV ranking across solver families.
 - The staged meta-solver remains compiled only in `#[cfg(test)]` as a reference teacher; it is not part of the runtime objective.
 - Release-facing parity claims are single-tick only; `crossing_light` and `crossing_heavy` synthetic cases remain validation-only scope tests.
 - Legacy distilled preserve/frontier proposals remain in the default exact-no-arb path; the newer V2 proposal path is diagnostic-only behind `REBALANCE_ENABLE_DISTILLED_PROPOSAL_V2=1`.

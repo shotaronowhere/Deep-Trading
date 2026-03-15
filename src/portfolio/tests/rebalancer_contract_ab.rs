@@ -5,15 +5,23 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use super::super::forecastflows::{
+    ForecastFlowsBenchmarkSolveTuning, ForecastFlowsCandidateVariant, ForecastFlowsFamilyCandidate,
+    build_problem_request_band_counts_for_test, solve_family_candidates,
+    with_live_benchmark_worker_and_tuning_for_test, with_live_benchmark_worker_for_test,
+    with_live_benchmark_worker_timeout_and_tuning_for_test,
+};
 use super::super::rebalancer::{
     TestPhaseOrderVariant, arb_only_with_custom_predictions_for_test,
-    benchmark_gas_assumptions_for_test, collect_mint_sell_preserve_candidates_for_test,
+    benchmark_gas_assumptions_for_test, benchmark_planner_cost_config_for_test,
+    collect_mint_sell_preserve_candidates_for_test,
     compare_constant_l_runtime_vs_best_known_for_test,
     compare_constant_l_runtime_vs_k2_oracle_for_test,
     compare_constant_l_runtime_vs_medium_oracle_for_test,
     compare_constant_l_runtime_vs_oracle_for_test, compile_constant_l_mixed_selected_plan_for_test,
     compile_target_delta_actions_for_test, estimate_plan_economics_for_test,
-    phase_order_exact_subset_choice_for_test, rebalance_with_custom_predictions_and_stats_for_test,
+    forecastflows_candidate_plan_variants_for_test, phase_order_exact_subset_choice_for_test,
+    rebalance_with_custom_predictions_and_stats_for_test,
     rebalance_with_custom_predictions_arb_first_for_test,
     rebalance_with_custom_predictions_arb_last_for_test,
     rebalance_with_custom_predictions_arb_primed_family_for_test,
@@ -29,7 +37,8 @@ use super::super::rebalancer::{
     rebalance_with_custom_predictions_rebalance_strict_no_arb_for_test,
     rebalance_with_custom_predictions_selected_plan_for_test,
     rebalance_with_custom_predictions_selected_plan_with_pricing_for_test,
-    rebalance_with_custom_predictions_staged_reference_for_test, staged_reference_choice_for_test,
+    rebalance_with_custom_predictions_staged_reference_for_test,
+    selected_plan_run_with_solver_for_test, staged_reference_choice_for_test,
     staged_teacher_snapshot_for_test,
 };
 use super::fixtures::mock_slot0_market_with_orientation_liquidity_and_ticks;
@@ -45,14 +54,16 @@ use crate::execution::gas::{
 use crate::execution::runtime::{
     DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK, DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
 };
+use crate::markets::{MarketData, Pool, Tick};
 use crate::pools::{
     normalize_market_name, prediction_map, prediction_to_sqrt_price_x96,
     sqrt_price_x96_to_price_outcome,
 };
-use crate::portfolio::Action;
 use crate::portfolio::core::sim::PoolSim;
+use crate::portfolio::{Action, RebalanceSolver};
 use alloy::hex;
 use alloy::primitives::{Address, Bytes, U256};
+use uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio;
 
 #[derive(Debug, Deserialize)]
 struct BenchmarkCaseRow {
@@ -150,6 +161,7 @@ struct OnchainBenchmarkCaseArtifact {
 struct SharedSnapshotSolverRow {
     case_id: String,
     flavor: String,
+    requested_solver: Option<String>,
     scenario_family: String,
     outcome_count: usize,
     profitable_count: usize,
@@ -182,6 +194,69 @@ struct SharedSnapshotSolverRow {
     mint_count: Option<usize>,
     merge_count: Option<usize>,
     total_calldata_bytes: Option<usize>,
+    forecastflows_requests: Option<usize>,
+    forecastflows_worker_available: Option<bool>,
+    forecastflows_worker_roundtrip_ms: Option<u128>,
+    forecastflows_driver_overhead_ms: Option<u128>,
+    forecastflows_strategy: Option<String>,
+    forecastflows_workspace_reused: Option<bool>,
+    forecastflows_local_candidate_build_ms: Option<u128>,
+    forecastflows_local_step_prune_ms: Option<u128>,
+    forecastflows_local_route_prune_ms: Option<u128>,
+    forecastflows_estimated_execution_cost_susd: Option<f64>,
+    forecastflows_estimated_net_ev_susd: Option<f64>,
+    forecastflows_validated_total_fee_susd: Option<f64>,
+    forecastflows_validated_net_ev_susd: Option<f64>,
+    forecastflows_fee_estimate_error_susd: Option<f64>,
+    forecastflows_validation_only: Option<bool>,
+    forecastflows_fallback_reason: Option<String>,
+    forecastflows_direct_status: Option<String>,
+    forecastflows_mixed_status: Option<String>,
+    forecastflows_direct_solver_time_ms: Option<u128>,
+    forecastflows_mixed_solver_time_ms: Option<u128>,
+    forecastflows_certified_drop_reason: Option<String>,
+    forecastflows_replay_drop_reason: Option<String>,
+    forecastflows_replay_tolerance_clamp_used: Option<bool>,
+    forecastflows_sysimage_status: Option<String>,
+    forecastflows_julia_threads: Option<String>,
+    forecastflows_solve_tuning: Option<String>,
+    forecastflows_winning_variant: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ForecastFlowsTuningRow {
+    case_id: String,
+    tuning: String,
+    requested_solver: String,
+    selected_family: String,
+    selected_compiler_variant: String,
+    runtime_millis: u128,
+    raw_ev_susd: f64,
+    total_fee_susd: Option<f64>,
+    net_ev_susd: Option<f64>,
+    forecastflows_requests: usize,
+    forecastflows_worker_available: bool,
+    forecastflows_worker_roundtrip_ms: Option<u128>,
+    forecastflows_driver_overhead_ms: Option<u128>,
+    forecastflows_strategy: String,
+    forecastflows_workspace_reused: bool,
+    forecastflows_local_candidate_build_ms: Option<u128>,
+    forecastflows_local_step_prune_ms: Option<u128>,
+    forecastflows_local_route_prune_ms: Option<u128>,
+    forecastflows_estimated_execution_cost_susd: Option<f64>,
+    forecastflows_estimated_net_ev_susd: Option<f64>,
+    forecastflows_validated_total_fee_susd: Option<f64>,
+    forecastflows_validated_net_ev_susd: Option<f64>,
+    forecastflows_fee_estimate_error_susd: Option<f64>,
+    forecastflows_validation_only: bool,
+    forecastflows_fallback_reason: Option<String>,
+    forecastflows_direct_status: Option<String>,
+    forecastflows_mixed_status: Option<String>,
+    forecastflows_direct_solver_time_ms: Option<u128>,
+    forecastflows_mixed_solver_time_ms: Option<u128>,
+    forecastflows_replay_drop_reason: Option<String>,
+    forecastflows_sysimage_status: Option<String>,
+    forecastflows_julia_threads: Option<String>,
 }
 
 type Slot0Case = Vec<(
@@ -372,6 +447,14 @@ fn fixture_case_row_metadata(
         fee_regime_label(fee_multiplier),
         fixture_tick_regime(case),
     )
+}
+
+fn forecastflows_benchmark_flavor(selected_family: &str) -> &'static str {
+    if selected_family == "forecastflows" {
+        "offchain_forecastflows"
+    } else {
+        "offchain_forecastflows_fallback_native"
+    }
 }
 
 fn scaled_benchmark_gas_assumptions(multiplier: f64) -> crate::execution::gas::GasAssumptions {
@@ -935,6 +1018,192 @@ fn build_explicit_case(
         predictions,
         cash_budget,
     }
+}
+
+#[derive(Clone, Copy)]
+struct LadderCaseMarketSpec {
+    outcome_index: usize,
+    price: f64,
+    prediction: f64,
+    holding: f64,
+    is_token1_outcome: bool,
+    pool_liquidity: u128,
+    tick_ladder: &'static [(i32, i128)],
+}
+
+fn mock_slot0_market_with_orientation_tick_ladder(
+    name: &'static str,
+    outcome_token: &'static str,
+    price_fraction: f64,
+    pool_liquidity: u128,
+    tick_ladder: &[(i32, i128)],
+    is_token1_outcome: bool,
+) -> (crate::pools::Slot0Result, &'static MarketData) {
+    let sqrt_price = prediction_to_sqrt_price_x96(price_fraction, is_token1_outcome)
+        .unwrap_or(U256::from(1u128 << 96));
+    let current_tick = get_tick_at_sqrt_ratio(sqrt_price).unwrap_or(0);
+    let liquidity_str = leak_string(pool_liquidity.to_string());
+    let ticks = Box::leak(
+        tick_ladder
+            .iter()
+            .map(|(tick_idx, liquidity_net)| Tick {
+                tick_idx: *tick_idx,
+                liquidity_net: *liquidity_net,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let pool = Box::leak(Box::new(Pool {
+        token0: if is_token1_outcome {
+            "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0"
+        } else {
+            outcome_token
+        },
+        token1: if is_token1_outcome {
+            outcome_token
+        } else {
+            "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0"
+        },
+        pool_id: "0xpool",
+        liquidity: liquidity_str,
+        ticks,
+    }));
+    let market = Box::leak(Box::new(MarketData {
+        name,
+        market_id: "0xmarket-contract",
+        outcome_token,
+        pool: Some(*pool),
+        quote_token: "0xb5B2dc7fd34C249F4be7fB1fCea07950784229e0",
+    }));
+    let slot0 = crate::pools::Slot0Result {
+        pool_id: Address::ZERO,
+        sqrt_price_x96: sqrt_price,
+        tick: current_tick,
+        observation_index: 0,
+        observation_cardinality: 0,
+        observation_cardinality_next: 0,
+        fee_protocol: 0,
+        unlocked: true,
+    };
+    (slot0, market)
+}
+
+fn build_ladder_case(
+    case_id: &str,
+    markets: &[LadderCaseMarketSpec],
+    cash_budget: f64,
+) -> BuiltCase {
+    let mut slot0_results = Vec::with_capacity(markets.len());
+    let mut balances = HashMap::new();
+    let mut predictions = HashMap::new();
+
+    for spec in markets {
+        let name = leak_string(format!("{case_id}_{}", spec.outcome_index));
+        let token = leak_string(format!("0x{:040x}", spec.outcome_index + 1));
+        let (slot0, market) = mock_slot0_market_with_orientation_tick_ladder(
+            name,
+            token,
+            spec.price,
+            spec.pool_liquidity,
+            spec.tick_ladder,
+            spec.is_token1_outcome,
+        );
+        slot0_results.push((slot0, market));
+        balances.insert(name, spec.holding);
+        predictions.insert(normalize_market_name(name), spec.prediction);
+    }
+
+    let balances_view = balances.clone();
+    BuiltCase {
+        slot0_results,
+        balances_view,
+        predictions,
+        cash_budget,
+    }
+}
+
+fn forecastflows_multiband_direct_case() -> BuiltCase {
+    const LADDER: &[(i32, i128)] = &[
+        (1, 1_000_000_000_000_000_000_000i128),
+        (35_000, 500_000_000_000_000_000_000i128),
+        (60_000, -500_000_000_000_000_000_000i128),
+        (92_108, -1_000_000_000_000_000_000_000i128),
+    ];
+    build_ladder_case(
+        "forecastflows_multiband_direct_case",
+        &[
+            LadderCaseMarketSpec {
+                outcome_index: 0,
+                price: 0.15,
+                prediction: 0.85,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 1_500_000_000_000_000_000_000u128,
+                tick_ladder: LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 1,
+                price: 0.85,
+                prediction: 0.15,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 1_500_000_000_000_000_000_000u128,
+                tick_ladder: LADDER,
+            },
+        ],
+        1.0,
+    )
+}
+
+fn forecastflows_multiband_mixed_case() -> BuiltCase {
+    const LADDER: &[(i32, i128)] = &[
+        (1, 1_200_000_000_000_000_000_000i128),
+        (35_000, 600_000_000_000_000_000_000i128),
+        (60_000, -600_000_000_000_000_000_000i128),
+        (92_108, -1_200_000_000_000_000_000_000i128),
+    ];
+    build_ladder_case(
+        "forecastflows_multiband_mixed_case",
+        &[
+            LadderCaseMarketSpec {
+                outcome_index: 0,
+                price: 0.15,
+                prediction: 0.40,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 1_800_000_000_000_000_000_000u128,
+                tick_ladder: LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 1,
+                price: 0.15,
+                prediction: 0.35,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 1_800_000_000_000_000_000_000u128,
+                tick_ladder: LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 2,
+                price: 0.35,
+                prediction: 0.15,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 1_800_000_000_000_000_000_000u128,
+                tick_ladder: LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 3,
+                price: 0.35,
+                prediction: 0.10,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 1_800_000_000_000_000_000_000u128,
+                tick_ladder: LADDER,
+            },
+        ],
+        2.0,
+    )
 }
 
 fn benchmark_ev_wei(actions: &[super::Action], built: &BuiltCase) -> u128 {
@@ -2654,6 +2923,7 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
             serde_json::to_string(&SharedSnapshotSolverRow {
                 case_id: case.case_id.clone(),
                 flavor: "offchain_direct".to_string(),
+                requested_solver: None,
                 scenario_family: shared_metadata.scenario_family.to_string(),
                 outcome_count: shared_metadata.outcome_count,
                 profitable_count: shared_metadata.profitable_count,
@@ -2687,6 +2957,33 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
                 mint_count: Some(offchain_direct_summary.mint_count),
                 merge_count: Some(offchain_direct_summary.merge_count),
                 total_calldata_bytes: offchain_direct_summary.total_calldata_bytes,
+                forecastflows_requests: None,
+                forecastflows_worker_available: None,
+                forecastflows_worker_roundtrip_ms: None,
+                forecastflows_driver_overhead_ms: None,
+                forecastflows_strategy: None,
+                forecastflows_workspace_reused: None,
+                forecastflows_local_candidate_build_ms: None,
+                forecastflows_local_step_prune_ms: None,
+                forecastflows_local_route_prune_ms: None,
+                forecastflows_estimated_execution_cost_susd: None,
+                forecastflows_estimated_net_ev_susd: None,
+                forecastflows_validated_total_fee_susd: None,
+                forecastflows_validated_net_ev_susd: None,
+                forecastflows_fee_estimate_error_susd: None,
+                forecastflows_validation_only: None,
+                forecastflows_fallback_reason: None,
+                forecastflows_direct_status: None,
+                forecastflows_mixed_status: None,
+                forecastflows_direct_solver_time_ms: None,
+                forecastflows_mixed_solver_time_ms: None,
+                forecastflows_certified_drop_reason: None,
+                forecastflows_replay_drop_reason: None,
+                forecastflows_replay_tolerance_clamp_used: None,
+                forecastflows_sysimage_status: None,
+                forecastflows_julia_threads: None,
+                forecastflows_solve_tuning: None,
+                forecastflows_winning_variant: None,
             })
             .expect("shared snapshot row should serialize")
         );
@@ -2711,6 +3008,7 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
             serde_json::to_string(&SharedSnapshotSolverRow {
                 case_id: case.case_id.clone(),
                 flavor: "offchain_default".to_string(),
+                requested_solver: None,
                 scenario_family: shared_metadata.scenario_family.to_string(),
                 outcome_count: shared_metadata.outcome_count,
                 profitable_count: shared_metadata.profitable_count,
@@ -2744,6 +3042,33 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
                 mint_count: Some(offchain_default_summary.mint_count),
                 merge_count: Some(offchain_default_summary.merge_count),
                 total_calldata_bytes: offchain_default_summary.total_calldata_bytes,
+                forecastflows_requests: None,
+                forecastflows_worker_available: None,
+                forecastflows_worker_roundtrip_ms: None,
+                forecastflows_driver_overhead_ms: None,
+                forecastflows_strategy: None,
+                forecastflows_workspace_reused: None,
+                forecastflows_local_candidate_build_ms: None,
+                forecastflows_local_step_prune_ms: None,
+                forecastflows_local_route_prune_ms: None,
+                forecastflows_estimated_execution_cost_susd: None,
+                forecastflows_estimated_net_ev_susd: None,
+                forecastflows_validated_total_fee_susd: None,
+                forecastflows_validated_net_ev_susd: None,
+                forecastflows_fee_estimate_error_susd: None,
+                forecastflows_validation_only: None,
+                forecastflows_fallback_reason: None,
+                forecastflows_direct_status: None,
+                forecastflows_mixed_status: None,
+                forecastflows_direct_solver_time_ms: None,
+                forecastflows_mixed_solver_time_ms: None,
+                forecastflows_certified_drop_reason: None,
+                forecastflows_replay_drop_reason: None,
+                forecastflows_replay_tolerance_clamp_used: None,
+                forecastflows_sysimage_status: None,
+                forecastflows_julia_threads: None,
+                forecastflows_solve_tuning: None,
+                forecastflows_winning_variant: None,
             })
             .expect("shared snapshot row should serialize")
         );
@@ -2774,6 +3099,7 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
                 serde_json::to_string(&SharedSnapshotSolverRow {
                     case_id: case.case_id.clone(),
                     flavor: flavor.to_string(),
+                    requested_solver: None,
                     scenario_family: shared_metadata.scenario_family.to_string(),
                     outcome_count: shared_metadata.outcome_count,
                     profitable_count: shared_metadata.profitable_count,
@@ -2806,6 +3132,33 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
                     mint_count: None,
                     merge_count: None,
                     total_calldata_bytes: None,
+                    forecastflows_requests: None,
+                    forecastflows_worker_available: None,
+                    forecastflows_worker_roundtrip_ms: None,
+                    forecastflows_driver_overhead_ms: None,
+                    forecastflows_strategy: None,
+                    forecastflows_workspace_reused: None,
+                    forecastflows_local_candidate_build_ms: None,
+                    forecastflows_local_step_prune_ms: None,
+                    forecastflows_local_route_prune_ms: None,
+                    forecastflows_estimated_execution_cost_susd: None,
+                    forecastflows_estimated_net_ev_susd: None,
+                    forecastflows_validated_total_fee_susd: None,
+                    forecastflows_validated_net_ev_susd: None,
+                    forecastflows_fee_estimate_error_susd: None,
+                    forecastflows_validation_only: None,
+                    forecastflows_fallback_reason: None,
+                    forecastflows_direct_status: None,
+                    forecastflows_mixed_status: None,
+                    forecastflows_direct_solver_time_ms: None,
+                    forecastflows_mixed_solver_time_ms: None,
+                    forecastflows_certified_drop_reason: None,
+                    forecastflows_replay_drop_reason: None,
+                    forecastflows_replay_tolerance_clamp_used: None,
+                    forecastflows_sysimage_status: None,
+                    forecastflows_julia_threads: None,
+                    forecastflows_solve_tuning: None,
+                    forecastflows_winning_variant: None,
                 })
                 .expect("shared snapshot row should serialize")
             );
@@ -2853,6 +3206,7 @@ async fn print_shared_op_snapshot_onchain_benchmark_rows_jsonl() {
                 serde_json::to_string(&SharedSnapshotSolverRow {
                     case_id: case.case_id.clone(),
                     flavor: flavor.to_string(),
+                    requested_solver: None,
                     scenario_family: shared_metadata.scenario_family.to_string(),
                     outcome_count: shared_metadata.outcome_count,
                     profitable_count: shared_metadata.profitable_count,
@@ -2885,6 +3239,33 @@ async fn print_shared_op_snapshot_onchain_benchmark_rows_jsonl() {
                     mint_count: None,
                     merge_count: None,
                     total_calldata_bytes: None,
+                    forecastflows_requests: None,
+                    forecastflows_worker_available: None,
+                    forecastflows_worker_roundtrip_ms: None,
+                    forecastflows_driver_overhead_ms: None,
+                    forecastflows_strategy: None,
+                    forecastflows_workspace_reused: None,
+                    forecastflows_local_candidate_build_ms: None,
+                    forecastflows_local_step_prune_ms: None,
+                    forecastflows_local_route_prune_ms: None,
+                    forecastflows_estimated_execution_cost_susd: None,
+                    forecastflows_estimated_net_ev_susd: None,
+                    forecastflows_validated_total_fee_susd: None,
+                    forecastflows_validated_net_ev_susd: None,
+                    forecastflows_fee_estimate_error_susd: None,
+                    forecastflows_validation_only: None,
+                    forecastflows_fallback_reason: None,
+                    forecastflows_direct_status: None,
+                    forecastflows_mixed_status: None,
+                    forecastflows_direct_solver_time_ms: None,
+                    forecastflows_mixed_solver_time_ms: None,
+                    forecastflows_certified_drop_reason: None,
+                    forecastflows_replay_drop_reason: None,
+                    forecastflows_replay_tolerance_clamp_used: None,
+                    forecastflows_sysimage_status: None,
+                    forecastflows_julia_threads: None,
+                    forecastflows_solve_tuning: None,
+                    forecastflows_winning_variant: None,
                 })
                 .expect("shared snapshot row should serialize")
             );
@@ -2931,6 +3312,7 @@ async fn print_shared_op_snapshot_offchain_selected_rows_jsonl() {
                 serde_json::to_string(&SharedSnapshotSolverRow {
                     case_id: case.case_id.clone(),
                     flavor: flavor.to_string(),
+                    requested_solver: None,
                     scenario_family: shared_metadata.scenario_family.to_string(),
                     outcome_count: shared_metadata.outcome_count,
                     profitable_count: shared_metadata.profitable_count,
@@ -2983,11 +3365,818 @@ async fn print_shared_op_snapshot_offchain_selected_rows_jsonl() {
                     mint_count: Some(summary.mint_count),
                     merge_count: Some(summary.merge_count),
                     total_calldata_bytes: summary.total_calldata_bytes,
+                    forecastflows_requests: None,
+                    forecastflows_worker_available: None,
+                    forecastflows_worker_roundtrip_ms: None,
+                    forecastflows_driver_overhead_ms: None,
+                    forecastflows_strategy: None,
+                    forecastflows_workspace_reused: None,
+                    forecastflows_local_candidate_build_ms: None,
+                    forecastflows_local_step_prune_ms: None,
+                    forecastflows_local_route_prune_ms: None,
+                    forecastflows_estimated_execution_cost_susd: None,
+                    forecastflows_estimated_net_ev_susd: None,
+                    forecastflows_validated_total_fee_susd: None,
+                    forecastflows_validated_net_ev_susd: None,
+                    forecastflows_fee_estimate_error_susd: None,
+                    forecastflows_validation_only: None,
+                    forecastflows_fallback_reason: None,
+                    forecastflows_direct_status: None,
+                    forecastflows_mixed_status: None,
+                    forecastflows_direct_solver_time_ms: None,
+                    forecastflows_mixed_solver_time_ms: None,
+                    forecastflows_certified_drop_reason: None,
+                    forecastflows_replay_drop_reason: None,
+                    forecastflows_replay_tolerance_clamp_used: None,
+                    forecastflows_sysimage_status: None,
+                    forecastflows_julia_threads: None,
+                    forecastflows_solve_tuning: None,
+                    forecastflows_winning_variant: None,
                 })
                 .expect("shared snapshot row should serialize")
             );
         }
     }
+}
+
+fn print_shared_op_snapshot_forecastflows_selected_rows_jsonl_impl() {
+    with_live_benchmark_worker_for_test(|| {
+        for case in cases_from_fixture() {
+            let built = build_case(&case);
+            let shared_metadata = fixture_case_row_metadata(&case, &built, 1.0);
+            let force_mint_available = !case.direct_only_reference;
+            let started = std::time::Instant::now();
+            let (actions, summary, stats) = selected_plan_run_with_solver_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                RebalanceSolver::ForecastFlows,
+            );
+            let runtime_millis = started.elapsed().as_millis();
+            let raw_ev_wei = benchmark_ev_wei(&actions, &built);
+            let raw_ev_susd = wad_to_f64(raw_ev_wei);
+            let total_fee_susd = summary
+                .estimated_total_fee_susd
+                .expect("ForecastFlows benchmark plan should have a modeled fee estimate");
+            let group_or_tx_count = summary.estimated_tx_count.unwrap_or(0);
+            let telemetry = &stats.forecastflows_telemetry;
+            println!(
+                "{}",
+                serde_json::to_string(&SharedSnapshotSolverRow {
+                    case_id: case.case_id.clone(),
+                    flavor: forecastflows_benchmark_flavor(summary.family).to_string(),
+                    requested_solver: Some(RebalanceSolver::ForecastFlows.as_str().to_string()),
+                    scenario_family: shared_metadata.scenario_family.to_string(),
+                    outcome_count: shared_metadata.outcome_count,
+                    profitable_count: shared_metadata.profitable_count,
+                    profitable_count_bucket: shared_metadata.profitable_count_bucket.to_string(),
+                    budget_regime: shared_metadata.budget_regime.to_string(),
+                    fee_regime: shared_metadata.fee_regime.to_string(),
+                    tick_regime: shared_metadata.tick_regime.to_string(),
+                    raw_ev_wei: raw_ev_wei.to_string(),
+                    raw_ev_susd,
+                    total_fee_susd,
+                    net_ev_susd: raw_ev_susd - total_fee_susd,
+                    action_count: actions.len(),
+                    group_or_tx_count,
+                    runtime_millis: Some(runtime_millis),
+                    fee_source: summary.fee_estimate_source.to_string(),
+                    family: Some(summary.family.to_string()),
+                    compiler_variant: Some(summary.compiler_variant.to_string()),
+                    selected_common_shift: summary.selected_common_shift,
+                    selected_mixed_lambda: summary.selected_mixed_lambda,
+                    selected_active_set_size: summary.selected_active_set_size,
+                    selected_stage_count: summary.selected_stage_count,
+                    selected_stage1_budget_fraction: summary.selected_stage1_budget_fraction,
+                    k1_teacher_source: None,
+                    runtime_k1_gap_net_ev: None,
+                    runtime_k1_gap_raw_ev: None,
+                    oracle_best_is_direct_prefix: None,
+                    oracle_best_active_set_size: None,
+                    direct_buy_count: Some(summary.direct_buy_count),
+                    direct_sell_count: Some(summary.direct_sell_count),
+                    mint_count: Some(summary.mint_count),
+                    merge_count: Some(summary.merge_count),
+                    total_calldata_bytes: summary.total_calldata_bytes,
+                    forecastflows_requests: Some(stats.forecastflows_requests),
+                    forecastflows_worker_available: Some(stats.forecastflows_worker_available),
+                    forecastflows_worker_roundtrip_ms: telemetry.worker_roundtrip_ms,
+                    forecastflows_driver_overhead_ms: telemetry.driver_overhead_ms,
+                    forecastflows_strategy: telemetry.strategy.clone(),
+                    forecastflows_workspace_reused: Some(telemetry.workspace_reused),
+                    forecastflows_local_candidate_build_ms: telemetry.local_candidate_build_ms,
+                    forecastflows_local_step_prune_ms: telemetry.local_step_prune_ms,
+                    forecastflows_local_route_prune_ms: telemetry.local_route_prune_ms,
+                    forecastflows_estimated_execution_cost_susd: telemetry
+                        .estimated_execution_cost_susd,
+                    forecastflows_estimated_net_ev_susd: telemetry.estimated_net_ev_susd,
+                    forecastflows_validated_total_fee_susd: telemetry.validated_total_fee_susd,
+                    forecastflows_validated_net_ev_susd: telemetry.validated_net_ev_susd,
+                    forecastflows_fee_estimate_error_susd: telemetry.fee_estimate_error_susd,
+                    forecastflows_validation_only: Some(telemetry.validation_only),
+                    forecastflows_fallback_reason: stats
+                        .forecastflows_fallback_reason
+                        .map(str::to_string),
+                    forecastflows_direct_status: telemetry.direct_status.clone(),
+                    forecastflows_mixed_status: telemetry.mixed_status.clone(),
+                    forecastflows_direct_solver_time_ms: telemetry.direct_solver_time_ms,
+                    forecastflows_mixed_solver_time_ms: telemetry.mixed_solver_time_ms,
+                    forecastflows_certified_drop_reason: telemetry.certified_drop_reason.clone(),
+                    forecastflows_replay_drop_reason: telemetry.replay_drop_reason.clone(),
+                    forecastflows_replay_tolerance_clamp_used: Some(
+                        telemetry.replay_tolerance_clamp_used,
+                    ),
+                    forecastflows_sysimage_status: telemetry.sysimage_status.clone(),
+                    forecastflows_julia_threads: telemetry.julia_threads.clone(),
+                    forecastflows_solve_tuning: telemetry.solve_tuning.clone(),
+                    forecastflows_winning_variant: stats
+                        .forecastflows_winning_variant
+                        .map(|variant| variant.as_str().to_string()),
+                })
+                .expect("shared snapshot row should serialize")
+            );
+        }
+    })
+    .expect("ForecastFlows benchmark worker should be available");
+}
+
+#[test]
+#[ignore = "debug helper; run explicitly with local Julia worker"]
+fn print_shared_op_snapshot_forecastflows_selected_rows_jsonl() {
+    print_shared_op_snapshot_forecastflows_selected_rows_jsonl_impl();
+}
+
+#[test]
+#[ignore = "machine-readable helper; run explicitly with local Julia worker"]
+fn print_shared_op_snapshot_forecastflows_latency_rows_jsonl() {
+    print_shared_op_snapshot_forecastflows_selected_rows_jsonl_impl();
+}
+
+#[test]
+#[ignore = "manual ForecastFlows tuning report"]
+fn print_shared_op_snapshot_forecastflows_tuning_rows_jsonl() {
+    for (tuning, tuning_label) in [
+        (ForecastFlowsBenchmarkSolveTuning::Baseline, "baseline"),
+        (ForecastFlowsBenchmarkSolveTuning::LowLatency, "low_latency"),
+    ] {
+        with_live_benchmark_worker_and_tuning_for_test(tuning, || {
+            for case in cases_from_fixture() {
+                let built = build_case(&case);
+                let force_mint_available = !case.direct_only_reference;
+                let started = std::time::Instant::now();
+                let (actions, summary, stats) = selected_plan_run_with_solver_for_test(
+                    &built.balances_view,
+                    built.cash_budget,
+                    &built.slot0_results,
+                    &built.predictions,
+                    force_mint_available,
+                    RebalanceSolver::ForecastFlows,
+                );
+                let raw_ev_susd = wad_to_f64(benchmark_ev_wei(&actions, &built));
+                let telemetry = &stats.forecastflows_telemetry;
+                println!(
+                    "{}",
+                    serde_json::to_string(&ForecastFlowsTuningRow {
+                        case_id: case.case_id.clone(),
+                        tuning: tuning_label.to_string(),
+                        requested_solver: RebalanceSolver::ForecastFlows.as_str().to_string(),
+                        selected_family: summary.family.to_string(),
+                        selected_compiler_variant: summary.compiler_variant.to_string(),
+                        runtime_millis: started.elapsed().as_millis(),
+                        raw_ev_susd,
+                        total_fee_susd: summary.estimated_total_fee_susd,
+                        net_ev_susd: summary.estimated_net_ev,
+                        forecastflows_requests: stats.forecastflows_requests,
+                        forecastflows_worker_available: stats.forecastflows_worker_available,
+                        forecastflows_worker_roundtrip_ms: telemetry.worker_roundtrip_ms,
+                        forecastflows_driver_overhead_ms: telemetry.driver_overhead_ms,
+                        forecastflows_strategy: telemetry
+                            .strategy
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        forecastflows_workspace_reused: telemetry.workspace_reused,
+                        forecastflows_local_candidate_build_ms: telemetry.local_candidate_build_ms,
+                        forecastflows_local_step_prune_ms: telemetry.local_step_prune_ms,
+                        forecastflows_local_route_prune_ms: telemetry.local_route_prune_ms,
+                        forecastflows_estimated_execution_cost_susd: telemetry
+                            .estimated_execution_cost_susd,
+                        forecastflows_estimated_net_ev_susd: telemetry.estimated_net_ev_susd,
+                        forecastflows_validated_total_fee_susd: telemetry.validated_total_fee_susd,
+                        forecastflows_validated_net_ev_susd: telemetry.validated_net_ev_susd,
+                        forecastflows_fee_estimate_error_susd: telemetry.fee_estimate_error_susd,
+                        forecastflows_validation_only: telemetry.validation_only,
+                        forecastflows_fallback_reason: stats
+                            .forecastflows_fallback_reason
+                            .map(str::to_string),
+                        forecastflows_direct_status: telemetry.direct_status.clone(),
+                        forecastflows_mixed_status: telemetry.mixed_status.clone(),
+                        forecastflows_direct_solver_time_ms: telemetry.direct_solver_time_ms,
+                        forecastflows_mixed_solver_time_ms: telemetry.mixed_solver_time_ms,
+                        forecastflows_replay_drop_reason: telemetry.replay_drop_reason.clone(),
+                        forecastflows_sysimage_status: telemetry.sysimage_status.clone(),
+                        forecastflows_julia_threads: telemetry.julia_threads.clone(),
+                    })
+                    .expect("ForecastFlows tuning row should serialize")
+                );
+            }
+        })
+        .expect("ForecastFlows tuning report should complete against the live worker");
+    }
+}
+
+#[test]
+#[ignore = "manual ForecastFlows repeated 98-case latency helper"]
+fn print_repeated_heterogeneous_ninety_eight_forecastflows_latency() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "heterogeneous_ninety_eight_outcome_l1_like_case")
+        .expect("fixture should include heterogeneous_ninety_eight_outcome_l1_like_case");
+    let built = build_case(&case);
+    let force_mint_available = !case.direct_only_reference;
+
+    with_live_benchmark_worker_timeout_and_tuning_for_test(
+        ForecastFlowsBenchmarkSolveTuning::LowLatency,
+        std::time::Duration::from_secs(300),
+        || {
+            for label in ["first", "second"] {
+                let started = std::time::Instant::now();
+                let (_actions, summary, stats) = selected_plan_run_with_solver_for_test(
+                    &built.balances_view,
+                    built.cash_budget,
+                    &built.slot0_results,
+                    &built.predictions,
+                    force_mint_available,
+                    RebalanceSolver::ForecastFlows,
+                );
+                let telemetry = &stats.forecastflows_telemetry;
+                println!(
+                    "{}",
+                    serde_json::to_string(&ForecastFlowsTuningRow {
+                        case_id: format!("{}::{label}", case.case_id),
+                        tuning: "low_latency".to_string(),
+                        requested_solver: RebalanceSolver::ForecastFlows.as_str().to_string(),
+                        selected_family: summary.family.to_string(),
+                        selected_compiler_variant: summary.compiler_variant.to_string(),
+                        runtime_millis: started.elapsed().as_millis(),
+                        raw_ev_susd: summary.raw_ev,
+                        total_fee_susd: summary.estimated_total_fee_susd,
+                        net_ev_susd: summary.estimated_net_ev,
+                        forecastflows_requests: stats.forecastflows_requests,
+                        forecastflows_worker_available: stats.forecastflows_worker_available,
+                        forecastflows_worker_roundtrip_ms: telemetry.worker_roundtrip_ms,
+                        forecastflows_driver_overhead_ms: telemetry.driver_overhead_ms,
+                        forecastflows_strategy: telemetry
+                            .strategy
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        forecastflows_workspace_reused: telemetry.workspace_reused,
+                        forecastflows_local_candidate_build_ms: telemetry.local_candidate_build_ms,
+                        forecastflows_local_step_prune_ms: telemetry.local_step_prune_ms,
+                        forecastflows_local_route_prune_ms: telemetry.local_route_prune_ms,
+                        forecastflows_estimated_execution_cost_susd: telemetry
+                            .estimated_execution_cost_susd,
+                        forecastflows_estimated_net_ev_susd: telemetry.estimated_net_ev_susd,
+                        forecastflows_validated_total_fee_susd: telemetry.validated_total_fee_susd,
+                        forecastflows_validated_net_ev_susd: telemetry.validated_net_ev_susd,
+                        forecastflows_fee_estimate_error_susd: telemetry.fee_estimate_error_susd,
+                        forecastflows_validation_only: telemetry.validation_only,
+                        forecastflows_fallback_reason: stats
+                            .forecastflows_fallback_reason
+                            .map(str::to_string),
+                        forecastflows_direct_status: telemetry.direct_status.clone(),
+                        forecastflows_mixed_status: telemetry.mixed_status.clone(),
+                        forecastflows_direct_solver_time_ms: telemetry.direct_solver_time_ms,
+                        forecastflows_mixed_solver_time_ms: telemetry.mixed_solver_time_ms,
+                        forecastflows_replay_drop_reason: telemetry.replay_drop_reason.clone(),
+                        forecastflows_sysimage_status: telemetry.sysimage_status.clone(),
+                        forecastflows_julia_threads: telemetry.julia_threads.clone(),
+                    })
+                    .expect("ForecastFlows repeated latency row should serialize")
+                );
+            }
+        },
+    )
+    .expect("ForecastFlows repeated latency helper should complete against the live worker");
+}
+
+#[test]
+fn forecastflows_polish_prunes_coupled_buy_merge_steps_without_corrupting_route_shape() {
+    let case = cases_from_fixture()
+        .into_iter()
+        .find(|case| case.case_id == "two_pool_single_tick_direct_only")
+        .expect("fixture should include two_pool_single_tick_direct_only");
+    let built = build_case(&case);
+    let source_market = built.slot0_results[0].1.name;
+    let candidate = ForecastFlowsFamilyCandidate {
+        actions: vec![
+            Action::Buy {
+                market_name: built.slot0_results[0].1.name,
+                amount: 0.01,
+                cost: 0.03,
+            },
+            Action::Buy {
+                market_name: built.slot0_results[1].1.name,
+                amount: 0.01,
+                cost: 0.03,
+            },
+            Action::Merge {
+                contract_1: "c1",
+                contract_2: "c2",
+                amount: 0.01,
+                source_market,
+            },
+        ],
+        variant: ForecastFlowsCandidateVariant::Mixed,
+        estimated_execution_cost_susd: None,
+        estimated_net_ev_susd: None,
+    };
+    let variants = forecastflows_candidate_plan_variants_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        candidate,
+    )
+    .expect("synthetic coupled ForecastFlows route should remain analyzable");
+
+    assert!(variants.raw_replayable);
+    assert!(variants.polished_replayable);
+    assert_eq!(variants.raw.family, "forecastflows");
+    assert_eq!(variants.polished.family, "forecastflows");
+    assert_eq!(variants.raw.compiler_variant, "forecastflows_mixed");
+    assert_eq!(variants.polished.compiler_variant, "forecastflows_mixed");
+    assert_eq!(variants.raw.action_count, 3);
+    assert_eq!(variants.raw.direct_buy_count, 2);
+    assert_eq!(variants.raw.merge_count, 1);
+    assert_eq!(variants.polished.action_count, 0);
+    assert_eq!(variants.polished.direct_buy_count, 0);
+    assert_eq!(variants.polished.merge_count, 0);
+    assert!(
+        variants
+            .polished
+            .estimated_net_ev
+            .unwrap_or(f64::NEG_INFINITY)
+            >= variants.raw.estimated_net_ev.unwrap_or(f64::NEG_INFINITY)
+    );
+}
+
+#[test]
+fn forecastflows_ev_benchmark_reaches_worker_on_committed_cases_when_enabled() {
+    if std::env::var("FORECASTFLOWS_BENCHMARK_ASSERT")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+
+    with_live_benchmark_worker_for_test(|| {
+        for case in cases_from_fixture() {
+            let built = build_case(&case);
+            let force_mint_available = !case.direct_only_reference;
+            let direct_report = solve_family_candidates(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                built.slot0_results.len(),
+                benchmark_planner_cost_config_for_test(),
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{} should produce a ForecastFlows solve report during benchmark measurement: {}",
+                    case.case_id, err
+                )
+            });
+            assert!(
+                !direct_report.candidates.is_empty(),
+                "{} should produce at least one replayable ForecastFlows candidate",
+                case.case_id
+            );
+            let mut best_polished_candidate_net_ev = f64::NEG_INFINITY;
+            for candidate in direct_report.candidates {
+                let variants = forecastflows_candidate_plan_variants_for_test(
+                    &built.balances_view,
+                    built.cash_budget,
+                    &built.slot0_results,
+                    &built.predictions,
+                    candidate,
+                )
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} should keep both raw and polished ForecastFlows candidates replayable",
+                        case.case_id
+                    )
+                });
+                let raw_net_ev = variants.raw.estimated_net_ev.unwrap_or_else(|| {
+                    panic!(
+                        "{} raw ForecastFlows candidate should have modeled net EV: {:?}",
+                        case.case_id, variants.raw
+                    )
+                });
+                let polished_net_ev = variants.polished.estimated_net_ev.unwrap_or_else(|| {
+                    panic!(
+                        "{} polished ForecastFlows candidate should have modeled net EV: {:?}",
+                        case.case_id, variants.polished
+                    )
+                });
+                assert!(
+                    variants.raw_replayable,
+                    "{} raw ForecastFlows candidate should remain replayable after translation: {:?}",
+                    case.case_id,
+                    variants.raw
+                );
+                assert!(
+                    variants.polished_replayable,
+                    "{} polished ForecastFlows candidate should remain replayable: {:?}",
+                    case.case_id,
+                    variants.polished
+                );
+                assert_eq!(
+                    variants.raw.family, "forecastflows",
+                    "{} raw candidate should stay in the ForecastFlows family: {:?}",
+                    case.case_id, variants.raw
+                );
+                assert_eq!(
+                    variants.polished.family, "forecastflows",
+                    "{} polished candidate should stay in the ForecastFlows family: {:?}",
+                    case.case_id, variants.polished
+                );
+                assert_eq!(
+                    variants.raw.compiler_variant, variants.polished.compiler_variant,
+                    "{} polished candidate should preserve the ForecastFlows compiler label",
+                    case.case_id
+                );
+                assert!(
+                    matches!(
+                        variants.polished.compiler_variant,
+                        "forecastflows_direct" | "forecastflows_mixed"
+                    ),
+                    "{} polished candidate should preserve a ForecastFlows compiler label: {:?}",
+                    case.case_id,
+                    variants.polished
+                );
+                assert!(
+                    polished_net_ev + 1e-12 >= raw_net_ev,
+                    "{} polished ForecastFlows candidate regressed net EV: raw={} polished={}",
+                    case.case_id,
+                    raw_net_ev,
+                    polished_net_ev
+                );
+                best_polished_candidate_net_ev =
+                    best_polished_candidate_net_ev.max(polished_net_ev);
+            }
+            let (_native_actions, native_summary, _native_stats) = selected_plan_run_with_solver_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                RebalanceSolver::Native,
+            );
+            let (_actions, summary, stats) = selected_plan_run_with_solver_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                RebalanceSolver::ForecastFlows,
+            );
+            let telemetry = &stats.forecastflows_telemetry;
+
+            assert!(
+                stats.forecastflows_requests >= 1,
+                "{} should issue at least one ForecastFlows request: {:?}",
+                case.case_id,
+                stats
+            );
+            assert!(
+                stats.forecastflows_worker_available,
+                "{} should reach a live ForecastFlows worker: {:?}",
+                case.case_id, stats
+            );
+            assert!(
+                stats
+                    .forecastflows_telemetry
+                    .worker_roundtrip_ms
+                    .is_some_and(|value| value > 0),
+                "{} should record a positive ForecastFlows roundtrip time: {:?}",
+                case.case_id,
+                stats
+            );
+            assert!(
+                stats
+                    .forecastflows_telemetry
+                    .driver_overhead_ms
+                    .is_some_and(|value| value > 0),
+                "{} should record positive ForecastFlows driver overhead: {:?}",
+                case.case_id,
+                stats
+            );
+            assert_eq!(
+                stats.forecastflows_fallback_reason, None,
+                "{} should not fall back during benchmark measurement: {:?}",
+                case.case_id, stats
+            );
+            assert!(
+                telemetry
+                    .direct_status
+                    .as_deref()
+                    .is_some_and(|status| !status.is_empty()),
+                "{} should record the direct branch status: {:?}",
+                case.case_id,
+                stats
+            );
+            assert!(
+                telemetry
+                    .mixed_status
+                    .as_deref()
+                    .is_some_and(|status| !status.is_empty()),
+                "{} should record the mixed branch status: {:?}",
+                case.case_id,
+                stats
+            );
+            assert!(
+                telemetry
+                    .direct_solver_time_ms
+                    .or(telemetry.mixed_solver_time_ms)
+                    .is_some(),
+                "{} should record at least one worker solver time: {:?}",
+                case.case_id,
+                stats
+            );
+            assert!(
+                telemetry
+                    .sysimage_status
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty()),
+                "{} should record the ForecastFlows sysimage status: {:?}",
+                case.case_id,
+                stats
+            );
+            assert!(
+                telemetry
+                    .julia_threads
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty()),
+                "{} should record the ForecastFlows Julia thread setting: {:?}",
+                case.case_id,
+                stats
+            );
+            assert_eq!(
+                summary.family, "forecastflows",
+                "{} should be measured with an actual ForecastFlows plan: {:?}",
+                case.case_id, summary
+            );
+            assert!(
+                matches!(
+                    summary.compiler_variant,
+                    "forecastflows_direct" | "forecastflows_mixed"
+                ),
+                "{} should select a ForecastFlows compiler variant: {:?}",
+                case.case_id,
+                summary
+            );
+            assert!(
+                summary
+                    .estimated_total_fee_susd
+                    .is_some_and(|value| value.is_finite()),
+                "{} should produce a finite modeled total fee: {:?}",
+                case.case_id,
+                summary
+            );
+            assert!(
+                summary
+                    .estimated_net_ev
+                    .is_some_and(|value| value.is_finite()),
+                "{} should produce a finite modeled net EV: {:?}",
+                case.case_id,
+                summary
+            );
+            let selected_net_ev = summary.estimated_net_ev.unwrap_or_else(|| {
+                panic!(
+                    "{} selected ForecastFlows benchmark plan should have modeled net EV: {:?}",
+                    case.case_id, summary
+                )
+            });
+            let native_net_ev = native_summary.estimated_net_ev.unwrap_or_else(|| {
+                panic!(
+                    "{} native benchmark plan should have modeled net EV: {:?}",
+                    case.case_id, native_summary
+                )
+            });
+            assert!(
+                selected_net_ev + 1e-12 >= best_polished_candidate_net_ev,
+                "{} selected ForecastFlows benchmark plan should not be worse than the best polished candidate: selected={} best_candidate={}",
+                case.case_id,
+                selected_net_ev,
+                best_polished_candidate_net_ev
+            );
+            assert!(
+                selected_net_ev + 1e-9 >= native_net_ev,
+                "{} ForecastFlows should match or beat the native waterfall benchmark: forecastflows={} native={}",
+                case.case_id,
+                selected_net_ev,
+                native_net_ev
+            );
+        }
+    })
+    .expect("ForecastFlows benchmark assertion should complete against the live worker");
+}
+
+#[test]
+fn forecastflows_real_multiband_fixture_cases_reach_worker_when_enabled() {
+    if std::env::var("FORECASTFLOWS_BENCHMARK_ASSERT")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+
+    with_live_benchmark_worker_for_test(|| {
+        let cases = [
+            (
+                "forecastflows_multiband_direct_case",
+                forecastflows_multiband_direct_case(),
+                false,
+            ),
+            (
+                "forecastflows_multiband_mixed_case",
+                forecastflows_multiband_mixed_case(),
+                true,
+            ),
+        ];
+
+        for (case_id, built, force_mint_available) in cases {
+            let band_counts = build_problem_request_band_counts_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                built.slot0_results.len(),
+            )
+            .unwrap_or_else(|err| panic!("{case_id} should build a ForecastFlows request: {err}"));
+            assert!(
+                band_counts.iter().all(|count| *count > 2),
+                "{case_id} should use real multi-band ladders instead of the test-only single-range fallback: {band_counts:?}"
+            );
+
+            let (_actions, summary, stats) = selected_plan_run_with_solver_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                RebalanceSolver::ForecastFlows,
+            );
+
+            assert!(
+                stats.forecastflows_requests >= 1,
+                "{case_id} should issue a ForecastFlows request: {:?}",
+                stats
+            );
+            assert!(
+                stats.forecastflows_worker_available,
+                "{case_id} should reach a ForecastFlows worker: {:?}",
+                stats
+            );
+            assert_eq!(
+                stats.forecastflows_fallback_reason, None,
+                "{case_id} should stay on actual ForecastFlows output: {:?}",
+                stats
+            );
+            assert_eq!(
+                summary.family, "forecastflows",
+                "{case_id} should select an actual ForecastFlows plan: {:?}",
+                summary
+            );
+            assert!(
+                matches!(
+                    summary.compiler_variant,
+                    "forecastflows_direct" | "forecastflows_mixed"
+                ),
+                "{case_id} should select a replayable ForecastFlows compiler variant: {:?}",
+                summary
+            );
+            assert!(
+                summary
+                    .estimated_net_ev
+                    .is_some_and(|value| value.is_finite()),
+                "{case_id} should report a finite modeled net EV: {:?}",
+                summary
+            );
+        }
+    })
+    .expect("ForecastFlows real multi-band fixture coverage should complete against the live worker");
+}
+
+#[test]
+fn forecastflows_benchmark_flavor_marks_native_fallbacks() {
+    assert_eq!(
+        forecastflows_benchmark_flavor("forecastflows"),
+        "offchain_forecastflows"
+    );
+    assert_eq!(
+        forecastflows_benchmark_flavor("plain"),
+        "offchain_forecastflows_fallback_native"
+    );
+    assert_eq!(
+        forecastflows_benchmark_flavor("arb_primed"),
+        "offchain_forecastflows_fallback_native"
+    );
+}
+
+#[test]
+fn forecastflows_benchmark_row_serializes_requested_solver_and_replay_drop_reason() {
+    let row = SharedSnapshotSolverRow {
+        case_id: "fixture_case".to_string(),
+        flavor: "offchain_forecastflows".to_string(),
+        requested_solver: Some("forecastflows".to_string()),
+        scenario_family: "l1_fixture".to_string(),
+        outcome_count: 98,
+        profitable_count: 12,
+        profitable_count_bucket: "10_24".to_string(),
+        budget_regime: "balanced".to_string(),
+        fee_regime: "benchmark".to_string(),
+        tick_regime: "multitick".to_string(),
+        raw_ev_wei: "1000000000000000000".to_string(),
+        raw_ev_susd: 1.0,
+        total_fee_susd: 0.01,
+        net_ev_susd: 0.99,
+        action_count: 4,
+        group_or_tx_count: 2,
+        runtime_millis: Some(250),
+        fee_source: "benchmark_snapshot".to_string(),
+        family: Some("forecastflows".to_string()),
+        compiler_variant: Some("forecastflows_direct".to_string()),
+        selected_common_shift: None,
+        selected_mixed_lambda: None,
+        selected_active_set_size: None,
+        selected_stage_count: None,
+        selected_stage1_budget_fraction: None,
+        k1_teacher_source: None,
+        runtime_k1_gap_net_ev: None,
+        runtime_k1_gap_raw_ev: None,
+        oracle_best_is_direct_prefix: None,
+        oracle_best_active_set_size: None,
+        direct_buy_count: Some(1),
+        direct_sell_count: Some(2),
+        mint_count: Some(0),
+        merge_count: Some(0),
+        total_calldata_bytes: Some(256),
+        forecastflows_requests: Some(1),
+        forecastflows_worker_available: Some(true),
+        forecastflows_worker_roundtrip_ms: Some(250),
+        forecastflows_driver_overhead_ms: Some(50),
+        forecastflows_strategy: Some("rust_prune".to_string()),
+        forecastflows_workspace_reused: Some(true),
+        forecastflows_local_candidate_build_ms: Some(22),
+        forecastflows_local_step_prune_ms: Some(11),
+        forecastflows_local_route_prune_ms: Some(7),
+        forecastflows_estimated_execution_cost_susd: Some(0.008),
+        forecastflows_estimated_net_ev_susd: Some(0.992),
+        forecastflows_validated_total_fee_susd: Some(0.01),
+        forecastflows_validated_net_ev_susd: Some(0.99),
+        forecastflows_fee_estimate_error_susd: Some(0.002),
+        forecastflows_validation_only: Some(false),
+        forecastflows_fallback_reason: None,
+        forecastflows_direct_status: Some("certified".to_string()),
+        forecastflows_mixed_status: Some("uncertified".to_string()),
+        forecastflows_direct_solver_time_ms: Some(123),
+        forecastflows_mixed_solver_time_ms: Some(77),
+        forecastflows_certified_drop_reason: None,
+        forecastflows_replay_drop_reason: Some(
+            "direct: local replay rejected sell due to insufficient holdings".to_string(),
+        ),
+        forecastflows_replay_tolerance_clamp_used: Some(true),
+        forecastflows_sysimage_status: Some("active".to_string()),
+        forecastflows_julia_threads: Some("4".to_string()),
+        forecastflows_solve_tuning: Some("baseline".to_string()),
+        forecastflows_winning_variant: Some("direct".to_string()),
+    };
+
+    let json = serde_json::to_value(&row).expect("row should serialize");
+    assert_eq!(json["requested_solver"], "forecastflows");
+    assert_eq!(json["family"], "forecastflows");
+    assert_eq!(json["forecastflows_direct_solver_time_ms"], 123);
+    assert_eq!(json["forecastflows_driver_overhead_ms"], 50);
+    assert_eq!(json["forecastflows_strategy"], "rust_prune");
+    assert_eq!(json["forecastflows_workspace_reused"], true);
+    assert_eq!(json["forecastflows_local_candidate_build_ms"], 22);
+    assert_eq!(json["forecastflows_local_step_prune_ms"], 11);
+    assert_eq!(json["forecastflows_local_route_prune_ms"], 7);
+    assert_eq!(json["forecastflows_estimated_execution_cost_susd"], 0.008);
+    assert_eq!(json["forecastflows_validated_total_fee_susd"], 0.01);
+    assert_eq!(json["forecastflows_validation_only"], false);
+    assert_eq!(json["forecastflows_sysimage_status"], "active");
+    assert_eq!(json["forecastflows_julia_threads"], "4");
+    assert_eq!(
+        json["forecastflows_replay_drop_reason"],
+        "direct: local replay rejected sell due to insufficient holdings"
+    );
 }
 
 #[test]

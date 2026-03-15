@@ -1,10 +1,15 @@
 # Solver Benchmark Matrix
 
-Last updated: 2026-03-10
+Last updated: 2026-03-14
 
 ## Purpose
 
 This is the central release-facing solver comparison document.
+
+Treat this as the source of truth for current cross-solver benchmark status, including the
+ForecastFlows lane and its local latency telemetry. Older benchmark and archive docs may preserve
+native-only or on-chain-only historical context, but they should not be read as the current
+release-facing solver matrix.
 
 It answers, in one place:
 
@@ -29,6 +34,23 @@ It answers, in one place:
   - `cargo test print_shared_op_snapshot_offchain_selected_rows_jsonl -- --ignored --nocapture`
   - note: this uses the current solver-selected modeled fee estimate from the planner summary
   - current committed benchmark rows are on replay-packed-program estimates; structural fallback remains contingency-only
+- shared-snapshot explicit ForecastFlows pricing under the benchmark OP snapshot:
+  - `cargo test print_shared_op_snapshot_forecastflows_selected_rows_jsonl -- --ignored --nocapture`
+  - the latest local refresh used `FORECASTFLOWS_SYSIMAGE=/Users/shotaro/proj/deep_trading/julia/forecastflows/forecastflows_sysimage.dylib`
+  - diagnostic only: rows include worker/fallback metadata because unsupported snapshots still fail open to the native planner
+  - benchmark tests allow the synthetic single-range fixtures to reconstruct active geometry from price when `slot0.tick` is synthetic, without changing production runtime behavior
+  - correctness lane:
+    - `FORECASTFLOWS_BENCHMARK_ASSERT=1 cargo test 'portfolio::core::tests::rebalancer_contract_ab::forecastflows_ev_benchmark_reaches_worker_on_committed_cases_when_enabled' -- --exact --nocapture`
+    - this uses a benchmark-only `30s` ForecastFlows compare timeout via the existing test override; production steady-state remains `5s`
+    - the local assertion now checks raw-vs-polished ForecastFlows monotonicity and requires the selected ForecastFlows result to match or beat the current native waterfall benchmark on the committed cases
+    - local/manual only for now; not wired into CI
+  - latency lane:
+    - `cargo test print_shared_op_snapshot_forecastflows_latency_rows_jsonl -- --ignored --nocapture`
+    - rows now include worker roundtrip, derived driver overhead, per-branch solver time, sysimage status, Julia thread config, fallback reason, and replay-drop reason
+    - when you want production-like latency numbers locally, run it with a built sysimage and an explicit `FORECASTFLOWS_JULIA_THREADS` setting
+  - tuning lane:
+    - `cargo test print_shared_op_snapshot_forecastflows_tuning_rows_jsonl -- --ignored --nocapture`
+    - compares `baseline` and `low_latency` ForecastFlows solve options on the committed EV cases without changing production defaults
 - deterministic stress coverage:
   - `cargo test shared_snapshot_metadata_classifies_committed_fixtures -- --nocapture --test-threads=1`
   - `cargo test offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_committed_cases -- --nocapture --test-threads=1`
@@ -39,7 +61,6 @@ It answers, in one place:
   - `cargo test tick_scope_cases_remain_finite_and_are_marked_noncanonical -- --nocapture --test-threads=1`
   - `cargo test --release offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_shared_single_tick_stress_cases -- --ignored --nocapture --test-threads=1`
   - `cargo test --release shared_single_tick_stress_cases_do_not_require_staged_reference -- --ignored --nocapture --test-threads=1`
-  - nightly workflow: `.github/workflows/nightly-single-tick-release-validation.yml`
 - release speed checks:
   - `cargo test --release portfolio::core::tests::execution::test_rebalance_perf_full_l1 -- --ignored --exact --nocapture`
   - `cargo test --release portfolio::core::tests::execution::test_rebalance_perf_full_l1_with_gas_pricing -- --ignored --exact --nocapture`
@@ -78,6 +99,20 @@ Availability notes:
 - `n/a` means the metric is not available or not measured in a trustworthy way for that row
 - literal `0` means the selected plan genuinely no-ops or the measured value is exactly zero under the shared-snapshot model
 - explicit `crossing_light` / `crossing_heavy` synthetic cases are validation-only scope tests today; they are not part of the release-facing “matches/beats on-chain” claim until multi-tick-aware economics are modeled end-to-end
+
+## Deferred Pending ForecastFlows Upstream
+
+The following are intentionally documented but deferred on the `deep_trading` side while upstream ForecastFlows feedback is pending:
+
+- richer branch-level worker diagnostics than the current status and `solver_time_sec`
+- a documented executable rounding contract for trade outputs
+- multi-session or batching protocol work beyond the current cached NDJSON worker reuse
+
+These are tracked in `docs/archive/implementation/2026-03-13-forecastflows-maintainer-notes.md`. We are not planning local protocol forks or speculative compatibility layers for them in this repo.
+
+One explicit non-goal: we are not moving the `deep_trading` execution-cost model into ForecastFlows.jl. The current split is to keep ForecastFlows as the gross-EV route generator and do net-EV replay / step-pruning locally.
+
+That architecture decision is documented in `docs/archive/implementation/2026-03-14-forecastflows-net-ev-boundary.md`. In particular: the current upstream `PredictionMarketFixedGasModel` is treated as a coarse activation-penalty model, not as the exact economic oracle for this repo.
 
 ## Solver Flavors
 
@@ -172,6 +207,75 @@ These rows price both off-chain and on-chain under the same benchmark OP snapsho
 | `heterogeneous_ninety_eight_outcome_l1_like_case` | `offchain_default` | `150.380245589644673024` | `$0.015059843882464171` | `150.3651857457622` | `94` | `1` | replay packed program estimate |
 | `heterogeneous_ninety_eight_outcome_l1_like_case` | `onchain_exact` | `150.258288614947875485` | `$0.013109266442788025` | `150.24517934850508` | `n/a` | `1` | modeled L1 + Foundry gas |
 | `heterogeneous_ninety_eight_outcome_l1_like_case` | `onchain_mixed` | `150.380322266504052605` | `$0.0678848029642546` | `150.3124374635398` | `n/a` | `1` | modeled L1 + Foundry gas |
+
+## ForecastFlows Shared-Snapshot Comparison
+
+These rows use the explicit ForecastFlows benchmark lane under the same shared benchmark OP
+pricing snapshot as the matrix above. They are the current per-case apples-to-apples comparison
+between:
+
+- explicit `RebalanceSolver::ForecastFlows`
+- the native `offchain_default` selected plan
+- the best on-chain reference (`max(onchain_exact, onchain_mixed)`)
+
+The checked-in ForecastFlows rows below were refreshed successfully on 2026-03-14 with:
+
+- `FORECASTFLOWS_SYSIMAGE=/Users/shotaro/proj/deep_trading/julia/forecastflows/forecastflows_sysimage.dylib cargo test 'portfolio::core::tests::rebalancer_contract_ab::print_shared_op_snapshot_forecastflows_selected_rows_jsonl' -- --ignored --exact --nocapture --test-threads=1`
+- `cargo test 'portfolio::core::tests::rebalancer_contract_ab::print_shared_op_snapshot_onchain_benchmark_rows_jsonl' -- --ignored --exact --nocapture --test-threads=1`
+
+The benchmark helper still uses the `baseline` ForecastFlows tuning so these rows remain comparable
+to prior benchmark captures. Production and `forecastflows_doctor` use the faster `low_latency`
+profile, documented separately below.
+
+The native `offchain_default` numbers are the shared-snapshot selected-plan rows in the matrix
+above. The local correctness lane also asserts that ForecastFlows matches or beats the native
+waterfall benchmark on all committed cases.
+
+| Case | ForecastFlows net EV | Native waterfall net EV | Best on-chain net EV | ForecastFlows delta vs native | Winner |
+|---|---:|---:|---:|---:|---|
+| `two_pool_single_tick_direct_only` | `100.10232463534447` | `100.10232463180911` | `100.10192764495564` | `+0.00000000353536` | ForecastFlows |
+| `ninety_eight_outcome_multitick_direct_only` | `98.11421045476544` | `98.10611206056846` | `98.10152337602982` | `+0.00809839419698` | ForecastFlows |
+| `small_bundle_mixed_case` | `100.1477632188038` | `100.14776321384267` | `100.14555893120693` | `+0.00000000496113` | ForecastFlows |
+| `legacy_holdings_direct_only_case` | `38.86288988543227` | `38.862889881900635` | `38.86228486234237` | `+0.00000000353164` | ForecastFlows |
+| `mixed_route_favorable_synthetic_case` | `100.10782500738713` | `100.10782498550209` | `100.10513429158343` | `+0.00000002188504` | ForecastFlows |
+| `heterogeneous_ninety_eight_outcome_l1_like_case` | `150.3654203240274` | `150.3651857457622` | `150.3124374635398` | `+0.00023457826520` | ForecastFlows |
+
+## ForecastFlows Latency Matrix
+
+This is the current local latency telemetry for the explicit ForecastFlows benchmark lane. These
+numbers are diagnostic, not release gates, but they are the benchmark-facing view of where time is
+spent today.
+
+Environment notes for the rows below:
+
+- `sysimage_status = active`
+- `forecastflows_solve_tuning = baseline`
+- `forecastflows_julia_threads = auto`
+
+| Case | Winning variant | Runtime ms | Worker roundtrip ms | Driver overhead ms | Direct solver ms | Mixed solver ms | Actions | Tx chunks |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `two_pool_single_tick_direct_only` | `direct` | `393` | `390` | `1` | `0` | `389` | `2` | `1` |
+| `ninety_eight_outcome_multitick_direct_only` | `mixed` | `2580` | `1541` | `5` | `0` | `1536` | `99` | `1` |
+| `small_bundle_mixed_case` | `mixed` | `478` | `474` | `1` | `0` | `473` | `5` | `1` |
+| `legacy_holdings_direct_only_case` | `direct` | `468` | `464` | `2` | `0` | `462` | `2` | `1` |
+| `mixed_route_favorable_synthetic_case` | `mixed` | `543` | `540` | `1` | `0` | `539` | `5` | `1` |
+| `heterogeneous_ninety_eight_outcome_l1_like_case` | `mixed` | `7567` | `4644` | `7` | `2` | `4635` | `92` | `1` |
+
+## ForecastFlows Tuning Snapshot
+
+The dedicated tuning helper now confirms the reason for the live-profile split:
+
+- `baseline` remains the benchmark default because it preserves the historical benchmark lane.
+- `low_latency` is now the production and doctor profile because it materially cuts warm solve time without changing the selected plan on the committed rows we sampled.
+
+Representative local 2026-03-14 results with an active sysimage:
+
+| Case | Baseline runtime ms | Low-latency runtime ms | Selected plan changed? |
+|---|---:|---:|---|
+| `two_pool_single_tick_direct_only` | `397` | `119` | No |
+| `small_bundle_mixed_case` | `466` | `168` | No |
+| `ninety_eight_outcome_multitick_direct_only` | `2762` | `1510` | No |
+| `heterogeneous_ninety_eight_outcome_l1_like_case` | `8659` | `4020` | No |
 
 ## Release Speed Matrix
 
