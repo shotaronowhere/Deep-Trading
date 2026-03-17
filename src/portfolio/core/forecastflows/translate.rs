@@ -847,14 +847,19 @@ fn affordable_buy_amount(sim: &super::super::sim::PoolSim, desired: f64, cash: f
     lo
 }
 
-fn merge_round_buy_cost(
+/// Simulates a merge round's sequential buys using the same FP operations
+/// as replay_buy. Returns true iff all buys are affordable with the given cash.
+/// This ensures algorithmic symmetry: the binary search predicate and the
+/// execution path agree at every floating-point bit.
+fn simulate_merge_round_affordable(
     sims: &[super::super::sim::PoolSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &BalanceMap,
     ordered_route: &[OrderedTradeRoute],
     amount: f64,
-) -> Result<f64, ForecastFlowsTranslationError> {
-    let mut total = 0.0;
+    cash: f64,
+) -> Result<bool, ForecastFlowsTranslationError> {
+    let mut simulated_cash = cash;
     for route in ordered_route {
         let holding = sim_balances
             .get(route.market_name)
@@ -872,14 +877,19 @@ fn merge_round_buy_cost(
             ))
         })?;
         let Some((bought, cost, _)) = sims[idx].buy_exact(shortfall) else {
-            return Ok(f64::INFINITY);
+            return Ok(false);
         };
-        if bought + EPS < shortfall {
-            return Ok(f64::INFINITY);
+        if bought + EPS < shortfall || !cost.is_finite() {
+            return Ok(false);
         }
-        total += cost;
+        // Identical to replay_buy's cash check: *cash + EPS < cost
+        if simulated_cash + EPS < cost {
+            return Ok(false);
+        }
+        // Identical to replay_buy's cash update: *cash -= cost
+        simulated_cash -= cost;
     }
-    Ok(total)
+    Ok(true)
 }
 
 fn affordable_merge_round(
@@ -911,19 +921,31 @@ fn affordable_merge_round(
         return Ok(0.0);
     }
 
-    if merge_round_buy_cost(sims, sim_idx_by_market, sim_balances, ordered_route, upper)?
-        <= cash + EPS
-    {
+    // Fast path: check if the full amount is affordable using sequential simulation
+    if simulate_merge_round_affordable(
+        sims,
+        sim_idx_by_market,
+        sim_balances,
+        ordered_route,
+        upper,
+        cash,
+    )? {
         return Ok(upper);
     }
 
+    // Binary search using the same sequential FP operations as replay_buy
     let mut lo = 0.0;
     let mut hi = upper;
     for _ in 0..64 {
         let mid = (lo + hi) / 2.0;
-        if merge_round_buy_cost(sims, sim_idx_by_market, sim_balances, ordered_route, mid)?
-            <= cash + EPS
-        {
+        if simulate_merge_round_affordable(
+            sims,
+            sim_idx_by_market,
+            sim_balances,
+            ordered_route,
+            mid,
+            cash,
+        )? {
             lo = mid;
         } else {
             hi = mid;
