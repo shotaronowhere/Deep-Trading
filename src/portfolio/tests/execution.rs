@@ -2164,3 +2164,90 @@ fn test_rebalance_regression_full_l1_augmented_multitick_liquidity_changes_exact
         ev_delta
     );
 }
+
+/// Validates that `execute_bundle_step` records live AMM costs in Actions,
+/// not stale pre-planned costs, when pool prices have moved since planning.
+#[test]
+fn test_execute_bundle_step_records_live_cost_not_stale_planned_cost() {
+    use super::super::bundle::{BundleRouteKind, BundleSegmentPlan, BundleStepPlan};
+    use super::super::trading::ExecutionState;
+
+    // 1. Build sims at initial prices
+    let mut sims = build_three_sims_with_preds([0.05, 0.08, 0.12], [0.15, 0.25, 0.35]);
+
+    // 2. Compute planned costs at initial prices
+    let idx = 0;
+    let target_price = 0.10; // buy to push price from 0.05 → 0.10
+    let (planned_cost, planned_amount, planned_new_price) =
+        sims[idx].cost_to_price(target_price).unwrap();
+    assert!(planned_amount > 1e-6, "should have non-trivial buy amount");
+    assert!(planned_cost > 1e-6, "should have non-trivial cost");
+
+    // 3. Shift pool price to simulate polish loop interference.
+    //    Buy a small amount to move the price up, making subsequent buys more expensive.
+    let (_, shift_cost, shift_price) = sims[idx].buy_exact(planned_amount * 0.3).unwrap();
+    assert!(shift_cost > 0.0);
+    sims[idx].set_price(shift_price);
+    let price_after_shift = sims[idx].price();
+    assert!(
+        price_after_shift > 0.05 + 1e-6,
+        "price should have moved up from shift"
+    );
+
+    // 4. Create a bundle step plan with the STALE planned cost (from pre-shift state)
+    let stale_plan = BundleStepPlan {
+        segments: vec![BundleSegmentPlan {
+            kind: BundleRouteKind::Direct,
+            target_prof: 0.5,
+            cash_cost: planned_cost,
+            mint_amount: 0.0,
+            direct_member_plans: vec![(idx, planned_amount, planned_cost, planned_new_price)],
+            mint_sell_leg_plans: vec![],
+        }],
+        final_prof: 0.5,
+    };
+
+    // 5. Compute what live cost SHOULD be (at current shifted price)
+    let (_, live_cost_expected, _) = sims[idx].buy_exact(planned_amount).unwrap();
+    assert!(
+        (live_cost_expected - planned_cost).abs() > 0.001,
+        "live cost should differ meaningfully from planned cost: live={}, planned={}",
+        live_cost_expected,
+        planned_cost
+    );
+
+    // 6. Execute the bundle step
+    let mut budget = 1000.0;
+    let mut actions = Vec::new();
+    let mut sim_balances = HashMap::new();
+    let mut exec = ExecutionState::new(&mut sims, &mut budget, &mut actions, &mut sim_balances);
+    let executed = exec.execute_bundle_step(&stale_plan, &[idx]);
+    assert!(executed, "step should execute");
+    assert_eq!(actions.len(), 1, "should produce one Buy action");
+
+    // 7. Verify: Action::Buy.cost should be the LIVE cost, not the stale planned cost
+    match &actions[0] {
+        Action::Buy { cost, amount, .. } => {
+            let diff_from_live = (*cost - live_cost_expected).abs();
+            let diff_from_planned = (*cost - planned_cost).abs();
+            assert!(
+                diff_from_live < 1e-6,
+                "Action cost should match live cost: action={:.6}, live={:.6}, planned={:.6}",
+                cost,
+                live_cost_expected,
+                planned_cost
+            );
+            assert!(
+                diff_from_planned > 0.001,
+                "Action cost should differ from stale planned cost: action={:.6}, planned={:.6}",
+                cost,
+                planned_cost
+            );
+            assert!(
+                (*amount - planned_amount).abs() < 1e-12,
+                "amount should match planned amount"
+            );
+        }
+        other => panic!("expected Action::Buy, got {:?}", other),
+    }
+}
