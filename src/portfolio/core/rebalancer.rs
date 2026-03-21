@@ -4828,6 +4828,10 @@ fn baseline_step_prune_candidate_for_program_net_ev(
             else {
                 continue;
             };
+            // Reject pruned plans that spend more cash than available.
+            if candidate_terminal_state.cash < -EPS {
+                continue;
+            }
             let candidate_raw_ev =
                 state_snapshot_expected_value(&candidate_terminal_state, predictions);
             let candidate = build_plan_result(
@@ -5383,7 +5387,8 @@ fn run_no_arb_rebalance_plan_from_state(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
 ) -> Option<PlanResult> {
-    let allow_common_shift = force_mint_available.unwrap_or(true);
+    let allow_common_shift = force_mint_available
+        .unwrap_or(state.slot0_results.len() >= expected_outcome_count);
     let mut ctx = build_rebalance_context_with_options(
         &state.holdings,
         state.cash,
@@ -6081,7 +6086,9 @@ fn enumerate_exact_no_arb_candidates_with_options(
         candidates.sort_by(plan_result_cmp);
     }
 
-    if force_mint_available.unwrap_or(true) {
+    let auto_mint_available =
+        force_mint_available.unwrap_or(state.slot0_results.len() >= expected_outcome_count);
+    if auto_mint_available {
         if let Some(analytic_mixed) = compile_best_frontier_candidate_for_program_net_ev(
             state,
             predictions,

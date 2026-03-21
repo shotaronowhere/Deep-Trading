@@ -4167,7 +4167,7 @@ fn test_waterfall_hard_caps_converges() {
         second_actions.is_empty(),
         "after cap convergence, subsequent pass should not trade"
     );
-    assert!(second_prof <= 1e-9);
+    assert!(second_prof <= 1e-9, "second_prof={}", second_prof);
 }
 
 #[test]
