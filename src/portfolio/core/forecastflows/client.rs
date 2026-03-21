@@ -30,6 +30,7 @@ const CIRCUIT_BREAKER_MAX_BACKOFF_SECS: u64 = 300;
 const LEGACY_WORKER_EXECUTION_MODEL: &str =
     "stateless NDJSON; one request at a time per worker process";
 const CACHED_WORKER_EXECUTION_MODEL: &str = "cached NDJSON; one request at a time per worker process; compatible compare requests reuse a workspace";
+const SERVE_PROTOCOL_EXECUTION_MODEL: &str = "NDJSON; one request at a time per worker process; serve_protocol reuses compatible compare workspaces; handle_protocol_json is stateless";
 const REPRESENTATIVE_REPORT_SOURCE: &str =
     "embedded:test/fixtures/rebalancer_ab_live_l1_snapshot_report.json";
 const REPRESENTATIVE_REPORT_JSON: &str = include_str!(concat!(
@@ -181,7 +182,7 @@ impl ForecastFlowsRequestProfile {
 fn worker_execution_model_supported(execution_model: &str) -> bool {
     matches!(
         execution_model,
-        LEGACY_WORKER_EXECUTION_MODEL | CACHED_WORKER_EXECUTION_MODEL
+        LEGACY_WORKER_EXECUTION_MODEL | CACHED_WORKER_EXECUTION_MODEL | SERVE_PROTOCOL_EXECUTION_MODEL
     )
 }
 

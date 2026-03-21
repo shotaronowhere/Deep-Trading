@@ -38,8 +38,8 @@ use super::super::rebalancer::{
     rebalance_with_custom_predictions_selected_plan_for_test,
     rebalance_with_custom_predictions_selected_plan_with_pricing_for_test,
     rebalance_with_custom_predictions_staged_reference_for_test,
-    selected_plan_run_with_solver_for_test, staged_reference_choice_for_test,
-    staged_teacher_snapshot_for_test,
+    selected_plan_run_with_solver_and_pricing_for_test, selected_plan_run_with_solver_for_test,
+    staged_reference_choice_for_test, staged_teacher_snapshot_for_test,
 };
 use super::fixtures::mock_slot0_market_with_orientation_liquidity_and_ticks;
 use super::replay_actions_to_state;
@@ -294,6 +294,57 @@ struct StressCaseDefinition {
     built: BuiltCase,
     force_mint_available: bool,
     metadata: CaseRowMetadata,
+}
+
+#[derive(Debug, Clone)]
+struct PathologicalForecastFlowsCase {
+    definition: StressCaseDefinition,
+    min_net_ev_gap_susd: f64,
+    min_profitable_count: Option<usize>,
+    require_multiband: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PathologicalForecastFlowsComparisonRow {
+    case_id: String,
+    scenario_family: String,
+    profitable_count: usize,
+    profitable_count_bucket: String,
+    budget_regime: String,
+    tick_regime: String,
+    band_counts: Vec<usize>,
+    native_runtime_millis: u128,
+    native_raw_ev_susd: f64,
+    native_total_fee_susd: f64,
+    native_net_ev_susd: f64,
+    native_action_count: usize,
+    native_tx_count: usize,
+    native_selected_family: String,
+    native_selected_compiler_variant: String,
+    forecastflows_runtime_millis: u128,
+    forecastflows_raw_ev_susd: f64,
+    forecastflows_total_fee_susd: f64,
+    forecastflows_net_ev_susd: f64,
+    forecastflows_action_count: usize,
+    forecastflows_tx_count: usize,
+    forecastflows_selected_family: String,
+    forecastflows_selected_compiler_variant: String,
+    raw_ev_gap_susd: f64,
+    net_ev_gap_susd: f64,
+    forecastflows_requests: usize,
+    forecastflows_worker_available: bool,
+    forecastflows_worker_roundtrip_ms: Option<u128>,
+    forecastflows_driver_overhead_ms: Option<u128>,
+    forecastflows_fallback_reason: Option<String>,
+    forecastflows_direct_status: Option<String>,
+    forecastflows_mixed_status: Option<String>,
+    forecastflows_direct_solver_time_ms: Option<u128>,
+    forecastflows_mixed_solver_time_ms: Option<u128>,
+    forecastflows_replay_drop_reason: Option<String>,
+    forecastflows_sysimage_status: Option<String>,
+    forecastflows_julia_threads: Option<String>,
+    forecastflows_solve_tuning: Option<String>,
+    forecastflows_winning_variant: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1204,6 +1255,286 @@ fn forecastflows_multiband_mixed_case() -> BuiltCase {
         ],
         2.0,
     )
+}
+
+fn forecastflows_large_nonprefix_active_set_case() -> PathologicalForecastFlowsCase {
+    const TRAP_COUNT: usize = 3;
+    const CHEAP_COUNT: usize = 14;
+    const OUTCOME_COUNT: usize = TRAP_COUNT + CHEAP_COUNT + 1;
+    const SINGLE_TICK_RANGE: [i32; 2] = [1, 92_108];
+    const TRAP_LIQUIDITY: u128 = 8_000_000_000_000_000_000_000u128;
+    const CHEAP_LIQUIDITY_BASE: u128 = 90_000_000_000_000_000_000u128;
+    const INACTIVE_LIQUIDITY_BASE: u128 = 2_200_000_000_000_000_000_000u128;
+    let weights: [u64; OUTCOME_COUNT] = [
+        180, 165, 150, 120, 118, 116, 114, 112, 110, 108, 106, 104, 102, 100, 98, 96, 94, 60,
+    ];
+    let predictions_wad = normalize_weights_to_wad(&weights);
+    let mut starting_prices_wad = Vec::with_capacity(OUTCOME_COUNT);
+    let mut liquidity = Vec::with_capacity(OUTCOME_COUNT);
+    let mut ticks = Vec::with_capacity(OUTCOME_COUNT);
+
+    for (idx, pred) in predictions_wad.iter().copied().enumerate() {
+        let (factor_bps, liq) = if idx < TRAP_COUNT {
+            (
+                3_150u128 + u128::from((idx * 140) as u64),
+                TRAP_LIQUIDITY + (idx as u128) * 850_000_000_000_000_000_000u128,
+            )
+        } else if idx < TRAP_COUNT + CHEAP_COUNT {
+            (
+                6_900u128 + u128::from(((idx - TRAP_COUNT) % 6 * 105) as u64),
+                CHEAP_LIQUIDITY_BASE + (idx as u128) * 7_000_000_000_000_000_000u128,
+            )
+        } else {
+            (
+                14_500u128,
+                INACTIVE_LIQUIDITY_BASE + (idx as u128) * 120_000_000_000_000_000_000u128,
+            )
+        };
+        starting_prices_wad.push(pred.saturating_mul(factor_bps) / 10_000);
+        liquidity.push(liq);
+        ticks.push(SINGLE_TICK_RANGE.to_vec());
+    }
+
+    let built = build_explicit_case_from_spec(&ExplicitCaseSpec {
+        case_id: "forecastflows_large_nonprefix_active_set_case".to_string(),
+        predictions_wad,
+        is_token1: vec![true; OUTCOME_COUNT],
+        starting_prices_wad,
+        initial_holdings_wad: vec![0; OUTCOME_COUNT],
+        liquidity,
+        ticks,
+        initial_cash_budget_wad: f64_to_wad(6.5),
+    });
+    let definition = stress_case(
+        "forecastflows_large_nonprefix_active_set_case".to_string(),
+        built,
+        "synthetic_pathological",
+        "full",
+        "single_tick",
+    );
+    PathologicalForecastFlowsCase {
+        definition,
+        min_net_ev_gap_susd: 0.001,
+        min_profitable_count: Some(17),
+        require_multiband: false,
+    }
+}
+
+fn forecastflows_multiband_mixed_chronology_case() -> PathologicalForecastFlowsCase {
+    const THIN_TO_DEEP_BUY_LADDER: &[(i32, i128)] = &[
+        (1, 800_000_000_000_000_000_000i128),
+        (18_000, 250_000_000_000_000_000_000i128),
+        (30_000, 1_200_000_000_000_000_000_000i128),
+        (46_000, -1_200_000_000_000_000_000_000i128),
+        (68_000, -250_000_000_000_000_000_000i128),
+        (92_108, -800_000_000_000_000_000_000i128),
+    ];
+    const RICH_SELL_LADDER: &[(i32, i128)] = &[
+        (1, 1_600_000_000_000_000_000_000i128),
+        (24_000, 700_000_000_000_000_000_000i128),
+        (56_000, -700_000_000_000_000_000_000i128),
+        (92_108, -1_600_000_000_000_000_000_000i128),
+    ];
+    let built = build_ladder_case(
+        "forecastflows_multiband_mixed_chronology_case",
+        &[
+            LadderCaseMarketSpec {
+                outcome_index: 0,
+                price: 0.06,
+                prediction: 0.27,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 2_250_000_000_000_000_000_000u128,
+                tick_ladder: THIN_TO_DEEP_BUY_LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 1,
+                price: 0.08,
+                prediction: 0.21,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 2_050_000_000_000_000_000_000u128,
+                tick_ladder: THIN_TO_DEEP_BUY_LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 2,
+                price: 0.24,
+                prediction: 0.17,
+                holding: 7.5,
+                is_token1_outcome: true,
+                pool_liquidity: 2_900_000_000_000_000_000_000u128,
+                tick_ladder: RICH_SELL_LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 3,
+                price: 0.20,
+                prediction: 0.14,
+                holding: 5.5,
+                is_token1_outcome: true,
+                pool_liquidity: 2_700_000_000_000_000_000_000u128,
+                tick_ladder: RICH_SELL_LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 4,
+                price: 0.23,
+                prediction: 0.12,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 3_100_000_000_000_000_000_000u128,
+                tick_ladder: RICH_SELL_LADDER,
+            },
+            LadderCaseMarketSpec {
+                outcome_index: 5,
+                price: 0.19,
+                prediction: 0.09,
+                holding: 0.0,
+                is_token1_outcome: true,
+                pool_liquidity: 2_650_000_000_000_000_000_000u128,
+                tick_ladder: RICH_SELL_LADDER,
+            },
+        ],
+        6.0,
+    );
+    let definition = stress_case(
+        "forecastflows_multiband_mixed_chronology_case".to_string(),
+        built,
+        "synthetic_pathological",
+        "medium",
+        "crossing_heavy",
+    );
+    PathologicalForecastFlowsCase {
+        definition,
+        min_net_ev_gap_susd: 0.0005,
+        min_profitable_count: None,
+        require_multiband: true,
+    }
+}
+
+fn pathological_forecastflows_stress_cases() -> Vec<PathologicalForecastFlowsCase> {
+    let cases = vec![
+        forecastflows_large_nonprefix_active_set_case(),
+        forecastflows_multiband_mixed_chronology_case(),
+    ];
+    let filter = std::env::var("FORECASTFLOWS_PATHOLOGICAL_CASE")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match filter {
+        Some(filter) => cases
+            .into_iter()
+            .filter(|case| case.definition.case_id == filter)
+            .collect(),
+        None => cases,
+    }
+}
+
+fn compare_pathological_forecastflows_case(
+    case: &PathologicalForecastFlowsCase,
+) -> PathologicalForecastFlowsComparisonRow {
+    let definition = &case.definition;
+    let built = &definition.built;
+    let gas_assumptions = benchmark_gas_assumptions_for_test();
+    let band_counts = build_problem_request_band_counts_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        built.slot0_results.len(),
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "{} should build a ForecastFlows request: {err}",
+            definition.case_id
+        )
+    });
+    let native_started = std::time::Instant::now();
+    let (native_actions, native_summary, _native_stats) =
+        selected_plan_run_with_solver_and_pricing_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            definition.force_mint_available,
+            RebalanceSolver::Native,
+            &gas_assumptions,
+            BENCHMARK_OP_GAS_PRICE_ETH,
+            BENCHMARK_OP_ETH_USD,
+        );
+    let native_runtime_millis = native_started.elapsed().as_millis();
+    let forecastflows_started = std::time::Instant::now();
+    let (forecastflows_actions, forecastflows_summary, forecastflows_stats) =
+        selected_plan_run_with_solver_and_pricing_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            definition.force_mint_available,
+            RebalanceSolver::ForecastFlows,
+            &gas_assumptions,
+            BENCHMARK_OP_GAS_PRICE_ETH,
+            BENCHMARK_OP_ETH_USD,
+        );
+    let forecastflows_runtime_millis = forecastflows_started.elapsed().as_millis();
+    let forecastflows_telemetry = &forecastflows_stats.forecastflows_telemetry;
+    let native_raw_ev_susd = wad_to_f64(benchmark_ev_wei(&native_actions, built));
+    let forecastflows_raw_ev_susd = wad_to_f64(benchmark_ev_wei(&forecastflows_actions, built));
+    let native_total_fee_susd = native_summary
+        .estimated_total_fee_susd
+        .expect("pathological native summary should retain modeled fee coverage");
+    let forecastflows_total_fee_susd = forecastflows_summary
+        .estimated_total_fee_susd
+        .expect("pathological ForecastFlows summary should retain modeled fee coverage");
+    let native_net_ev_susd = native_summary
+        .estimated_net_ev
+        .expect("pathological native summary should expose modeled net EV");
+    let forecastflows_net_ev_susd = forecastflows_summary
+        .estimated_net_ev
+        .expect("pathological ForecastFlows summary should expose modeled net EV");
+
+    PathologicalForecastFlowsComparisonRow {
+        case_id: definition.case_id.clone(),
+        scenario_family: definition.metadata.scenario_family.to_string(),
+        profitable_count: definition.metadata.profitable_count,
+        profitable_count_bucket: definition.metadata.profitable_count_bucket.to_string(),
+        budget_regime: definition.metadata.budget_regime.to_string(),
+        tick_regime: definition.metadata.tick_regime.to_string(),
+        band_counts,
+        native_runtime_millis,
+        native_raw_ev_susd,
+        native_total_fee_susd,
+        native_net_ev_susd,
+        native_action_count: native_actions.len(),
+        native_tx_count: native_summary.estimated_tx_count.unwrap_or(0),
+        native_selected_family: native_summary.family.to_string(),
+        native_selected_compiler_variant: native_summary.compiler_variant.to_string(),
+        forecastflows_runtime_millis,
+        forecastflows_raw_ev_susd,
+        forecastflows_total_fee_susd,
+        forecastflows_net_ev_susd,
+        forecastflows_action_count: forecastflows_actions.len(),
+        forecastflows_tx_count: forecastflows_summary.estimated_tx_count.unwrap_or(0),
+        forecastflows_selected_family: forecastflows_summary.family.to_string(),
+        forecastflows_selected_compiler_variant: forecastflows_summary.compiler_variant.to_string(),
+        raw_ev_gap_susd: forecastflows_raw_ev_susd - native_raw_ev_susd,
+        net_ev_gap_susd: forecastflows_net_ev_susd - native_net_ev_susd,
+        forecastflows_requests: forecastflows_stats.forecastflows_requests,
+        forecastflows_worker_available: forecastflows_stats.forecastflows_worker_available,
+        forecastflows_worker_roundtrip_ms: forecastflows_telemetry.worker_roundtrip_ms,
+        forecastflows_driver_overhead_ms: forecastflows_telemetry.driver_overhead_ms,
+        forecastflows_fallback_reason: forecastflows_stats
+            .forecastflows_fallback_reason
+            .map(str::to_string),
+        forecastflows_direct_status: forecastflows_telemetry.direct_status.clone(),
+        forecastflows_mixed_status: forecastflows_telemetry.mixed_status.clone(),
+        forecastflows_direct_solver_time_ms: forecastflows_telemetry.direct_solver_time_ms,
+        forecastflows_mixed_solver_time_ms: forecastflows_telemetry.mixed_solver_time_ms,
+        forecastflows_replay_drop_reason: forecastflows_telemetry.replay_drop_reason.clone(),
+        forecastflows_sysimage_status: forecastflows_telemetry.sysimage_status.clone(),
+        forecastflows_julia_threads: forecastflows_telemetry.julia_threads.clone(),
+        forecastflows_solve_tuning: forecastflows_telemetry.solve_tuning.clone(),
+        forecastflows_winning_variant: forecastflows_stats
+            .forecastflows_winning_variant
+            .map(|variant| variant.as_str().to_string()),
+    }
 }
 
 fn benchmark_ev_wei(actions: &[super::Action], built: &BuiltCase) -> u128 {
@@ -3710,9 +4041,21 @@ fn forecastflows_polish_prunes_coupled_buy_merge_steps_without_corrupting_route_
     assert_eq!(variants.raw.action_count, 3);
     assert_eq!(variants.raw.direct_buy_count, 2);
     assert_eq!(variants.raw.merge_count, 1);
-    assert_eq!(variants.polished.action_count, 0);
-    assert_eq!(variants.polished.direct_buy_count, 0);
-    assert_eq!(variants.polished.merge_count, 0);
+    // With consistent PoolSim evaluation, the pruner may keep the
+    // buy-merge group if it is genuinely profitable.  The key invariant
+    // is that the group remains intact (not partially pruned).
+    assert!(
+        variants.polished.action_count == 0 || variants.polished.action_count == 3,
+        "polished plan should either drop the whole buy-merge group or keep it intact, got {}",
+        variants.polished.action_count,
+    );
+    if variants.polished.action_count == 3 {
+        assert_eq!(variants.polished.direct_buy_count, 2);
+        assert_eq!(variants.polished.merge_count, 1);
+    } else {
+        assert_eq!(variants.polished.direct_buy_count, 0);
+        assert_eq!(variants.polished.merge_count, 0);
+    }
     assert!(
         variants
             .polished
@@ -4071,6 +4414,87 @@ fn forecastflows_real_multiband_fixture_cases_reach_worker_when_enabled() {
         }
     })
     .expect("ForecastFlows real multi-band fixture coverage should complete against the live worker");
+}
+
+#[test]
+fn forecastflows_pathological_stress_cases_show_material_net_ev_gap_when_enabled() {
+    if std::env::var("FORECASTFLOWS_BENCHMARK_ASSERT")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+
+    with_live_benchmark_worker_for_test(|| {
+        for case in pathological_forecastflows_stress_cases() {
+            let row = compare_pathological_forecastflows_case(&case);
+
+            if let Some(min_profitable_count) = case.min_profitable_count {
+                assert!(
+                    row.profitable_count >= min_profitable_count,
+                    "{} should keep more than the native constant-L profitable-universe cap active: {:?}",
+                    row.case_id,
+                    row
+                );
+            }
+            if case.require_multiband {
+                assert!(
+                    row.band_counts.iter().all(|count| *count > 2),
+                    "{} should build true multi-band ForecastFlows ladders: {:?}",
+                    row.case_id,
+                    row
+                );
+            }
+            assert!(
+                row.forecastflows_requests >= 1,
+                "{} should issue at least one ForecastFlows request: {:?}",
+                row.case_id,
+                row
+            );
+            assert!(
+                row.forecastflows_worker_available,
+                "{} should reach a live ForecastFlows worker: {:?}",
+                row.case_id,
+                row
+            );
+            assert_eq!(
+                row.forecastflows_fallback_reason, None,
+                "{} should stay on actual ForecastFlows output: {:?}",
+                row.case_id,
+                row
+            );
+            assert_eq!(
+                row.forecastflows_selected_family, "forecastflows",
+                "{} should be evaluated from an actual ForecastFlows plan: {:?}",
+                row.case_id,
+                row
+            );
+            assert!(
+                row.net_ev_gap_susd >= case.min_net_ev_gap_susd,
+                "{} should show a material ForecastFlows net-EV edge: min_gap={} actual_row={:?}",
+                row.case_id,
+                case.min_net_ev_gap_susd,
+                row
+            );
+        }
+    })
+    .expect("ForecastFlows pathological stress benchmark should complete against the live worker");
+}
+
+#[test]
+#[ignore = "machine-readable helper; run explicitly with local Julia worker"]
+fn print_forecastflows_pathological_rows_jsonl() {
+    with_live_benchmark_worker_for_test(|| {
+        for case in pathological_forecastflows_stress_cases() {
+            println!(
+                "{}",
+                serde_json::to_string(&compare_pathological_forecastflows_case(&case))
+                    .expect("pathological ForecastFlows row should serialize")
+            );
+        }
+    })
+    .expect("ForecastFlows pathological row printer should complete against the live worker");
 }
 
 #[test]
@@ -5252,6 +5676,56 @@ fn print_heterogeneous_ninety_eight_case_family_breakdown() {
         ultimate.len()
     );
     println!("cyclic ev={} actions={}", cyclic_ev, cyclic_actions);
+}
+
+#[test]
+#[ignore = "debug helper; run explicitly"]
+fn print_large_nonprefix_native_actions() {
+    let case = forecastflows_large_nonprefix_active_set_case();
+    let built = &case.definition.built;
+    let force_mint_available = case.definition.force_mint_available;
+
+    let actions = rebalance_with_custom_predictions_for_test(
+        &built.balances_view,
+        built.cash_budget,
+        &built.slot0_results,
+        &built.predictions,
+        force_mint_available,
+    );
+    let ev_wei = benchmark_ev_wei(&actions, built);
+    let (holdings, cash) = replay_actions_to_state(
+        &actions,
+        &built.slot0_results,
+        &built.balances_view,
+        built.cash_budget,
+    );
+
+    println!("=== Native solver for large_nonprefix_active_set_case ===");
+    println!("EV (Wei): {}", ev_wei);
+    println!("EV (sUSD): {:.10}", wad_to_f64(ev_wei));
+    println!("Cash remaining: {:.10}", cash);
+    println!("Actions ({} total):", actions.len());
+    for (i, action) in actions.iter().enumerate() {
+        match action {
+            super::Action::Buy { market_name, amount, cost } =>
+                println!("  [{:>3}] BUY  {} amount={:.6} cost={:.6}", i, market_name, amount, cost),
+            super::Action::Sell { market_name, amount, proceeds } =>
+                println!("  [{:>3}] SELL {} amount={:.6} proceeds={:.6}", i, market_name, amount, proceeds),
+            super::Action::Mint { amount, .. } =>
+                println!("  [{:>3}] MINT amount={:.6}", i, amount),
+            super::Action::Merge { amount, .. } =>
+                println!("  [{:>3}] MERGE amount={:.6}", i, amount),
+        }
+    }
+    println!("\nFinal holdings:");
+    let mut sorted_holdings: Vec<_> = holdings.iter().collect();
+    sorted_holdings.sort_by_key(|(name, _)| *name);
+    for (name, units) in &sorted_holdings {
+        if **units > 1e-12 {
+            let pred = built.predictions.get(&normalize_market_name(name)).copied().unwrap_or(0.0);
+            println!("  {} = {:.6} (pred={:.6}, ev_contrib={:.6})", name, units, pred, pred * **units);
+        }
+    }
 }
 
 #[test]
