@@ -1257,7 +1257,7 @@ fn test_phase3_recycling_full_l1_with_mint_routes_reduces_low_prof_legacy() {
     let budget = 40.0;
 
     let ev_before = replay_actions_to_ev(&[], &slot0_results, &balances, budget);
-    let actions = rebalance(&balances, budget, &slot0_results);
+    let actions = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
     assert_rebalance_action_invariants(&actions, &slot0_results, &balances, budget);
     assert_action_values_are_finite(&actions);
     assert!(

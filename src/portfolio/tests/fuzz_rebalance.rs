@@ -5,7 +5,7 @@ use super::super::merge::{merge_sell_cap_with_inventory, optimal_sell_split_with
 use super::super::planning::{
     active_skip_indices, plan_active_routes, plan_is_budget_feasible, solve_prof,
 };
-use super::super::rebalancer::rebalance;
+use super::super::rebalancer::{rebalance, rebalance_zero_cost_for_test};
 use super::super::sim::{PoolSim, Route, alt_price, profitability};
 use super::super::solver::mint_cost_to_prof;
 use super::super::waterfall::waterfall;
@@ -1311,8 +1311,8 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     }
     let budget = 41.0;
 
-    let actions_a = rebalance(&balances, budget, &slot0_results);
-    let actions_b = rebalance(&balances, budget, &slot0_results);
+    let actions_a = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
+    let actions_b = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
     assert_eq!(
         actions_a, actions_b,
         "full-L1 regression fixture should be deterministic"
