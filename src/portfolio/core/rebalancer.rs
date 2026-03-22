@@ -8322,6 +8322,50 @@ fn rebalance_full(
     )
 }
 
+/// Zero-cost rebalance for oracle comparison tests.
+///
+/// Uses disabled route gates and a pricing snapshot where gas costs are
+/// effectively zero, so that plan selection ranks by raw EV and the result
+/// can be compared directly against a brute-force grid oracle.
+#[cfg(test)]
+pub(super) fn rebalance_zero_cost_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+) -> Vec<Action> {
+    let preds = crate::pools::prediction_map();
+    let expected_count = crate::predictions::PREDICTIONS_L1.len();
+    rebalance_full_with_predictions(
+        balances,
+        susds_balance,
+        slot0_results,
+        &preds,
+        expected_count,
+        RouteGateThresholds::disabled(),
+        zero_cost_config_for_test(),
+        RebalanceFlags::default(),
+        None,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn zero_cost_config_for_test() -> PlannerCostConfig {
+    PlannerCostConfig {
+        gas_assumptions: GasAssumptions::default(),
+        pricing: PlannerPricingSnapshot {
+            gas_price_eth: 0.0,
+            eth_usd: 0.0,
+            l1_fee_per_byte_wei: 0.0,
+            source_label: "zero_cost_test",
+        },
+        conservative_execution: ConservativeExecutionConfig {
+            quote_latency_blocks: 0,
+            adverse_move_bps_per_block: 0,
+        },
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TestPhaseOrderVariant {
