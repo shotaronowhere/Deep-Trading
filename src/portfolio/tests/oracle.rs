@@ -4185,7 +4185,7 @@ fn phase1_skips_subgas_liquidation_runtime_thresholds() {
     balances.insert(selected[0].name, 40.0);
     let budget = 0.0;
 
-    let baseline_actions = rebalance(&balances, budget, &slot0_results);
+    let baseline_actions = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
     assert!(
         baseline_actions.iter().any(
             |a| matches!(a, Action::Sell { market_name, .. } if *market_name == selected[0].name)
@@ -4223,7 +4223,7 @@ fn phase3_skips_subgas_recycling_runtime_thresholds() {
     balances.insert(selected[0].name, 30.0);
     let budget = 1.0;
 
-    let baseline_actions = rebalance(&balances, budget, &slot0_results);
+    let baseline_actions = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
     assert!(
         baseline_actions.iter().any(
             |a| matches!(a, Action::Sell { market_name, .. } if *market_name == selected[0].name)

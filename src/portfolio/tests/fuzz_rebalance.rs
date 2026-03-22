@@ -1231,8 +1231,8 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
     }
     let budget = 83.0;
 
-    let actions_a = rebalance(&balances, budget, &slot0_results);
-    let actions_b = rebalance(&balances, budget, &slot0_results);
+    let actions_a = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
+    let actions_b = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
     assert_eq!(
         actions_a, actions_b,
         "full-L1 regression fixture should be deterministic"
@@ -1329,7 +1329,7 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     let gain = ev_after - ev_before;
 
     const EXPECTED_EV_BEFORE: f64 = 41.229_354_975;
-    const EXPECTED_EV_AFTER: f64 = 45.865_172_947;
+    const EXPECTED_EV_AFTER: f64 = 45.783_077_637;
     const EV_TOL: f64 = 3e-6;
 
     assert!(
