@@ -7610,6 +7610,19 @@ fn replay_actions_to_market_state_with_predictions(
     }
 
     for action in actions {
+        // Guard: the planner must never emit Buy/Sell for a market that
+        // was skipped (zero-liquidity).  If this fires, the planner has a
+        // bug — not the replay path.
+        match action {
+            Action::Buy { market_name, .. } | Action::Sell { market_name, .. } => {
+                debug_assert!(
+                    idx_by_market.contains_key(market_name),
+                    "replay: action targets unsimulated market '{}'",
+                    market_name,
+                );
+            }
+            _ => {}
+        }
         match action {
             Action::Buy {
                 market_name,
@@ -8356,7 +8369,10 @@ pub(super) fn rebalance_zero_cost_for_test(
 #[cfg(test)]
 fn zero_cost_config_for_test() -> PlannerCostConfig {
     PlannerCostConfig {
-        gas_assumptions: GasAssumptions::default(),
+        gas_assumptions: GasAssumptions {
+            l1_data_fee_floor_susd: 0.0,
+            ..GasAssumptions::default()
+        },
         pricing: PlannerPricingSnapshot {
             gas_price_eth: 0.0,
             eth_usd: 0.0,
