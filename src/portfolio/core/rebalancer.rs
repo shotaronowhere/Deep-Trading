@@ -7600,7 +7600,11 @@ fn replay_actions_to_market_state_with_predictions(
             .get(&crate::pools::normalize_market_name(market.name))
             .copied()
             .unwrap_or(0.0);
-        let sim = PoolSim::from_slot0(slot0, market, pred)?;
+        let Some(sim) = PoolSim::from_slot0(slot0, market, pred) else {
+            // Zero-liquidity markets cannot be simulated; skip them so the
+            // remaining markets can still be replayed and evaluated.
+            continue;
+        };
         idx_by_market.insert(market.name, sims.len());
         sims.push(sim);
     }
