@@ -511,7 +511,13 @@ fn waterfall_with_execution_gate_and_preserve_with_forced_first_frontier(
             break;
         }
 
-        last_prof = executable_plan.final_prof;
+        // Only update last_prof when the step fully executed to its target
+        // profitability. Budget-capped partial steps don't actually reach
+        // final_prof, so recording it would overstate how far the waterfall
+        // descended and misguide Phase 3 recycling.
+        if executable_plan.fully_affordable {
+            last_prof = executable_plan.final_prof;
+        }
         if using_forced_frontier {
             forced_first_step_executed = true;
         }

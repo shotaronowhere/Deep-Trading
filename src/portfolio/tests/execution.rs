@@ -2205,6 +2205,7 @@ fn test_execute_bundle_step_records_live_cost_not_stale_planned_cost() {
             mint_sell_leg_plans: vec![],
         }],
         final_prof: 0.5,
+        fully_affordable: true,
     };
 
     // 5. Compute what live cost SHOULD be (at current shifted price)

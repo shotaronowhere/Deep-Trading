@@ -45,6 +45,7 @@ pub(super) struct BundleSegmentPlan {
 pub(super) struct BundleStepPlan {
     pub(super) segments: Vec<BundleSegmentPlan>,
     pub(super) final_prof: f64,
+    pub(super) fully_affordable: bool,
 }
 
 pub(super) fn profs_tied(a: f64, b: f64) -> bool {
@@ -192,15 +193,25 @@ pub(super) fn bundle_frontier(
     gas_mint_susd: f64,
     preserve_sell_indices: &HashSet<usize>,
 ) -> Option<BundleFrontier> {
-    direct_bundle_frontier(sims, remaining_budget, gas_direct_susd).or_else(|| {
-        mint_bundle_frontier(
-            sims,
-            mint_available,
-            remaining_budget,
-            gas_mint_susd,
-            preserve_sell_indices,
-        )
-    })
+    let direct = direct_bundle_frontier(sims, remaining_budget, gas_direct_susd);
+    let mint = mint_bundle_frontier(
+        sims,
+        mint_available,
+        remaining_budget,
+        gas_mint_susd,
+        preserve_sell_indices,
+    );
+    match (direct, mint) {
+        (Some(d), Some(m)) => {
+            if m.current_prof > d.current_prof {
+                Some(m)
+            } else {
+                Some(d)
+            }
+        }
+        (Some(d), None) => Some(d),
+        (None, m) => m,
+    }
 }
 
 pub(super) fn direct_bundle_marginal_cost_at_prof(

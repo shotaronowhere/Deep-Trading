@@ -4807,56 +4807,72 @@ fn baseline_step_prune_candidate_for_program_net_ev(
         None,
     );
 
-    loop {
-        let Ok(step_groups) = group_execution_actions_by_profitability_step(&best.actions) else {
-            break;
+    // Single-pass reverse prune: try dropping each step group from lowest
+    // profitability upward. Because reverse iteration monotonically frees
+    // cash, restarting the loop provides near-zero additional compaction
+    // at massive cost. A single pass is sufficient.
+    let Ok(step_groups) = group_execution_actions_by_profitability_step(&best.actions) else {
+        return best;
+    };
+    if step_groups.is_empty() {
+        return best;
+    }
+
+    // Collect indices to exclude as a set for O(1) lookup.
+    let mut excluded: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for step_group in step_groups.iter().rev() {
+        // Tentatively add this group's indices to the excluded set.
+        for &idx in &step_group.action_indices {
+            excluded.insert(idx);
+        }
+        let keep_actions: Vec<Action> = best
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !excluded.contains(i))
+            .map(|(_, a)| a.clone())
+            .collect();
+        let Some(candidate_terminal_state) =
+            apply_actions_to_solver_state(starting_state, &keep_actions, predictions)
+        else {
+            // Can't drop this group — remove from excluded and continue.
+            for &idx in &step_group.action_indices {
+                excluded.remove(&idx);
+            }
+            continue;
         };
-        if step_groups.is_empty() {
-            break;
+        // Reject pruned plans that spend more cash than available.
+        if candidate_terminal_state.cash < -EPS {
+            for &idx in &step_group.action_indices {
+                excluded.remove(&idx);
+            }
+            continue;
         }
-
-        let mut improved = false;
-        for step_group in step_groups.iter().rev() {
-            let mut keep_actions = Vec::with_capacity(best.actions.len());
-            for (action_index, action) in best.actions.iter().enumerate() {
-                if !step_group.action_indices.contains(&action_index) {
-                    keep_actions.push(action.clone());
-                }
+        let candidate_raw_ev =
+            state_snapshot_expected_value(&candidate_terminal_state, predictions);
+        let candidate = build_plan_result(
+            starting_state,
+            candidate_terminal_state,
+            keep_actions,
+            candidate_raw_ev,
+            frontier_family,
+            best.preserve_markets.clone(),
+            family,
+            cost_config,
+            PlanCompilerVariant::BaselineStepPrune,
+            None,
+            None,
+            None,
+        );
+        if plan_result_is_better(&candidate, &best) {
+            best = candidate;
+            // Keep excluded — this group stays dropped for subsequent tries.
+        } else {
+            // Dropping this group didn't help — restore it.
+            for &idx in &step_group.action_indices {
+                excluded.remove(&idx);
             }
-            let Some(candidate_terminal_state) =
-                apply_actions_to_solver_state(starting_state, &keep_actions, predictions)
-            else {
-                continue;
-            };
-            // Reject pruned plans that spend more cash than available.
-            if candidate_terminal_state.cash < -EPS {
-                continue;
-            }
-            let candidate_raw_ev =
-                state_snapshot_expected_value(&candidate_terminal_state, predictions);
-            let candidate = build_plan_result(
-                starting_state,
-                candidate_terminal_state,
-                keep_actions,
-                candidate_raw_ev,
-                frontier_family,
-                best.preserve_markets.clone(),
-                family,
-                cost_config,
-                compiler_variant,
-                None,
-                None,
-                None,
-            );
-            if plan_result_is_better(&candidate, &best) {
-                best = candidate;
-                improved = true;
-                break;
-            }
-        }
-
-        if !improved {
-            break;
         }
     }
 
@@ -5388,7 +5404,7 @@ fn run_no_arb_rebalance_plan_from_state(
     cost_config: PlannerCostConfig,
 ) -> Option<PlanResult> {
     let allow_common_shift = force_mint_available
-        .unwrap_or(state.slot0_results.len() >= expected_outcome_count);
+        .unwrap_or(state.slot0_results.len() == expected_outcome_count);
     let mut ctx = build_rebalance_context_with_options(
         &state.holdings,
         state.cash,
@@ -6087,7 +6103,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
     }
 
     let auto_mint_available =
-        force_mint_available.unwrap_or(state.slot0_results.len() >= expected_outcome_count);
+        force_mint_available.unwrap_or(state.slot0_results.len() == expected_outcome_count);
     if auto_mint_available {
         if let Some(analytic_mixed) = compile_best_frontier_candidate_for_program_net_ev(
             state,

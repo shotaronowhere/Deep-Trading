@@ -322,7 +322,7 @@ pub(super) fn plan_bundle_step_with_scratch(
     if let Some(mint_cost) = mint_start
         && mint_cost + EPS < direct_start.unwrap_or(f64::INFINITY)
     {
-        let (segment, _) = build_mint_segment(
+        let (segment, mint_fully_affordable) = build_mint_segment(
             sims,
             &frontier.members,
             frontier.current_prof,
@@ -332,12 +332,13 @@ pub(super) fn plan_bundle_step_with_scratch(
         return Some(BundleStepPlan {
             segments: vec![segment],
             final_prof: frontier.current_prof,
+            fully_affordable: mint_fully_affordable,
         });
     }
 
     if !direct_feasible_at_frontier {
         if mint_available {
-            let (segment, _) = build_mint_segment(
+            let (segment, mint_fully_affordable) = build_mint_segment(
                 sims,
                 &frontier.members,
                 frontier.current_prof,
@@ -347,6 +348,7 @@ pub(super) fn plan_bundle_step_with_scratch(
             return Some(BundleStepPlan {
                 segments: vec![segment],
                 final_prof: frontier.current_prof,
+                fully_affordable: mint_fully_affordable,
             });
         }
         return None;
@@ -367,6 +369,7 @@ pub(super) fn plan_bundle_step_with_scratch(
     )?;
 
     let mut segments = vec![direct_segment];
+    let mut step_fully_affordable = direct_fully_affordable;
     let mut remaining_budget = budget.map(|value| value - segments[0].cash_cost);
     if let Some(value) = remaining_budget.as_mut() {
         *value = (*value).max(0.0);
@@ -383,7 +386,7 @@ pub(super) fn plan_bundle_step_with_scratch(
             sim_state[idx].set_price(new_price);
         }
 
-        if let Some((mint_segment, _)) = build_mint_segment(
+        if let Some((mint_segment, mint_fully_affordable)) = build_mint_segment(
             sim_state,
             &frontier.members,
             direct_final_prof,
@@ -391,6 +394,9 @@ pub(super) fn plan_bundle_step_with_scratch(
             preserve_sell_indices,
         ) {
             if mint_segment.cash_cost > DUST {
+                if !mint_fully_affordable {
+                    step_fully_affordable = false;
+                }
                 segments.push(mint_segment);
             }
         }
@@ -399,6 +405,7 @@ pub(super) fn plan_bundle_step_with_scratch(
     Some(BundleStepPlan {
         segments,
         final_prof: direct_final_prof,
+        fully_affordable: step_fully_affordable,
     })
 }
 
