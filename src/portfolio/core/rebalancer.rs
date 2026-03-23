@@ -5390,6 +5390,96 @@ fn compose_rebalance_step(
     plan
 }
 
+/// Cheap seed solve: phase 1 (sell overpriced) + phase 2 (single waterfall pass) only.
+/// Skips phase 3/4/5 recycling/polish and all compaction (constant-L, target-delta, staged).
+/// Used for ranking candidates before full-solving the top K.
+fn seed_no_arb_plan_from_state(
+    state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    expected_outcome_count: usize,
+    route_gates: RouteGateThresholds,
+    preserve_markets: &[&'static str],
+    frontier_family: Option<BundleRouteKind>,
+    force_mint_available: Option<bool>,
+    family: SolverFamily,
+    cost_config: PlannerCostConfig,
+) -> Option<PlanResult> {
+    let mut ctx = build_rebalance_context_with_options(
+        &state.holdings,
+        state.cash,
+        &state.slot0_results,
+        predictions,
+        expected_outcome_count,
+        route_gates,
+        force_mint_available,
+    )
+    .ok()?;
+    ctx.mint_sell_preserve_markets = preserve_markets.iter().copied().collect();
+
+    // Phase 1 only: sell overpriced
+    ctx.run_phase1_sell_overpriced();
+
+    // Phase 2 only: single waterfall pass (no phase 3/4/5)
+    let mut wf_stats = WaterfallGateStats::default();
+    if let Some(frontier_family) = frontier_family {
+        waterfall_with_execution_gate_and_forced_first_frontier_and_preserve(
+            &mut ctx.sims,
+            &mut ctx.budget,
+            &mut ctx.actions,
+            ctx.mint_available,
+            ctx.route_gates.direct_buy,
+            ctx.route_gates.mint_sell,
+            ctx.route_gates.buffer_frac,
+            ctx.route_gates.buffer_min_susd,
+            Some(&ctx.mint_sell_preserve_markets),
+            frontier_family,
+            Some(&mut wf_stats),
+        );
+    } else {
+        waterfall_with_execution_gate_and_preserve(
+            &mut ctx.sims,
+            &mut ctx.budget,
+            &mut ctx.actions,
+            ctx.mint_available,
+            ctx.route_gates.direct_buy,
+            ctx.route_gates.mint_sell,
+            ctx.route_gates.buffer_frac,
+            ctx.route_gates.buffer_min_susd,
+            Some(&ctx.mint_sell_preserve_markets),
+            Some(&mut wf_stats),
+        );
+    }
+
+    let (terminal_state, raw_ev) = if ctx.actions.is_empty() {
+        // No phase 1/2 actions, but phase 3+ in the full solver might still produce value
+        // (e.g. legacy negative-alpha recycling). Keep as a zero-delta candidate so it
+        // can still make the shortlist and get full-solved.
+        let raw_ev = state_snapshot_expected_value(state, predictions);
+        (state.clone(), raw_ev)
+    } else {
+        let terminal = match apply_actions_to_solver_state(state, &ctx.actions, predictions) {
+            Some(t) => t,
+            None => return None,
+        };
+        let raw_ev = state_snapshot_expected_value(&terminal, predictions);
+        (terminal, raw_ev)
+    };
+    Some(build_plan_result(
+        state,
+        terminal_state,
+        ctx.actions,
+        raw_ev,
+        frontier_family,
+        sorted_preserve_markets(preserve_markets),
+        family,
+        cost_config,
+        PlanCompilerVariant::BaselineStepPrune,
+        None,
+        None,
+        None,
+    ))
+}
+
 fn run_no_arb_rebalance_plan_from_state(
     state: &SolverStateSnapshot,
     predictions: &HashMap<String, f64>,
@@ -5879,6 +5969,14 @@ fn enumerate_preserve_subsets(preserve_universe: &[&'static str]) -> Vec<Vec<&'s
     subsets
 }
 
+/// Maximum number of seed candidates to full-solve after cheap ranking.
+const SEED_SHORTLIST_MIN_K: usize = 3;
+
+/// Adaptive shortlist size: at least 3, up to 25% of candidates, capped at 8.
+fn seed_shortlist_k(candidate_count: usize) -> usize {
+    SEED_SHORTLIST_MIN_K.max(candidate_count / 4).min(8)
+}
+
 fn enumerate_exact_no_arb_candidates_over_preserve_universe(
     mut candidates: Vec<PlanResult>,
     state: &SolverStateSnapshot,
@@ -5910,8 +6008,38 @@ fn enumerate_exact_no_arb_candidates_over_preserve_universe(
                 .map(move |subset| (frontier_family, subset))
         })
         .collect();
-    stats.exact_rebalance_candidate_evals += tasks.len();
-    let mut extra_candidates: Vec<PlanResult> = tasks
+    let num_tasks = tasks.len();
+    stats.exact_rebalance_candidate_evals += num_tasks;
+
+    // Phase A: cheap seed solve for all candidates
+    let mut seeds: Vec<(Option<BundleRouteKind>, Vec<&'static str>, PlanResult)> = tasks
+        .into_par_iter()
+        .filter_map(|(frontier_family, preserve_markets)| {
+            let seed = seed_no_arb_plan_from_state(
+                state,
+                predictions,
+                expected_outcome_count,
+                route_gates,
+                &preserve_markets,
+                frontier_family,
+                force_mint_available,
+                family,
+                cost_config,
+            )?;
+            Some((frontier_family, preserve_markets, seed))
+        })
+        .collect();
+
+    // Phase B: rank seeds, full-solve top K only
+    seeds.sort_by(|a, b| plan_result_cmp(&a.2, &b.2));
+    let k = seed_shortlist_k(num_tasks);
+    let shortlist: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> = seeds
+        .into_iter()
+        .take(k)
+        .map(|(ff, pm, _)| (ff, pm))
+        .collect();
+
+    let mut extra_candidates: Vec<PlanResult> = shortlist
         .into_par_iter()
         .filter_map(|(frontier_family, preserve_markets)| {
             run_no_arb_rebalance_plan_from_state(
@@ -6033,7 +6161,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
         let singleton_candidates: Vec<PlanResult> = singleton_tasks
             .into_par_iter()
             .filter_map(|(frontier_family, market_name)| {
-                run_no_arb_rebalance_plan_from_state(
+                seed_no_arb_plan_from_state(
                     state,
                     predictions,
                     expected_outcome_count,
@@ -6041,8 +6169,6 @@ fn enumerate_exact_no_arb_candidates_with_options(
                     &[market_name],
                     frontier_family,
                     force_mint_available,
-                    verify_internal_state,
-                    run_phase0_in_polish,
                     family,
                     cost_config,
                 )
@@ -6077,9 +6203,37 @@ fn enumerate_exact_no_arb_candidates_with_options(
         let features =
             collect_distilled_market_features(state, predictions, &merged_preserve_scores);
         let proposal_tasks = distilled_proposal_tasks(&features);
-        stats.distilled_proposal_sets += proposal_tasks.len();
-        stats.distilled_proposal_candidate_evals += proposal_tasks.len();
-        let mut proposal_candidates: Vec<PlanResult> = proposal_tasks
+        let num_proposal_tasks = proposal_tasks.len();
+        stats.distilled_proposal_sets += num_proposal_tasks;
+        stats.distilled_proposal_candidate_evals += num_proposal_tasks;
+        // Seed+shortlist for distilled proposals
+        let mut proposal_seeds: Vec<(Option<BundleRouteKind>, Vec<&'static str>, PlanResult)> =
+            proposal_tasks
+                .into_par_iter()
+                .filter_map(|(frontier_family, preserve_markets)| {
+                    let seed = seed_no_arb_plan_from_state(
+                        state,
+                        predictions,
+                        expected_outcome_count,
+                        route_gates,
+                        &preserve_markets,
+                        frontier_family,
+                        force_mint_available,
+                        family,
+                        cost_config,
+                    )?;
+                    Some((frontier_family, preserve_markets, seed))
+                })
+                .collect();
+        proposal_seeds.sort_by(|a, b| plan_result_cmp(&a.2, &b.2));
+        let proposal_k = seed_shortlist_k(num_proposal_tasks);
+        let proposal_shortlist: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> =
+            proposal_seeds
+                .into_iter()
+                .take(proposal_k)
+                .map(|(ff, pm, _)| (ff, pm))
+                .collect();
+        let mut proposal_candidates: Vec<PlanResult> = proposal_shortlist
             .into_par_iter()
             .filter_map(|(frontier_family, preserve_markets)| {
                 run_no_arb_rebalance_plan_from_state(
