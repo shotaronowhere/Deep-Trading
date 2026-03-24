@@ -7,6 +7,7 @@ pub mod bounds;
 mod edge;
 pub mod gas;
 pub mod grouping;
+pub mod onchain_preview;
 pub mod preview;
 pub mod program;
 pub mod runtime;

@@ -123,6 +123,7 @@ That architecture decision is documented in `docs/archive/implementation/2026-03
 | Off-chain full-rebalance-only | Raw benchmark row without the full mixed fallback behavior | Benchmark row only | `docs/portfolio.md` |
 | On-chain exact direct | `Rebalancer.rebalanceExact(...)` atomic direct solve | Production reference | `docs/rebalancer.md` |
 | On-chain mixed constant-`L` | `RebalancerMixed.rebalanceMixedConstantL(...)` atomic mixed-route solve | Experimental on-chain reference | `docs/rebalancer_mixed.md` |
+| On-chain arb + direct | `Rebalancer.rebalanceAndArb(...)` atomic direct solve with pre-buy complete-set arb and post-buy recycle | Benchmark only | `docs/rebalancer.md` |
 | Staged reference diagnostics | Test-only legacy reference solve used for parity assertions; not compiled into the shipped runtime path | Test-only | `docs/portfolio.md` |
 
 ## Central 98-Outcome L1-Like Case
@@ -135,6 +136,7 @@ Case id: `heterogeneous_ninety_eight_outcome_l1_like_case`
 | Off-chain direct-only baseline | `150.258105490229428224` | `$0.006413207231552927` | `150.25169228299788` | `39` | `1` | replay packed program estimate | `direct_only` compiler selected; compact exact-direct-like frontier program |
 | On-chain exact direct | `150.258288614947875485` | `$0.013109266442788025` | `150.24517934850508` | `n/a` | `1` | modeled L1 + Foundry gas | Off-chain direct baseline now slightly beats this row on modeled net EV |
 | On-chain mixed constant-`L` | `150.380322266504052605` | `$0.0678848029642546` | `150.3124374635398` | `n/a` | `1` | modeled L1 + Foundry gas | Off-chain default now beats this row on modeled net EV |
+| On-chain arb + direct | `150.349511933836299140` | `n/a` | `n/a` | `n/a` | `1` | Foundry gas only | 19,358,113 gas; +0.091 sUSD raw EV over exact but +15.1M gas; net EV depends on fee environment |
 | Off-chain full-rebalance-only | `150.378870058707484672` | `n/a` | `n/a` | `n/a` | `n/a` | raw fixture only | Raw benchmark reference only; not a shipped runtime flavor |
 
 Interpretation:
@@ -155,14 +157,14 @@ Interpretation:
 
 This is still the canonical raw benchmark table from the committed fixture.
 
-| Case | Off-chain direct | Off-chain full-rebalance-only | Off-chain default mixed | On-chain exact direct | On-chain mixed constant-`L` | Off-chain default action count |
-|---|---:|---:|---:|---:|---:|---:|
-| `two_pool_single_tick_direct_only` | `100.102675011503407104` | `100.102675011503407104` | `100.102675011503407104` | `100.102675011503391898` | `100.102675011503391898` | `2` |
-| `ninety_eight_outcome_multitick_direct_only` | `98.123254863635890176` | `98.123254863635890176` | `98.123254863635890176` | `98.123254863636424997` | `98.123254863636424997` | `98` |
-| `small_bundle_mixed_case` | `100.132867689650405376` | `100.132867689650405376` | `100.148477979531444224` | `100.132867689650403452` | `100.148477979531421487` | `5` |
-| `legacy_holdings_direct_only_case` | `38.863181796980015104` | `38.863181796980015104` | `38.863181796980015104` | `38.863181798833603563` | `38.863181796980015678` | `2` |
-| `mixed_route_favorable_synthetic_case` | `100.021703842635415552` | `100.108205685259485184` | `100.108519024112205824` | `100.021703842635411426` | `100.108519024112198000` | `5` |
-| `heterogeneous_ninety_eight_outcome_l1_like_case` | `150.258105490229428224` | `150.378870058707484672` | `150.380245589644673024` | `150.258288614947875485` | `150.380322266504052605` | `94` |
+| Case | Off-chain direct | Off-chain full-rebalance-only | Off-chain default mixed | On-chain exact direct | On-chain mixed constant-`L` | On-chain arb + direct | Off-chain default action count |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `two_pool_single_tick_direct_only` | `100.102675011503407104` | `100.102675011503407104` | `100.102675011503407104` | `100.102675011503391898` | `100.102675011503391898` | `100.102675011503391898` | `2` |
+| `ninety_eight_outcome_multitick_direct_only` | `98.123254863635890176` | `98.123254863635890176` | `98.123254863635890176` | `98.123254863636424997` | `98.123254863636424997` | `98.123254863636425001` | `98` |
+| `small_bundle_mixed_case` | `100.132867689650405376` | `100.132867689650405376` | `100.148477979531444224` | `100.132867689650403452` | `100.148477979531421487` | `100.102134372522789293` | `5` |
+| `legacy_holdings_direct_only_case` | `38.863181796980015104` | `38.863181796980015104` | `38.863181796980015104` | `38.863181798833603563` | `38.863181796980015678` | `38.863160399139309387` | `2` |
+| `mixed_route_favorable_synthetic_case` | `100.021703842635415552` | `100.108205685259485184` | `100.108519024112205824` | `100.021703842635411426` | `100.108519024112198000` | `100.096401372532681755` | `5` |
+| `heterogeneous_ninety_eight_outcome_l1_like_case` | `150.258105490229428224` | `150.378870058707484672` | `150.380245589644673024` | `150.258288614947875485` | `150.380322266504052605` | `150.349511933836299140` | `94` |
 
 Raw-EV interpretation:
 
@@ -170,6 +172,27 @@ Raw-EV interpretation:
 - `small_bundle_mixed_case` now collapses to the compact constant-`L` state-space solution instead of preserving the old 13-action trace
 - `mixed_route_favorable_synthetic_case` no longer regresses on raw EV; the compact solver now lands at on-chain mixed parity with `5` actions
 - the heterogeneous 98-outcome default row now accepts a slightly lower-raw but lower-fee `constant_l_mixed` program, improving net EV while cutting the packed action count from `98` to `94`
+- arb solver (`rebalanceAndArb`) adds meaningful raw EV only on heterogeneous (+0.091 sUSD) and mixed_route_favorable (+0.075 sUSD) cases; on small_bundle and legacy_holdings it slightly reduces EV; on direct-only cases it matches exact to dust
+
+## On-Chain Arb Solver Gas Matrix
+
+Benchmark parameters: `maxArbRounds = 3`, `maxRecycleRounds = 2`.
+
+| Case | Exact gas | Arb gas | Arb - Exact gas | Arb - Exact EV (sUSD) |
+|---|---:|---:|---:|---:|
+| `two_pool_single_tick_direct_only` | `158,854` | `269,595` | `+110,741` | `~0` |
+| `ninety_eight_outcome_multitick_direct_only` | `7,197,686` | `12,373,641` | `+5,175,955` | `+0.000000000000000004` |
+| `small_bundle_mixed_case` | `269,185` | `670,567` | `+401,382` | `-0.031` |
+| `mixed_route_favorable_synthetic_case` | `208,270` | `872,762` | `+664,492` | `+0.075` |
+| `heterogeneous_ninety_eight_outcome_l1_like_case` | `4,260,433` | `19,358,113` | `+15,097,680` | `+0.091` |
+| `legacy_holdings_direct_only_case` | `296,832` | `510,254` | `+213,422` | `~0` |
+
+Interpretation:
+
+- arb always costs more gas; the gas overhead ranges from +110K (2-pool) to +15.1M (heterogeneous 98)
+- arb recovers meaningful EV only when the pre-buy arb and recycle phases find exploitable complete-set opportunities
+- for direct-only cases and small bundles, arb adds gas without EV benefit or even loses EV
+- at the current OP fee snapshot, the heterogeneous arb gas overhead (~$0.058 at 1,002,325 wei gas price) exceeds the +0.091 sUSD raw EV gain, making arb net-EV-negative for this snapshot
 
 ## Shared-Snapshot Net-EV Matrix
 

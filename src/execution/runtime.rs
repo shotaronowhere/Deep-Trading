@@ -13,7 +13,26 @@ use alloy::rpc::types::TransactionRequest;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_RPC_URL: &str = "https://optimism.drpc.org";
-pub const DEFAULT_EXECUTE_SUBMIT: bool = false;
+/// Controls whether transactions are submitted on-chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitMode {
+    /// Log calldata and stop after the first chunk. Never deploy or send transactions.
+    DryRun,
+    /// Submit transactions automatically without user confirmation.
+    Live,
+    /// Print a trade summary and wait for the user to press Enter before each submission.
+    Confirm,
+}
+
+impl SubmitMode {
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Live | Self::Confirm)
+    }
+
+    pub fn is_dry_run(&self) -> bool {
+        matches!(self, Self::DryRun)
+    }
+}
 pub const DEFAULT_EXECUTION_MAX_STEPS: usize = 32;
 pub const DEFAULT_EXECUTION_MAX_STALE_BLOCKS: u64 = 2;
 pub const DEFAULT_EXECUTION_DEADLINE_SECS: u64 = 20;
@@ -21,6 +40,7 @@ pub const DEFAULT_EXECUTION_BLOCK_POLL_MS: u64 = 250;
 pub const DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS: u64 = 1;
 pub const DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK: u64 = 15;
 pub const DEFAULT_FORECASTFLOWS_NATIVE_AUDIT_INTERVAL_BLOCKS: u64 = 12;
+pub const DEFAULT_NET_EV_THRESHOLD_SUSD: f64 = 0.0;
 pub const TRADE_EXECUTOR_CACHE_PATH: &str = "cache/trade_executor.json";
 pub const TRADE_EXECUTOR_ARTIFACT_PATH: &str = "out/TradeExecutor.sol/TradeExecutor.json";
 
@@ -30,7 +50,7 @@ const OWNER_SELECTOR: [u8; 4] = [0x8d, 0xa5, 0xcb, 0x5b];
 pub struct ExecutionRuntimeConfig {
     pub private_key: String,
     pub rpc_url: String,
-    pub execute_submit: bool,
+    pub submit_mode: SubmitMode,
     pub execution_max_steps: usize,
     pub execution_max_stale_blocks: u64,
     pub execution_deadline_secs: u64,
@@ -38,6 +58,7 @@ pub struct ExecutionRuntimeConfig {
     pub execution_quote_latency_blocks: u64,
     pub execution_adverse_move_bps_per_block: u64,
     pub forecastflows_native_audit_interval_blocks: u64,
+    pub net_ev_threshold_susd: f64,
 }
 
 pub fn is_submission_deadline_exceeded(elapsed: Duration, deadline_secs: u64) -> bool {
@@ -68,7 +89,7 @@ impl ExecutionRuntimeConfig {
             });
         }
 
-        let execute_submit = parse_env_bool("EXECUTE_SUBMIT", DEFAULT_EXECUTE_SUBMIT)?;
+        let submit_mode = parse_submit_mode("EXECUTE_SUBMIT")?;
         let execution_max_steps =
             parse_env_usize("EXECUTION_MAX_STEPS", DEFAULT_EXECUTION_MAX_STEPS)?;
         let execution_max_stale_blocks = parse_env_u64(
@@ -91,11 +112,13 @@ impl ExecutionRuntimeConfig {
             "FORECASTFLOWS_NATIVE_AUDIT_INTERVAL_BLOCKS",
             DEFAULT_FORECASTFLOWS_NATIVE_AUDIT_INTERVAL_BLOCKS,
         )?;
+        let net_ev_threshold_susd =
+            parse_env_f64("NET_EV_THRESHOLD_SUSD", DEFAULT_NET_EV_THRESHOLD_SUSD)?;
 
         Ok(Self {
             private_key,
             rpc_url,
-            execute_submit,
+            submit_mode,
             execution_max_steps,
             execution_max_stale_blocks,
             execution_deadline_secs,
@@ -103,6 +126,7 @@ impl ExecutionRuntimeConfig {
             execution_quote_latency_blocks,
             execution_adverse_move_bps_per_block,
             forecastflows_native_audit_interval_blocks,
+            net_ev_threshold_susd,
         })
     }
 }
@@ -372,11 +396,16 @@ fn decode_hex(raw: &str) -> Result<Vec<u8>, RuntimeError> {
     hex::decode(trimmed).map_err(|err| RuntimeError::InvalidHex(err.to_string()))
 }
 
-fn parse_env_bool(name: &'static str, default: bool) -> Result<bool, RuntimeError> {
+fn parse_submit_mode(name: &'static str) -> Result<SubmitMode, RuntimeError> {
     let Some(raw) = std::env::var(name).ok() else {
-        return Ok(default);
+        return Ok(SubmitMode::DryRun);
     };
-    parse_bool_literal(raw.trim()).ok_or_else(|| RuntimeError::InvalidEnvValue { name, value: raw })
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "no" | "n" | "off" => Ok(SubmitMode::DryRun),
+        "1" | "true" | "yes" | "y" | "on" => Ok(SubmitMode::Live),
+        "confirm" | "interactive" | "prompt" => Ok(SubmitMode::Confirm),
+        _ => Err(RuntimeError::InvalidEnvValue { name, value: raw }),
+    }
 }
 
 fn parse_env_u64(name: &'static str, default: u64) -> Result<u64, RuntimeError> {
@@ -388,6 +417,23 @@ fn parse_env_u64(name: &'static str, default: u64) -> Result<u64, RuntimeError> 
         .map_err(|_| RuntimeError::InvalidEnvValue { name, value: raw })
 }
 
+fn parse_env_f64(name: &'static str, default: f64) -> Result<f64, RuntimeError> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+    let value = raw
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| RuntimeError::InvalidEnvValue {
+            name,
+            value: raw.clone(),
+        })?;
+    if !value.is_finite() {
+        return Err(RuntimeError::InvalidEnvValue { name, value: raw });
+    }
+    Ok(value)
+}
+
 fn parse_env_usize(name: &'static str, default: usize) -> Result<usize, RuntimeError> {
     let Some(raw) = std::env::var(name).ok() else {
         return Ok(default);
@@ -395,14 +441,6 @@ fn parse_env_usize(name: &'static str, default: usize) -> Result<usize, RuntimeE
     raw.trim()
         .parse::<usize>()
         .map_err(|_| RuntimeError::InvalidEnvValue { name, value: raw })
-}
-
-fn parse_bool_literal(raw: &str) -> Option<bool> {
-    match raw.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "y" | "on" => Some(true),
-        "0" | "false" | "no" | "n" | "off" => Some(false),
-        _ => None,
-    }
 }
 
 fn load_cached_executor(chain_id: u64, owner: Address) -> Result<Option<Address>, RuntimeError> {
@@ -495,31 +533,9 @@ mod tests {
     use alloy::primitives::Address;
 
     use super::{
-        is_submission_deadline_exceeded, load_cached_executor_from_path, parse_bool_literal,
+        is_submission_deadline_exceeded, load_cached_executor_from_path,
         save_cached_executor_to_path,
     };
-
-    #[test]
-    fn parse_bool_literal_accepts_common_truthy_values() {
-        assert_eq!(parse_bool_literal("1"), Some(true));
-        assert_eq!(parse_bool_literal("true"), Some(true));
-        assert_eq!(parse_bool_literal("YES"), Some(true));
-        assert_eq!(parse_bool_literal("On"), Some(true));
-    }
-
-    #[test]
-    fn parse_bool_literal_accepts_common_falsy_values() {
-        assert_eq!(parse_bool_literal("0"), Some(false));
-        assert_eq!(parse_bool_literal("false"), Some(false));
-        assert_eq!(parse_bool_literal("NO"), Some(false));
-        assert_eq!(parse_bool_literal("off"), Some(false));
-    }
-
-    #[test]
-    fn parse_bool_literal_rejects_unknown_values() {
-        assert_eq!(parse_bool_literal(""), None);
-        assert_eq!(parse_bool_literal("maybe"), None);
-    }
 
     #[test]
     fn deadline_gate_is_fail_closed_past_threshold() {

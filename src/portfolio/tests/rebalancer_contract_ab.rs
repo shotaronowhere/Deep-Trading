@@ -5707,14 +5707,28 @@ fn print_large_nonprefix_native_actions() {
     println!("Actions ({} total):", actions.len());
     for (i, action) in actions.iter().enumerate() {
         match action {
-            super::Action::Buy { market_name, amount, cost } =>
-                println!("  [{:>3}] BUY  {} amount={:.6} cost={:.6}", i, market_name, amount, cost),
-            super::Action::Sell { market_name, amount, proceeds } =>
-                println!("  [{:>3}] SELL {} amount={:.6} proceeds={:.6}", i, market_name, amount, proceeds),
-            super::Action::Mint { amount, .. } =>
-                println!("  [{:>3}] MINT amount={:.6}", i, amount),
-            super::Action::Merge { amount, .. } =>
-                println!("  [{:>3}] MERGE amount={:.6}", i, amount),
+            super::Action::Buy {
+                market_name,
+                amount,
+                cost,
+            } => println!(
+                "  [{:>3}] BUY  {} amount={:.6} cost={:.6}",
+                i, market_name, amount, cost
+            ),
+            super::Action::Sell {
+                market_name,
+                amount,
+                proceeds,
+            } => println!(
+                "  [{:>3}] SELL {} amount={:.6} proceeds={:.6}",
+                i, market_name, amount, proceeds
+            ),
+            super::Action::Mint { amount, .. } => {
+                println!("  [{:>3}] MINT amount={:.6}", i, amount)
+            }
+            super::Action::Merge { amount, .. } => {
+                println!("  [{:>3}] MERGE amount={:.6}", i, amount)
+            }
         }
     }
     println!("\nFinal holdings:");
@@ -5722,8 +5736,18 @@ fn print_large_nonprefix_native_actions() {
     sorted_holdings.sort_by_key(|(name, _)| *name);
     for (name, units) in &sorted_holdings {
         if **units > 1e-12 {
-            let pred = built.predictions.get(&normalize_market_name(name)).copied().unwrap_or(0.0);
-            println!("  {} = {:.6} (pred={:.6}, ev_contrib={:.6})", name, units, pred, pred * **units);
+            let pred = built
+                .predictions
+                .get(&normalize_market_name(name))
+                .copied()
+                .unwrap_or(0.0);
+            println!(
+                "  {} = {:.6} (pred={:.6}, ev_contrib={:.6})",
+                name,
+                units,
+                pred,
+                pred * **units
+            );
         }
     }
 }

@@ -24,9 +24,10 @@ use deep_trading_bot::execution::program::{
     build_chunk_calls_checked, compile_execution_program_unchecked,
 };
 use deep_trading_bot::execution::runtime::{
-    ExecutionRuntimeConfig, is_submission_deadline_exceeded, resolve_trade_executor,
+    ExecutionRuntimeConfig, SubmitMode, is_submission_deadline_exceeded, resolve_trade_executor,
     resolve_trade_executor_readonly,
 };
+use deep_trading_bot::execution::onchain_preview;
 use deep_trading_bot::execution::tx_builder::build_trade_executor_calls;
 use deep_trading_bot::execution::{ExecutionMode, ITradeExecutor, SUSD_DECIMALS};
 use deep_trading_bot::markets::MarketData;
@@ -37,6 +38,113 @@ use deep_trading_bot::portfolio::{
 };
 
 const EXPLICIT_GAS_PRICE_ETH: f64 = 1e-9;
+
+fn portfolio_ev(susds_balance: f64, balances: &HashMap<&'static str, f64>) -> f64 {
+    let predictions = deep_trading_bot::pools::prediction_map();
+    let holdings_ev: f64 = balances
+        .iter()
+        .map(|(market, units)| predictions.get(*market).copied().unwrap_or(0.0) * units)
+        .sum();
+    susds_balance + holdings_ev
+}
+
+fn chunk_net_ev(
+    chunk_plans: &[deep_trading_bot::execution::ExecutionGroupPlan],
+    chunk_fee_susd: f64,
+) -> f64 {
+    let gross: f64 = chunk_plans.iter().map(|p| p.edge_plan_susd).sum();
+    gross - chunk_fee_susd
+}
+
+fn print_pre_submission_summary(
+    step: usize,
+    chunk_plans: &[deep_trading_bot::execution::ExecutionGroupPlan],
+    actions: &[deep_trading_bot::portfolio::Action],
+    estimated_chunk_net_ev: f64,
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+) {
+    use deep_trading_bot::execution::LegKind;
+    use deep_trading_bot::pools::{sqrt_price_x96_to_price_outcome, u256_to_f64};
+
+    let predictions = deep_trading_bot::pools::prediction_map();
+
+    // Build slot0 lookup by market name
+    let slot0_by_name: HashMap<&str, &(Slot0Result, &MarketData)> = slot0_results
+        .iter()
+        .map(|entry| (entry.1.name, entry))
+        .collect();
+
+    let total_gas: f64 = chunk_plans.iter().map(|p| p.gas_total_susd).sum();
+    let total_edge: f64 = chunk_plans.iter().map(|p| p.edge_plan_susd).sum();
+
+    eprintln!();
+    eprintln!("  === Step {step} Transaction Summary ===");
+    eprintln!(
+        "  Subgroups: {}   Net EV: {:+.4} sUSD",
+        chunk_plans.len(),
+        estimated_chunk_net_ev
+    );
+    eprintln!(
+        "  Edge: {:+.4} sUSD   Gas: {:.4} sUSD",
+        total_edge, total_gas
+    );
+    eprintln!("  ---");
+
+    for plan in chunk_plans {
+        eprintln!(
+            "  {:?}  step {} subgroup {}/{}  edge {:.4} gas {:.4}",
+            plan.kind,
+            plan.profitability_step_index,
+            plan.step_subgroup_index + 1,
+            plan.step_subgroup_count,
+            plan.edge_plan_susd,
+            plan.gas_total_susd,
+        );
+        for leg in &plan.legs {
+            let market = leg.market_name.unwrap_or("?");
+            let direction = match leg.kind {
+                LegKind::Buy => "BUY ",
+                LegKind::Sell => "SELL",
+            };
+            let quote_label = match leg.kind {
+                LegKind::Buy => "cost",
+                LegKind::Sell => "recv",
+            };
+            // Look up planned token amount from the action
+            let token_amount = actions.get(leg.action_index).and_then(|a| match a {
+                deep_trading_bot::portfolio::Action::Buy { amount, .. } => Some(*amount),
+                deep_trading_bot::portfolio::Action::Sell { amount, .. } => Some(*amount),
+                deep_trading_bot::portfolio::Action::Mint { amount, .. } => Some(*amount),
+                deep_trading_bot::portfolio::Action::Merge { amount, .. } => Some(*amount),
+            });
+            // Look up current price and prediction
+            let price_pred = leg.market_name.and_then(|name| {
+                let (slot0, mkt) = slot0_by_name.get(name)?;
+                let pool = mkt.pool.as_ref()?;
+                let is_token1 = pool.token1.eq_ignore_ascii_case(mkt.outcome_token);
+                let price = u256_to_f64(sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1)?);
+                let pred = predictions.get(name).copied()?;
+                Some((price, pred))
+            });
+            let pp_suffix = match price_pred {
+                Some((price, pred)) => format!("  price={price:.4} pred={pred:.4}"),
+                None => String::new(),
+            };
+            if let Some(tokens) = token_amount {
+                eprintln!(
+                    "    {direction} {market:<30} {quote_label} {:.4} sUSD  ({tokens:.4} tokens){pp_suffix}",
+                    leg.planned_quote_susd,
+                );
+            } else {
+                eprintln!(
+                    "    {direction} {market:<30} {quote_label} {:.4} sUSD{pp_suffix}",
+                    leg.planned_quote_susd,
+                );
+            }
+        }
+    }
+    eprintln!("  ===");
+}
 
 struct ForecastFlowsShutdownGuard {
     enabled: bool,
@@ -418,7 +526,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .expect("failed to build reqwest client")
             });
 
-    let resolved = if config.execute_submit {
+    let resolved = if config.submit_mode.is_live() {
         resolve_trade_executor(provider.clone(), signer_address).await?
     } else {
         resolve_trade_executor_readonly(provider.clone(), signer_address)
@@ -433,7 +541,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         signer = %signer_address,
         executor = %resolved.executor,
         reused_cache = resolved.reused_cache,
-        execute_submit = config.execute_submit,
+        submit_mode = ?config.submit_mode,
         mode = ?mode,
         requested_solver = solver.as_str(),
         native_audit_enabled,
@@ -442,6 +550,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         enable_greedy_churn_pruning,
         quote_latency_blocks = conservative_execution.quote_latency_blocks,
         adverse_move_bps_per_block = conservative_execution.adverse_move_bps_per_block,
+        net_ev_threshold_susd = config.net_ev_threshold_susd,
         "trade executor resolved"
     );
     if resolved.owner != signer_address {
@@ -452,7 +561,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
-    if config.execute_submit {
+    if config.submit_mode.is_live() {
         let approval_summary =
             ensure_executor_approvals(provider.clone(), resolved.executor).await?;
         tracing::info!(
@@ -464,6 +573,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         tracing::info!("dry-run mode: skipping approval preprocessing");
     }
+
+    // Resolve on-chain solvers for preview (deploy if live, cache-only if dry-run)
+    let solver_addrs = if config.submit_mode.is_live() {
+        match onchain_preview::resolve_solvers(provider.clone(), signer_address).await {
+            Ok(addrs) => Some(addrs),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to resolve on-chain solvers; preview disabled");
+                None
+            }
+        }
+    } else {
+        onchain_preview::resolve_solvers_readonly()
+    };
 
     let gas_assumptions = match default_gas_assumptions_with_optimism_l1_fee(&config.rpc_url).await
     {
@@ -849,7 +971,71 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        if !config.execute_submit {
+        let estimated_chunk_net_ev = chunk_net_ev(
+            &chunk_plans,
+            chunk_plans.iter().map(|p| p.gas_total_susd).sum(),
+        );
+        if estimated_chunk_net_ev < config.net_ev_threshold_susd {
+            tracing::info!(
+                step = steps,
+                block = submit_block,
+                estimated_chunk_net_ev,
+                net_ev_threshold_susd = config.net_ev_threshold_susd,
+                "chunk net EV below threshold; skipping submission"
+            );
+            let latest_after_cycle = provider.get_block_number().await.unwrap_or(submit_block);
+            log_skipped_blocks(
+                steps,
+                cycle_block,
+                latest_after_cycle,
+                &mut skipped_blocks_while_busy_total,
+            );
+            last_seen_block = last_seen_block.max(latest_after_cycle);
+            continue;
+        }
+
+        // --- On-chain solver preview (dry-run and confirm modes) ---
+        if !config.submit_mode.is_live() || config.submit_mode == SubmitMode::Confirm {
+            if let Some((rebalancer, rebalancer_mixed)) = solver_addrs {
+                match onchain_preview::build_rebalance_params(
+                    &slot0_results,
+                    &balances_owned,
+                    susds_balance,
+                ) {
+                    Ok(params) => {
+                        let market_names: Vec<&'static str> = slot0_results
+                            .iter()
+                            .filter(|(_, m)| m.pool.is_some())
+                            .filter_map(|(_, m)| {
+                                let pred = deep_trading_bot::pools::prediction_map()
+                                    .get(m.name)
+                                    .copied()
+                                    .unwrap_or(0.0);
+                                if pred > 0.0 { Some(m.name) } else { None }
+                            })
+                            .collect();
+                        let pre_ev = portfolio_ev(susds_balance, &balances_owned);
+                        let preview_results = onchain_preview::preview_all_solvers(
+                            provider.clone(),
+                            resolved.executor,
+                            signer_address,
+                            rebalancer,
+                            rebalancer_mixed,
+                            &params,
+                            &market_names,
+                        )
+                        .await;
+                        onchain_preview::print_solver_comparison(&preview_results, pre_ev);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to build RebalanceParams for preview");
+                    }
+                }
+            }
+        }
+
+        // --- Dry-run: log calldata and stop ---
+        if config.submit_mode.is_dry_run() {
             for (call_index, call) in calls.iter().enumerate() {
                 tracing::info!(
                     step = steps,
@@ -859,24 +1045,106 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     "dry-run call"
                 );
             }
+            print_pre_submission_summary(
+                steps,
+                &chunk_plans,
+                &live_decision.actions,
+                estimated_chunk_net_ev,
+                &slot0_results,
+            );
             tracing::info!(
                 step = steps,
                 tx_mode = ?execution_mode,
                 subgroups = chunk_plans.len(),
-                "dry-run mode active (set EXECUTE_SUBMIT=1 to broadcast); stopping after first chunk"
+                "dry-run mode active (set EXECUTE_SUBMIT=1 or EXECUTE_SUBMIT=confirm to broadcast); stopping after first chunk"
             );
             break;
         }
 
+        // --- Confirm mode: print summary and wait for user approval ---
+        if config.submit_mode == SubmitMode::Confirm {
+            print_pre_submission_summary(
+                steps,
+                &chunk_plans,
+                &live_decision.actions,
+                estimated_chunk_net_ev,
+                &slot0_results,
+            );
+            eprintln!("\n  Press Enter to submit, or Ctrl-C to abort (60s timeout)...");
+            let confirm = tokio::time::timeout(
+                Duration::from_secs(60),
+                tokio::task::spawn_blocking(|| {
+                    let mut buf = String::new();
+                    std::io::stdin().read_line(&mut buf).map(|_| ())
+                }),
+            )
+            .await;
+            match confirm {
+                Ok(Ok(Ok(()))) => {} // user pressed Enter
+                Ok(Ok(Err(err))) => {
+                    tracing::warn!(step = steps, error = %err, "stdin read failed; skipping submission");
+                    continue;
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(step = steps, error = %err, "confirm task panicked; skipping submission");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        step = steps,
+                        "confirm timed out after 60s; skipping submission"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // --- Submit transaction ---
+        let pre_portfolio_ev = portfolio_ev(susds_balance, &balances_owned);
         let executor_contract = ITradeExecutor::new(resolved.executor, provider.clone());
-        let receipt = executor_contract
-            .batchExecute(calls)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
+        let receipt = match executor_contract.batchExecute(calls).send().await {
+            Ok(pending) => match pending.get_receipt().await {
+                Ok(receipt) => receipt,
+                Err(err) => {
+                    tracing::warn!(
+                        step = steps,
+                        error = %err,
+                        "tx receipt retrieval failed; invalidating snapshot cache"
+                    );
+                    last_snapshot_fingerprint = None;
+                    continue;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    step = steps,
+                    error = %err,
+                    "batchExecute send failed; invalidating snapshot cache"
+                );
+                last_snapshot_fingerprint = None;
+                continue;
+            }
+        };
+
+        // Always invalidate snapshot cache after tx attempt so the next cycle re-plans fresh.
+        last_snapshot_fingerprint = None;
+
         if !receipt.status() {
-            return Err(format!("executor tx {} reverted", receipt.transaction_hash()).into());
+            tracing::warn!(
+                step = steps,
+                tx_hash = %receipt.transaction_hash(),
+                gas_used = receipt.gas_used(),
+                "executor tx reverted; snapshot cache invalidated"
+            );
+            let latest_after_cycle = provider.get_block_number().await.unwrap_or(submit_block);
+            log_skipped_blocks(
+                steps,
+                cycle_block,
+                latest_after_cycle,
+                &mut skipped_blocks_while_busy_total,
+            );
+            last_seen_block = last_seen_block.max(latest_after_cycle);
+            continue;
         }
 
         tracing::info!(
@@ -886,8 +1154,67 @@ async fn main() -> Result<(), Box<dyn Error>> {
             gas_used = receipt.gas_used(),
             tx_mode = ?execution_mode,
             submitted_subgroups = chunk_plans.len(),
+            estimated_chunk_net_ev,
             "execution chunk submitted"
         );
+
+        // Post-tx verification: re-fetch balances and compute realized portfolio EV delta.
+        match pools::fetch_balances(provider.clone(), resolved.executor).await {
+            Ok((post_susds, post_balances)) => {
+                let post_ev = portfolio_ev(post_susds, &post_balances);
+                let approx_realized_gain = post_ev - pre_portfolio_ev;
+
+                // Per-token deltas
+                let mut token_deltas: Vec<(&str, f64)> = Vec::new();
+                for (market, &post_units) in &post_balances {
+                    let pre_units = balances_owned.get(market).copied().unwrap_or(0.0);
+                    let delta = post_units - pre_units;
+                    if delta.abs() > 1e-12 {
+                        token_deltas.push((market, delta));
+                    }
+                }
+                // Check tokens we held before but might not hold after
+                for (market, &pre_units) in &balances_owned {
+                    if !post_balances.contains_key(market) && pre_units.abs() > 1e-12 {
+                        token_deltas.push((market, -pre_units));
+                    }
+                }
+                token_deltas
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                let susds_delta = post_susds - susds_balance;
+
+                tracing::info!(
+                    step = steps,
+                    pre_portfolio_ev,
+                    post_portfolio_ev = post_ev,
+                    approx_realized_gain_susd = approx_realized_gain,
+                    estimated_chunk_net_ev,
+                    estimated_chunk_gas_susd =
+                        chunk_plans.iter().map(|p| p.gas_total_susd).sum::<f64>(),
+                    actual_gas_used = receipt.gas_used(),
+                    susds_delta,
+                    "post-tx verification"
+                );
+                for (market, delta) in &token_deltas {
+                    let direction = if *delta > 0.0 { "gained" } else { "lost" };
+                    tracing::info!(
+                        step = steps,
+                        market,
+                        delta,
+                        direction,
+                        "post-tx token delta"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    step = steps,
+                    error = %err,
+                    "post-tx balance re-fetch failed; skipping verification"
+                );
+            }
+        }
 
         let latest_after_cycle = provider.get_block_number().await.unwrap_or(submit_block);
         log_skipped_blocks(

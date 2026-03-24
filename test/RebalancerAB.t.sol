@@ -335,6 +335,8 @@ contract RebalancerABTest is Test {
     uint256 internal constant WAD = 1e18;
     uint256 internal constant BENCHMARK_MAX_OUTER_ITERS = 24;
     uint256 internal constant BENCHMARK_MAX_INNER_ITERS = 24;
+    uint256 internal constant BENCHMARK_MAX_ARB_ROUNDS = 3;
+    uint256 internal constant BENCHMARK_MAX_RECYCLE_ROUNDS = 2;
     address internal constant BENCHMARK_MARKET = address(0xBEEF);
 
     struct Scenario {
@@ -467,6 +469,29 @@ contract RebalancerABTest is Test {
         }
     }
 
+    function test_rebalancer_arb_benchmark_report() external {
+        string[] memory caseIds = new string[](6);
+        caseIds[0] = "two_pool_single_tick_direct_only";
+        caseIds[1] = "ninety_eight_outcome_multitick_direct_only";
+        caseIds[2] = "small_bundle_mixed_case";
+        caseIds[3] = "mixed_route_favorable_synthetic_case";
+        caseIds[4] = "heterogeneous_ninety_eight_outcome_l1_like_case";
+        caseIds[5] = "legacy_holdings_direct_only_case";
+
+        for (uint256 i = 0; i < caseIds.length; i++) {
+            OnchainBenchmarkCallArtifact memory exact = _buildExactArtifact(caseIds[i]);
+            OnchainBenchmarkCallArtifact memory arb = _buildArbArtifact(caseIds[i]);
+
+            emit log_string(caseIds[i]);
+            emit log_named_uint("exact_ev_wei", exact.rawEvWei);
+            emit log_named_uint("arb_ev_wei", arb.rawEvWei);
+            emit log_named_int("arb_minus_exact_ev_wei", int256(arb.rawEvWei) - int256(exact.rawEvWei));
+            emit log_named_uint("exact_gas", exact.gasUnits);
+            emit log_named_uint("arb_gas", arb.gasUnits);
+            emit log_named_int("arb_minus_exact_gas", int256(arb.gasUnits) - int256(exact.gasUnits));
+        }
+    }
+
     function test_write_rebalancer_ab_onchain_call_report() external {
         string[] memory caseIds = new string[](6);
         caseIds[0] = "two_pool_single_tick_direct_only";
@@ -482,6 +507,7 @@ contract RebalancerABTest is Test {
             string memory caseId = caseIds[i];
             OnchainBenchmarkCallArtifact memory exact = _buildExactArtifact(caseId);
             OnchainBenchmarkCallArtifact memory mixed = _buildMixedArtifact(caseId);
+            OnchainBenchmarkCallArtifact memory arb = _buildArbArtifact(caseId);
 
             string memory exactKey = string.concat(caseId, "_exact");
             string memory exactJson = vm.serializeAddress(exactKey, "target", exact.target);
@@ -495,10 +521,17 @@ contract RebalancerABTest is Test {
             mixedJson = vm.serializeUint(mixedKey, "gas_units", mixed.gasUnits);
             mixedJson = vm.serializeString(mixedKey, "raw_ev_wei", vm.toString(mixed.rawEvWei));
 
+            string memory arbKey = string.concat(caseId, "_arb");
+            string memory arbJson = vm.serializeAddress(arbKey, "target", arb.target);
+            arbJson = vm.serializeBytes(arbKey, "calldata", arb.calldataBytes);
+            arbJson = vm.serializeUint(arbKey, "gas_units", arb.gasUnits);
+            arbJson = vm.serializeString(arbKey, "raw_ev_wei", vm.toString(arb.rawEvWei));
+
             string memory caseKey = string.concat(caseId, "_case");
             string memory caseJson = vm.serializeString(caseKey, "case_id", caseId);
             caseJson = vm.serializeString(caseKey, "exact", exactJson);
             caseJson = vm.serializeString(caseKey, "mixed", mixedJson);
+            caseJson = vm.serializeString(caseKey, "arb", arbJson);
             rootJson = vm.serializeString(rootKey, caseId, caseJson);
         }
 
@@ -687,6 +720,22 @@ contract RebalancerABTest is Test {
         artifact.gasUnits = gasStart - gasleft();
         artifact.rawEvWei =
             _portfolioEvWad(mixedScenario.collateral, mixedScenario.tokens, mixedScenario.predictionsWad);
+    }
+
+    function _buildArbArtifact(string memory caseId) internal returns (OnchainBenchmarkCallArtifact memory artifact) {
+        Scenario memory arbScenario = _buildArbCase(caseId);
+        artifact.target = address(arbScenario.rebalancer);
+        artifact.calldataBytes = abi.encodeCall(
+            arbScenario.rebalancer.rebalanceAndArb,
+            (arbScenario.params, BENCHMARK_MARKET, BENCHMARK_MAX_ARB_ROUNDS, BENCHMARK_MAX_RECYCLE_ROUNDS)
+        );
+        uint256 gasStart = gasleft();
+        arbScenario.rebalancer.rebalanceAndArb(
+            arbScenario.params, BENCHMARK_MARKET, BENCHMARK_MAX_ARB_ROUNDS, BENCHMARK_MAX_RECYCLE_ROUNDS
+        );
+        artifact.gasUnits = gasStart - gasleft();
+        artifact.rawEvWei =
+            _portfolioEvWad(arbScenario.collateral, arbScenario.tokens, arbScenario.predictionsWad);
     }
 
     function _buildCase(string memory caseId) internal returns (Scenario memory scenario) {
@@ -1052,6 +1101,121 @@ contract RebalancerABTest is Test {
             collateral: address(scenario.collateral),
             fee: feeTier
         });
+    }
+
+    function _buildArbScenario(
+        uint256[] memory pricesWad,
+        uint256[] memory predsWad,
+        uint256[] memory holdingsWad,
+        uint256[] memory liquidities,
+        bool[] memory isToken1,
+        uint256 cashWad,
+        uint24 feeTier
+    ) internal returns (Scenario memory scenario) {
+        uint256 n = pricesWad.length;
+        require(
+            n == predsWad.length && n == holdingsWad.length && n == liquidities.length && n == isToken1.length,
+            "length mismatch"
+        );
+
+        scenario.collateral = new BenchmarkERC20();
+        BenchmarkRouter router = new BenchmarkRouter();
+        BenchmarkCTFRouter ctfRouter = new BenchmarkCTFRouter();
+        scenario.rebalancer = new Rebalancer(address(router), address(ctfRouter));
+        scenario.tokens = new BenchmarkERC20[](n);
+        scenario.predictionsWad = predsWad;
+
+        ScenarioArrays memory arrays = _allocScenarioArrays(n);
+
+        for (uint256 i = 0; i < n; i++) {
+            BenchmarkERC20 token = new BenchmarkERC20();
+            BenchmarkPool pool =
+                new BenchmarkPool(_priceWadToSqrtX96(pricesWad[i], isToken1[i]), uint128(liquidities[i]));
+            pool.setTick(0);
+
+            scenario.tokens[i] = token;
+            arrays.tokens[i] = address(token);
+            arrays.pools[i] = address(pool);
+            arrays.isToken1[i] = isToken1[i];
+            arrays.balances[i] = holdingsWad[i];
+            arrays.sqrtPredX96[i] = _priceWadToSqrtX96(predsWad[i], isToken1[i]);
+
+            router.configure(address(token), address(pool), isToken1[i]);
+
+            if (holdingsWad[i] > 0) {
+                token.mint(address(this), holdingsWad[i]);
+                token.approve(address(scenario.rebalancer), holdingsWad[i]);
+            }
+        }
+        ctfRouter.setTokens(arrays.tokens);
+
+        if (cashWad > 0) {
+            scenario.collateral.mint(address(this), cashWad);
+            scenario.collateral.approve(address(scenario.rebalancer), cashWad);
+            // Fund CTF router so mergePositions can return collateral.
+            scenario.collateral.mint(address(ctfRouter), cashWad * 10);
+        }
+
+        scenario.params = Rebalancer.RebalanceParams({
+            tokens: arrays.tokens,
+            pools: arrays.pools,
+            isToken1: arrays.isToken1,
+            balances: arrays.balances,
+            collateralAmount: cashWad,
+            sqrtPredX96: arrays.sqrtPredX96,
+            collateral: address(scenario.collateral),
+            fee: feeTier
+        });
+    }
+
+    function _buildArbUniformScenario(
+        uint256 count,
+        uint256 priceBps,
+        uint256 liquidityPerPool,
+        uint256 cashWad,
+        uint24 feeTier
+    ) internal returns (Scenario memory) {
+        uint256[] memory pricesWad = new uint256[](count);
+        uint256[] memory predsWad = new uint256[](count);
+        uint256[] memory holdingsWad = new uint256[](count);
+        uint256[] memory liquidities = new uint256[](count);
+        bool[] memory isToken1 = new bool[](count);
+        uint256 basePred = WAD / count;
+        uint256 remainder = WAD - basePred * count;
+
+        for (uint256 i = 0; i < count; i++) {
+            uint256 pred = basePred;
+            if (i == 0) pred += remainder;
+            predsWad[i] = pred;
+            pricesWad[i] = pred * priceBps / 10_000;
+            holdingsWad[i] = 0;
+            liquidities[i] = liquidityPerPool;
+            isToken1[i] = true;
+        }
+
+        return _buildArbScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
+    }
+
+    function _buildArbCase(string memory caseId) internal returns (Scenario memory scenario) {
+        string memory json = _casesJson();
+        string memory prefix = string.concat(".", caseId);
+        uint256 uniformCount = json.readUint(string.concat(prefix, ".uniform_count"));
+        uint256 cashWad = json.readUint(string.concat(prefix, ".initial_cash_budget_wad"));
+        uint24 feeTier = uint24(json.readUint(string.concat(prefix, ".fee_tier")));
+
+        if (uniformCount > 0) {
+            uint256 uniformPriceBps = json.readUint(string.concat(prefix, ".uniform_price_bps"));
+            uint256 uniformLiquidity = json.readUint(string.concat(prefix, ".uniform_liquidity"));
+            return _buildArbUniformScenario(uniformCount, uniformPriceBps, uniformLiquidity, cashWad, feeTier);
+        }
+
+        uint256[] memory pricesWad = json.readUintArray(string.concat(prefix, ".starting_prices_wad"));
+        uint256[] memory predsWad = json.readUintArray(string.concat(prefix, ".predictions_wad"));
+        uint256[] memory holdingsWad = json.readUintArray(string.concat(prefix, ".initial_holdings_wad"));
+        uint256[] memory liquidities = json.readUintArray(string.concat(prefix, ".liquidity"));
+        bool[] memory isToken1 = json.readBoolArray(string.concat(prefix, ".is_token1"));
+
+        return _buildArbScenario(pricesWad, predsWad, holdingsWad, liquidities, isToken1, cashWad, feeTier);
     }
 
     function _buildMixedUniformScenario(

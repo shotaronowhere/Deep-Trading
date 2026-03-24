@@ -74,12 +74,12 @@ pub fn sqrt_price_x96_to_price_outcome(
 }
 
 /// Converts U256 (assumed 18-decimal fixed point) to f64.
-pub(crate) fn u256_to_f64(v: U256) -> f64 {
+pub fn u256_to_f64(v: U256) -> f64 {
     f64::from(v) / 1e18
 }
 
 /// Converts a prediction probability to the corresponding sqrtPriceX96.
-pub(crate) fn prediction_to_sqrt_price_x96(
+pub fn prediction_to_sqrt_price_x96(
     prediction: f64,
     is_token1_outcome: bool,
 ) -> Option<U256> {

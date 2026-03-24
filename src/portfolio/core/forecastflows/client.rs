@@ -182,7 +182,9 @@ impl ForecastFlowsRequestProfile {
 fn worker_execution_model_supported(execution_model: &str) -> bool {
     matches!(
         execution_model,
-        LEGACY_WORKER_EXECUTION_MODEL | CACHED_WORKER_EXECUTION_MODEL | SERVE_PROTOCOL_EXECUTION_MODEL
+        LEGACY_WORKER_EXECUTION_MODEL
+            | CACHED_WORKER_EXECUTION_MODEL
+            | SERVE_PROTOCOL_EXECUTION_MODEL
     )
 }
 

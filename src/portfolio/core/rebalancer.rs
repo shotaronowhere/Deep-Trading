@@ -2600,7 +2600,12 @@ fn apply_actions_to_solver_state_consistent(
     for (_, market) in &state.slot0_results {
         holdings.insert(
             market.name,
-            state.holdings.get(market.name).copied().unwrap_or(0.0).max(0.0),
+            state
+                .holdings
+                .get(market.name)
+                .copied()
+                .unwrap_or(0.0)
+                .max(0.0),
         );
     }
 
@@ -2698,9 +2703,8 @@ fn apply_actions_to_solver_state_consistent(
             {
                 let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
                 let next_price = sims[idx].price().max(1e-12);
-                next.sqrt_price_x96 =
-                    prediction_to_sqrt_price_x96(next_price, is_token1_outcome)
-                        .unwrap_or(slot0.sqrt_price_x96);
+                next.sqrt_price_x96 = prediction_to_sqrt_price_x96(next_price, is_token1_outcome)
+                    .unwrap_or(slot0.sqrt_price_x96);
             }
             (next, *market)
         })
@@ -4973,7 +4977,11 @@ fn baseline_step_prune_candidate_for_program_net_ev(
                 }
             }
             let Some((candidate_terminal_state, candidate_actions)) =
-                apply_actions_to_solver_state_consistent(starting_state, &keep_actions, predictions)
+                apply_actions_to_solver_state_consistent(
+                    starting_state,
+                    &keep_actions,
+                    predictions,
+                )
             else {
                 continue;
             };
@@ -5063,7 +5071,11 @@ fn route_group_prune_candidate_for_program_net_ev(
                 }
             }
             let Some((candidate_terminal_state, candidate_actions)) =
-                apply_actions_to_solver_state_consistent(starting_state, &keep_actions, predictions)
+                apply_actions_to_solver_state_consistent(
+                    starting_state,
+                    &keep_actions,
+                    predictions,
+                )
             else {
                 continue;
             };
@@ -6572,8 +6584,11 @@ fn evaluate_forecastflows_action_set(
     let evaluated =
         estimate_plan_cost_from_replay(&actions, &starting_state.slot0_results, cost_config)
             .and_then(|plan_cost| {
-                let (terminal_state, updated_actions) =
-                    apply_actions_to_solver_state_consistent(starting_state, &actions, predictions)?;
+                let (terminal_state, updated_actions) = apply_actions_to_solver_state_consistent(
+                    starting_state,
+                    &actions,
+                    predictions,
+                )?;
                 let raw_ev = state_snapshot_expected_value(&terminal_state, predictions);
                 Some(ForecastFlowsEvaluatedActionSet {
                     actions: updated_actions,
