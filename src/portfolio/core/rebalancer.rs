@@ -4960,56 +4960,72 @@ fn baseline_step_prune_candidate_for_program_net_ev(
         None,
     );
 
-    loop {
-        let Ok(step_groups) = group_execution_actions_by_profitability_step(&best.actions) else {
-            break;
+    // Single-pass reverse prune: try dropping each step group from lowest
+    // profitability upward. Because reverse iteration monotonically frees
+    // cash, restarting the loop provides near-zero additional compaction
+    // at massive cost. A single pass is sufficient.
+    let Ok(step_groups) = group_execution_actions_by_profitability_step(&best.actions) else {
+        return best;
+    };
+    if step_groups.is_empty() {
+        return best;
+    }
+
+    // Collect indices to exclude as a set for O(1) lookup.
+    let mut excluded: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    for step_group in step_groups.iter().rev() {
+        // Tentatively add this group's indices to the excluded set.
+        for &idx in &step_group.action_indices {
+            excluded.insert(idx);
+        }
+        let keep_actions: Vec<Action> = best
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !excluded.contains(i))
+            .map(|(_, a)| a.clone())
+            .collect();
+        let Some(candidate_terminal_state) =
+            apply_actions_to_solver_state(starting_state, &keep_actions, predictions)
+        else {
+            // Can't drop this group — remove from excluded and continue.
+            for &idx in &step_group.action_indices {
+                excluded.remove(&idx);
+            }
+            continue;
         };
-        if step_groups.is_empty() {
-            break;
-        }
-
-        let mut improved = false;
-        for step_group in step_groups.iter().rev() {
-            let mut keep_actions = Vec::with_capacity(best.actions.len());
-            for (action_index, action) in best.actions.iter().enumerate() {
-                if !step_group.action_indices.contains(&action_index) {
-                    keep_actions.push(action.clone());
-                }
+        // Reject pruned plans that spend more cash than available.
+        if candidate_terminal_state.cash < -EPS {
+            for &idx in &step_group.action_indices {
+                excluded.remove(&idx);
             }
-            let Some((candidate_terminal_state, candidate_actions)) =
-                apply_actions_to_solver_state_consistent(
-                    starting_state,
-                    &keep_actions,
-                    predictions,
-                )
-            else {
-                continue;
-            };
-            let candidate_raw_ev =
-                state_snapshot_expected_value(&candidate_terminal_state, predictions);
-            let candidate = build_plan_result(
-                starting_state,
-                candidate_terminal_state,
-                candidate_actions,
-                candidate_raw_ev,
-                frontier_family,
-                best.preserve_markets.clone(),
-                family,
-                cost_config,
-                compiler_variant,
-                None,
-                None,
-                None,
-            );
-            if plan_result_is_better(&candidate, &best) {
-                best = candidate;
-                improved = true;
-                break;
-            }
+            continue;
         }
-
-        if !improved {
-            break;
+        let candidate_raw_ev =
+            state_snapshot_expected_value(&candidate_terminal_state, predictions);
+        let candidate = build_plan_result(
+            starting_state,
+            candidate_terminal_state,
+            keep_actions,
+            candidate_raw_ev,
+            frontier_family,
+            best.preserve_markets.clone(),
+            family,
+            cost_config,
+            PlanCompilerVariant::BaselineStepPrune,
+            None,
+            None,
+            None,
+        );
+        if plan_result_is_better(&candidate, &best) {
+            best = candidate;
+            // Keep excluded — this group stays dropped for subsequent tries.
+        } else {
+            // Dropping this group didn't help — restore it.
+            for &idx in &step_group.action_indices {
+                excluded.remove(&idx);
+            }
         }
     }
 
@@ -5531,6 +5547,96 @@ fn compose_rebalance_step(
     plan
 }
 
+/// Cheap seed solve: phase 1 (sell overpriced) + phase 2 (single waterfall pass) only.
+/// Skips phase 3/4/5 recycling/polish and all compaction (constant-L, target-delta, staged).
+/// Used for ranking candidates before full-solving the top K.
+fn seed_no_arb_plan_from_state(
+    state: &SolverStateSnapshot,
+    predictions: &HashMap<String, f64>,
+    expected_outcome_count: usize,
+    route_gates: RouteGateThresholds,
+    preserve_markets: &[&'static str],
+    frontier_family: Option<BundleRouteKind>,
+    force_mint_available: Option<bool>,
+    family: SolverFamily,
+    cost_config: PlannerCostConfig,
+) -> Option<PlanResult> {
+    let mut ctx = build_rebalance_context_with_options(
+        &state.holdings,
+        state.cash,
+        &state.slot0_results,
+        predictions,
+        expected_outcome_count,
+        route_gates,
+        force_mint_available,
+    )
+    .ok()?;
+    ctx.mint_sell_preserve_markets = preserve_markets.iter().copied().collect();
+
+    // Phase 1 only: sell overpriced
+    ctx.run_phase1_sell_overpriced();
+
+    // Phase 2 only: single waterfall pass (no phase 3/4/5)
+    let mut wf_stats = WaterfallGateStats::default();
+    if let Some(frontier_family) = frontier_family {
+        waterfall_with_execution_gate_and_forced_first_frontier_and_preserve(
+            &mut ctx.sims,
+            &mut ctx.budget,
+            &mut ctx.actions,
+            ctx.mint_available,
+            ctx.route_gates.direct_buy,
+            ctx.route_gates.mint_sell,
+            ctx.route_gates.buffer_frac,
+            ctx.route_gates.buffer_min_susd,
+            Some(&ctx.mint_sell_preserve_markets),
+            frontier_family,
+            Some(&mut wf_stats),
+        );
+    } else {
+        waterfall_with_execution_gate_and_preserve(
+            &mut ctx.sims,
+            &mut ctx.budget,
+            &mut ctx.actions,
+            ctx.mint_available,
+            ctx.route_gates.direct_buy,
+            ctx.route_gates.mint_sell,
+            ctx.route_gates.buffer_frac,
+            ctx.route_gates.buffer_min_susd,
+            Some(&ctx.mint_sell_preserve_markets),
+            Some(&mut wf_stats),
+        );
+    }
+
+    let (terminal_state, raw_ev) = if ctx.actions.is_empty() {
+        // No phase 1/2 actions, but phase 3+ in the full solver might still produce value
+        // (e.g. legacy negative-alpha recycling). Keep as a zero-delta candidate so it
+        // can still make the shortlist and get full-solved.
+        let raw_ev = state_snapshot_expected_value(state, predictions);
+        (state.clone(), raw_ev)
+    } else {
+        let terminal = match apply_actions_to_solver_state(state, &ctx.actions, predictions) {
+            Some(t) => t,
+            None => return None,
+        };
+        let raw_ev = state_snapshot_expected_value(&terminal, predictions);
+        (terminal, raw_ev)
+    };
+    Some(build_plan_result(
+        state,
+        terminal_state,
+        ctx.actions,
+        raw_ev,
+        frontier_family,
+        sorted_preserve_markets(preserve_markets),
+        family,
+        cost_config,
+        PlanCompilerVariant::BaselineStepPrune,
+        None,
+        None,
+        None,
+    ))
+}
+
 fn run_no_arb_rebalance_plan_from_state(
     state: &SolverStateSnapshot,
     predictions: &HashMap<String, f64>,
@@ -5544,7 +5650,8 @@ fn run_no_arb_rebalance_plan_from_state(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
 ) -> Option<PlanResult> {
-    let allow_common_shift = force_mint_available.unwrap_or(true);
+    let allow_common_shift = force_mint_available
+        .unwrap_or(state.slot0_results.len() == expected_outcome_count);
     let mut ctx = build_rebalance_context_with_options(
         &state.holdings,
         state.cash,
@@ -6019,6 +6126,14 @@ fn enumerate_preserve_subsets(preserve_universe: &[&'static str]) -> Vec<Vec<&'s
     subsets
 }
 
+/// Maximum number of seed candidates to full-solve after cheap ranking.
+const SEED_SHORTLIST_MIN_K: usize = 3;
+
+/// Adaptive shortlist size: at least 3, up to 25% of candidates, capped at 8.
+fn seed_shortlist_k(candidate_count: usize) -> usize {
+    SEED_SHORTLIST_MIN_K.max(candidate_count / 4).min(8)
+}
+
 fn enumerate_exact_no_arb_candidates_over_preserve_universe(
     mut candidates: Vec<PlanResult>,
     state: &SolverStateSnapshot,
@@ -6050,8 +6165,38 @@ fn enumerate_exact_no_arb_candidates_over_preserve_universe(
                 .map(move |subset| (frontier_family, subset))
         })
         .collect();
-    stats.exact_rebalance_candidate_evals += tasks.len();
-    let mut extra_candidates: Vec<PlanResult> = tasks
+    let num_tasks = tasks.len();
+    stats.exact_rebalance_candidate_evals += num_tasks;
+
+    // Phase A: cheap seed solve for all candidates
+    let mut seeds: Vec<(Option<BundleRouteKind>, Vec<&'static str>, PlanResult)> = tasks
+        .into_par_iter()
+        .filter_map(|(frontier_family, preserve_markets)| {
+            let seed = seed_no_arb_plan_from_state(
+                state,
+                predictions,
+                expected_outcome_count,
+                route_gates,
+                &preserve_markets,
+                frontier_family,
+                force_mint_available,
+                family,
+                cost_config,
+            )?;
+            Some((frontier_family, preserve_markets, seed))
+        })
+        .collect();
+
+    // Phase B: rank seeds, full-solve top K only
+    seeds.sort_by(|a, b| plan_result_cmp(&a.2, &b.2));
+    let k = seed_shortlist_k(num_tasks);
+    let shortlist: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> = seeds
+        .into_iter()
+        .take(k)
+        .map(|(ff, pm, _)| (ff, pm))
+        .collect();
+
+    let mut extra_candidates: Vec<PlanResult> = shortlist
         .into_par_iter()
         .filter_map(|(frontier_family, preserve_markets)| {
             run_no_arb_rebalance_plan_from_state(
@@ -6173,7 +6318,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
         let singleton_candidates: Vec<PlanResult> = singleton_tasks
             .into_par_iter()
             .filter_map(|(frontier_family, market_name)| {
-                run_no_arb_rebalance_plan_from_state(
+                seed_no_arb_plan_from_state(
                     state,
                     predictions,
                     expected_outcome_count,
@@ -6181,8 +6326,6 @@ fn enumerate_exact_no_arb_candidates_with_options(
                     &[market_name],
                     frontier_family,
                     force_mint_available,
-                    verify_internal_state,
-                    run_phase0_in_polish,
                     family,
                     cost_config,
                 )
@@ -6217,9 +6360,37 @@ fn enumerate_exact_no_arb_candidates_with_options(
         let features =
             collect_distilled_market_features(state, predictions, &merged_preserve_scores);
         let proposal_tasks = distilled_proposal_tasks(&features);
-        stats.distilled_proposal_sets += proposal_tasks.len();
-        stats.distilled_proposal_candidate_evals += proposal_tasks.len();
-        let mut proposal_candidates: Vec<PlanResult> = proposal_tasks
+        let num_proposal_tasks = proposal_tasks.len();
+        stats.distilled_proposal_sets += num_proposal_tasks;
+        stats.distilled_proposal_candidate_evals += num_proposal_tasks;
+        // Seed+shortlist for distilled proposals
+        let mut proposal_seeds: Vec<(Option<BundleRouteKind>, Vec<&'static str>, PlanResult)> =
+            proposal_tasks
+                .into_par_iter()
+                .filter_map(|(frontier_family, preserve_markets)| {
+                    let seed = seed_no_arb_plan_from_state(
+                        state,
+                        predictions,
+                        expected_outcome_count,
+                        route_gates,
+                        &preserve_markets,
+                        frontier_family,
+                        force_mint_available,
+                        family,
+                        cost_config,
+                    )?;
+                    Some((frontier_family, preserve_markets, seed))
+                })
+                .collect();
+        proposal_seeds.sort_by(|a, b| plan_result_cmp(&a.2, &b.2));
+        let proposal_k = seed_shortlist_k(num_proposal_tasks);
+        let proposal_shortlist: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> =
+            proposal_seeds
+                .into_iter()
+                .take(proposal_k)
+                .map(|(ff, pm, _)| (ff, pm))
+                .collect();
+        let mut proposal_candidates: Vec<PlanResult> = proposal_shortlist
             .into_par_iter()
             .filter_map(|(frontier_family, preserve_markets)| {
                 run_no_arb_rebalance_plan_from_state(
@@ -6242,7 +6413,9 @@ fn enumerate_exact_no_arb_candidates_with_options(
         candidates.sort_by(plan_result_cmp);
     }
 
-    if force_mint_available.unwrap_or(true) {
+    let auto_mint_available =
+        force_mint_available.unwrap_or(state.slot0_results.len() == expected_outcome_count);
+    if auto_mint_available {
         if let Some(analytic_mixed) = compile_best_frontier_candidate_for_program_net_ev(
             state,
             predictions,
@@ -7741,12 +7914,29 @@ fn replay_actions_to_market_state_with_predictions(
             .get(&crate::pools::normalize_market_name(market.name))
             .copied()
             .unwrap_or(0.0);
-        let sim = PoolSim::from_slot0(slot0, market, pred)?;
+        let Some(sim) = PoolSim::from_slot0(slot0, market, pred) else {
+            // Zero-liquidity markets cannot be simulated; skip them so the
+            // remaining markets can still be replayed and evaluated.
+            continue;
+        };
         idx_by_market.insert(market.name, sims.len());
         sims.push(sim);
     }
 
     for action in actions {
+        // Guard: the planner must never emit Buy/Sell for a market that
+        // was skipped (zero-liquidity).  If this fires, the planner has a
+        // bug — not the replay path.
+        match action {
+            Action::Buy { market_name, .. } | Action::Sell { market_name, .. } => {
+                debug_assert!(
+                    idx_by_market.contains_key(market_name),
+                    "replay: action targets unsimulated market '{}'",
+                    market_name,
+                );
+            }
+            _ => {}
+        }
         match action {
             Action::Buy {
                 market_name,
@@ -8461,6 +8651,54 @@ fn rebalance_full(
         None,
         false,
     )
+}
+
+/// Zero-cost rebalance for oracle comparison tests.
+///
+/// Uses disabled route gates and a pricing snapshot where gas costs are
+/// effectively zero, so that plan selection ranks by raw EV and the result
+/// can be compared directly against a brute-force grid oracle.
+#[cfg(test)]
+pub(super) fn rebalance_zero_cost_for_test(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+) -> Vec<Action> {
+    let preds = crate::pools::prediction_map();
+    let expected_count = crate::predictions::PREDICTIONS_L1.len();
+    rebalance_full_with_predictions(
+        balances,
+        susds_balance,
+        slot0_results,
+        &preds,
+        expected_count,
+        RebalanceSolver::from_env(),
+        RouteGateThresholds::disabled(),
+        zero_cost_config_for_test(),
+        RebalanceFlags::default(),
+        None,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn zero_cost_config_for_test() -> PlannerCostConfig {
+    PlannerCostConfig {
+        gas_assumptions: GasAssumptions {
+            l1_data_fee_floor_susd: 0.0,
+            ..GasAssumptions::default()
+        },
+        pricing: PlannerPricingSnapshot {
+            gas_price_eth: 0.0,
+            eth_usd: 0.0,
+            l1_fee_per_byte_wei: 0.0,
+            source_label: "zero_cost_test",
+        },
+        conservative_execution: ConservativeExecutionConfig {
+            quote_latency_blocks: 0,
+            adverse_move_bps_per_block: 0,
+        },
+    }
 }
 
 #[cfg(test)]

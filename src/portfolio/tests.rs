@@ -1065,6 +1065,18 @@ fn build_rebalance_fuzz_case(
     HashMap<&'static str, f64>,
     f64,
 ) {
+    build_rebalance_fuzz_case_capped(rng, force_partial, None)
+}
+
+fn build_rebalance_fuzz_case_capped(
+    rng: &mut TestRng,
+    force_partial: bool,
+    max_markets: Option<usize>,
+) -> (
+    Vec<(Slot0Result, &'static crate::markets::MarketData)>,
+    HashMap<&'static str, f64>,
+    f64,
+) {
     use crate::markets::MARKETS_L1;
 
     let preds = crate::pools::prediction_map();
@@ -1084,6 +1096,11 @@ fn build_rebalance_fuzz_case(
     for i in (1..candidates.len()).rev() {
         let j = rng.pick(i + 1);
         candidates.swap(i, j);
+    }
+
+    // Cap to max_markets if specified (deterministic after shuffle).
+    if let Some(cap) = max_markets {
+        candidates.truncate(cap);
     }
 
     let total = candidates.len();

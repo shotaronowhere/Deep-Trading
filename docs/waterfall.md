@@ -2,7 +2,7 @@
 
 This is the definitive implementation spec for the waterfall rebalancing algorithm.
 
-Status: current as of 2026-03-10.
+Status: current as of 2026-03-22.
 Source-of-truth code paths:
 
 - `src/portfolio/core/rebalancer.rs`
@@ -95,7 +95,7 @@ Current runtime behavior:
    - cap the online preserve universe at `K = 4`
    - enumerate every `(frontier_family, preserve_subset)` pair from fresh state
    - for each exact no-arb candidate, keep the rich trace, replay it to terminal holdings, and compare exactly eight compact forms:
-     - `baseline_step_prune`
+     - `baseline_step_prune` (single-pass reverse pruning by profitability step group, O(G×A))
      - `target_delta`
      - `analytic_mixed`
      - `constant_l_mixed`
@@ -179,6 +179,7 @@ Admission/ranking:
 - Frontier membership is chosen from the best currently executable route per outcome:
   - direct candidates use `remaining_budget * direct_prof >= gas_direct_susd`
   - mint candidates use `remaining_budget * mint_prof >= gas_mint_susd`
+- `bundle_frontier` computes both direct and mint frontiers independently, then selects whichever has higher `current_prof`. This prevents direct-first bias from suppressing more profitable mint routes.
 - This means mint-only opportunities are still admitted when every direct route is currently unprofitable.
 
 Execution-meaningful step gating:
@@ -208,6 +209,11 @@ Boundary behavior:
 - Mint steps may split at active-set boundaries (join conditions).
 - Boundary splits continue the same profitability level with refreshed ranking and skip set.
 - Budget-partial non-boundary steps continue from `current_prof = achievable`.
+
+Profitability tracking (`last_prof`):
+
+- `last_prof` records the lowest profitability level the waterfall actually reached, used as Phase 3 recycling threshold.
+- Only updated when a step is fully affordable (`BundleStepPlan.fully_affordable == true`). Budget-capped partial steps don't actually reach their `final_prof`, so recording it would overstate how far the waterfall descended and set an incorrect recycling threshold.
 
 Safety bounds:
 

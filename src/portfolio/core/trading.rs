@@ -442,14 +442,23 @@ impl<'a> ExecutionState<'a> {
                     if segment.cash_cost > DUST {
                         executed_any = true;
                     }
-                    for &(idx, amount, cost, new_price) in &segment.direct_member_plans {
+                    for &(idx, amount, _planned_cost, new_price) in
+                        &segment.direct_member_plans
+                    {
                         if amount <= DUST {
                             continue;
                         }
+                        // Recompute cost from live pool state so Actions
+                        // record accurate costs even if prices moved since
+                        // planning time (e.g. during polish/recycle loops).
+                        let live_cost = self.sims[idx]
+                            .buy_exact(amount)
+                            .map(|(_, c, _)| c)
+                            .unwrap_or(_planned_cost);
                         self.actions.push(Action::Buy {
                             market_name: self.sims[idx].market_name,
                             amount,
-                            cost,
+                            cost: live_cost,
                         });
                         self.sims[idx].set_price(new_price);
                         *self

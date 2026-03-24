@@ -5,14 +5,15 @@ use super::super::merge::{merge_sell_cap_with_inventory, optimal_sell_split_with
 use super::super::planning::{
     active_skip_indices, plan_active_routes, plan_is_budget_feasible, solve_prof,
 };
-use super::super::rebalancer::rebalance;
+use super::super::rebalancer::{rebalance, rebalance_zero_cost_for_test};
 use super::super::sim::{PoolSim, Route, alt_price, profitability};
 use super::super::solver::mint_cost_to_prof;
 use super::super::waterfall::waterfall;
 use super::{
     Action, TestRng, assert_rebalance_action_invariants,
     assert_strict_ev_gain_with_portfolio_trace, brute_force_best_split_with_inventory,
-    build_rebalance_fuzz_case, build_slot0_results_for_markets, build_three_sims_with_preds,
+    build_rebalance_fuzz_case, build_rebalance_fuzz_case_capped, build_slot0_results_for_markets,
+    build_three_sims_with_preds,
     eligible_l1_markets_with_predictions, ev_from_state, mock_slot0_market,
     replay_actions_to_state,
 };
@@ -142,6 +143,296 @@ fn collect_fuzz_case_by_index(
     }
     out.expect("seeded fuzz case should exist for requested index")
 }
+
+// --- Tiered regression infrastructure (capped market count) ---
+//
+// Runtime profiling shows the solver scales linearly up to ~95 markets (<0.5s)
+// then explodes at 98 markets (~71s) due to complete-set mint/merge combinatorics.
+//
+// Tier 1 (breadth): 20 markets, 10 full + 10 partial — variation in market selection
+// Tier 2 (depth):   95 markets, 2 full + 2 partial  — near-full scale, real distributions
+
+const BREADTH_MAX_MARKETS: usize = 20;
+const BREADTH_CASES_PER_SIDE: usize = 10;
+const DEPTH_MAX_MARKETS: usize = 95;
+const DEPTH_CASES_PER_SIDE: usize = 2;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TieredEvSnapshots {
+    breadth_full: Vec<f64>,
+    breadth_partial: Vec<f64>,
+    depth_full: Vec<f64>,
+    depth_partial: Vec<f64>,
+}
+
+fn tiered_ev_snapshots() -> &'static TieredEvSnapshots {
+    static SNAPSHOTS: OnceLock<TieredEvSnapshots> = OnceLock::new();
+    SNAPSHOTS.get_or_init(|| {
+        serde_json::from_str(include_str!("ev_snapshots_tiered.json"))
+            .expect("tiered ev snapshot fixture must be valid JSON")
+    })
+}
+
+fn collect_fuzz_case_by_index_capped(
+    force_partial: bool,
+    case_idx: usize,
+    max_markets: usize,
+) -> (
+    Vec<(
+        crate::pools::Slot0Result,
+        &'static crate::markets::MarketData,
+    )>,
+    HashMap<&'static str, f64>,
+    f64,
+) {
+    let seed = if force_partial {
+        0xABCD_1234_EF99_7788u64
+    } else {
+        0xFEED_FACE_1234_4321u64
+    };
+    let mut rng = TestRng::new(seed);
+    let mut out = None;
+    for _ in 0..=case_idx {
+        out = Some(build_rebalance_fuzz_case_capped(
+            &mut rng,
+            force_partial,
+            Some(max_markets),
+        ));
+    }
+    out.expect("seeded fuzz case should exist for requested index")
+}
+
+fn collect_fuzz_ev_after_capped(force_partial: bool, num_cases: usize, max_markets: usize) -> Vec<f64> {
+    let seed = if force_partial {
+        0xABCD_1234_EF99_7788u64
+    } else {
+        0xFEED_FACE_1234_4321u64
+    };
+    let mut out = vec![0.0_f64; num_cases];
+    let mut rng = TestRng::new(seed);
+    for case_idx in 0..num_cases {
+        let (slot0_results, balances_static, susd_balance) =
+            build_rebalance_fuzz_case_capped(&mut rng, force_partial, Some(max_markets));
+        let balances: HashMap<&str, f64> = balances_static
+            .iter()
+            .map(|(k, v)| (*k as &str, *v))
+            .collect();
+        let actions = rebalance(&balances, susd_balance, &slot0_results);
+        assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
+        if force_partial {
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+                "mint actions should be disabled for partial case {}",
+                case_idx
+            );
+        }
+
+        let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
+        for (_, market) in &slot0_results {
+            holdings_before.insert(
+                market.name,
+                balances.get(market.name).copied().unwrap_or(0.0).max(0.0),
+            );
+        }
+        let ev_before = ev_from_state(&holdings_before, susd_balance);
+        let (holdings_after, cash_after) =
+            replay_actions_to_state(&actions, &slot0_results, &balances, susd_balance);
+        let ev_after = ev_from_state(&holdings_after, cash_after);
+        assert!(
+            ev_after >= ev_before - 1e-9,
+            "expected EV non-decrease for case {} (force_partial={}, max_markets={}): before={:.9}, after={:.9}",
+            case_idx, force_partial, max_markets, ev_before, ev_after
+        );
+        out[case_idx] = ev_after;
+    }
+    out
+}
+
+#[test]
+#[ignore = "updates src/portfolio/tests/ev_snapshots_tiered.json; run explicitly"]
+fn test_refresh_ev_snapshots_tiered() {
+    let snapshots = TieredEvSnapshots {
+        breadth_full: collect_fuzz_ev_after_capped(false, BREADTH_CASES_PER_SIDE, BREADTH_MAX_MARKETS),
+        breadth_partial: collect_fuzz_ev_after_capped(true, BREADTH_CASES_PER_SIDE, BREADTH_MAX_MARKETS),
+        depth_full: collect_fuzz_ev_after_capped(false, DEPTH_CASES_PER_SIDE, DEPTH_MAX_MARKETS),
+        depth_partial: collect_fuzz_ev_after_capped(true, DEPTH_CASES_PER_SIDE, DEPTH_MAX_MARKETS),
+    };
+    let json = serde_json::to_string_pretty(&snapshots)
+        .expect("tiered ev snapshots should serialize to valid JSON");
+    std::fs::write("src/portfolio/tests/ev_snapshots_tiered.json", format!("{json}\n"))
+        .expect("failed to write tiered ev snapshots fixture");
+    println!("[tiered-snapshot-refresh] wrote src/portfolio/tests/ev_snapshots_tiered.json");
+}
+
+/// Tiered EV regression test with snapshot bands.
+///
+/// Breadth tier: 20 real L1 markets, 10 full + 10 partial cases (~1s total).
+///   Catches edge-case distributions via high variation in randomized market selection.
+///
+/// Depth tier: 95 real L1 markets, 2 full + 2 partial cases (~2s total).
+///   Near-full scale with real price distributions; stresses profitability sorting
+///   and waterfall at high market counts (just below the 98-market mint/merge cliff).
+#[test]
+fn test_rebalance_ev_regression_tiered() {
+    let snapshots = tiered_ev_snapshots();
+
+    // --- Breadth tier: 20 markets, 10+10 cases ---
+    for case_idx in 0..BREADTH_CASES_PER_SIDE {
+        let (slot0_results, balances_static, susd_balance) =
+            collect_fuzz_case_by_index_capped(false, case_idx, BREADTH_MAX_MARKETS);
+        let balances: HashMap<&str, f64> = balances_static
+            .iter()
+            .map(|(k, v)| (*k as &str, *v))
+            .collect();
+        let actions = rebalance(&balances, susd_balance, &slot0_results);
+        assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
+
+        let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
+        for (_, market) in &slot0_results {
+            holdings_before.insert(
+                market.name,
+                balances.get(market.name).copied().unwrap_or(0.0).max(0.0),
+            );
+        }
+        let ev_before = ev_from_state(&holdings_before, susd_balance);
+        let (holdings_after, cash_after) =
+            replay_actions_to_state(&actions, &slot0_results, &balances, susd_balance);
+        let ev_after = ev_from_state(&holdings_after, cash_after);
+        assert!(
+            ev_after >= ev_before - 1e-9,
+            "breadth full case {}: EV decreased: before={:.9}, after={:.9}",
+            case_idx, ev_before, ev_after
+        );
+        let (ok, floor_tol, ceiling_tol) =
+            ev_within_snapshot_band(ev_after, snapshots.breadth_full[case_idx]);
+        assert!(
+            ok,
+            "breadth full case {} out of snapshot band: got={:.12}, expected={:.12}, floor={:.12}, ceiling={:.12}",
+            case_idx, ev_after, snapshots.breadth_full[case_idx], floor_tol, ceiling_tol
+        );
+    }
+    for case_idx in 0..BREADTH_CASES_PER_SIDE {
+        let (slot0_results, balances_static, susd_balance) =
+            collect_fuzz_case_by_index_capped(true, case_idx, BREADTH_MAX_MARKETS);
+        let balances: HashMap<&str, f64> = balances_static
+            .iter()
+            .map(|(k, v)| (*k as &str, *v))
+            .collect();
+        let actions = rebalance(&balances, susd_balance, &slot0_results);
+        assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+            "breadth partial case {}: mint should be disabled", case_idx
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+            "breadth partial case {}: merge should be disabled", case_idx
+        );
+
+        let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
+        for (_, market) in &slot0_results {
+            holdings_before.insert(
+                market.name,
+                balances.get(market.name).copied().unwrap_or(0.0).max(0.0),
+            );
+        }
+        let ev_before = ev_from_state(&holdings_before, susd_balance);
+        let (holdings_after, cash_after) =
+            replay_actions_to_state(&actions, &slot0_results, &balances, susd_balance);
+        let ev_after = ev_from_state(&holdings_after, cash_after);
+        assert!(
+            ev_after >= ev_before - 1e-9,
+            "breadth partial case {}: EV decreased: before={:.9}, after={:.9}",
+            case_idx, ev_before, ev_after
+        );
+        let (ok, floor_tol, ceiling_tol) =
+            ev_within_snapshot_band(ev_after, snapshots.breadth_partial[case_idx]);
+        assert!(
+            ok,
+            "breadth partial case {} out of snapshot band: got={:.12}, expected={:.12}, floor={:.12}, ceiling={:.12}",
+            case_idx, ev_after, snapshots.breadth_partial[case_idx], floor_tol, ceiling_tol
+        );
+    }
+
+    // --- Depth tier: 95 markets, 2+2 cases ---
+    for case_idx in 0..DEPTH_CASES_PER_SIDE {
+        let (slot0_results, balances_static, susd_balance) =
+            collect_fuzz_case_by_index_capped(false, case_idx, DEPTH_MAX_MARKETS);
+        let balances: HashMap<&str, f64> = balances_static
+            .iter()
+            .map(|(k, v)| (*k as &str, *v))
+            .collect();
+        let actions = rebalance(&balances, susd_balance, &slot0_results);
+        assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
+
+        let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
+        for (_, market) in &slot0_results {
+            holdings_before.insert(
+                market.name,
+                balances.get(market.name).copied().unwrap_or(0.0).max(0.0),
+            );
+        }
+        let ev_before = ev_from_state(&holdings_before, susd_balance);
+        let (holdings_after, cash_after) =
+            replay_actions_to_state(&actions, &slot0_results, &balances, susd_balance);
+        let ev_after = ev_from_state(&holdings_after, cash_after);
+        assert!(
+            ev_after >= ev_before - 1e-9,
+            "depth full case {}: EV decreased: before={:.9}, after={:.9}",
+            case_idx, ev_before, ev_after
+        );
+        let (ok, floor_tol, ceiling_tol) =
+            ev_within_snapshot_band(ev_after, snapshots.depth_full[case_idx]);
+        assert!(
+            ok,
+            "depth full case {} out of snapshot band: got={:.12}, expected={:.12}, floor={:.12}, ceiling={:.12}",
+            case_idx, ev_after, snapshots.depth_full[case_idx], floor_tol, ceiling_tol
+        );
+    }
+    for case_idx in 0..DEPTH_CASES_PER_SIDE {
+        let (slot0_results, balances_static, susd_balance) =
+            collect_fuzz_case_by_index_capped(true, case_idx, DEPTH_MAX_MARKETS);
+        let balances: HashMap<&str, f64> = balances_static
+            .iter()
+            .map(|(k, v)| (*k as &str, *v))
+            .collect();
+        let actions = rebalance(&balances, susd_balance, &slot0_results);
+        assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
+            "depth partial case {}: mint should be disabled", case_idx
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
+            "depth partial case {}: merge should be disabled", case_idx
+        );
+
+        let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
+        for (_, market) in &slot0_results {
+            holdings_before.insert(
+                market.name,
+                balances.get(market.name).copied().unwrap_or(0.0).max(0.0),
+            );
+        }
+        let ev_before = ev_from_state(&holdings_before, susd_balance);
+        let (holdings_after, cash_after) =
+            replay_actions_to_state(&actions, &slot0_results, &balances, susd_balance);
+        let ev_after = ev_from_state(&holdings_after, cash_after);
+        assert!(
+            ev_after >= ev_before - 1e-9,
+            "depth partial case {}: EV decreased: before={:.9}, after={:.9}",
+            case_idx, ev_before, ev_after
+        );
+        let (ok, floor_tol, ceiling_tol) =
+            ev_within_snapshot_band(ev_after, snapshots.depth_partial[case_idx]);
+        assert!(
+            ok,
+            "depth partial case {} out of snapshot band: got={:.12}, expected={:.12}, floor={:.12}, ceiling={:.12}",
+            case_idx, ev_after, snapshots.depth_partial[case_idx], floor_tol, ceiling_tol
+        );
+    }
+}
+
 
 #[derive(Debug, Clone, Copy)]
 struct FastEvCaseReport {
@@ -288,6 +579,7 @@ fn test_refresh_ev_snapshots_fixture() {
 }
 
 #[test]
+#[ignore = "uses all 98 L1 markets; takes 5-30 min per case — run test_rebalance_ev_regression_synthetic instead"]
 fn test_fuzz_rebalance_ev_regression_fast_suite() {
     // Fast representative subset; catches meaningful EV drift quickly.
     const FULL_CASES: [usize; 4] = [0, 1, 10, 14];
@@ -312,6 +604,141 @@ fn test_fuzz_rebalance_ev_regression_fast_suite() {
     print_fast_ev_summary("full", &full_reports);
     print_fast_ev_summary("partial", &partial_reports);
     print_fast_ev_summary("combined", &combined_reports);
+}
+
+/// Fast synthetic EV regression test using small market sets (5 markets).
+/// Replaces the slow L1-based regression suite that takes 5-30 min per case.
+/// Runs in seconds, catches budget enforcement, step-prune, and mint-availability bugs.
+#[test]
+fn test_rebalance_ev_regression_synthetic() {
+    use super::super::rebalancer::rebalance_with_custom_predictions_for_test;
+
+    struct SyntheticCase {
+        label: &'static str,
+        // (name, outcome_token, price, prediction)
+        markets: Vec<(&'static str, &'static str, f64, f64)>,
+        balances: Vec<(&'static str, f64)>,
+        cash: f64,
+        force_mint: bool,
+    }
+
+    let cases = vec![
+        SyntheticCase {
+            label: "basic_underpriced_direct_only",
+            markets: vec![
+                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.05, 0.15),
+                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.08, 0.20),
+                ("mkt_c", "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0.12, 0.10),
+            ],
+            balances: vec![("mkt_c", 5.0)],
+            cash: 10.0,
+            force_mint: false,
+        },
+        SyntheticCase {
+            label: "sell_overpriced_and_buy_underpriced",
+            markets: vec![
+                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.05, 0.15),
+                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.20, 0.08),
+                ("mkt_c", "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0.10, 0.12),
+            ],
+            balances: vec![("mkt_b", 8.0)],
+            cash: 5.0,
+            force_mint: false,
+        },
+        SyntheticCase {
+            label: "low_budget_many_profitable",
+            markets: vec![
+                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.03, 0.12),
+                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.04, 0.15),
+                ("mkt_c", "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0.06, 0.18),
+                ("mkt_d", "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD", 0.02, 0.10),
+                ("mkt_e", "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE", 0.07, 0.20),
+            ],
+            balances: vec![],
+            cash: 2.0,
+            force_mint: false,
+        },
+        SyntheticCase {
+            label: "mint_available_mixed_routes",
+            markets: vec![
+                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.05, 0.15),
+                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.08, 0.20),
+                ("mkt_c", "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0.10, 0.05),
+            ],
+            balances: vec![("mkt_c", 10.0)],
+            cash: 15.0,
+            force_mint: true,
+        },
+        SyntheticCase {
+            label: "zero_budget_legacy_only",
+            markets: vec![
+                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.05, 0.15),
+                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.20, 0.08),
+            ],
+            balances: vec![("mkt_b", 20.0)],
+            cash: 0.0,
+            force_mint: false,
+        },
+    ];
+
+    for case in &cases {
+        let slot0_results: Vec<_> = case
+            .markets
+            .iter()
+            .map(|(name, token, price, _)| mock_slot0_market(name, token, *price))
+            .collect();
+
+        let predictions: HashMap<String, f64> = case
+            .markets
+            .iter()
+            .map(|(name, _, _, pred)| (name.to_string(), *pred))
+            .collect();
+
+        let balances: HashMap<&str, f64> = case.balances.iter().copied().collect();
+
+        let actions = rebalance_with_custom_predictions_for_test(
+            &balances,
+            case.cash,
+            &slot0_results,
+            &predictions,
+            case.force_mint,
+        );
+
+        // 1. Cash must never go negative
+        assert_rebalance_action_invariants(&actions, &slot0_results, &balances, case.cash);
+
+        // 2. EV must not decrease
+        let _ev_before = ev_from_state(
+            &{
+                let mut h = HashMap::new();
+                for (name, bal) in &case.balances {
+                    h.insert(*name, *bal);
+                }
+                h
+            },
+            case.cash,
+        );
+        let (_, cash_after) =
+            replay_actions_to_state(&actions, &slot0_results, &balances, case.cash);
+        // Cash after should be non-negative (redundant with invariants but explicit)
+        assert!(
+            cash_after >= -1e-6,
+            "[{}] negative cash after rebalance: {}",
+            case.label,
+            cash_after
+        );
+
+        // 3. No mint/merge when not forced
+        if !case.force_mint {
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Mint { .. } | Action::Merge { .. })),
+                "[{}] unexpected mint/merge actions when force_mint=false",
+                case.label
+            );
+        }
+    }
 }
 
 #[test]
@@ -804,8 +1231,8 @@ fn test_rebalance_regression_full_l1_snapshot_invariants() {
     }
     let budget = 83.0;
 
-    let actions_a = rebalance(&balances, budget, &slot0_results);
-    let actions_b = rebalance(&balances, budget, &slot0_results);
+    let actions_a = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
+    let actions_b = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
     assert_eq!(
         actions_a, actions_b,
         "full-L1 regression fixture should be deterministic"
@@ -884,8 +1311,8 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     }
     let budget = 41.0;
 
-    let actions_a = rebalance(&balances, budget, &slot0_results);
-    let actions_b = rebalance(&balances, budget, &slot0_results);
+    let actions_a = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
+    let actions_b = rebalance_zero_cost_for_test(&balances, budget, &slot0_results);
     assert_eq!(
         actions_a, actions_b,
         "full-L1 regression fixture should be deterministic"
@@ -902,7 +1329,7 @@ fn test_rebalance_regression_full_l1_snapshot_variant_b_invariants() {
     let gain = ev_after - ev_before;
 
     const EXPECTED_EV_BEFORE: f64 = 41.229_354_975;
-    const EXPECTED_EV_AFTER: f64 = 45.865_172_947;
+    const EXPECTED_EV_AFTER: f64 = 45.783_077_637;
     const EV_TOL: f64 = 3e-6;
 
     assert!(

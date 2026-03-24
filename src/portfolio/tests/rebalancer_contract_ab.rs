@@ -2450,70 +2450,119 @@ fn shared_snapshot_metadata_classifies_committed_fixtures() {
     assert!(saw_release_fixture, "expected at least one release fixture");
 }
 
-#[test]
-fn offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_committed_cases() {
+fn run_fee_sweep_for_case(case_id: &str) {
     const NET_EV_TOL: f64 = 1e-9;
 
+    let cases = cases_from_fixture();
+    let case = cases
+        .iter()
+        .find(|c| c.case_id == case_id)
+        .unwrap_or_else(|| panic!("unknown fixture case: {}", case_id));
+    let built = build_case(case);
+    let force_mint_available = !case.direct_only_reference;
     let onchain_artifacts = load_onchain_call_artifacts();
-    for case in cases_from_fixture() {
-        let built = build_case(&case);
-        let force_mint_available = !case.direct_only_reference;
-        let onchain = onchain_artifacts
-            .get(&case.case_id)
-            .unwrap_or_else(|| panic!("missing on-chain artifact for {}", case.case_id));
+    let onchain = onchain_artifacts
+        .get(&case.case_id)
+        .unwrap_or_else(|| panic!("missing on-chain artifact for {}", case.case_id));
 
-        for fee_multiplier in [0.5, 1.0, 2.0] {
-            let gas_assumptions = scaled_benchmark_gas_assumptions(fee_multiplier);
-            let fee_inputs = benchmark_fee_inputs_with_multiplier(fee_multiplier);
-            let metadata = fixture_case_row_metadata(&case, &built, fee_multiplier);
-            let summary = rebalance_with_custom_predictions_selected_plan_with_pricing_for_test(
-                &built.balances_view,
-                built.cash_budget,
-                &built.slot0_results,
-                &built.predictions,
-                force_mint_available,
+    for fee_multiplier in [0.5, 1.0, 2.0] {
+        let gas_assumptions = scaled_benchmark_gas_assumptions(fee_multiplier);
+        let fee_inputs = benchmark_fee_inputs_with_multiplier(fee_multiplier);
+        let metadata = fixture_case_row_metadata(case, &built, fee_multiplier);
+        let t0 = std::time::Instant::now();
+        let summary = rebalance_with_custom_predictions_selected_plan_with_pricing_for_test(
+            &built.balances_view,
+            built.cash_budget,
+            &built.slot0_results,
+            &built.predictions,
+            force_mint_available,
+            &gas_assumptions,
+            BENCHMARK_OP_GAS_PRICE_ETH * fee_multiplier,
+            BENCHMARK_OP_ETH_USD,
+        );
+        eprintln!(
+            "[fee-sweep] case={} fee={:.1}x  solver={:.2?}  n_markets={}",
+            case.case_id,
+            fee_multiplier,
+            t0.elapsed(),
+            built.slot0_results.len(),
+        );
+        let offchain_net_ev = summary
+            .estimated_net_ev
+            .expect("off-chain benchmark plan should have modeled net EV under fee sweep");
+        let onchain_exact_net_ev = wad_to_f64(onchain.exact.raw_ev_wei)
+            - modeled_total_fee_susd_for_onchain_artifact(
+                &onchain.exact,
                 &gas_assumptions,
-                BENCHMARK_OP_GAS_PRICE_ETH * fee_multiplier,
+                fee_inputs,
                 BENCHMARK_OP_ETH_USD,
             );
-            let offchain_net_ev = summary
-                .estimated_net_ev
-                .expect("off-chain benchmark plan should have modeled net EV under fee sweep");
-            let onchain_exact_net_ev = wad_to_f64(onchain.exact.raw_ev_wei)
-                - modeled_total_fee_susd_for_onchain_artifact(
-                    &onchain.exact,
-                    &gas_assumptions,
-                    fee_inputs,
-                    BENCHMARK_OP_ETH_USD,
-                );
-            let onchain_mixed_net_ev = wad_to_f64(onchain.mixed.raw_ev_wei)
-                - modeled_total_fee_susd_for_onchain_artifact(
-                    &onchain.mixed,
-                    &gas_assumptions,
-                    fee_inputs,
-                    BENCHMARK_OP_ETH_USD,
-                );
+        let onchain_mixed_net_ev = wad_to_f64(onchain.mixed.raw_ev_wei)
+            - modeled_total_fee_susd_for_onchain_artifact(
+                &onchain.mixed,
+                &gas_assumptions,
+                fee_inputs,
+                BENCHMARK_OP_ETH_USD,
+            );
 
-            assert_eq!(metadata.fee_regime, fee_regime_label(fee_multiplier));
-            assert!(
-                offchain_net_ev + NET_EV_TOL >= onchain_exact_net_ev,
-                "{} {} off-chain net EV lost to on-chain exact: offchain={} onchain_exact={} summary={:?}",
-                case.case_id,
-                metadata.fee_regime,
-                offchain_net_ev,
-                onchain_exact_net_ev,
-                summary
-            );
-            assert!(
-                offchain_net_ev + NET_EV_TOL >= onchain_mixed_net_ev,
-                "{} {} off-chain net EV lost to on-chain mixed: offchain={} onchain_mixed={} summary={:?}",
-                case.case_id,
-                metadata.fee_regime,
-                offchain_net_ev,
-                onchain_mixed_net_ev,
-                summary
-            );
-        }
+        assert_eq!(metadata.fee_regime, fee_regime_label(fee_multiplier));
+        assert!(
+            offchain_net_ev + NET_EV_TOL >= onchain_exact_net_ev,
+            "{} {} off-chain net EV lost to on-chain exact: offchain={} onchain_exact={} summary={:?}",
+            case.case_id,
+            metadata.fee_regime,
+            offchain_net_ev,
+            onchain_exact_net_ev,
+            summary
+        );
+        assert!(
+            offchain_net_ev + NET_EV_TOL >= onchain_mixed_net_ev,
+            "{} {} off-chain net EV lost to on-chain mixed: offchain={} onchain_mixed={} summary={:?}",
+            case.case_id,
+            metadata.fee_regime,
+            offchain_net_ev,
+            onchain_mixed_net_ev,
+            summary
+        );
+    }
+}
+
+#[test]
+fn fee_sweep_two_pool_single_tick_direct_only() {
+    run_fee_sweep_for_case("two_pool_single_tick_direct_only");
+}
+
+#[test]
+fn fee_sweep_small_bundle_mixed_case() {
+    run_fee_sweep_for_case("small_bundle_mixed_case");
+}
+
+#[test]
+fn fee_sweep_mixed_route_favorable_synthetic_case() {
+    run_fee_sweep_for_case("mixed_route_favorable_synthetic_case");
+}
+
+#[test]
+fn fee_sweep_legacy_holdings_direct_only_case() {
+    run_fee_sweep_for_case("legacy_holdings_direct_only_case");
+}
+
+#[test]
+fn fee_sweep_ninety_eight_outcome_multitick_direct_only() {
+    run_fee_sweep_for_case("ninety_eight_outcome_multitick_direct_only");
+}
+
+#[test]
+#[ignore = "heavy: 98-market solver with gas pricing takes 10+ min in release"]
+fn fee_sweep_heterogeneous_ninety_eight_outcome_l1_like_case() {
+    run_fee_sweep_for_case("heterogeneous_ninety_eight_outcome_l1_like_case");
+}
+
+#[test]
+#[ignore = "aggregate of per-case fee sweep tests; run individually instead"]
+fn offchain_default_net_ev_matches_or_beats_onchain_under_fee_sweeps_on_committed_cases() {
+    for case in cases_from_fixture() {
+        run_fee_sweep_for_case(&case.case_id);
     }
 }
 
