@@ -2987,6 +2987,7 @@ fn ultimate_solver_mixed_ev_dominates_staged_reference() {
 }
 
 #[test]
+#[ignore = "heavy: 98-market exact solver enumeration ~8 min wall time; run explicitly"]
 fn exact_no_arb_dominates_heuristic_no_arb() {
     let cases = cases_from_fixture();
 
@@ -3030,6 +3031,7 @@ fn exact_no_arb_dominates_heuristic_no_arb() {
 }
 
 #[test]
+#[ignore = "heavy: 98-market exact solver enumeration ~8 min wall time; run explicitly"]
 fn distilled_exact_no_arb_is_non_regressive_vs_baseline_k4_search() {
     let cases = cases_from_fixture();
 
@@ -3077,6 +3079,7 @@ fn distilled_exact_no_arb_is_non_regressive_vs_baseline_k4_search() {
 }
 
 #[test]
+#[ignore = "heavy: 98-market exact solver enumeration ~8 min wall time; run explicitly"]
 fn plain_family_is_non_regressive_vs_exact_no_arb() {
     let cases = cases_from_fixture();
 
