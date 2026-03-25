@@ -24,6 +24,19 @@ On startup, execute flow:
 3. Redeploys from `out/TradeExecutor.sol/TradeExecutor.json` if invalid or missing.
 4. Persists refreshed cache entry.
 
+## Gnosis chain (Swapr / AlgebraV1.9) addresses
+
+Used by `RebalancerAlgebra.sol` for scalar futarchy markets.
+
+- Swapr AlgebraV1.9 Router: `0xfFB643E73f280B97809A8b41f7232AB401a04EE1`
+- Algebra Pool Deployer (CREATE2): `0xC1b576AC6Ec749d5Ace1787bF9Ec6340908ddB47`
+- Pool Init Code Hash: `0xbce37a54eab2fcd71913a0d40723e04238970e7fc1159bfd58ad5b79531697e7`
+- GnosisRouter (CTF): `0xeC9048b59b3467415b1a38F63416407eA0c70fB8`
+- sDAI (collateral): `0xaf204776c7245bF4147c2612BF6e5972Ee483701`
+
+Pool addresses are derived via CREATE2 from the Pool Deployer + init code hash + `keccak256(token0, token1)`.
+All Swapr futarchy pools use `tickSpacing = 60`.
+
 ## Note
 
 `BATCH_SWAP_ROUTER_ADDRESS` is currently hardcoded in Rust. If router bytecode is redeployed, update

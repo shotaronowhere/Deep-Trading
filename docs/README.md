@@ -13,6 +13,7 @@ If documents conflict, follow this precedence:
 
 - `docs/waterfall.md`: definitive off-chain waterfall/rebalance spec.
 - `docs/rebalancer.md`: definitive on-chain direct solver spec.
+- `docs/rebalancer_algebra.md`: on-chain AlgebraV1.9 (Swapr/Gnosis) solver spec.
 - `docs/rebalancer_mixed.md`: on-chain mixed solver spec (experimental).
 - `docs/rebalancer_approaches_playbook.md`: cross-approach policy, thresholds, and validation cadence.
 - `docs/rebalancer_policy_metrics_schema.md`: machine-readable threshold dashboard schema.

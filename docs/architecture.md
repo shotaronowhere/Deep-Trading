@@ -104,9 +104,10 @@ Converts Uniswap V3 `sqrtPriceX96` to outcome token prices (18-decimal fixed poi
 
 ## On-Chain Contracts
 
-- **contracts/Rebalancer.sol**: Fully on-chain rebalancer that reads pool state, computes closed-form waterfall allocation (ψ), and executes sell/buy swaps atomically. Replaces the off-chain hybrid approach (see [docs/slippage.md](slippage.md)). Also includes complete-set arbitrage (`arb()`).
+- **contracts/Rebalancer.sol**: Fully on-chain rebalancer that reads pool state, computes closed-form waterfall allocation (ψ), and executes sell/buy swaps atomically. Replaces the off-chain hybrid approach (see [docs/slippage.md](slippage.md)). Also includes complete-set arbitrage (`arb()`). Targets Uniswap V3 (Optimism).
+- **contracts/RebalancerAlgebra.sol**: Fork of Rebalancer.sol adapted for AlgebraV1.9 (Swapr) DEX on Gnosis chain. Key differences: `globalState()` instead of `slot0()`, dynamic per-pool fees, `tickTable()` with raw tick bitmap (no spacing compression), and Algebra router params. See [docs/rebalancer_algebra.md](rebalancer_algebra.md).
 - **contracts/BatchSwapRouter.sol**: Batch router contract/API for explicit basket execution and tests. The current Rust runtime executor does not target it directly; it emits per-leg `SwapRouter02` calls while the deployed batch-router ABI is kept in Rust for compatibility.
-- **contracts/interfaces/**: `IV3SwapRouter`, `ICTFRouter`, `IUniswapV3Pool`, `IERC20`, `IBatchSwapRouter`
+- **contracts/interfaces/**: `IV3SwapRouter`, `ICTFRouter`, `IUniswapV3Pool`, `IERC20`, `IBatchSwapRouter`, `IAlgebraSwapRouter`, `IAlgebraPool`
 - **contracts/libraries/FullMath.sol**: 512-bit `mulDiv` from Uniswap V3 core
 
 ## External Dependencies
