@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::BufWriter;
 
 pub mod execution;
+pub mod gnosis;
 #[allow(clippy::all, clippy::pedantic)]
 pub mod markets;
 pub mod pools;

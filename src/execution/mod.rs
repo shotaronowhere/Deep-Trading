@@ -6,6 +6,7 @@ mod batch_bounds;
 pub mod bounds;
 mod edge;
 pub mod gas;
+pub mod gnosis_preview;
 pub mod grouping;
 pub mod onchain_preview;
 pub mod preview;
