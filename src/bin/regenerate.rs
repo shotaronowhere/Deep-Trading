@@ -20,12 +20,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let manifest_path = Path::new(&manifest_dir);
 
-    let l1_predictions_csv = manifest_path.join("l1-predictions.csv");
-    let l2_predictions_csv = manifest_path.join("l2-predictions.csv");
-    let originality_predictions_csv = manifest_path.join("originality-predictions.csv");
-    let markets_data_l1_json = manifest_path.join("markets_data_l1.json");
-    let markets_data_l2_json = manifest_path.join("markets_data_l2.json");
-    let markets_data_originality_json = manifest_path.join("markets_data_originality.json");
+    let l1_predictions_csv = manifest_path.join("data/l1-predictions.csv");
+    let l2_predictions_csv = manifest_path.join("data/l2-predictions.csv");
+    let originality_predictions_csv = manifest_path.join("data/originality-predictions.csv");
+    let markets_data_l1_json = manifest_path.join("data/markets_data_l1.json");
+    let markets_data_l2_json = manifest_path.join("data/markets_data_l2.json");
+    let markets_data_originality_json = manifest_path.join("data/markets_data_originality.json");
     let predictions_rs = manifest_path.join("src/predictions.rs");
     let markets_rs = manifest_path.join("src/markets.rs");
 

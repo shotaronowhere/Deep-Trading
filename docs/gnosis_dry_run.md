@@ -11,7 +11,7 @@ Dry-run system that polls Gnosis chain blocks, static-calls RebalancerAlgebra on
 **Key distinction**: Pools are `outcomeToken/underlyingToken` pairs, NOT `outcomeToken/sDAI`. Each movie has its own `underlyingToken`, so solver calls are grouped per-movie (2 pools each: up + down).
 
 ### Prediction mapping
-- `upToken` price = `score / 100` (from `movie_predictions.csv`)
+- `upToken` price = `score / 100` (from `data/movie_predictions.csv`)
 - `downToken` price = `1 - score / 100`
 
 ## Architecture

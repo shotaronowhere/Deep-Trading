@@ -2,7 +2,7 @@
 //!
 //! 15 scalar markets from the "Session 1 - Movies Experiment".
 //! Each movie has an upToken and downToken with pools against its underlyingToken.
-//! Data sourced from futarchy-ui/src/consts/markets.ts and movie_predictions.csv.
+//! Data sourced from futarchy-ui/src/consts/markets.ts and data/movie_predictions.csv.
 
 use alloy::primitives::{Address, address, keccak256};
 
@@ -90,7 +90,7 @@ impl MovieMarket {
 }
 
 /// All 15 movie markets with predictions.
-/// Source: futarchy-ui/src/consts/markets.ts + movie_predictions.csv
+/// Source: futarchy-ui/src/consts/markets.ts + data/movie_predictions.csv
 pub static MOVIES: [MovieMarket; 15] = [
     MovieMarket {
         name: "Judge Dredd (1995)",

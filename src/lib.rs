@@ -156,7 +156,7 @@ mod tests {
             return;
         }
         let url: &str = "https://deep.seer.pm/.netlify/functions/get-l1-markets-data";
-        let name = "markets_data_l1.json";
+        let name = "data/markets_data_l1.json";
         let result = prepare(url, name).await;
         assert!(result.is_ok());
     }
@@ -167,7 +167,7 @@ mod tests {
             return;
         }
         let url: &str = "https://deep.seer.pm/.netlify/functions/get-l2-markets-data";
-        let name = "markets_data_l2.json";
+        let name = "data/markets_data_l2.json";
         let result = prepare(url, name).await;
         assert!(result.is_ok());
     }
@@ -178,7 +178,7 @@ mod tests {
             return;
         }
         let url: &str = "https://deep.seer.pm/.netlify/functions/get-originality-markets-data";
-        let name = "markets_data_originality.json";
+        let name = "data/markets_data_originality.json";
         let result = prepare(url, name).await;
         assert!(result.is_ok());
     }

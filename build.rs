@@ -5,12 +5,12 @@ use std::time::SystemTime;
 const GENERATED_FILES: &[&str] = &["src/markets.rs", "src/predictions.rs"];
 const SKIP_STALENESS_ENV: &str = "DEEP_TRADING_SKIP_GENERATED_STALENESS_CHECK";
 const GENERATOR_INPUTS: &[&str] = &[
-    "l1-predictions.csv",
-    "l2-predictions.csv",
-    "originality-predictions.csv",
-    "markets_data_l1.json",
-    "markets_data_l2.json",
-    "markets_data_originality.json",
+    "data/l1-predictions.csv",
+    "data/l2-predictions.csv",
+    "data/originality-predictions.csv",
+    "data/markets_data_l1.json",
+    "data/markets_data_l2.json",
+    "data/markets_data_originality.json",
     "src/bin/regenerate.rs",
     "src/bin/regenerate/common.rs",
     "src/bin/regenerate/markets.rs",
