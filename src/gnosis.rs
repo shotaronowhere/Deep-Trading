@@ -22,9 +22,8 @@ pub const POOL_DEPLOYER: Address = address!("C1b576AC6Ec749d5Ace1787bF9Ec6340908
 
 /// Pool init code hash for CREATE2 derivation.
 const POOL_INIT_CODE_HASH: [u8; 32] = [
-    0xbc, 0xe3, 0x7a, 0x54, 0xea, 0xb2, 0xfc, 0xd7, 0x19, 0x13, 0xa0, 0xd4, 0x07, 0x23, 0xe0,
-    0x42, 0x38, 0x97, 0x0e, 0x7f, 0xc1, 0x15, 0x9b, 0xfd, 0x58, 0xad, 0x5b, 0x79, 0x53, 0x16,
-    0x97, 0xe7,
+    0xbc, 0xe3, 0x7a, 0x54, 0xea, 0xb2, 0xfc, 0xd7, 0x19, 0x13, 0xa0, 0xd4, 0x07, 0x23, 0xe0, 0x42,
+    0x38, 0x97, 0x0e, 0x7f, 0xc1, 0x15, 0x9b, 0xfd, 0x58, 0xad, 0x5b, 0x79, 0x53, 0x16, 0x97, 0xe7,
 ];
 
 /// Parent market — all movie outcomes are conditional on this.
@@ -284,10 +283,8 @@ mod tests {
                 return;
             }
         };
-        let provider = alloy::providers::ProviderBuilder::new().with_reqwest(
-            rpc.parse().unwrap(),
-            |b| b.no_proxy().build().unwrap(),
-        );
+        let provider = alloy::providers::ProviderBuilder::new()
+            .with_reqwest(rpc.parse().unwrap(), |b| b.no_proxy().build().unwrap());
 
         let mut up_active = 0;
         let mut down_active = 0;
@@ -312,9 +309,7 @@ mod tests {
             }
         }
 
-        println!(
-            "\nActive: {up_active} up pools, {down_active} down pools out of 15 each"
-        );
+        println!("\nActive: {up_active} up pools, {down_active} down pools out of 15 each");
         assert_eq!(up_active, 15, "expected all 15 up pools to exist");
         assert_eq!(down_active, 15, "expected all 15 down pools to exist");
     }

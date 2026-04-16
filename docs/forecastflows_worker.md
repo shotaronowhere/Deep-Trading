@@ -1,18 +1,36 @@
 # ForecastFlows Worker Integration
 
-Status: current as of 2026-03-15.
+Status: current as of 2026-04-16.
 Source-of-truth code paths:
 
 - `src/portfolio/core/forecastflows/client.rs`
 - `src/portfolio/core/forecastflows/translate.rs`
 - `src/portfolio/core/rebalancer.rs`
 
+## Worker Backends
+
+Two interchangeable worker backends speak the same NDJSON stdio protocol (version `2`). The driver selects one at startup via `FORECASTFLOWS_BACKEND`:
+
+- `rust_worker` (default): a standalone `forecast-flows-worker` binary built from the Rust port at `../ForecastFlows.rs/crates/forecast-flows-worker`. Requires `FORECASTFLOWS_WORKER_BIN` to point at an existing regular file. The driver launches it directly with no `--project`, sysimage flag, or `JULIA_NUM_THREADS` env, because the Rust worker has no equivalent runtime knobs.
+- `julia_worker`: the original `ForecastFlows.jl` Julia process described in the section below. This is now an explicit legacy rollback path, selected only with `FORECASTFLOWS_BACKEND=julia_worker`.
+
+Rebalance, replay, pruning, translation, ranking, and fallback policy are backend-agnostic. Doctor and telemetry output tag each run with `worker_backend` and `worker_version` (worker `/health.package_version`, when the backend reports one). Julia-specific fields (`julia_version`, `sysimage_status`, `sysimage_detail`, `julia_threads`, `manifest_repo_url/rev/git_tree_sha1`, `allow_plain_julia_escape_hatch`) are reported only when `worker_backend = julia_worker`.
+
+Build the Rust worker:
+
+```bash
+cargo build --release --manifest-path ../ForecastFlows.rs/crates/forecast-flows-worker/Cargo.toml
+export FORECASTFLOWS_WORKER_BIN=$(realpath ../ForecastFlows.rs/target/release/forecast-flows-worker)
+```
+
+Runtime policy: the Rust worker is the default backend. Operators should set a valid `FORECASTFLOWS_WORKER_BIN`; no `FORECASTFLOWS_BACKEND` value is needed for the normal Rust path. Set `FORECASTFLOWS_BACKEND=julia_worker` only for an explicit legacy rollback. The Julia worker and sysimage tooling remain in-tree as a fallback.
+
 ## Purpose
 
 ForecastFlows is integrated as an external whole-plan solver family for `RebalanceMode::Full`.
 The driver now uses a single live path:
 
-- `rust_prune`: Julia route generation plus Rust replay, exact-fee pruning,
+- `rust_prune`: ForecastFlows route generation plus Rust replay, exact-fee pruning,
   chunking, and final net-EV ranking
 
 ForecastFlows still does not own exact tx grouping, tx packing, or submission.
@@ -34,7 +52,7 @@ Rust still owns:
 julia --startup-file=no --project=julia/forecastflows -e 'using ForecastFlows; ForecastFlows.serve_protocol(stdin, stdout)'
 ```
 
-By default the runtime uses the repo-local `julia/forecastflows` project under `CARGO_MANIFEST_DIR`, so it does not depend on the shell cwd.
+When `FORECASTFLOWS_BACKEND=julia_worker` is set, the runtime uses the repo-local `julia/forecastflows` project under `CARGO_MANIFEST_DIR`, so it does not depend on the shell cwd.
 The Julia binary may be overridden with `FORECASTFLOWS_JULIA_BIN`.
 The Julia project directory may be overridden with `FORECASTFLOWS_PROJECT_DIR`; when relative, it is resolved against the shell cwd.
 Worker threads are set explicitly with `FORECASTFLOWS_JULIA_THREADS` and default to `auto`.
@@ -111,13 +129,13 @@ Current benchmark rows live in `docs/solver_benchmark_matrix.md`.
 
 Lifecycle:
 
-1. Spawn Julia with piped stdin/stdout/stderr.
+1. Spawn the configured worker (Julia or Rust) with piped stdin/stdout/stderr.
 2. On first use, send `health`.
 3. For operator-facing binaries that request ForecastFlows, eagerly run `warm_forecastflows_worker()` at startup so every configured pool slot is prewarmed.
-4. Warmup sends one tiny synthetic `compare_prediction_market_families` request on a `UniV3` fixture so the production code path gets JIT-compiled before live planning.
+4. Warmup sends one tiny synthetic `compare_prediction_market_families` request on a `UniV3` fixture so the production code path is fully primed before live planning (Julia JIT warmup or Rust solver allocator priming).
 5. Steady-state compare requests retry once on worker-level spawn, health, transport, or protocol failure before the external candidate is abandoned for that solve.
 6. Repeated startup/transport failures trip a circuit breaker: after 3 consecutive failures, the worker enters cooldown for 60s, then exponentially backs off to a 5 minute cap until a compare succeeds.
-7. Operator binaries and `forecastflows_doctor` call `shutdown_forecastflows_worker()` on exit as a best-effort cleanup hook so short-lived runs do not orphan Julia worker processes.
+7. Operator binaries and `forecastflows_doctor` call `shutdown_forecastflows_worker()` on exit as a best-effort cleanup hook so short-lived runs do not orphan worker processes.
 
 Timeouts:
 
@@ -142,14 +160,14 @@ Diagnostics:
 - Rust keeps the last 200 worker `stderr` lines in memory.
 - Spawn / health / timeout / protocol errors include the recent `stderr` tail.
 - Compare telemetry now records `forecastflows_strategy`, `workspace_reused`,
-  local `candidate_build` timing, Julia-estimated execution cost / net EV,
+  local `candidate_build` timing, worker-estimated execution cost / net EV,
   Rust-validated total fee / net EV, and a `validation_only` flag.
 - `validation_only` is currently `false` on the live path.
 - `local_step_prune_ms` and `local_route_prune_ms` are populated for the live
   path because Rust always owns the exact-fee prune stage.
-- `cargo run --bin forecastflows_doctor` prints Julia path/version, launch args, manifest repo URL / rev / git-tree, Julia thread config, live solve tuning, sysimage policy, health summary, warmup timing, representative full-L1 compare timing, solver-vs-driver timing splits when available, and recent `stderr`.
+- `cargo run --bin forecastflows_doctor` prints the selected `worker_backend`, worker program path, reported worker version, launch args, live solve tuning, health summary, warmup timing, representative full-L1 compare timing, and solver-vs-driver timing splits when available, plus recent `stderr`. When running under `julia_worker`, it also prints Julia version, manifest repo URL / rev / git-tree, Julia thread config, sysimage status/detail, and the plain-Julia escape-hatch flag.
 - `cargo run --bin forecastflows_doctor -- --json` emits the same report as machine-readable JSON.
-- `cargo run --bin forecastflows_doctor -- --json --require-production-ready` exits nonzero unless the current production-style runtime would use an active sysimage.
+- `cargo run --bin forecastflows_doctor -- --json --require-production-ready` exits nonzero unless the current production-style runtime is production-ready. Under `julia_worker` that requires an active sysimage; the `rust_worker` backend is production-ready on any successful health probe.
 - If the doctor hits a worker or compare failure after launch, it still prints the partial report and exits nonzero with a final `failure:` line.
 
 ## Rolling Execute Runtime

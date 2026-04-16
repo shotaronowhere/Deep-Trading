@@ -4972,8 +4972,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
     }
 
     // Collect indices to exclude as a set for O(1) lookup.
-    let mut excluded: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut excluded: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for step_group in step_groups.iter().rev() {
         // Tentatively add this group's indices to the excluded set.
         for &idx in &step_group.action_indices {
@@ -5650,8 +5649,8 @@ fn run_no_arb_rebalance_plan_from_state(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
 ) -> Option<PlanResult> {
-    let allow_common_shift = force_mint_available
-        .unwrap_or(state.slot0_results.len() == expected_outcome_count);
+    let allow_common_shift =
+        force_mint_available.unwrap_or(state.slot0_results.len() == expected_outcome_count);
     let mut ctx = build_rebalance_context_with_options(
         &state.holdings,
         state.cash,
@@ -6384,12 +6383,11 @@ fn enumerate_exact_no_arb_candidates_with_options(
                 .collect();
         proposal_seeds.sort_by(|a, b| plan_result_cmp(&a.2, &b.2));
         let proposal_k = seed_shortlist_k(num_proposal_tasks);
-        let proposal_shortlist: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> =
-            proposal_seeds
-                .into_iter()
-                .take(proposal_k)
-                .map(|(ff, pm, _)| (ff, pm))
-                .collect();
+        let proposal_shortlist: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> = proposal_seeds
+            .into_iter()
+            .take(proposal_k)
+            .map(|(ff, pm, _)| (ff, pm))
+            .collect();
         let mut proposal_candidates: Vec<PlanResult> = proposal_shortlist
             .into_par_iter()
             .filter_map(|(frontier_family, preserve_markets)| {
@@ -7352,6 +7350,16 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         forecastflows_solve_tuning = stats
             .forecastflows_telemetry
             .solve_tuning
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_backend = stats
+            .forecastflows_telemetry
+            .forecastflows_backend
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_worker_version = stats
+            .forecastflows_telemetry
+            .forecastflows_worker_version
             .as_deref()
             .unwrap_or("none"),
         forecastflows_winning_variant = stats

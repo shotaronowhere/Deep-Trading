@@ -221,6 +221,8 @@ struct SharedSnapshotSolverRow {
     forecastflows_julia_threads: Option<String>,
     forecastflows_solve_tuning: Option<String>,
     forecastflows_winning_variant: Option<String>,
+    forecastflows_backend: Option<String>,
+    forecastflows_worker_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,6 +259,8 @@ struct ForecastFlowsTuningRow {
     forecastflows_replay_drop_reason: Option<String>,
     forecastflows_sysimage_status: Option<String>,
     forecastflows_julia_threads: Option<String>,
+    forecastflows_backend: Option<String>,
+    forecastflows_worker_version: Option<String>,
 }
 
 type Slot0Case = Vec<(
@@ -345,6 +349,8 @@ struct PathologicalForecastFlowsComparisonRow {
     forecastflows_julia_threads: Option<String>,
     forecastflows_solve_tuning: Option<String>,
     forecastflows_winning_variant: Option<String>,
+    forecastflows_backend: Option<String>,
+    forecastflows_worker_version: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1534,6 +1540,8 @@ fn compare_pathological_forecastflows_case(
         forecastflows_winning_variant: forecastflows_stats
             .forecastflows_winning_variant
             .map(|variant| variant.as_str().to_string()),
+        forecastflows_backend: forecastflows_telemetry.forecastflows_backend.clone(),
+        forecastflows_worker_version: forecastflows_telemetry.forecastflows_worker_version.clone(),
     }
 }
 
@@ -3367,6 +3375,8 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
                 forecastflows_julia_threads: None,
                 forecastflows_solve_tuning: None,
                 forecastflows_winning_variant: None,
+                forecastflows_backend: None,
+                forecastflows_worker_version: None,
             })
             .expect("shared snapshot row should serialize")
         );
@@ -3452,6 +3462,8 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
                 forecastflows_julia_threads: None,
                 forecastflows_solve_tuning: None,
                 forecastflows_winning_variant: None,
+                forecastflows_backend: None,
+                forecastflows_worker_version: None,
             })
             .expect("shared snapshot row should serialize")
         );
@@ -3542,6 +3554,8 @@ async fn print_shared_op_snapshot_solver_matrix_jsonl() {
                     forecastflows_julia_threads: None,
                     forecastflows_solve_tuning: None,
                     forecastflows_winning_variant: None,
+                    forecastflows_backend: None,
+                    forecastflows_worker_version: None,
                 })
                 .expect("shared snapshot row should serialize")
             );
@@ -3649,6 +3663,8 @@ async fn print_shared_op_snapshot_onchain_benchmark_rows_jsonl() {
                     forecastflows_julia_threads: None,
                     forecastflows_solve_tuning: None,
                     forecastflows_winning_variant: None,
+                    forecastflows_backend: None,
+                    forecastflows_worker_version: None,
                 })
                 .expect("shared snapshot row should serialize")
             );
@@ -3775,6 +3791,8 @@ async fn print_shared_op_snapshot_offchain_selected_rows_jsonl() {
                     forecastflows_julia_threads: None,
                     forecastflows_solve_tuning: None,
                     forecastflows_winning_variant: None,
+                    forecastflows_backend: None,
+                    forecastflows_worker_version: None,
                 })
                 .expect("shared snapshot row should serialize")
             );
@@ -3877,6 +3895,8 @@ fn print_shared_op_snapshot_forecastflows_selected_rows_jsonl_impl() {
                     forecastflows_winning_variant: stats
                         .forecastflows_winning_variant
                         .map(|variant| variant.as_str().to_string()),
+                    forecastflows_backend: telemetry.forecastflows_backend.clone(),
+                    forecastflows_worker_version: telemetry.forecastflows_worker_version.clone(),
                 })
                 .expect("shared snapshot row should serialize")
             );
@@ -3960,6 +3980,10 @@ fn print_shared_op_snapshot_forecastflows_tuning_rows_jsonl() {
                         forecastflows_replay_drop_reason: telemetry.replay_drop_reason.clone(),
                         forecastflows_sysimage_status: telemetry.sysimage_status.clone(),
                         forecastflows_julia_threads: telemetry.julia_threads.clone(),
+                        forecastflows_backend: telemetry.forecastflows_backend.clone(),
+                        forecastflows_worker_version: telemetry
+                            .forecastflows_worker_version
+                            .clone(),
                     })
                     .expect("ForecastFlows tuning row should serialize")
                 );
@@ -4035,6 +4059,10 @@ fn print_repeated_heterogeneous_ninety_eight_forecastflows_latency() {
                         forecastflows_replay_drop_reason: telemetry.replay_drop_reason.clone(),
                         forecastflows_sysimage_status: telemetry.sysimage_status.clone(),
                         forecastflows_julia_threads: telemetry.julia_threads.clone(),
+                        forecastflows_backend: telemetry.forecastflows_backend.clone(),
+                        forecastflows_worker_version: telemetry
+                            .forecastflows_worker_version
+                            .clone(),
                     })
                     .expect("ForecastFlows repeated latency row should serialize")
                 );
@@ -4115,6 +4143,127 @@ fn forecastflows_polish_prunes_coupled_buy_merge_steps_without_corrupting_route_
             .unwrap_or(f64::NEG_INFINITY)
             >= variants.raw.estimated_net_ev.unwrap_or(f64::NEG_INFINITY)
     );
+}
+
+#[test]
+fn forecastflows_vs_native_gap_report() {
+    if std::env::var("FORECASTFLOWS_GAP_REPORT").ok().as_deref() != Some("1") {
+        return;
+    }
+    with_live_benchmark_worker_for_test(|| {
+        eprintln!(
+            "{:<55} {:>12} {:>12} {:>10} {:>8}  {:>16} {:>16} {:>6} {:>6}",
+            "case",
+            "ff_net_ev",
+            "native_ev",
+            "gap",
+            "gap%",
+            "ff_variant",
+            "native_family",
+            "ff_n",
+            "nat_n"
+        );
+        eprintln!("{}", "-".repeat(150));
+        for case in cases_from_fixture() {
+            let built = build_case(&case);
+            let force_mint_available = !case.direct_only_reference;
+            let (na, ns, _) = selected_plan_run_with_solver_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                RebalanceSolver::Native,
+            );
+            let (fa, fs, fstats) = selected_plan_run_with_solver_for_test(
+                &built.balances_view,
+                built.cash_budget,
+                &built.slot0_results,
+                &built.predictions,
+                force_mint_available,
+                RebalanceSolver::ForecastFlows,
+            );
+            let ff_ev = fs.estimated_net_ev.unwrap_or(f64::NAN);
+            let nat_ev = ns.estimated_net_ev.unwrap_or(f64::NAN);
+            let gap = ff_ev - nat_ev;
+            let pct = if nat_ev.abs() > 1e-12 {
+                100.0 * gap / nat_ev
+            } else {
+                f64::NAN
+            };
+            eprintln!(
+                "{:<55} {:>12.4} {:>12.4} {:>10.4} {:>7.2}%  {:>16} {:>16} {:>6} {:>6}",
+                case.case_id,
+                ff_ev,
+                nat_ev,
+                gap,
+                pct,
+                fs.compiler_variant,
+                ns.family,
+                fa.len(),
+                na.len()
+            );
+            if gap < -0.01 {
+                let ff_buys = fa
+                    .iter()
+                    .filter(|a| matches!(a, super::Action::Buy { .. }))
+                    .count();
+                let ff_sells = fa
+                    .iter()
+                    .filter(|a| matches!(a, super::Action::Sell { .. }))
+                    .count();
+                let ff_mints = fa
+                    .iter()
+                    .filter(|a| matches!(a, super::Action::Mint { .. }))
+                    .count();
+                let ff_merges = fa
+                    .iter()
+                    .filter(|a| matches!(a, super::Action::Merge { .. }))
+                    .count();
+                let nat_buys = na
+                    .iter()
+                    .filter(|a| matches!(a, super::Action::Buy { .. }))
+                    .count();
+                let nat_sells = na
+                    .iter()
+                    .filter(|a| matches!(a, super::Action::Sell { .. }))
+                    .count();
+                let nat_mints = na
+                    .iter()
+                    .filter(|a| matches!(a, super::Action::Mint { .. }))
+                    .count();
+                let nat_merges = na
+                    .iter()
+                    .filter(|a| matches!(a, super::Action::Merge { .. }))
+                    .count();
+                eprintln!(
+                    "  FF  actions: {} buy, {} sell, {} mint, {} merge | fee={:?} tx={:?}",
+                    ff_buys,
+                    ff_sells,
+                    ff_mints,
+                    ff_merges,
+                    fs.estimated_total_fee_susd,
+                    fs.estimated_tx_count,
+                );
+                eprintln!(
+                    "  NAT actions: {} buy, {} sell, {} mint, {} merge | fee={:?} tx={:?}",
+                    nat_buys,
+                    nat_sells,
+                    nat_mints,
+                    nat_merges,
+                    ns.estimated_total_fee_susd,
+                    ns.estimated_tx_count,
+                );
+                eprintln!(
+                    "  FF  telemetry: direct={:?} mixed={:?} winning={:?}",
+                    fstats.forecastflows_telemetry.direct_status,
+                    fstats.forecastflows_telemetry.mixed_status,
+                    fstats.forecastflows_winning_variant,
+                );
+            }
+        }
+    })
+    .expect("gap report should complete");
 }
 
 #[test]
@@ -4302,24 +4451,26 @@ fn forecastflows_ev_benchmark_reaches_worker_on_committed_cases_when_enabled() {
                 case.case_id,
                 stats
             );
-            assert!(
-                telemetry
-                    .sysimage_status
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty()),
-                "{} should record the ForecastFlows sysimage status: {:?}",
-                case.case_id,
-                stats
-            );
-            assert!(
-                telemetry
-                    .julia_threads
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty()),
-                "{} should record the ForecastFlows Julia thread setting: {:?}",
-                case.case_id,
-                stats
-            );
+            if telemetry.forecastflows_backend.as_deref() == Some("julia_worker") {
+                assert!(
+                    telemetry
+                        .sysimage_status
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty()),
+                    "{} should record the ForecastFlows sysimage status: {:?}",
+                    case.case_id,
+                    stats
+                );
+                assert!(
+                    telemetry
+                        .julia_threads
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty()),
+                    "{} should record the ForecastFlows Julia thread setting: {:?}",
+                    case.case_id,
+                    stats
+                );
+            }
             assert_eq!(
                 summary.family, "forecastflows",
                 "{} should be measured with an actual ForecastFlows plan: {:?}",
@@ -4632,6 +4783,8 @@ fn forecastflows_benchmark_row_serializes_requested_solver_and_replay_drop_reaso
         forecastflows_julia_threads: Some("4".to_string()),
         forecastflows_solve_tuning: Some("baseline".to_string()),
         forecastflows_winning_variant: Some("direct".to_string()),
+        forecastflows_backend: Some("julia_worker".to_string()),
+        forecastflows_worker_version: Some("0.1.0".to_string()),
     };
 
     let json = serde_json::to_value(&row).expect("row should serialize");
@@ -4649,6 +4802,8 @@ fn forecastflows_benchmark_row_serializes_requested_solver_and_replay_drop_reaso
     assert_eq!(json["forecastflows_validation_only"], false);
     assert_eq!(json["forecastflows_sysimage_status"], "active");
     assert_eq!(json["forecastflows_julia_threads"], "4");
+    assert_eq!(json["forecastflows_backend"], "julia_worker");
+    assert_eq!(json["forecastflows_worker_version"], "0.1.0");
     assert_eq!(
         json["forecastflows_replay_drop_reason"],
         "direct: local replay rejected sell due to insufficient holdings"

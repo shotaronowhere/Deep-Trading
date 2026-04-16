@@ -79,10 +79,7 @@ pub fn u256_to_f64(v: U256) -> f64 {
 }
 
 /// Converts a prediction probability to the corresponding sqrtPriceX96.
-pub fn prediction_to_sqrt_price_x96(
-    prediction: f64,
-    is_token1_outcome: bool,
-) -> Option<U256> {
+pub fn prediction_to_sqrt_price_x96(prediction: f64, is_token1_outcome: bool) -> Option<U256> {
     let prediction_scaled = U256::from((prediction * 1e18) as u128);
     if prediction_scaled.is_zero() {
         return None;

@@ -233,11 +233,38 @@ pub(super) struct ForecastFlowsCompareSuccess {
     pub(super) runtime_policy: ForecastFlowsRuntimePolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForecastFlowsBackend {
+    JuliaWorker,
+    RustWorker,
+}
+
+impl ForecastFlowsBackend {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::JuliaWorker => "julia_worker",
+            Self::RustWorker => "rust_worker",
+        }
+    }
+}
+
+impl fmt::Display for ForecastFlowsBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ForecastFlowsRuntimePolicy {
-    pub(super) sysimage_status: String,
-    pub(super) julia_threads: String,
+    pub(super) backend: ForecastFlowsBackend,
+    pub(super) worker_version: Option<String>,
     pub(super) solve_tuning: String,
+    /// Julia-specific: one of "active", "disabled", "rejected". `None` when the
+    /// backend does not use a Julia sysimage (e.g., the Rust worker).
+    pub(super) sysimage_status: Option<String>,
+    /// Julia-specific: value of `JULIA_NUM_THREADS`. `None` under the Rust
+    /// worker which does not expose a thread configuration knob.
+    pub(super) julia_threads: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,11 +278,28 @@ struct WorkerLaunchConfig {
     program: OsString,
     args: Vec<OsString>,
     current_dir: PathBuf,
+    envs: Vec<(OsString, OsString)>,
+    details: WorkerLaunchDetails,
+}
+
+#[derive(Debug, Clone)]
+enum WorkerLaunchDetails {
+    Julia(JuliaLaunchDetails),
+    Rust(RustLaunchDetails),
+}
+
+#[derive(Debug, Clone)]
+struct JuliaLaunchDetails {
     project_dir: PathBuf,
     julia_version: Option<String>,
     manifest_source: ForecastFlowsManifestSource,
     sysimage_status: SysimageStatus,
     worker_config: ForecastFlowsWorkerConfig,
+}
+
+#[derive(Debug, Clone)]
+struct RustLaunchDetails {
+    worker_bin: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -266,12 +310,18 @@ struct ForecastFlowsManifestSource {
 }
 
 impl WorkerLaunchConfig {
-    fn sysimage_status_label(&self) -> &'static str {
-        self.sysimage_status.label()
+    fn backend(&self) -> ForecastFlowsBackend {
+        match self.details {
+            WorkerLaunchDetails::Julia(_) => ForecastFlowsBackend::JuliaWorker,
+            WorkerLaunchDetails::Rust(_) => ForecastFlowsBackend::RustWorker,
+        }
     }
 
-    fn sysimage_status_detail(&self) -> String {
-        self.sysimage_status.detail()
+    fn julia(&self) -> Option<&JuliaLaunchDetails> {
+        match &self.details {
+            WorkerLaunchDetails::Julia(j) => Some(j),
+            WorkerLaunchDetails::Rust(_) => None,
+        }
     }
 
     fn program_display(&self) -> String {
@@ -282,17 +332,37 @@ impl WorkerLaunchConfig {
         self.args.iter().map(|arg| os_string_display(arg)).collect()
     }
 
-    fn julia_threads_display(&self) -> String {
-        os_string_display(&self.worker_config.julia_threads)
-    }
-
     fn launch_envs(&self) -> Vec<(OsString, OsString)> {
-        vec![(
-            OsString::from("JULIA_NUM_THREADS"),
-            self.worker_config.julia_threads.clone(),
-        )]
+        self.envs.clone()
     }
 
+    fn runtime_detail(&self) -> String {
+        match &self.details {
+            WorkerLaunchDetails::Julia(j) => format!(
+                "julia worker (sysimage {}; JULIA_NUM_THREADS={})",
+                j.sysimage_status.detail(),
+                os_string_display(&j.worker_config.julia_threads),
+            ),
+            WorkerLaunchDetails::Rust(r) => {
+                format!("rust worker binary {}", r.worker_bin.display())
+            }
+        }
+    }
+
+    fn ensure_profile_support(
+        &self,
+        profile: ForecastFlowsRequestProfile,
+    ) -> Result<(), ForecastFlowsClientError> {
+        match &self.details {
+            WorkerLaunchDetails::Julia(j) => j.ensure_profile_support(profile),
+            // The Rust worker binary has no equivalent of the Julia sysimage
+            // gate, so every request profile is supported as-is.
+            WorkerLaunchDetails::Rust(_) => Ok(()),
+        }
+    }
+}
+
+impl JuliaLaunchDetails {
     fn ensure_profile_support(
         &self,
         profile: ForecastFlowsRequestProfile,
@@ -308,6 +378,10 @@ impl WorkerLaunchConfig {
             profile,
             self.sysimage_status.detail()
         )))
+    }
+
+    fn julia_threads_display(&self) -> String {
+        os_string_display(&self.worker_config.julia_threads)
     }
 }
 
@@ -344,6 +418,11 @@ struct WorkerProcess {
     stdout_rx: Receiver<Result<String, String>>,
     stderr_tail: Arc<Mutex<StderrTail>>,
     launch_config: WorkerLaunchConfig,
+    /// Populated after the first successful health probe from
+    /// `HealthResult::package_version`. `None` if the worker response does not
+    /// advertise a version (e.g., older Julia workers) or if the process has
+    /// not yet completed its initial health handshake.
+    worker_version: Option<String>,
 }
 
 #[derive(Default)]
@@ -657,21 +736,37 @@ impl WorkerService {
         state.launch_logged = false;
 
         let launch = worker_launch_config(ForecastFlowsRequestProfile::DoctorWarmup)?;
+        let julia = launch.julia().cloned();
         let mut report = ForecastFlowsDoctorReport {
-            julia_program: launch.program_display(),
-            julia_version: launch.julia_version.clone(),
-            project_dir: launch.project_dir.display().to_string(),
-            launch_args: launch.launch_args(),
-            manifest_repo_url: launch.manifest_source.repo_url.clone(),
-            manifest_repo_rev: launch.manifest_source.repo_rev.clone(),
-            manifest_git_tree_sha1: launch.manifest_source.git_tree_sha1.clone(),
-            julia_threads: launch.julia_threads_display(),
+            worker_backend: launch.backend().as_str().to_string(),
+            worker_program: launch.program_display(),
+            worker_version: None,
+            worker_project_dir: julia.as_ref().map(|j| j.project_dir.display().to_string()),
+            worker_launch_args: launch.launch_args(),
+            worker_runtime_detail: launch.runtime_detail(),
+            julia_version: julia.as_ref().and_then(|j| j.julia_version.clone()),
+            manifest_repo_url: julia
+                .as_ref()
+                .and_then(|j| j.manifest_source.repo_url.clone()),
+            manifest_repo_rev: julia
+                .as_ref()
+                .and_then(|j| j.manifest_source.repo_rev.clone()),
+            manifest_git_tree_sha1: julia
+                .as_ref()
+                .and_then(|j| j.manifest_source.git_tree_sha1.clone()),
+            julia_threads: julia
+                .as_ref()
+                .map(JuliaLaunchDetails::julia_threads_display),
+            allow_plain_julia_escape_hatch: julia
+                .as_ref()
+                .map(|j| j.worker_config.allow_plain_julia_escape_hatch),
+            sysimage_status: julia
+                .as_ref()
+                .map(|j| j.sysimage_status.label().to_string()),
+            sysimage_detail: julia.as_ref().map(|j| j.sysimage_status.detail()),
             live_solve_tuning: solve_tuning_for_profile(ForecastFlowsRequestProfile::Production)
                 .as_str()
                 .to_string(),
-            allow_plain_julia_escape_hatch: launch.worker_config.allow_plain_julia_escape_hatch,
-            sysimage_status: launch.sysimage_status_label().to_string(),
-            sysimage_detail: launch.sysimage_status_detail(),
             health_status: None,
             supported_commands: Vec::new(),
             supported_modes: Vec::new(),
@@ -709,6 +804,9 @@ impl WorkerService {
             }
         };
         report.health_status = Some(health.result.status.clone());
+        report
+            .worker_version
+            .clone_from(&health.result.package_version);
         report.supported_commands = health.result.supported_commands.clone();
         report.supported_modes = health.result.supported_modes.clone();
         report.execution_model = Some(health.result.execution_model.clone());
@@ -894,6 +992,10 @@ impl WorkerService {
             )));
         }
 
+        if let Some(process) = state.process.as_mut() {
+            process.worker_version.clone_from(&result.package_version);
+        }
+
         Ok(Some(HealthCheckOutcome {
             result,
             duration: started.elapsed(),
@@ -979,8 +1081,10 @@ impl WorkerService {
     ) -> Result<WorkerProcess, ForecastFlowsClientError> {
         let launch = worker_launch_config(profile)?;
         launch.ensure_profile_support(profile)?;
-        if let SysimageStatus::Rejected { reason, .. } = &launch.sysimage_status {
-            tracing::warn!(reason = %reason, sysimage = %launch.sysimage_status.detail(), "ForecastFlows sysimage disabled; falling back to plain Julia");
+        if let WorkerLaunchDetails::Julia(julia) = &launch.details
+            && let SysimageStatus::Rejected { reason, .. } = &julia.sysimage_status
+        {
+            tracing::warn!(reason = %reason, sysimage = %julia.sysimage_status.detail(), "ForecastFlows sysimage disabled; falling back to plain Julia");
         }
         let mut command = Command::new(&launch.program);
         command
@@ -1054,6 +1158,7 @@ impl WorkerService {
             stdout_rx,
             stderr_tail,
             launch_config: launch,
+            worker_version: None,
         })
     }
 
@@ -1066,6 +1171,7 @@ impl WorkerService {
                 stdout_rx,
                 stderr_tail,
                 launch_config: _,
+                worker_version: _,
             } = process;
             drop(stdin);
             drop(stdout_rx);
@@ -1157,16 +1263,27 @@ impl WorkerService {
         if state.launch_logged {
             return;
         }
-        tracing::info!(
-            julia_program = %process.launch_config.program_display(),
-            julia_version = process.launch_config.julia_version.as_deref().unwrap_or("unknown"),
-            project_dir = %process.launch_config.project_dir.display(),
-            julia_threads = %process.launch_config.julia_threads_display(),
-            allow_plain_julia_escape_hatch = process.launch_config.worker_config.allow_plain_julia_escape_hatch,
-            sysimage_status = process.launch_config.sysimage_status_label(),
-            sysimage_detail = %process.launch_config.sysimage_status_detail(),
-            "ForecastFlows worker launch configuration"
-        );
+        match &process.launch_config.details {
+            WorkerLaunchDetails::Julia(julia) => tracing::info!(
+                backend = %ForecastFlowsBackend::JuliaWorker,
+                worker_program = %process.launch_config.program_display(),
+                worker_version = process.worker_version.as_deref().unwrap_or("unknown"),
+                julia_version = julia.julia_version.as_deref().unwrap_or("unknown"),
+                project_dir = %julia.project_dir.display(),
+                julia_threads = %julia.julia_threads_display(),
+                allow_plain_julia_escape_hatch = julia.worker_config.allow_plain_julia_escape_hatch,
+                sysimage_status = julia.sysimage_status.label(),
+                sysimage_detail = %julia.sysimage_status.detail(),
+                "ForecastFlows worker launch configuration"
+            ),
+            WorkerLaunchDetails::Rust(rust) => tracing::info!(
+                backend = %ForecastFlowsBackend::RustWorker,
+                worker_program = %process.launch_config.program_display(),
+                worker_version = process.worker_version.as_deref().unwrap_or("unknown"),
+                worker_bin = %rust.worker_bin.display(),
+                "ForecastFlows worker launch configuration"
+            ),
+        }
         state.launch_logged = true;
     }
 
@@ -1251,18 +1368,33 @@ fn runtime_policy_from_state_locked(
     state: &WorkerState,
     profile: ForecastFlowsRequestProfile,
 ) -> Option<ForecastFlowsRuntimePolicy> {
-    let launch = state.process.as_ref()?.launch_config.clone();
-    Some(runtime_policy_from_launch(&launch, profile))
+    let process = state.process.as_ref()?;
+    let launch = process.launch_config.clone();
+    let worker_version = process.worker_version.clone();
+    Some(runtime_policy_from_launch(&launch, worker_version, profile))
 }
 
 fn runtime_policy_from_launch(
     launch: &WorkerLaunchConfig,
+    worker_version: Option<String>,
     profile: ForecastFlowsRequestProfile,
 ) -> ForecastFlowsRuntimePolicy {
-    ForecastFlowsRuntimePolicy {
-        sysimage_status: launch.sysimage_status_label().to_string(),
-        julia_threads: launch.julia_threads_display(),
-        solve_tuning: solve_tuning_for_profile(profile).as_str().to_string(),
+    let solve_tuning = solve_tuning_for_profile(profile).as_str().to_string();
+    match &launch.details {
+        WorkerLaunchDetails::Julia(julia) => ForecastFlowsRuntimePolicy {
+            backend: ForecastFlowsBackend::JuliaWorker,
+            worker_version,
+            solve_tuning,
+            sysimage_status: Some(julia.sysimage_status.label().to_string()),
+            julia_threads: Some(julia.julia_threads_display()),
+        },
+        WorkerLaunchDetails::Rust(_) => ForecastFlowsRuntimePolicy {
+            backend: ForecastFlowsBackend::RustWorker,
+            worker_version,
+            solve_tuning,
+            sysimage_status: None,
+            julia_threads: None,
+        },
     }
 }
 
@@ -1303,7 +1435,40 @@ fn build_worker_launch_config_from_env(
     current_dir: Option<PathBuf>,
     profile: ForecastFlowsRequestProfile,
 ) -> Result<WorkerLaunchConfig, ForecastFlowsClientError> {
-    let project_dir = resolve_project_dir(&read_env, &repo_root, current_dir.as_deref())?;
+    let backend = parse_backend_from_env(&read_env)?;
+    let launch = match backend {
+        ForecastFlowsBackend::JuliaWorker => {
+            build_julia_worker_launch_config(&read_env, &repo_root, current_dir.as_deref())?
+        }
+        ForecastFlowsBackend::RustWorker => {
+            build_rust_worker_launch_config(&read_env, current_dir.as_deref())?
+        }
+    };
+    launch.ensure_profile_support(profile)?;
+    Ok(launch)
+}
+
+fn parse_backend_from_env(
+    read_env: &impl Fn(&str) -> Option<OsString>,
+) -> Result<ForecastFlowsBackend, ForecastFlowsClientError> {
+    let Some(value) = read_env("FORECASTFLOWS_BACKEND") else {
+        return Ok(ForecastFlowsBackend::RustWorker);
+    };
+    match value.to_string_lossy().as_ref() {
+        "" | "rust_worker" => Ok(ForecastFlowsBackend::RustWorker),
+        "julia_worker" => Ok(ForecastFlowsBackend::JuliaWorker),
+        other => Err(ForecastFlowsClientError::Spawn(format!(
+            "FORECASTFLOWS_BACKEND must be \"julia_worker\" or \"rust_worker\" (got {other:?})"
+        ))),
+    }
+}
+
+fn build_julia_worker_launch_config(
+    read_env: &impl Fn(&str) -> Option<OsString>,
+    repo_root: &Path,
+    current_dir: Option<&Path>,
+) -> Result<WorkerLaunchConfig, ForecastFlowsClientError> {
+    let project_dir = resolve_project_dir(read_env, repo_root, current_dir)?;
     let program = read_env("FORECASTFLOWS_JULIA_BIN").unwrap_or_else(|| OsString::from("julia"));
     let julia_version = probe_julia_version(program.as_os_str());
     let worker_config = ForecastFlowsWorkerConfig {
@@ -1311,7 +1476,7 @@ fn build_worker_launch_config_from_env(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| OsString::from("auto")),
         allow_plain_julia_escape_hatch: env_flag_is_true(
-            &read_env,
+            read_env,
             "FORECASTFLOWS_ALLOW_PLAIN_JULIA",
         ),
     };
@@ -1321,7 +1486,7 @@ fn build_worker_launch_config_from_env(
             project_dir.join("Manifest.toml").display()
         ))
     })?;
-    let manifest_source = manifest_source(&project_dir);
+    let manifest_source_value = manifest_source(&project_dir);
     let sysimage_status = read_env("FORECASTFLOWS_SYSIMAGE")
         .map(PathBuf::from)
         .map(|path| resolve_sysimage_status(&path, julia_version.as_deref(), Some(&manifest_hash)))
@@ -1340,22 +1505,89 @@ fn build_worker_launch_config_from_env(
         "using ForecastFlows; ForecastFlows.serve_protocol(stdin, stdout)",
     ));
 
+    let current_dir = project_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| project_dir.clone());
+    let envs = vec![(
+        OsString::from("JULIA_NUM_THREADS"),
+        worker_config.julia_threads.clone(),
+    )];
+    let julia_details = JuliaLaunchDetails {
+        project_dir,
+        julia_version,
+        manifest_source: manifest_source_value,
+        sysimage_status,
+        worker_config,
+    };
+
     Ok(WorkerLaunchConfig {
         program,
         args,
-        current_dir: project_dir
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| project_dir.clone()),
-        project_dir,
-        julia_version,
-        manifest_source,
-        sysimage_status,
-        worker_config,
+        current_dir,
+        envs,
+        details: WorkerLaunchDetails::Julia(julia_details),
     })
-    .and_then(|launch| {
-        launch.ensure_profile_support(profile)?;
-        Ok(launch)
+}
+
+fn build_rust_worker_launch_config(
+    read_env: &impl Fn(&str) -> Option<OsString>,
+    current_dir: Option<&Path>,
+) -> Result<WorkerLaunchConfig, ForecastFlowsClientError> {
+    let program = read_env("FORECASTFLOWS_WORKER_BIN").ok_or_else(|| {
+        ForecastFlowsClientError::Spawn(
+            "rust_worker backend requires FORECASTFLOWS_WORKER_BIN \
+             (absolute path to the forecast-flows-worker binary)"
+                .to_string(),
+        )
+    })?;
+    let worker_bin = PathBuf::from(&program);
+    if !worker_bin.is_absolute() {
+        return Err(ForecastFlowsClientError::Spawn(format!(
+            "FORECASTFLOWS_WORKER_BIN {} must be an absolute path",
+            worker_bin.display()
+        )));
+    }
+    if !worker_bin.exists() {
+        return Err(ForecastFlowsClientError::Spawn(format!(
+            "FORECASTFLOWS_WORKER_BIN {} does not exist",
+            worker_bin.display()
+        )));
+    }
+    if !worker_bin.is_file() {
+        return Err(ForecastFlowsClientError::Spawn(format!(
+            "FORECASTFLOWS_WORKER_BIN {} is not a regular file",
+            worker_bin.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&worker_bin).map_err(|err| {
+            ForecastFlowsClientError::Spawn(format!(
+                "failed to stat FORECASTFLOWS_WORKER_BIN {}: {}",
+                worker_bin.display(),
+                err
+            ))
+        })?;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(ForecastFlowsClientError::Spawn(format!(
+                "FORECASTFLOWS_WORKER_BIN {} is not executable",
+                worker_bin.display()
+            )));
+        }
+    }
+    let launch_dir = worker_bin
+        .parent()
+        .map(Path::to_path_buf)
+        .or_else(|| current_dir.map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    Ok(WorkerLaunchConfig {
+        program,
+        args: Vec::new(),
+        current_dir: launch_dir,
+        envs: Vec::new(),
+        details: WorkerLaunchDetails::Rust(RustLaunchDetails { worker_bin }),
     })
 }
 
@@ -1785,6 +2017,7 @@ pub(super) struct TestWorkerHarnessState {
 #[derive(Default)]
 struct TestOverrides {
     worker_command: Option<Vec<String>>,
+    worker_backend: Option<ForecastFlowsBackend>,
     request_timeout: Option<Duration>,
     request_profile: Option<ForecastFlowsRequestProfile>,
     solve_tuning: Option<ForecastFlowsSolveTuning>,
@@ -1810,6 +2043,12 @@ pub(super) fn forecastflows_test_lock() -> &'static Mutex<()> {
 pub(super) fn set_test_worker_command(command: &[&str]) {
     let mut overrides = test_overrides().lock().expect("test overrides mutex");
     overrides.worker_command = Some(command.iter().map(|part| (*part).to_string()).collect());
+}
+
+#[cfg(test)]
+pub(super) fn set_test_worker_backend(backend: ForecastFlowsBackend) {
+    let mut overrides = test_overrides().lock().expect("test overrides mutex");
+    overrides.worker_backend = Some(backend);
 }
 
 #[cfg(test)]
@@ -1901,20 +2140,32 @@ fn test_worker_launch_config() -> Option<WorkerLaunchConfig> {
     let overrides = test_overrides().lock().expect("test overrides mutex");
     let command = overrides.worker_command.as_ref()?;
     let (program, args) = command.split_first()?;
+    let backend = overrides
+        .worker_backend
+        .unwrap_or(ForecastFlowsBackend::JuliaWorker);
+    let details = match backend {
+        ForecastFlowsBackend::JuliaWorker => WorkerLaunchDetails::Julia(JuliaLaunchDetails {
+            project_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("julia")
+                .join("forecastflows"),
+            julia_version: None,
+            manifest_source: ForecastFlowsManifestSource::default(),
+            sysimage_status: SysimageStatus::Disabled,
+            worker_config: ForecastFlowsWorkerConfig {
+                julia_threads: OsString::from("auto"),
+                allow_plain_julia_escape_hatch: true,
+            },
+        }),
+        ForecastFlowsBackend::RustWorker => WorkerLaunchDetails::Rust(RustLaunchDetails {
+            worker_bin: PathBuf::from(program),
+        }),
+    };
     Some(WorkerLaunchConfig {
         program: OsString::from(program),
         args: args.iter().map(OsString::from).collect(),
         current_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-        project_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("julia")
-            .join("forecastflows"),
-        julia_version: None,
-        manifest_source: ForecastFlowsManifestSource::default(),
-        sysimage_status: SysimageStatus::Disabled,
-        worker_config: ForecastFlowsWorkerConfig {
-            julia_threads: OsString::from("auto"),
-            allow_plain_julia_escape_hatch: true,
-        },
+        envs: Vec::new(),
+        details,
     })
 }
 
@@ -2000,7 +2251,10 @@ mod tests {
         write_manifest(&root, "manifest = true\n");
 
         let launch = build_worker_launch_config_from_env(
-            |_| None,
+            |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("julia_worker")),
+                _ => None,
+            },
             root.clone(),
             Some(root.clone()),
             ForecastFlowsRequestProfile::Benchmark,
@@ -2014,8 +2268,9 @@ mod tests {
             project_flag_arg(&root.join("julia").join("forecastflows"))
         );
         assert_eq!(launch.current_dir, root.join("julia"));
-        assert!(matches!(launch.sysimage_status, SysimageStatus::Disabled));
-        assert_eq!(launch.julia_threads_display(), "auto");
+        let julia = launch.julia().expect("julia details present");
+        assert!(matches!(julia.sysimage_status, SysimageStatus::Disabled));
+        assert_eq!(julia.julia_threads_display(), "auto");
         assert_eq!(
             launch.launch_envs(),
             vec![(OsString::from("JULIA_NUM_THREADS"), OsString::from("auto"))]
@@ -2119,6 +2374,7 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
 
         let launch = build_worker_launch_config_from_env(
             |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("julia_worker")),
                 "FORECASTFLOWS_JULIA_THREADS" => Some(OsString::from("8")),
                 _ => None,
             },
@@ -2128,7 +2384,13 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
         )
         .expect("launch config should build with explicit Julia threads");
 
-        assert_eq!(launch.julia_threads_display(), "8");
+        assert_eq!(
+            launch
+                .julia()
+                .expect("julia details present")
+                .julia_threads_display(),
+            "8"
+        );
         assert_eq!(
             launch.launch_envs(),
             vec![(OsString::from("JULIA_NUM_THREADS"), OsString::from("8"))]
@@ -2142,7 +2404,10 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
         write_manifest(&root, "manifest = true\n");
 
         let err = build_worker_launch_config_from_env(
-            |_| None,
+            |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("julia_worker")),
+                _ => None,
+            },
             root.clone(),
             Some(root.clone()),
             ForecastFlowsRequestProfile::Production,
@@ -2156,6 +2421,7 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
 
         let launch = build_worker_launch_config_from_env(
             |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("julia_worker")),
                 "FORECASTFLOWS_ALLOW_PLAIN_JULIA" => Some(OsString::from("1")),
                 _ => None,
             },
@@ -2164,8 +2430,9 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
             ForecastFlowsRequestProfile::Production,
         )
         .expect("escape hatch should allow plain Julia for local production-style testing");
-        assert!(matches!(launch.sysimage_status, SysimageStatus::Disabled));
-        assert!(launch.worker_config.allow_plain_julia_escape_hatch);
+        let julia = launch.julia().expect("julia details present");
+        assert!(matches!(julia.sysimage_status, SysimageStatus::Disabled));
+        assert!(julia.worker_config.allow_plain_julia_escape_hatch);
     }
 
     #[test]
@@ -2179,6 +2446,10 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
             .expect("override manifest");
         let sysimage_path = root.join("forecastflows.dylib");
         fs::write(&sysimage_path, b"sysimage").expect("sysimage write");
+        let fake_julia = root.join("fake-julia");
+        fs::write(&fake_julia, b"#!/bin/sh\necho 'julia version 1.12.0'\n")
+            .expect("fake julia write");
+        mark_executable(&fake_julia);
         let metadata = SysimageMetadata {
             julia_major_minor: "1.12".to_string(),
             manifest_sha256: manifest_sha256(&override_project).expect("override hash"),
@@ -2192,6 +2463,8 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
 
         let launch = build_worker_launch_config_from_env(
             |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("julia_worker")),
+                "FORECASTFLOWS_JULIA_BIN" => Some(fake_julia.as_os_str().to_os_string()),
                 "FORECASTFLOWS_PROJECT_DIR" => Some(OsString::from("override-project")),
                 "FORECASTFLOWS_SYSIMAGE" => Some(sysimage_path.as_os_str().to_os_string()),
                 _ => None,
@@ -2202,13 +2475,14 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
         )
         .expect("launch config should honor override project dir");
 
-        assert_eq!(launch.project_dir, override_project);
+        let julia = launch.julia().expect("julia details present");
+        assert_eq!(julia.project_dir, override_project);
         assert_eq!(
             launch.args[1],
             project_flag_arg(&root.join("override-project"))
         );
         assert_eq!(launch.current_dir, root);
-        assert!(matches!(launch.sysimage_status, SysimageStatus::Active(_)));
+        assert!(matches!(julia.sysimage_status, SysimageStatus::Active(_)));
     }
 
     #[test]
@@ -2219,6 +2493,7 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
 
         let err = build_worker_launch_config_from_env(
             |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("julia_worker")),
                 "FORECASTFLOWS_PROJECT_DIR" => Some(OsString::from("missing-project")),
                 _ => None,
             },
@@ -2231,6 +2506,234 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
             err.to_string()
                 .contains("ForecastFlows Julia project directory")
         );
+    }
+
+    #[test]
+    fn parse_backend_from_env_returns_rust_worker_by_default() {
+        let backend = parse_backend_from_env(&|_| None).expect("default backend parses");
+        assert_eq!(backend, ForecastFlowsBackend::RustWorker);
+    }
+
+    #[test]
+    fn parse_backend_from_env_treats_empty_value_as_rust_worker() {
+        let backend = parse_backend_from_env(&|key| match key {
+            "FORECASTFLOWS_BACKEND" => Some(OsString::new()),
+            _ => None,
+        })
+        .expect("empty value parses");
+        assert_eq!(backend, ForecastFlowsBackend::RustWorker);
+    }
+
+    #[test]
+    fn parse_backend_from_env_accepts_explicit_julia_worker() {
+        let backend = parse_backend_from_env(&|key| match key {
+            "FORECASTFLOWS_BACKEND" => Some(OsString::from("julia_worker")),
+            _ => None,
+        })
+        .expect("explicit julia_worker parses");
+        assert_eq!(backend, ForecastFlowsBackend::JuliaWorker);
+    }
+
+    #[test]
+    fn parse_backend_from_env_accepts_rust_worker() {
+        let backend = parse_backend_from_env(&|key| match key {
+            "FORECASTFLOWS_BACKEND" => Some(OsString::from("rust_worker")),
+            _ => None,
+        })
+        .expect("rust_worker parses");
+        assert_eq!(backend, ForecastFlowsBackend::RustWorker);
+    }
+
+    #[test]
+    fn parse_backend_from_env_rejects_unknown_value() {
+        let err = parse_backend_from_env(&|key| match key {
+            "FORECASTFLOWS_BACKEND" => Some(OsString::from("go_worker")),
+            _ => None,
+        })
+        .expect_err("unknown backend should fail");
+        let message = err.to_string();
+        assert!(message.contains("FORECASTFLOWS_BACKEND"));
+        assert!(message.contains("julia_worker"));
+        assert!(message.contains("rust_worker"));
+    }
+
+    #[test]
+    fn build_rust_worker_launch_config_requires_worker_bin_env() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("rust-missing-env");
+
+        let err = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("rust_worker")),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
+        )
+        .expect_err("rust backend without FORECASTFLOWS_WORKER_BIN must fail");
+        assert!(err.to_string().contains("FORECASTFLOWS_WORKER_BIN"));
+    }
+
+    #[test]
+    fn build_rust_worker_launch_config_rejects_nonexistent_binary() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("rust-missing-binary");
+        let bogus = root.join("does-not-exist");
+
+        let err = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("rust_worker")),
+                "FORECASTFLOWS_WORKER_BIN" => Some(bogus.as_os_str().to_os_string()),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
+        )
+        .expect_err("missing rust worker binary must fail");
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn build_rust_worker_launch_config_rejects_directory_binary() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("rust-dir-binary");
+        let dir_path = root.join("worker-dir");
+        fs::create_dir_all(&dir_path).expect("worker dir");
+
+        let err = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("rust_worker")),
+                "FORECASTFLOWS_WORKER_BIN" => Some(dir_path.as_os_str().to_os_string()),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
+        )
+        .expect_err("directory path for rust worker binary must fail");
+        assert!(err.to_string().contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    fn mark_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(path).expect("stat worker bin").permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(path, perm).expect("chmod worker bin");
+    }
+
+    #[cfg(not(unix))]
+    fn mark_executable(_path: &Path) {}
+
+    #[test]
+    fn build_rust_worker_launch_config_produces_direct_launch_without_julia_flags() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("rust-happy");
+        let worker_bin = root.join("forecast-flows-worker");
+        fs::write(&worker_bin, b"#!/bin/sh\nexit 0\n").expect("worker bin write");
+        mark_executable(&worker_bin);
+
+        let launch = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("rust_worker")),
+                "FORECASTFLOWS_WORKER_BIN" => Some(worker_bin.as_os_str().to_os_string()),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Production,
+        )
+        .expect("rust worker launch should build under production profile without sysimage gate");
+
+        assert_eq!(launch.backend(), ForecastFlowsBackend::RustWorker);
+        assert!(matches!(launch.details, WorkerLaunchDetails::Rust(_)));
+        assert_eq!(launch.program, worker_bin.as_os_str());
+        assert!(launch.args.is_empty(), "rust worker takes no launch args");
+        assert!(
+            launch.launch_envs().is_empty(),
+            "rust worker must not propagate JULIA_NUM_THREADS or other Julia env vars",
+        );
+        assert_eq!(launch.current_dir, root);
+        assert!(launch.julia().is_none());
+        assert!(launch.runtime_detail().starts_with("rust worker binary "));
+    }
+
+    #[test]
+    fn build_rust_worker_launch_config_rejects_relative_path() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("rust-relative");
+
+        let err = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("rust_worker")),
+                "FORECASTFLOWS_WORKER_BIN" => Some(OsString::from("forecast-flows-worker")),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
+        )
+        .expect_err("relative worker bin path must fail up front");
+        assert!(
+            err.to_string().contains("must be an absolute path"),
+            "error should cite absolute-path requirement, got {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_rust_worker_launch_config_rejects_non_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = lock_tests();
+        let root = unique_temp_dir("rust-non-exec");
+        let worker_bin = root.join("forecast-flows-worker");
+        fs::write(&worker_bin, b"fake").expect("worker bin write");
+        let mut perm = fs::metadata(&worker_bin)
+            .expect("stat worker bin")
+            .permissions();
+        perm.set_mode(0o644);
+        fs::set_permissions(&worker_bin, perm).expect("chmod worker bin");
+
+        let err = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_BACKEND" => Some(OsString::from("rust_worker")),
+                "FORECASTFLOWS_WORKER_BIN" => Some(worker_bin.as_os_str().to_os_string()),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
+        )
+        .expect_err("non-executable worker bin must fail up front");
+        assert!(
+            err.to_string().contains("not executable"),
+            "error should cite executable-bit requirement, got {err}"
+        );
+    }
+
+    #[test]
+    fn build_worker_launch_config_default_uses_rust_backend() {
+        let _guard = lock_tests();
+        let root = unique_temp_dir("backend-default-rust");
+        let worker_bin = root.join("forecast-flows-worker");
+        fs::write(&worker_bin, b"#!/bin/sh\nexit 0\n").expect("worker bin write");
+        mark_executable(&worker_bin);
+
+        let launch = build_worker_launch_config_from_env(
+            |key| match key {
+                "FORECASTFLOWS_WORKER_BIN" => Some(worker_bin.as_os_str().to_os_string()),
+                _ => None,
+            },
+            root.clone(),
+            Some(root.clone()),
+            ForecastFlowsRequestProfile::Benchmark,
+        )
+        .expect("default backend should build via Rust worker path");
+
+        assert_eq!(launch.backend(), ForecastFlowsBackend::RustWorker);
+        assert!(matches!(launch.details, WorkerLaunchDetails::Rust(_)));
     }
 
     #[test]
@@ -2390,6 +2893,34 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
     }
 
     #[test]
+    fn compare_under_rust_backend_override_reports_rust_runtime_policy() {
+        let _guard = lock_tests();
+        reset_test_overrides();
+        set_test_worker_backend(ForecastFlowsBackend::RustWorker);
+        set_test_worker_command(&[
+            "/bin/sh",
+            &format!(
+                "{}/test/bin/fake_forecastflows_worker.sh",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            "healthy_direct",
+        ]);
+
+        warm_worker().expect("rust-backend fake worker should warm");
+        let compare = compare_prediction_market_families(tiny_compare_problem())
+            .expect("rust-backend compare should pass");
+        assert_eq!(compare.request_count, 1);
+        assert_eq!(
+            compare.runtime_policy.backend,
+            ForecastFlowsBackend::RustWorker
+        );
+        assert!(compare.runtime_policy.sysimage_status.is_none());
+        assert!(compare.runtime_policy.julia_threads.is_none());
+
+        reset_test_overrides();
+    }
+
+    #[test]
     fn cached_execution_model_reuses_workspace_on_second_compare() {
         let _guard = lock_tests();
         reset_test_overrides();
@@ -2516,9 +3047,10 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
         ]);
 
         let report = doctor_report().expect("doctor should return partial report");
-        assert!(!report.julia_program.is_empty());
-        assert!(!report.project_dir.is_empty());
-        assert!(!report.sysimage_status.is_empty());
+        assert!(!report.worker_program.is_empty());
+        assert_eq!(report.worker_backend, "julia_worker");
+        assert!(report.worker_project_dir.is_some());
+        assert!(report.sysimage_status.is_some());
         assert_eq!(report.representative_fixture, REPRESENTATIVE_REPORT_SOURCE);
         assert_eq!(report.health_status.as_deref(), Some("ok"));
         assert!(report.warmup_compare_duration_ms.is_none());
@@ -2536,6 +3068,44 @@ repo-url = "https://github.com/shotaronowhere/ForecastFlows.jl"
                 .iter()
                 .any(|line| line.contains("stderr line two"))
         );
+
+        reset_test_overrides();
+    }
+
+    #[test]
+    fn doctor_report_elides_julia_fields_under_rust_backend() {
+        let _guard = lock_tests();
+        reset_test_overrides();
+        set_test_worker_backend(ForecastFlowsBackend::RustWorker);
+        set_test_worker_command(&[
+            "/bin/sh",
+            &format!(
+                "{}/test/bin/fake_forecastflows_worker.sh",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            "healthy_direct",
+        ]);
+
+        let report = doctor_report().expect("doctor should pass under rust backend");
+        assert_eq!(report.worker_backend, "rust_worker");
+        assert!(report.worker_project_dir.is_none());
+        assert!(report.julia_version.is_none());
+        assert!(report.manifest_repo_url.is_none());
+        assert!(report.manifest_repo_rev.is_none());
+        assert!(report.manifest_git_tree_sha1.is_none());
+        assert!(report.julia_threads.is_none());
+        assert!(report.allow_plain_julia_escape_hatch.is_none());
+        assert!(report.sysimage_status.is_none());
+        assert!(report.sysimage_detail.is_none());
+        assert_eq!(report.health_status.as_deref(), Some("ok"));
+        assert!(
+            report
+                .worker_runtime_detail
+                .starts_with("rust worker binary ")
+        );
+        assert!(report.warmup_compare_duration_ms.is_some());
+        assert!(report.representative_compare_duration_ms.is_some());
+        assert!(report.failure.is_none());
 
         reset_test_overrides();
     }

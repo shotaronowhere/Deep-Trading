@@ -20,10 +20,10 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use tokio::time::sleep;
 
+use deep_trading_bot::execution::ITradeExecutor;
 use deep_trading_bot::execution::gnosis_preview::{
     self, ActivePool, resolve_algebra_solver, resolve_algebra_solver_readonly,
 };
-use deep_trading_bot::execution::ITradeExecutor;
 use deep_trading_bot::gnosis::MOVIES;
 
 sol! {
@@ -115,10 +115,7 @@ async fn fetch_balances<P: Provider<Ethereum> + Clone>(
     Ok(balances)
 }
 
-fn portfolio_ev(
-    token_balances: &HashMap<Address, U256>,
-    active_pools: &[ActivePool],
-) -> f64 {
+fn portfolio_ev(token_balances: &HashMap<Address, U256>, active_pools: &[ActivePool]) -> f64 {
     // TODO: underlying_token value depends on parent market probability, not 1:1 with sDAI.
     // Relative per-movie deltas are still valid; absolute EV is approximate.
     let mut collateral_ev = 0.0;
@@ -126,7 +123,10 @@ fn portfolio_ev(
     for ap in active_pools {
         if !counted_collaterals.contains(&ap.collateral) {
             collateral_ev += u256_to_f64(
-                token_balances.get(&ap.collateral).copied().unwrap_or(U256::ZERO),
+                token_balances
+                    .get(&ap.collateral)
+                    .copied()
+                    .unwrap_or(U256::ZERO),
             );
             counted_collaterals.push(ap.collateral);
         }
@@ -173,8 +173,7 @@ async fn ensure_approvals<P: Provider<Ethereum> + Clone>(
             let allowance = IERC20::new(token, provider.clone())
                 .allowance(executor, spender)
                 .call()
-                .await?
-                ;
+                .await?;
             if allowance < threshold {
                 let data = IERC20::approveCall {
                     spender,
@@ -194,7 +193,10 @@ async fn ensure_approvals<P: Provider<Ethereum> + Clone>(
         return Ok(());
     }
 
-    tracing::info!(count = approval_calls.len(), "sending infinite approval batch");
+    tracing::info!(
+        count = approval_calls.len(),
+        "sending infinite approval batch"
+    );
     let batch_data = ITradeExecutor::batchExecuteCall {
         calls: approval_calls,
     }
@@ -226,8 +228,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     // ── Config ──
-    let rpc_url = std::env::var("RPC_GNOSIS")
-        .unwrap_or_else(|_| "https://rpc.gnosischain.com".into());
+    let rpc_url =
+        std::env::var("RPC_GNOSIS").unwrap_or_else(|_| "https://rpc.gnosischain.com".into());
     let private_key = std::env::var("PRIVATE_KEY").expect("PRIVATE_KEY must be set");
     let executor_str = std::env::var("TRADE_EXECUTOR").expect("TRADE_EXECUTOR must be set");
     let executor: Address = executor_str
@@ -269,7 +271,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Verify cached solver has on-chain code
         let code = provider.get_code_at(addr).await?;
         if code.is_empty() {
-            return Err("cached solver has no on-chain code — redeploy with EXECUTE_SUBMIT=Live".into());
+            return Err(
+                "cached solver has no on-chain code — redeploy with EXECUTE_SUBMIT=Live".into(),
+            );
         }
         addr
     };
@@ -302,22 +306,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         last_block = latest;
 
         // Fetch balances
-        let token_bals =
-            match fetch_balances(provider.clone(), executor, &active_pools).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to fetch balances");
-                    sleep(poll_interval).await;
-                    continue;
-                }
-            };
+        let token_bals = match fetch_balances(provider.clone(), executor, &active_pools).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to fetch balances");
+                sleep(poll_interval).await;
+                continue;
+            }
+        };
         let pre_ev = portfolio_ev(&token_bals, &active_pools);
 
-        tracing::info!(
-            block = latest,
-            pre_ev = format!("{pre_ev:.4}"),
-            "new block"
-        );
+        tracing::info!(block = latest, pre_ev = format!("{pre_ev:.4}"), "new block");
 
         // Group pools by collateral (underlying_token) — one solver call per movie
         let mut groups: HashMap<Address, Vec<&ActivePool>> = HashMap::new();
@@ -332,7 +331,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         for (collateral, group) in &groups {
             let group_owned: Vec<ActivePool> = group.iter().map(|ap| (*ap).clone()).collect();
             let collateral_bal = token_bals.get(collateral).copied().unwrap_or(U256::ZERO);
-            let params = gnosis_preview::build_algebra_params(&group_owned, &token_bals, collateral_bal);
+            let params =
+                gnosis_preview::build_algebra_params(&group_owned, &token_bals, collateral_bal);
 
             let arb_market = group_owned[0].market_id;
             let results = gnosis_preview::preview_algebra_solvers(
