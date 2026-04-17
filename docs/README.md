@@ -27,6 +27,7 @@ If documents conflict, follow this precedence:
 
 - `docs/execution_program_packing.md`: packed execution-program compilation and chunked submission model.
 - `docs/local_foundry_e2e_harness.md`: local Foundry executable-transaction harness for Seer + Uniswap V3 + solver output validation.
+- `docs/local_foundry_e2e_harness_next_steps.md`: planned follow-up work for connected child mint/merge, connected on-chain solver support, tolerance tightening, release-mode FFI, and unrelated Rust regressions.
 - `docs/execution_submission.md`: strict execution submission gates and operator steps.
 - `docs/deployments.md`: contract addresses/constants.
 - `docs/batch_swap_router.md`: BatchSwapRouter API + test coverage map.
