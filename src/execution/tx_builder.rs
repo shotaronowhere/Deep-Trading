@@ -610,6 +610,9 @@ fn outcome_token_for_market(
     if let Some(token) = address_book.outcome_tokens.get(market_name) {
         return Ok(*token);
     }
+    if !address_book.outcome_tokens.is_empty() {
+        return Err(TxBuildError::UnknownMarket { market_name });
+    }
 
     let market = match MARKETS_L1.iter().find(|market| market.name == market_name) {
         Some(market) => market,
@@ -767,6 +770,38 @@ mod tests {
             .expect("decode should succeed");
         assert_eq!(decoded.collateralToken, BASE_COLLATERAL);
         assert_eq!(decoded.market, MARKET_1_ADDRESS);
+    }
+
+    #[test]
+    fn local_address_book_fails_closed_when_outcome_mapping_is_missing() {
+        let (market, _) = first_two_markets();
+        let mut address_book = ExecutionAddressBook::default();
+        address_book
+            .outcome_tokens
+            .insert("other local market".to_string(), Address::repeat_byte(0x33));
+        let actions = vec![Action::Buy {
+            market_name: market,
+            amount: 1.0,
+            cost: 0.5,
+        }];
+        let bounds = Some(BatchTokenBounds::Buy {
+            planned_total_in_wei: U256::from(1u64),
+            max_total_in_wei: U256::from(2u64),
+        });
+
+        let err = match build_trade_executor_calls_with_address_book(
+            Address::ZERO,
+            &actions,
+            &plan(GroupKind::DirectBuy, vec![0]),
+            bounds,
+            &address_book,
+        ) {
+            Ok(_) => panic!("missing local outcome mapping must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, TxBuildError::UnknownMarket { market_name } if market_name == market)
+        );
     }
 
     #[test]

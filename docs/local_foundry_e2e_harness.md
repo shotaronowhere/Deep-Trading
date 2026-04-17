@@ -182,8 +182,9 @@ The harness asserts:
 - every emitted transaction executes successfully
 - each chunk stays below the `40_000_000` L2 gas cap
 - realized raw EV matches the Rust expected raw EV within the scenario tolerance
+- realized net EV is positive for each executable Rust fixture scenario
 - realized net EV matches the Rust estimated net EV within tolerance plus a small fee-model allowance
-- helper/router/rebalancer contracts do not keep unexpected collateral or outcome balances
+- helper/router/swap-router/rebalancer contracts do not keep unexpected collateral or outcome balances
 - the full Foundry file passes under concurrent Forge scheduling by using scenario-specific FFI input paths
 
 ## Commands

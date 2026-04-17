@@ -425,6 +425,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         emit log_named_uint("modeled_fee_wad", fee);
         emit log_named_int("realized_net_ev_wad", realizedNet);
 
+        assertGt(realizedNet, 0, "realized net ev");
         assertApproxEqAbs(postRaw, fixture.expectedRawEvWad, toleranceWad, "raw ev");
         assertApproxEqAbs(_positiveInt(realizedNet), fixture.estimatedNetEvWad, toleranceWad + fee / 20, "net ev");
         _assertNoHelperStranding(scenario);
@@ -746,8 +747,10 @@ contract LocalFoundryExecutableTxE2E is Test {
     function _assertNoHelperStranding(ConnectedScenario memory scenario) internal view {
         assertEq(IERC20(address(collateral)).balanceOf(address(mintHelper)), 0, "mintHelper collateral");
         assertEq(IERC20(address(collateral)).balanceOf(seerRouter), 0, "seerRouter collateral");
+        assertEq(IERC20(address(collateral)).balanceOf(swapRouter02), 0, "swapRouter collateral");
         for (uint256 i = 0; i < scenario.tradeables.length; i++) {
             assertEq(IERC20(scenario.tradeables[i].token).balanceOf(seerRouter), 0, "seerRouter outcome");
+            assertEq(IERC20(scenario.tradeables[i].token).balanceOf(swapRouter02), 0, "swapRouter outcome");
         }
     }
 
