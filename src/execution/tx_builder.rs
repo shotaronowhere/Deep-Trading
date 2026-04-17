@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -17,6 +18,32 @@ use crate::{execution::ExecutionGroupPlan, execution::GroupKind, execution::LegK
 
 const TOKEN_DECIMALS: u8 = 18;
 const SWAP_FEE_TIER: u16 = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionAddressBook {
+    pub collateral: Address,
+    pub seer_router: Address,
+    pub swap_router: Address,
+    pub market1: Address,
+    pub market2: Address,
+    pub market2_collateral: Address,
+    pub outcome_tokens: HashMap<String, Address>,
+}
+
+impl Default for ExecutionAddressBook {
+    fn default() -> Self {
+        Self {
+            collateral: BASE_COLLATERAL,
+            seer_router: CTF_ROUTER_ADDRESS,
+            swap_router: SWAP_ROUTER,
+            market1: MARKET_1_ADDRESS,
+            market2: MARKET_2_ADDRESS,
+            market2_collateral: MARKET_2_COLLATERAL,
+            outcome_tokens: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxBuildError {
     ActionIndexOutOfBounds {
@@ -100,12 +127,38 @@ pub fn build_trade_executor_calls(
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
+    build_trade_executor_calls_with_address_book(
+        executor,
+        actions,
+        plan,
+        batch_bounds,
+        &ExecutionAddressBook::default(),
+    )
+}
+
+pub fn build_trade_executor_calls_with_address_book(
+    executor: Address,
+    actions: &[Action],
+    plan: &ExecutionGroupPlan,
+    batch_bounds: Option<BatchTokenBounds>,
+    address_book: &ExecutionAddressBook,
+) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
     match plan.kind {
-        GroupKind::DirectBuy => build_direct_buy_calls(executor, actions, plan, batch_bounds),
-        GroupKind::DirectSell => build_direct_sell_calls(executor, actions, plan, batch_bounds),
-        GroupKind::MintSell => build_mint_sell_calls(executor, actions, plan, batch_bounds),
-        GroupKind::BuyMerge => build_buy_merge_calls(executor, actions, plan, batch_bounds),
-        GroupKind::DirectMerge => build_direct_merge_calls(actions, plan, batch_bounds),
+        GroupKind::DirectBuy => {
+            build_direct_buy_calls(executor, actions, plan, batch_bounds, address_book)
+        }
+        GroupKind::DirectSell => {
+            build_direct_sell_calls(executor, actions, plan, batch_bounds, address_book)
+        }
+        GroupKind::MintSell => {
+            build_mint_sell_calls(executor, actions, plan, batch_bounds, address_book)
+        }
+        GroupKind::BuyMerge => {
+            build_buy_merge_calls(executor, actions, plan, batch_bounds, address_book)
+        }
+        GroupKind::DirectMerge => {
+            build_direct_merge_calls(actions, plan, batch_bounds, address_book)
+        }
     }
 }
 
@@ -162,6 +215,7 @@ fn min_proceeds_for_leg(
 
 fn build_exact_output_single_call(
     recipient: Address,
+    address_book: &ExecutionAddressBook,
     token_out: Address,
     amount_out: U256,
     amount_in_max: U256,
@@ -169,7 +223,7 @@ fn build_exact_output_single_call(
 ) -> ITradeExecutor::Call {
     let calldata = IV3SwapRouter::exactOutputSingleCall {
         params: IV3SwapRouter::ExactOutputSingleParams {
-            tokenIn: BASE_COLLATERAL,
+            tokenIn: address_book.collateral,
             tokenOut: token_out,
             fee: U24::from(SWAP_FEE_TIER),
             recipient,
@@ -179,11 +233,12 @@ fn build_exact_output_single_call(
         },
     }
     .abi_encode();
-    executor_call(SWAP_ROUTER, calldata)
+    executor_call(address_book.swap_router, calldata)
 }
 
 fn build_exact_input_single_call(
     recipient: Address,
+    address_book: &ExecutionAddressBook,
     token_in: Address,
     amount_in: U256,
     amount_out_min: U256,
@@ -192,7 +247,7 @@ fn build_exact_input_single_call(
     let calldata = IV3SwapRouter::exactInputSingleCall {
         params: IV3SwapRouter::ExactInputSingleParams {
             tokenIn: token_in,
-            tokenOut: BASE_COLLATERAL,
+            tokenOut: address_book.collateral,
             fee: U24::from(SWAP_FEE_TIER),
             recipient,
             amountIn: amount_in,
@@ -201,7 +256,7 @@ fn build_exact_input_single_call(
         },
     }
     .abi_encode();
-    executor_call(SWAP_ROUTER, calldata)
+    executor_call(address_book.swap_router, calldata)
 }
 
 fn build_direct_buy_calls(
@@ -209,6 +264,7 @@ fn build_direct_buy_calls(
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
+    address_book: &ExecutionAddressBook,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
     let _ = expect_buy_bounds(plan.kind, batch_bounds)?;
     if plan.action_indices.len() != 1 {
@@ -231,7 +287,7 @@ fn build_direct_buy_calls(
         });
     };
 
-    let token_out = outcome_token_for_market(*market_name)?;
+    let token_out = outcome_token_for_market(*market_name, address_book)?;
     let amount_out_wei = amount_to_wei_ceil(*amount)?;
     let leg = leg_for_action(plan, super::LegKind::Buy, plan.action_indices[0])?;
     let max_cost_wei = max_cost_for_leg(plan, leg)?;
@@ -239,6 +295,7 @@ fn build_direct_buy_calls(
 
     Ok(vec![build_exact_output_single_call(
         executor,
+        address_book,
         token_out,
         amount_out_wei,
         max_cost_wei,
@@ -251,6 +308,7 @@ fn build_direct_sell_calls(
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
+    address_book: &ExecutionAddressBook,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
     let _ = expect_sell_bounds(plan.kind, batch_bounds)?;
     if plan.action_indices.len() != 1 {
@@ -273,7 +331,7 @@ fn build_direct_sell_calls(
         });
     };
 
-    let token_in = outcome_token_for_market(*market_name)?;
+    let token_in = outcome_token_for_market(*market_name, address_book)?;
     let amount_in_wei = amount_to_wei_floor(*amount)?;
     let leg = leg_for_action(plan, super::LegKind::Sell, plan.action_indices[0])?;
     let min_proceeds_wei = min_proceeds_for_leg(plan, leg)?;
@@ -281,6 +339,7 @@ fn build_direct_sell_calls(
 
     Ok(vec![build_exact_input_single_call(
         executor,
+        address_book,
         token_in,
         amount_in_wei,
         min_proceeds_wei,
@@ -293,6 +352,7 @@ fn build_mint_sell_calls(
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
+    address_book: &ExecutionAddressBook,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
     let _ = expect_sell_bounds(plan.kind, batch_bounds)?;
     if plan.action_indices.len() < 2 {
@@ -326,12 +386,13 @@ fn build_mint_sell_calls(
             });
         };
         let leg = leg_for_action(plan, super::LegKind::Sell, *action_index)?;
-        let token_in = outcome_token_for_market(*market_name)?;
+        let token_in = outcome_token_for_market(*market_name, address_book)?;
         let amount_in_wei = amount_to_wei_floor(*amount)?;
         let min_proceeds_wei = min_proceeds_for_leg(plan, leg)?;
         let sqrt_price_limit_x96 = price_limit_for_leg(plan, leg)?;
         swap_calls.push(build_exact_input_single_call(
             executor,
+            address_book,
             token_in,
             amount_in_wei,
             min_proceeds_wei,
@@ -346,23 +407,23 @@ fn build_mint_sell_calls(
     }
 
     let split_market_1 = ICTFRouter::splitPositionCall {
-        collateralToken: BASE_COLLATERAL,
-        market: MARKET_1_ADDRESS,
+        collateralToken: address_book.collateral,
+        market: address_book.market1,
         amount: mint_amount_wei,
     }
     .abi_encode();
     // Action::Mint semantics are cross-contract complete-set minting, so both
     // market splits are intentional even if this subgroup only sells a subset.
-    let split_market_2 = ICTFRouter::splitPositionCall {
-        collateralToken: MARKET_2_COLLATERAL,
-        market: MARKET_2_ADDRESS,
-        amount: mint_amount_wei,
+    let mut calls = vec![executor_call(address_book.seer_router, split_market_1)];
+    if address_book.market2 != Address::ZERO {
+        let split_market_2 = ICTFRouter::splitPositionCall {
+            collateralToken: address_book.market2_collateral,
+            market: address_book.market2,
+            amount: mint_amount_wei,
+        }
+        .abi_encode();
+        calls.push(executor_call(address_book.seer_router, split_market_2));
     }
-    .abi_encode();
-    let mut calls = vec![
-        executor_call(CTF_ROUTER_ADDRESS, split_market_1),
-        executor_call(CTF_ROUTER_ADDRESS, split_market_2),
-    ];
     calls.extend(swap_calls);
     Ok(calls)
 }
@@ -372,6 +433,7 @@ fn build_buy_merge_calls(
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
+    address_book: &ExecutionAddressBook,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
     let _ = expect_buy_bounds(plan.kind, batch_bounds)?;
     if plan.action_indices.len() < 2 {
@@ -410,12 +472,13 @@ fn build_buy_merge_calls(
             });
         };
         let leg = leg_for_action(plan, super::LegKind::Buy, *action_index)?;
-        let token_out = outcome_token_for_market(*market_name)?;
+        let token_out = outcome_token_for_market(*market_name, address_book)?;
         let amount_out_wei = amount_to_wei_ceil(*amount)?;
         let max_cost_wei = max_cost_for_leg(plan, leg)?;
         let sqrt_price_limit_x96 = price_limit_for_leg(plan, leg)?;
         swap_calls.push(build_exact_output_single_call(
             executor,
+            address_book,
             token_out,
             amount_out_wei,
             max_cost_wei,
@@ -429,24 +492,24 @@ fn build_buy_merge_calls(
         });
     }
     // Action::Merge semantics are cross-contract complete-set merge/burn.
-    let merge_market_2 = ICTFRouter::mergePositionsCall {
-        collateralToken: MARKET_2_COLLATERAL,
-        market: MARKET_2_ADDRESS,
-        amount: merge_amount_wei,
-    }
-    .abi_encode();
     let merge_market_1 = ICTFRouter::mergePositionsCall {
-        collateralToken: BASE_COLLATERAL,
-        market: MARKET_1_ADDRESS,
+        collateralToken: address_book.collateral,
+        market: address_book.market1,
         amount: merge_amount_wei,
     }
     .abi_encode();
 
     let mut calls = swap_calls;
-    calls.extend([
-        executor_call(CTF_ROUTER_ADDRESS, merge_market_2),
-        executor_call(CTF_ROUTER_ADDRESS, merge_market_1),
-    ]);
+    if address_book.market2 != Address::ZERO {
+        let merge_market_2 = ICTFRouter::mergePositionsCall {
+            collateralToken: address_book.market2_collateral,
+            market: address_book.market2,
+            amount: merge_amount_wei,
+        }
+        .abi_encode();
+        calls.push(executor_call(address_book.seer_router, merge_market_2));
+    }
+    calls.push(executor_call(address_book.seer_router, merge_market_1));
     Ok(calls)
 }
 
@@ -454,6 +517,7 @@ fn build_direct_merge_calls(
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     batch_bounds: Option<BatchTokenBounds>,
+    address_book: &ExecutionAddressBook,
 ) -> Result<Vec<ITradeExecutor::Call>, TxBuildError> {
     if batch_bounds.is_some() {
         return Err(TxBuildError::UnexpectedBounds { kind: plan.kind });
@@ -474,23 +538,25 @@ fn build_direct_merge_calls(
     };
     let merge_amount_wei = amount_to_wei_floor(*amount)?;
 
-    let merge_market_2 = ICTFRouter::mergePositionsCall {
-        collateralToken: MARKET_2_COLLATERAL,
-        market: MARKET_2_ADDRESS,
-        amount: merge_amount_wei,
-    }
-    .abi_encode();
     let merge_market_1 = ICTFRouter::mergePositionsCall {
-        collateralToken: BASE_COLLATERAL,
-        market: MARKET_1_ADDRESS,
+        collateralToken: address_book.collateral,
+        market: address_book.market1,
         amount: merge_amount_wei,
     }
     .abi_encode();
 
-    Ok(vec![
-        executor_call(CTF_ROUTER_ADDRESS, merge_market_2),
-        executor_call(CTF_ROUTER_ADDRESS, merge_market_1),
-    ])
+    let mut calls = Vec::new();
+    if address_book.market2 != Address::ZERO {
+        let merge_market_2 = ICTFRouter::mergePositionsCall {
+            collateralToken: address_book.market2_collateral,
+            market: address_book.market2,
+            amount: merge_amount_wei,
+        }
+        .abi_encode();
+        calls.push(executor_call(address_book.seer_router, merge_market_2));
+    }
+    calls.push(executor_call(address_book.seer_router, merge_market_1));
+    Ok(calls)
 }
 
 fn expect_buy_bounds(
@@ -537,7 +603,14 @@ fn action_at(actions: &[Action], index: usize) -> Result<&Action, TxBuildError> 
         .ok_or(TxBuildError::ActionIndexOutOfBounds { index })
 }
 
-fn outcome_token_for_market(market_name: &'static str) -> Result<Address, TxBuildError> {
+fn outcome_token_for_market(
+    market_name: &'static str,
+    address_book: &ExecutionAddressBook,
+) -> Result<Address, TxBuildError> {
+    if let Some(token) = address_book.outcome_tokens.get(market_name) {
+        return Ok(*token);
+    }
+
     let market = match MARKETS_L1.iter().find(|market| market.name == market_name) {
         Some(market) => market,
         None => {
@@ -625,6 +698,75 @@ mod tests {
         let first = iter.next().expect("expected first market").name;
         let second = iter.next().expect("expected second market").name;
         (first, second)
+    }
+
+    #[test]
+    fn default_address_book_preserves_live_constants() {
+        let (market, _) = first_two_markets();
+        let address_book = ExecutionAddressBook::default();
+        assert_eq!(address_book.collateral, BASE_COLLATERAL);
+        assert_eq!(address_book.seer_router, CTF_ROUTER_ADDRESS);
+        assert_eq!(address_book.swap_router, SWAP_ROUTER);
+        assert_eq!(address_book.market1, MARKET_1_ADDRESS);
+        assert_eq!(address_book.market2, MARKET_2_ADDRESS);
+        assert_eq!(address_book.market2_collateral, MARKET_2_COLLATERAL);
+
+        let actions = vec![Action::Buy {
+            market_name: market,
+            amount: 1.0,
+            cost: 0.5,
+        }];
+        let direct_plan = plan(GroupKind::DirectBuy, vec![0]);
+        let bounds = Some(BatchTokenBounds::Buy {
+            planned_total_in_wei: U256::from(1u64),
+            max_total_in_wei: U256::from(2u64),
+        });
+        let legacy_calls =
+            build_trade_executor_calls(Address::ZERO, &actions, &direct_plan, bounds.clone())
+                .expect("default call build should succeed");
+        let address_book_calls = build_trade_executor_calls_with_address_book(
+            Address::ZERO,
+            &actions,
+            &direct_plan,
+            bounds,
+            &address_book,
+        )
+        .expect("address book call build should succeed");
+        assert_eq!(legacy_calls.len(), address_book_calls.len());
+        for (legacy, with_address_book) in legacy_calls.iter().zip(address_book_calls.iter()) {
+            assert_eq!(legacy.to, with_address_book.to);
+            assert_eq!(legacy.data, with_address_book.data);
+        }
+    }
+
+    #[test]
+    fn zero_market2_address_builds_single_market_merge_calls() {
+        let (market, _) = first_two_markets();
+        let address_book = ExecutionAddressBook {
+            market2: Address::ZERO,
+            ..ExecutionAddressBook::default()
+        };
+        let actions = vec![Action::Merge {
+            contract_1: "c1",
+            contract_2: "c2",
+            amount: 1.0,
+            source_market: market,
+        }];
+
+        let calls = build_trade_executor_calls_with_address_book(
+            Address::ZERO,
+            &actions,
+            &plan(GroupKind::DirectMerge, vec![0]),
+            None,
+            &address_book,
+        )
+        .expect("single-market merge should build");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].to, CTF_ROUTER_ADDRESS);
+        let decoded = ICTFRouter::mergePositionsCall::abi_decode(&calls[0].data)
+            .expect("decode should succeed");
+        assert_eq!(decoded.collateralToken, BASE_COLLATERAL);
+        assert_eq!(decoded.market, MARKET_1_ADDRESS);
     }
 
     #[test]
@@ -740,6 +882,70 @@ mod tests {
                 kind: GroupKind::DirectBuy
             }
         ));
+    }
+
+    #[test]
+    fn address_book_overrides_live_addresses_for_local_fixture_calls() {
+        let (market, _) = first_two_markets();
+        let local_collateral = Address::repeat_byte(0x11);
+        let local_router = Address::repeat_byte(0x22);
+        let local_outcome = Address::repeat_byte(0x33);
+        let local_seer_router = Address::repeat_byte(0x44);
+        let mut address_book = ExecutionAddressBook {
+            collateral: local_collateral,
+            seer_router: local_seer_router,
+            swap_router: local_router,
+            market1: Address::repeat_byte(0x55),
+            market2: Address::repeat_byte(0x66),
+            market2_collateral: Address::repeat_byte(0x77),
+            outcome_tokens: HashMap::new(),
+        };
+        address_book
+            .outcome_tokens
+            .insert(market.to_string(), local_outcome);
+
+        let actions = vec![Action::Buy {
+            market_name: market,
+            amount: 1.0,
+            cost: 0.5,
+        }];
+        let direct_plan = plan(GroupKind::DirectBuy, vec![0]);
+        let bounds = Some(BatchTokenBounds::Buy {
+            planned_total_in_wei: U256::from(1u64),
+            max_total_in_wei: U256::from(2u64),
+        });
+
+        let calls = build_trade_executor_calls_with_address_book(
+            Address::ZERO,
+            &actions,
+            &direct_plan,
+            bounds,
+            &address_book,
+        )
+        .expect("local call build should succeed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].to, local_router);
+        let decoded = IV3SwapRouter::exactOutputSingleCall::abi_decode(&calls[0].data)
+            .expect("decode should succeed");
+        assert_eq!(decoded.params.tokenIn, local_collateral);
+        assert_eq!(decoded.params.tokenOut, local_outcome);
+
+        let merge_actions = vec![Action::Merge {
+            contract_1: "c1",
+            contract_2: "c2",
+            amount: 1.0,
+            source_market: market,
+        }];
+        let merge_calls = build_trade_executor_calls_with_address_book(
+            Address::ZERO,
+            &merge_actions,
+            &plan(GroupKind::DirectMerge, vec![0]),
+            None,
+            &address_book,
+        )
+        .expect("merge call build should succeed");
+        assert_eq!(merge_calls[0].to, local_seer_router);
+        assert_eq!(merge_calls[1].to, local_seer_router);
     }
 
     #[test]

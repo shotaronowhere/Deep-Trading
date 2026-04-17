@@ -10940,6 +10940,38 @@ pub fn rebalance_with_solver_and_gas_pricing_and_flags_and_decision(
     )
 }
 
+pub fn rebalance_with_custom_predictions_and_solver_and_gas_pricing_and_flags_and_decision(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    solver: RebalanceSolver,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+    flags: RebalanceFlags,
+    force_mint_available: bool,
+) -> RebalancePlanDecision {
+    let n_sims = slot0_results.len();
+    let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
+    let cost_config =
+        planner_cost_config_with_pricing(gas, gas_price_eth, eth_usd, "explicit_gas_pricing");
+    let (plan, stats) = rebalance_full_ultimate_with_predictions_and_stats(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+        route_gates,
+        cost_config,
+        solver,
+        flags,
+        Some(force_mint_available),
+        false,
+    );
+    decision_from_plan_result(plan, &stats)
+}
+
 pub fn warm_forecastflows_worker() -> Result<(), String> {
     forecastflows::warm_worker().map_err(|err| err.to_string())
 }

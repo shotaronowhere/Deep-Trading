@@ -6,7 +6,9 @@ use super::gas::{
     build_unsigned_batch_execute_tx_bytes, estimate_l1_data_fee_susd_for_tx_bytes_len,
     estimate_l2_gas_susd,
 };
-use super::tx_builder::{TxBuildError, build_trade_executor_calls};
+use super::tx_builder::{
+    ExecutionAddressBook, TxBuildError, build_trade_executor_calls_with_address_book,
+};
 use super::{ExecutionGroupPlan, ExecutionMode, ITradeExecutor, SUSD_DECIMALS, is_plan_stale};
 use crate::portfolio::Action;
 
@@ -66,22 +68,24 @@ impl From<ExactGasQuoteError> for ProgramBuildError {
     }
 }
 
-fn append_plan_calls_unchecked(
+fn append_plan_calls_unchecked_with_address_book(
     executor: Address,
     actions: &[Action],
     plan: &ExecutionGroupPlan,
     calls: &mut Vec<ITradeExecutor::Call>,
+    address_book: &ExecutionAddressBook,
 ) -> Result<(), ProgramBuildError> {
     let batch_bounds = derive_batch_quote_bounds_unchecked(plan)
         .map_err(|err| ProgramBuildError::MissingBounds(err.to_string()))?
         .map(|bounds| bounds.to_token_bounds(SUSD_DECIMALS))
         .transpose()
         .map_err(|err| ProgramBuildError::MissingBounds(err.to_string()))?;
-    calls.extend(build_trade_executor_calls(
+    calls.extend(build_trade_executor_calls_with_address_book(
         executor,
         actions,
         plan,
         batch_bounds,
+        address_book,
     )?);
     Ok(())
 }
@@ -92,6 +96,24 @@ pub fn build_chunk_calls_checked(
     plans: &[ExecutionGroupPlan],
     current_block: u64,
     max_stale_blocks: u64,
+) -> Result<Vec<ITradeExecutor::Call>, ProgramBuildError> {
+    build_chunk_calls_checked_with_address_book(
+        executor,
+        actions,
+        plans,
+        current_block,
+        max_stale_blocks,
+        &ExecutionAddressBook::default(),
+    )
+}
+
+pub fn build_chunk_calls_checked_with_address_book(
+    executor: Address,
+    actions: &[Action],
+    plans: &[ExecutionGroupPlan],
+    current_block: u64,
+    max_stale_blocks: u64,
+    address_book: &ExecutionAddressBook,
 ) -> Result<Vec<ITradeExecutor::Call>, ProgramBuildError> {
     let mut calls = Vec::new();
     for plan in plans {
@@ -107,11 +129,12 @@ pub fn build_chunk_calls_checked(
                 .map(|bounds| bounds.to_token_bounds(SUSD_DECIMALS))
                 .transpose()
                 .map_err(|err| ProgramBuildError::MissingBounds(err.to_string()))?;
-        calls.extend(build_trade_executor_calls(
+        calls.extend(build_trade_executor_calls_with_address_book(
             executor,
             actions,
             plan,
             batch_bounds,
+            address_book,
         )?);
     }
     Ok(calls)
@@ -154,6 +177,28 @@ pub fn compile_execution_program_unchecked(
     fee_inputs: LiveOptimismFeeInputs,
     gas_assumptions: &GasAssumptions,
     eth_usd: f64,
+) -> Result<ExecutionProgramPlan, ProgramBuildError> {
+    compile_execution_program_unchecked_with_address_book(
+        mode,
+        executor,
+        actions,
+        plans,
+        fee_inputs,
+        gas_assumptions,
+        eth_usd,
+        &ExecutionAddressBook::default(),
+    )
+}
+
+pub fn compile_execution_program_unchecked_with_address_book(
+    mode: ExecutionMode,
+    executor: Address,
+    actions: &[Action],
+    plans: &[ExecutionGroupPlan],
+    fee_inputs: LiveOptimismFeeInputs,
+    gas_assumptions: &GasAssumptions,
+    eth_usd: f64,
+    address_book: &ExecutionAddressBook,
 ) -> Result<ExecutionProgramPlan, ProgramBuildError> {
     if plans.is_empty() {
         return Ok(ExecutionProgramPlan {
@@ -205,7 +250,13 @@ pub fn compile_execution_program_unchecked(
         }
 
         let mut plan_calls = Vec::new();
-        append_plan_calls_unchecked(executor, actions, plan, &mut plan_calls)?;
+        append_plan_calls_unchecked_with_address_book(
+            executor,
+            actions,
+            plan,
+            &mut plan_calls,
+            address_book,
+        )?;
 
         match mode {
             ExecutionMode::Strict => {
