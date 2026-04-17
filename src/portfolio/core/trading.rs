@@ -442,9 +442,7 @@ impl<'a> ExecutionState<'a> {
                     if segment.cash_cost > DUST {
                         executed_any = true;
                     }
-                    for &(idx, amount, _planned_cost, new_price) in
-                        &segment.direct_member_plans
-                    {
+                    for &(idx, amount, _planned_cost, new_price) in &segment.direct_member_plans {
                         if amount <= DUST {
                             continue;
                         }

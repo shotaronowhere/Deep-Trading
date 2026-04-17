@@ -21,23 +21,25 @@ If documents conflict, follow this precedence:
 - `docs/rebalancer_policy_metrics_template.json`: metrics row template (JSON).
 - `docs/model.md`: mathematical derivations used by the off-chain solver.
 - `docs/architecture.md`: system architecture and source map.
-- `docs/forecastflows_worker.md`: ForecastFlows worker boundary, Julia environment, sysimage workflow, doctor tool, replay acceptance, and fallback policy.
+- `docs/forecastflows_worker.md`: ForecastFlows worker boundary, supported backends (`julia_worker`, `rust_worker`), Julia sysimage workflow, doctor tool, replay acceptance, and fallback policy.
 
 ## Operational runbooks
 
 - `docs/execution_program_packing.md`: packed execution-program compilation and chunked submission model.
+- `docs/local_foundry_e2e_harness.md`: local Foundry executable-transaction harness for Seer + Uniswap V3 + solver output validation.
 - `docs/execution_submission.md`: strict execution submission gates and operator steps.
 - `docs/deployments.md`: contract addresses/constants.
 - `docs/batch_swap_router.md`: BatchSwapRouter API + test coverage map.
 - `docs/slippage.md`: current slippage/staleness policy summary.
 - `docs/TODO.md`: prioritized open items and completion log.
+- `docs/forecastflows_rust_worker_integration_plan.md`: implementation plan for migrating the ForecastFlows backend from Julia worker to Rust worker.
 
 ## Module and validation docs
 
 - `docs/portfolio.md`: portfolio module surface, diagnostics, and test map.
 - `docs/solver_benchmark_matrix.md`: central release-facing EV / gas / speed comparison across solver flavors.
 - `docs/gas_model.md`: gas threshold assumptions.
-- `docs/forecastflows_worker.md`: external solver worker lifecycle, doctor workflow, and translation contract.
+- `docs/forecastflows_worker.md`: external solver worker lifecycle (Julia and Rust backends), doctor workflow, and translation contract.
 - `docs/rebalance_test_ev_trace.md`: EV trace instrumentation.
 - `docs/monte_carlo_rebalance_validation.md`: Monte Carlo EV validation harness.
 

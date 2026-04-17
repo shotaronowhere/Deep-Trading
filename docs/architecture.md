@@ -48,7 +48,8 @@ API (deep.seer.pm)
 - **src/main.rs**: Runtime planning entrypoint using HTTP JSON-RPC provider wiring, mode selection (`full`/`arb_only`), solver selection (`REBALANCE_SOLVER`), gas-assumption hydration, and diagnostics output
 - **src/bin/plan_preview.rs**: Runtime snapshot planner / execution preview entrypoint
 - **src/bin/execute.rs**: Block-triggered runtime execution loop with snapshot-fingerprint skips, stale-block dropping, and optional background native audits for the ForecastFlows live lane
-- **src/bin/forecastflows_doctor.rs**: Operator diagnostic entrypoint for Julia path/version, manifest pin, live solve tuning, worker health, sysimage status, and representative compare timings
+- **src/bin/forecastflows_doctor.rs**: Operator diagnostic entrypoint for the selected worker backend (`julia_worker` or `rust_worker`), worker program/version, live solve tuning, worker health, Julia-only sysimage status (when applicable), and representative compare timings
+- **src/bin/local_foundry_e2e_fixture.rs**: FFI fixture generator for `test/LocalFoundryExecutableTxE2E.t.sol`; turns Foundry-deployed local Seer/Uniswap addresses into executable packed `TradeExecutor` calls.
 - **src/markets.rs**: Generated static market data arrays
 - **src/predictions.rs**: Generated prediction weights from CSVs
 - **src/pools.rs**: Facade/re-exports for pool utilities
@@ -63,13 +64,14 @@ API (deep.seer.pm)
 - **docs/batch_swap_router.md**: Canonical BatchSwapRouter API and coverage reference
 - **src/execution/bounds.rs**: Profitability-step-aware strict-subgroup planning, strict gating, and prefix-safe execution-plan orchestration
 - **src/execution/tx_builder.rs**: Encodes per-leg `SwapRouter02` calls for runtime execution; the batch-router ABI in Rust remains compatibility-only until a new batch router is deployed
+- **test/LocalFoundryExecutableTxE2E.t.sol**: Local Foundry executable-transaction harness for Seer markets, Uniswap V3 pools, Rust solver output, and on-chain solver calls. See [docs/local_foundry_e2e_harness.md](local_foundry_e2e_harness.md).
 - **src/execution/edge.rs**: Group cashflow/EV edge derivation helpers
 - **src/execution/batch_bounds.rs**: Aggregate `sell(min)` / `buy(max)` bound derivation + plan stamping
 - **src/execution/gas.rs**: L2/L1 gas estimate model + cached Optimism L1 fee-per-byte hydration
 - **src/execution/grouping.rs**: Strict action grouping, profitability-step formation, and route-shape validation (`Mint->Sell+`, `Buy+->Merge`)
 - **src/portfolio/mod.rs**: Portfolio module entrypoint exporting `Action` and `rebalance`
 - **src/portfolio/core/mod.rs**: Portfolio core aggregation module
-- **src/portfolio/core/forecastflows/client.rs**: ForecastFlows worker lifecycle, launch config/sysimage validation, NDJSON request/response handling, warmup, cooldown/backoff, stderr diagnostics, and doctor workload generation
+- **src/portfolio/core/forecastflows/client.rs**: ForecastFlows worker lifecycle shared across the `julia_worker` and `rust_worker` backends — backend selection, launch config (Julia sysimage/threads validation or Rust binary validation), NDJSON request/response handling, warmup, cooldown/backoff, stderr diagnostics, and doctor workload generation
 - **src/portfolio/core/forecastflows/translate.rs**: L1 snapshot -> ForecastFlows problem mapping and worker response -> local `Action` translation
 - **src/portfolio/core/sim.rs**: Pool simulation primitives and route-agnostic math helpers
 - **src/portfolio/core/planning.rs**: Bundle-step planning for the live waterfall path; legacy route-level planning helpers are retained under `#[cfg(test)]` for oracle parity tests

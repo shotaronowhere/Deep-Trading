@@ -18,18 +18,29 @@ use super::rebalancer::PlannerCostConfig;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ForecastFlowsDoctorReport {
-    pub julia_program: String,
+    pub worker_backend: String,
+    pub worker_program: String,
+    pub worker_version: Option<String>,
+    pub worker_project_dir: Option<String>,
+    pub worker_launch_args: Vec<String>,
+    pub worker_runtime_detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub julia_version: Option<String>,
-    pub project_dir: String,
-    pub launch_args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_repo_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_repo_rev: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_git_tree_sha1: Option<String>,
-    pub julia_threads: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub julia_threads: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_plain_julia_escape_hatch: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sysimage_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sysimage_detail: Option<String>,
     pub live_solve_tuning: String,
-    pub allow_plain_julia_escape_hatch: bool,
-    pub sysimage_status: String,
-    pub sysimage_detail: String,
     pub health_status: Option<String>,
     pub supported_commands: Vec<String>,
     pub supported_modes: Vec<String>,
@@ -98,6 +109,8 @@ pub(super) struct ForecastFlowsTelemetry {
     pub(super) certified_drop_reason: Option<String>,
     pub(super) replay_drop_reason: Option<String>,
     pub(super) replay_tolerance_clamp_used: bool,
+    pub(super) forecastflows_backend: Option<String>,
+    pub(super) forecastflows_worker_version: Option<String>,
     pub(super) sysimage_status: Option<String>,
     pub(super) julia_threads: Option<String>,
     pub(super) solve_tuning: Option<String>,
@@ -155,8 +168,10 @@ impl From<client::ForecastFlowsCompareFailure> for ForecastFlowsSolveError {
         let telemetry = value
             .runtime_policy
             .map(|runtime_policy| ForecastFlowsTelemetry {
-                sysimage_status: Some(runtime_policy.sysimage_status),
-                julia_threads: Some(runtime_policy.julia_threads),
+                forecastflows_backend: Some(runtime_policy.backend.as_str().to_string()),
+                forecastflows_worker_version: runtime_policy.worker_version,
+                sysimage_status: runtime_policy.sysimage_status,
+                julia_threads: runtime_policy.julia_threads,
                 solve_tuning: Some(runtime_policy.solve_tuning),
                 ..ForecastFlowsTelemetry::default()
             })
@@ -249,9 +264,11 @@ pub(super) fn solve_family_candidates(
         mixed_status: Some(compare_report.compare.mixed_enabled.status.clone()),
         direct_solver_time_ms,
         mixed_solver_time_ms,
-        sysimage_status: Some(compare_report.runtime_policy.sysimage_status),
-        julia_threads: Some(compare_report.runtime_policy.julia_threads),
-        solve_tuning: Some(compare_report.runtime_policy.solve_tuning),
+        forecastflows_backend: Some(compare_report.runtime_policy.backend.as_str().to_string()),
+        forecastflows_worker_version: compare_report.runtime_policy.worker_version.clone(),
+        sysimage_status: compare_report.runtime_policy.sysimage_status.clone(),
+        julia_threads: compare_report.runtime_policy.julia_threads.clone(),
+        solve_tuning: Some(compare_report.runtime_policy.solve_tuning.clone()),
         ..ForecastFlowsTelemetry::default()
     };
     let translation_started = std::time::Instant::now();
@@ -807,6 +824,13 @@ mod tests {
         assert_eq!(
             stats.forecastflows_fallback_reason,
             Some("worker_error_response")
+        );
+        assert_eq!(
+            stats
+                .forecastflows_telemetry
+                .forecastflows_backend
+                .as_deref(),
+            Some("julia_worker"),
         );
         assert!(
             stats

@@ -13,9 +13,8 @@ use super::{
     Action, TestRng, assert_rebalance_action_invariants,
     assert_strict_ev_gain_with_portfolio_trace, brute_force_best_split_with_inventory,
     build_rebalance_fuzz_case, build_rebalance_fuzz_case_capped, build_slot0_results_for_markets,
-    build_three_sims_with_preds,
-    eligible_l1_markets_with_predictions, ev_from_state, mock_slot0_market,
-    replay_actions_to_state,
+    build_three_sims_with_preds, eligible_l1_markets_with_predictions, ev_from_state,
+    mock_slot0_market, replay_actions_to_state,
 };
 use serde::{Deserialize, Serialize};
 
@@ -202,7 +201,11 @@ fn collect_fuzz_case_by_index_capped(
     out.expect("seeded fuzz case should exist for requested index")
 }
 
-fn collect_fuzz_ev_after_capped(force_partial: bool, num_cases: usize, max_markets: usize) -> Vec<f64> {
+fn collect_fuzz_ev_after_capped(
+    force_partial: bool,
+    num_cases: usize,
+    max_markets: usize,
+) -> Vec<f64> {
     let seed = if force_partial {
         0xABCD_1234_EF99_7788u64
     } else {
@@ -241,7 +244,11 @@ fn collect_fuzz_ev_after_capped(force_partial: bool, num_cases: usize, max_marke
         assert!(
             ev_after >= ev_before - 1e-9,
             "expected EV non-decrease for case {} (force_partial={}, max_markets={}): before={:.9}, after={:.9}",
-            case_idx, force_partial, max_markets, ev_before, ev_after
+            case_idx,
+            force_partial,
+            max_markets,
+            ev_before,
+            ev_after
         );
         out[case_idx] = ev_after;
     }
@@ -252,15 +259,26 @@ fn collect_fuzz_ev_after_capped(force_partial: bool, num_cases: usize, max_marke
 #[ignore = "updates src/portfolio/tests/ev_snapshots_tiered.json; run explicitly"]
 fn test_refresh_ev_snapshots_tiered() {
     let snapshots = TieredEvSnapshots {
-        breadth_full: collect_fuzz_ev_after_capped(false, BREADTH_CASES_PER_SIDE, BREADTH_MAX_MARKETS),
-        breadth_partial: collect_fuzz_ev_after_capped(true, BREADTH_CASES_PER_SIDE, BREADTH_MAX_MARKETS),
+        breadth_full: collect_fuzz_ev_after_capped(
+            false,
+            BREADTH_CASES_PER_SIDE,
+            BREADTH_MAX_MARKETS,
+        ),
+        breadth_partial: collect_fuzz_ev_after_capped(
+            true,
+            BREADTH_CASES_PER_SIDE,
+            BREADTH_MAX_MARKETS,
+        ),
         depth_full: collect_fuzz_ev_after_capped(false, DEPTH_CASES_PER_SIDE, DEPTH_MAX_MARKETS),
         depth_partial: collect_fuzz_ev_after_capped(true, DEPTH_CASES_PER_SIDE, DEPTH_MAX_MARKETS),
     };
     let json = serde_json::to_string_pretty(&snapshots)
         .expect("tiered ev snapshots should serialize to valid JSON");
-    std::fs::write("src/portfolio/tests/ev_snapshots_tiered.json", format!("{json}\n"))
-        .expect("failed to write tiered ev snapshots fixture");
+    std::fs::write(
+        "src/portfolio/tests/ev_snapshots_tiered.json",
+        format!("{json}\n"),
+    )
+    .expect("failed to write tiered ev snapshots fixture");
     println!("[tiered-snapshot-refresh] wrote src/portfolio/tests/ev_snapshots_tiered.json");
 }
 
@@ -301,7 +319,9 @@ fn test_rebalance_ev_regression_tiered() {
         assert!(
             ev_after >= ev_before - 1e-9,
             "breadth full case {}: EV decreased: before={:.9}, after={:.9}",
-            case_idx, ev_before, ev_after
+            case_idx,
+            ev_before,
+            ev_after
         );
         let (ok, floor_tol, ceiling_tol) =
             ev_within_snapshot_band(ev_after, snapshots.breadth_full[case_idx]);
@@ -322,11 +342,13 @@ fn test_rebalance_ev_regression_tiered() {
         assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
-            "breadth partial case {}: mint should be disabled", case_idx
+            "breadth partial case {}: mint should be disabled",
+            case_idx
         );
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
-            "breadth partial case {}: merge should be disabled", case_idx
+            "breadth partial case {}: merge should be disabled",
+            case_idx
         );
 
         let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
@@ -343,7 +365,9 @@ fn test_rebalance_ev_regression_tiered() {
         assert!(
             ev_after >= ev_before - 1e-9,
             "breadth partial case {}: EV decreased: before={:.9}, after={:.9}",
-            case_idx, ev_before, ev_after
+            case_idx,
+            ev_before,
+            ev_after
         );
         let (ok, floor_tol, ceiling_tol) =
             ev_within_snapshot_band(ev_after, snapshots.breadth_partial[case_idx]);
@@ -379,7 +403,9 @@ fn test_rebalance_ev_regression_tiered() {
         assert!(
             ev_after >= ev_before - 1e-9,
             "depth full case {}: EV decreased: before={:.9}, after={:.9}",
-            case_idx, ev_before, ev_after
+            case_idx,
+            ev_before,
+            ev_after
         );
         let (ok, floor_tol, ceiling_tol) =
             ev_within_snapshot_band(ev_after, snapshots.depth_full[case_idx]);
@@ -400,11 +426,13 @@ fn test_rebalance_ev_regression_tiered() {
         assert_rebalance_action_invariants(&actions, &slot0_results, &balances, susd_balance);
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Mint { .. })),
-            "depth partial case {}: mint should be disabled", case_idx
+            "depth partial case {}: mint should be disabled",
+            case_idx
         );
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Merge { .. })),
-            "depth partial case {}: merge should be disabled", case_idx
+            "depth partial case {}: merge should be disabled",
+            case_idx
         );
 
         let mut holdings_before: HashMap<&'static str, f64> = HashMap::new();
@@ -421,7 +449,9 @@ fn test_rebalance_ev_regression_tiered() {
         assert!(
             ev_after >= ev_before - 1e-9,
             "depth partial case {}: EV decreased: before={:.9}, after={:.9}",
-            case_idx, ev_before, ev_after
+            case_idx,
+            ev_before,
+            ev_after
         );
         let (ok, floor_tol, ceiling_tol) =
             ev_within_snapshot_band(ev_after, snapshots.depth_partial[case_idx]);
@@ -432,7 +462,6 @@ fn test_rebalance_ev_regression_tiered() {
         );
     }
 }
-
 
 #[derive(Debug, Clone, Copy)]
 struct FastEvCaseReport {
@@ -626,9 +655,24 @@ fn test_rebalance_ev_regression_synthetic() {
         SyntheticCase {
             label: "basic_underpriced_direct_only",
             markets: vec![
-                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.05, 0.15),
-                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.08, 0.20),
-                ("mkt_c", "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0.12, 0.10),
+                (
+                    "mkt_a",
+                    "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    0.05,
+                    0.15,
+                ),
+                (
+                    "mkt_b",
+                    "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                    0.08,
+                    0.20,
+                ),
+                (
+                    "mkt_c",
+                    "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                    0.12,
+                    0.10,
+                ),
             ],
             balances: vec![("mkt_c", 5.0)],
             cash: 10.0,
@@ -637,9 +681,24 @@ fn test_rebalance_ev_regression_synthetic() {
         SyntheticCase {
             label: "sell_overpriced_and_buy_underpriced",
             markets: vec![
-                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.05, 0.15),
-                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.20, 0.08),
-                ("mkt_c", "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0.10, 0.12),
+                (
+                    "mkt_a",
+                    "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    0.05,
+                    0.15,
+                ),
+                (
+                    "mkt_b",
+                    "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                    0.20,
+                    0.08,
+                ),
+                (
+                    "mkt_c",
+                    "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                    0.10,
+                    0.12,
+                ),
             ],
             balances: vec![("mkt_b", 8.0)],
             cash: 5.0,
@@ -648,11 +707,36 @@ fn test_rebalance_ev_regression_synthetic() {
         SyntheticCase {
             label: "low_budget_many_profitable",
             markets: vec![
-                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.03, 0.12),
-                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.04, 0.15),
-                ("mkt_c", "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0.06, 0.18),
-                ("mkt_d", "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD", 0.02, 0.10),
-                ("mkt_e", "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE", 0.07, 0.20),
+                (
+                    "mkt_a",
+                    "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    0.03,
+                    0.12,
+                ),
+                (
+                    "mkt_b",
+                    "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                    0.04,
+                    0.15,
+                ),
+                (
+                    "mkt_c",
+                    "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                    0.06,
+                    0.18,
+                ),
+                (
+                    "mkt_d",
+                    "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+                    0.02,
+                    0.10,
+                ),
+                (
+                    "mkt_e",
+                    "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+                    0.07,
+                    0.20,
+                ),
             ],
             balances: vec![],
             cash: 2.0,
@@ -661,9 +745,24 @@ fn test_rebalance_ev_regression_synthetic() {
         SyntheticCase {
             label: "mint_available_mixed_routes",
             markets: vec![
-                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.05, 0.15),
-                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.08, 0.20),
-                ("mkt_c", "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 0.10, 0.05),
+                (
+                    "mkt_a",
+                    "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    0.05,
+                    0.15,
+                ),
+                (
+                    "mkt_b",
+                    "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                    0.08,
+                    0.20,
+                ),
+                (
+                    "mkt_c",
+                    "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                    0.10,
+                    0.05,
+                ),
             ],
             balances: vec![("mkt_c", 10.0)],
             cash: 15.0,
@@ -672,8 +771,18 @@ fn test_rebalance_ev_regression_synthetic() {
         SyntheticCase {
             label: "zero_budget_legacy_only",
             markets: vec![
-                ("mkt_a", "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 0.05, 0.15),
-                ("mkt_b", "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", 0.20, 0.08),
+                (
+                    "mkt_a",
+                    "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    0.05,
+                    0.15,
+                ),
+                (
+                    "mkt_b",
+                    "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                    0.20,
+                    0.08,
+                ),
             ],
             balances: vec![("mkt_b", 20.0)],
             cash: 0.0,

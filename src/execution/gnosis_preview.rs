@@ -162,8 +162,7 @@ fn build_init_code(artifact_path: &str, constructor_args: &[u8]) -> Result<Vec<u
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| PreviewError::Build(format!("missing bytecode in {artifact_path}")))?;
     let trimmed = bytecode_hex.strip_prefix("0x").unwrap_or(bytecode_hex);
-    let mut code =
-        hex::decode(trimmed).map_err(|e| PreviewError::Build(format!("hex: {e}")))?;
+    let mut code = hex::decode(trimmed).map_err(|e| PreviewError::Build(format!("hex: {e}")))?;
     code.extend_from_slice(constructor_args);
     Ok(code)
 }
@@ -277,15 +276,13 @@ pub fn build_algebra_params(
     let mut sqrt_pred_x96 = Vec::with_capacity(active_pools.len());
 
     // All pools in a single call must share the same collateral
-    let collateral = active_pools
-        .first()
-        .map(|ap| ap.collateral)
-        .unwrap_or(SDAI);
+    let collateral = active_pools.first().map(|ap| ap.collateral).unwrap_or(SDAI);
 
     for ap in active_pools {
         let sqrt_pred = U160::from(
-            prediction_to_sqrt_price_x96(ap.prediction, ap.is_token1)
-                .unwrap_or_else(|| panic!("invalid prediction {} for pool {}", ap.prediction, ap.pool)),
+            prediction_to_sqrt_price_x96(ap.prediction, ap.is_token1).unwrap_or_else(|| {
+                panic!("invalid prediction {} for pool {}", ap.prediction, ap.pool)
+            }),
         );
         let held = token_balances.get(&ap.token).copied().unwrap_or(U256::ZERO);
         tokens.push(ap.token);
@@ -477,8 +474,7 @@ pub async fn preview_algebra_solvers<P: Provider<Ethereum> + Clone>(
     let mut results = Vec::new();
 
     for (name, solver_calldata) in solvers {
-        let calls =
-            build_batch_execute_calls(QUOTER_ADDRESS, rebalancer, solver_calldata, params);
+        let calls = build_batch_execute_calls(QUOTER_ADDRESS, rebalancer, solver_calldata, params);
         let batch_calldata = ITradeExecutor::batchExecuteCall { calls }.abi_encode();
 
         let tx = TransactionRequest::default()
@@ -495,31 +491,30 @@ pub async fn preview_algebra_solvers<P: Provider<Ethereum> + Clone>(
 
         let call_result = provider
             .call(tx)
-            .overrides(alloy::rpc::types::state::StateOverride::from_iter(overrides))
+            .overrides(alloy::rpc::types::state::StateOverride::from_iter(
+                overrides,
+            ))
             .await;
 
         match call_result {
             Ok(_) => {
                 tracing::warn!(solver = name, "unexpected success (expected revert)");
             }
-            Err(err) => {
-                match extract_revert_data(&err).and_then(|d| parse_quoter_revert(&d)) {
-                    Some((success, post_cash, post_balances)) => {
-                        let raw_ev =
-                            compute_raw_ev(post_cash, &post_balances, active_pools);
-                        results.push(SolverPreviewResult {
-                            name,
-                            success,
-                            post_cash_wei: post_cash,
-                            post_balances_wei: post_balances,
-                            raw_ev,
-                        });
-                    }
-                    None => {
-                        tracing::warn!(solver = name, "failed to parse quoter revert");
-                    }
+            Err(err) => match extract_revert_data(&err).and_then(|d| parse_quoter_revert(&d)) {
+                Some((success, post_cash, post_balances)) => {
+                    let raw_ev = compute_raw_ev(post_cash, &post_balances, active_pools);
+                    results.push(SolverPreviewResult {
+                        name,
+                        success,
+                        post_cash_wei: post_cash,
+                        post_balances_wei: post_balances,
+                        raw_ev,
+                    });
                 }
-            }
+                None => {
+                    tracing::warn!(solver = name, "failed to parse quoter revert");
+                }
+            },
         }
     }
 
@@ -532,11 +527,7 @@ pub async fn preview_algebra_solvers<P: Provider<Ethereum> + Clone>(
 }
 
 /// Print solver comparison table.
-pub fn print_solver_comparison(
-    results: &[SolverPreviewResult],
-    pre_ev: f64,
-    gas_cost_sdai: f64,
-) {
+pub fn print_solver_comparison(results: &[SolverPreviewResult], pre_ev: f64, gas_cost_sdai: f64) {
     if results.is_empty() {
         return;
     }

@@ -57,48 +57,72 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<DoctorCliOptio
 }
 
 fn production_ready_failure(report: &ForecastFlowsDoctorReport) -> Option<String> {
-    if report.sysimage_status == "active" {
-        None
-    } else {
-        Some(format!(
-            "production-ready ForecastFlows requires an active sysimage ({})",
-            report.sysimage_detail
-        ))
+    match report.worker_backend.as_str() {
+        // The Rust worker has no sysimage gate; any successful health probe is
+        // sufficient to declare the backend production-ready.
+        "rust_worker" => None,
+        "julia_worker" => {
+            if report.sysimage_status.as_deref() == Some("active") {
+                None
+            } else {
+                Some(format!(
+                    "production-ready ForecastFlows (julia_worker) requires an active sysimage ({})",
+                    report.sysimage_detail.as_deref().unwrap_or("unknown")
+                ))
+            }
+        }
+        other => Some(format!("unknown ForecastFlows worker backend: {other}")),
     }
 }
 
 fn print_report(report: &ForecastFlowsDoctorReport) {
     println!("ForecastFlows doctor");
-    println!("julia_program: {}", report.julia_program);
+    println!("worker_backend: {}", report.worker_backend);
+    println!("worker_program: {}", report.worker_program);
+    print_optional(
+        "worker_version",
+        report.worker_version.as_deref(),
+        "unknown",
+    );
+    print_optional(
+        "worker_project_dir",
+        report.worker_project_dir.as_deref(),
+        "n/a",
+    );
     println!(
-        "julia_version: {}",
-        report.julia_version.as_deref().unwrap_or("unknown")
+        "worker_launch_args: {}",
+        report.worker_launch_args.join(" ")
     );
-    println!("project_dir: {}", report.project_dir);
-    println!("launch_args: {}", report.launch_args.join(" "));
-    print_optional(
-        "manifest_repo_url",
-        report.manifest_repo_url.as_deref(),
-        "unknown",
-    );
-    print_optional(
-        "manifest_repo_rev",
-        report.manifest_repo_rev.as_deref(),
-        "unknown",
-    );
-    print_optional(
-        "manifest_git_tree_sha1",
-        report.manifest_git_tree_sha1.as_deref(),
-        "unknown",
-    );
-    println!("julia_threads: {}", report.julia_threads);
+    println!("worker_runtime_detail: {}", report.worker_runtime_detail);
+    if report.worker_backend == "julia_worker" {
+        print_optional("julia_version", report.julia_version.as_deref(), "n/a");
+        print_optional(
+            "manifest_repo_url",
+            report.manifest_repo_url.as_deref(),
+            "n/a",
+        );
+        print_optional(
+            "manifest_repo_rev",
+            report.manifest_repo_rev.as_deref(),
+            "n/a",
+        );
+        print_optional(
+            "manifest_git_tree_sha1",
+            report.manifest_git_tree_sha1.as_deref(),
+            "n/a",
+        );
+        print_optional("julia_threads", report.julia_threads.as_deref(), "n/a");
+    }
     println!("live_solve_tuning: {}", report.live_solve_tuning);
-    println!(
-        "allow_plain_julia_escape_hatch: {}",
-        report.allow_plain_julia_escape_hatch
-    );
-    println!("sysimage_status: {}", report.sysimage_status);
-    println!("sysimage_detail: {}", report.sysimage_detail);
+    if report.worker_backend == "julia_worker" {
+        print_optional(
+            "allow_plain_julia_escape_hatch",
+            report.allow_plain_julia_escape_hatch,
+            "n/a",
+        );
+        print_optional("sysimage_status", report.sysimage_status.as_deref(), "n/a");
+        print_optional("sysimage_detail", report.sysimage_detail.as_deref(), "n/a");
+    }
     print_optional("health_status", report.health_status.as_deref(), "unknown");
     print_list("supported_commands", &report.supported_commands);
     print_list("supported_modes", &report.supported_modes);
@@ -237,22 +261,65 @@ mod tests {
     use deep_trading_bot::portfolio::ForecastFlowsDoctorReport;
     use std::ffi::OsString;
 
-    fn empty_report() -> ForecastFlowsDoctorReport {
+    fn empty_julia_report() -> ForecastFlowsDoctorReport {
         ForecastFlowsDoctorReport {
-            julia_program: "julia".to_string(),
+            worker_backend: "julia_worker".to_string(),
+            worker_program: "julia".to_string(),
+            worker_version: None,
+            worker_project_dir: Some("/tmp/project".to_string()),
+            worker_launch_args: vec!["julia".to_string()],
+            worker_runtime_detail: "julia worker (sysimage disabled)".to_string(),
             julia_version: Some("1.12.5".to_string()),
-            project_dir: "/tmp/project".to_string(),
-            launch_args: vec!["julia".to_string()],
             manifest_repo_url: Some(
                 "https://github.com/shotaronowhere/ForecastFlows.jl".to_string(),
             ),
             manifest_repo_rev: Some("codex/ff-public-univ3-parity".to_string()),
             manifest_git_tree_sha1: Some("abc123".to_string()),
-            julia_threads: "4".to_string(),
+            julia_threads: Some("4".to_string()),
             live_solve_tuning: "low_latency".to_string(),
-            allow_plain_julia_escape_hatch: false,
-            sysimage_status: "disabled".to_string(),
-            sysimage_detail: "no FORECASTFLOWS_SYSIMAGE configured".to_string(),
+            allow_plain_julia_escape_hatch: Some(false),
+            sysimage_status: Some("disabled".to_string()),
+            sysimage_detail: Some("no FORECASTFLOWS_SYSIMAGE configured".to_string()),
+            health_status: None,
+            supported_commands: Vec::new(),
+            supported_modes: Vec::new(),
+            execution_model: None,
+            health_duration_ms: None,
+            warmup_compare_duration_ms: None,
+            warmup_direct_status: None,
+            warmup_mixed_status: None,
+            warmup_direct_solver_time_ms: None,
+            warmup_mixed_solver_time_ms: None,
+            warmup_driver_overhead_ms: None,
+            representative_compare_duration_ms: None,
+            representative_direct_status: None,
+            representative_mixed_status: None,
+            representative_direct_solver_time_ms: None,
+            representative_mixed_solver_time_ms: None,
+            representative_driver_overhead_ms: None,
+            representative_fixture: "fixture".to_string(),
+            stderr_tail: Vec::new(),
+            failure: None,
+        }
+    }
+
+    fn empty_rust_report() -> ForecastFlowsDoctorReport {
+        ForecastFlowsDoctorReport {
+            worker_backend: "rust_worker".to_string(),
+            worker_program: "/opt/forecast-flows-worker".to_string(),
+            worker_version: Some("2.0.0".to_string()),
+            worker_project_dir: None,
+            worker_launch_args: Vec::new(),
+            worker_runtime_detail: "rust worker binary /opt/forecast-flows-worker".to_string(),
+            julia_version: None,
+            manifest_repo_url: None,
+            manifest_repo_rev: None,
+            manifest_git_tree_sha1: None,
+            julia_threads: None,
+            live_solve_tuning: "low_latency".to_string(),
+            allow_plain_julia_escape_hatch: None,
+            sysimage_status: None,
+            sysimage_detail: None,
             health_status: None,
             supported_commands: Vec::new(),
             supported_modes: Vec::new(),
@@ -294,12 +361,18 @@ mod tests {
     }
 
     #[test]
-    fn production_ready_failure_requires_active_sysimage() {
-        let mut report = empty_report();
+    fn production_ready_failure_requires_active_sysimage_under_julia() {
+        let mut report = empty_julia_report();
         assert!(production_ready_failure(&report).is_some());
 
-        report.sysimage_status = "active".to_string();
-        report.sysimage_detail = "using /tmp/forecastflows.so".to_string();
+        report.sysimage_status = Some("active".to_string());
+        report.sysimage_detail = Some("using /tmp/forecastflows.so".to_string());
+        assert_eq!(production_ready_failure(&report), None);
+    }
+
+    #[test]
+    fn production_ready_accepts_rust_worker_without_sysimage() {
+        let report = empty_rust_report();
         assert_eq!(production_ready_failure(&report), None);
     }
 }

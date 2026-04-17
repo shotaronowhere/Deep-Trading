@@ -152,7 +152,8 @@ fn load_solver_cache() -> Option<SolverCacheEntry> {
 fn save_solver_cache(entry: &SolverCacheEntry) -> Result<(), PreviewError> {
     let dir = std::path::Path::new(SOLVER_CACHE_PATH).parent().unwrap();
     fs::create_dir_all(dir).map_err(|e| PreviewError::Cache(e.to_string()))?;
-    let json = serde_json::to_string_pretty(entry).map_err(|e| PreviewError::Cache(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(entry).map_err(|e| PreviewError::Cache(e.to_string()))?;
     fs::write(SOLVER_CACHE_PATH, json).map_err(|e| PreviewError::Cache(e.to_string()))
 }
 
@@ -316,19 +317,13 @@ pub fn build_rebalance_params(
             .map_err(|e| PreviewError::Build(format!("bad pool addr {}: {e}", market.name)))?;
         let is_t1 = pool.token1.eq_ignore_ascii_case(market.outcome_token);
 
-        let pred = predictions
-            .get(market.name)
-            .copied()
-            .unwrap_or(0.0);
+        let pred = predictions.get(market.name).copied().unwrap_or(0.0);
         let sqrt_pred = match prediction_to_sqrt_price_x96(pred, is_t1) {
             Some(v) => U160::from(v),
             None => continue, // skip zero-prediction markets
         };
 
-        let held = balances_owned
-            .get(market.name)
-            .copied()
-            .unwrap_or(0.0);
+        let held = balances_owned.get(market.name).copied().unwrap_or(0.0);
         let balance_wei = U256::from((held * 1e18) as u128);
 
         tokens.push(outcome_addr);
@@ -410,15 +405,14 @@ fn build_batch_execute_calls(
 /// Parse the revert data from a SolverQuoter.quote() call.
 /// Decodes: abi.encode(bool success, bytes returnData, uint256 postCash, uint256[] postBalances)
 fn parse_quoter_revert(revert_data: &[u8]) -> Option<(bool, U256, Vec<U256>)> {
-    let decoded =
-        alloy::dyn_abi::DynSolType::Tuple(vec![
-            alloy::dyn_abi::DynSolType::Bool,
-            alloy::dyn_abi::DynSolType::Bytes,
-            alloy::dyn_abi::DynSolType::Uint(256),
-            alloy::dyn_abi::DynSolType::Array(Box::new(alloy::dyn_abi::DynSolType::Uint(256))),
-        ])
-        .abi_decode(revert_data)
-        .ok()?;
+    let decoded = alloy::dyn_abi::DynSolType::Tuple(vec![
+        alloy::dyn_abi::DynSolType::Bool,
+        alloy::dyn_abi::DynSolType::Bytes,
+        alloy::dyn_abi::DynSolType::Uint(256),
+        alloy::dyn_abi::DynSolType::Array(Box::new(alloy::dyn_abi::DynSolType::Uint(256))),
+    ])
+    .abi_decode(revert_data)
+    .ok()?;
 
     let tuple = match decoded {
         DynSolValue::Tuple(t) => t,
@@ -527,12 +521,7 @@ pub async fn preview_all_solvers<P: Provider<Ethereum> + Clone>(
     let mut results = Vec::new();
 
     for (name, solver_addr, solver_calldata) in solvers {
-        let calls = build_batch_execute_calls(
-            QUOTER_ADDRESS,
-            solver_addr,
-            solver_calldata,
-            params,
-        );
+        let calls = build_batch_execute_calls(QUOTER_ADDRESS, solver_addr, solver_calldata, params);
 
         let batch_calldata = ITradeExecutor::batchExecuteCall { calls }.abi_encode();
 
@@ -551,13 +540,18 @@ pub async fn preview_all_solvers<P: Provider<Ethereum> + Clone>(
 
         let call_result = provider
             .call(tx)
-            .overrides(alloy::rpc::types::state::StateOverride::from_iter(overrides))
+            .overrides(alloy::rpc::types::state::StateOverride::from_iter(
+                overrides,
+            ))
             .await;
 
         match call_result {
             Ok(_) => {
                 // SolverQuoter always reverts — if we get Ok, something is wrong
-                tracing::warn!(solver = name, "unexpected success from quoter (expected revert)");
+                tracing::warn!(
+                    solver = name,
+                    "unexpected success from quoter (expected revert)"
+                );
             }
             Err(err) => {
                 // Parse revert data from the error
@@ -574,22 +568,25 @@ pub async fn preview_all_solvers<P: Provider<Ethereum> + Clone>(
                         });
                     }
                     None => {
-                        tracing::warn!(
-                            solver = name,
-                            "failed to parse quoter revert data"
-                        );
+                        tracing::warn!(solver = name, "failed to parse quoter revert data");
                     }
                 }
             }
         }
     }
 
-    results.sort_by(|a, b| b.raw_ev.partial_cmp(&a.raw_ev).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.raw_ev
+            .partial_cmp(&a.raw_ev)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 
 /// Extract raw revert bytes from a provider error.
-fn extract_revert_data(err: &alloy::transports::RpcError<alloy::transports::TransportErrorKind>) -> Option<Vec<u8>> {
+fn extract_revert_data(
+    err: &alloy::transports::RpcError<alloy::transports::TransportErrorKind>,
+) -> Option<Vec<u8>> {
     // The error message often contains the revert data as hex after "revert" or "execution reverted"
     let err_str = format!("{err:?}");
 

@@ -81,6 +81,11 @@ pub(super) struct HealthResult {
     pub(super) supported_commands: Vec<String>,
     pub(super) supported_modes: Vec<String>,
     pub(super) execution_model: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(super) package: Option<String>,
+    #[serde(default)]
+    pub(super) package_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

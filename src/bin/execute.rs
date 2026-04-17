@@ -20,6 +20,7 @@ use deep_trading_bot::execution::bounds::{
 use deep_trading_bot::execution::gas::{
     GasAssumptions, default_gas_assumptions_with_optimism_l1_fee, fetch_live_optimism_fee_inputs,
 };
+use deep_trading_bot::execution::onchain_preview;
 use deep_trading_bot::execution::program::{
     build_chunk_calls_checked, compile_execution_program_unchecked,
 };
@@ -27,7 +28,6 @@ use deep_trading_bot::execution::runtime::{
     ExecutionRuntimeConfig, SubmitMode, is_submission_deadline_exceeded, resolve_trade_executor,
     resolve_trade_executor_readonly,
 };
-use deep_trading_bot::execution::onchain_preview;
 use deep_trading_bot::execution::tx_builder::build_trade_executor_calls;
 use deep_trading_bot::execution::{ExecutionMode, ITradeExecutor, SUSD_DECIMALS};
 use deep_trading_bot::markets::MarketData;
@@ -122,7 +122,10 @@ fn print_pre_submission_summary(
                 let (slot0, mkt) = slot0_by_name.get(name)?;
                 let pool = mkt.pool.as_ref()?;
                 let is_token1 = pool.token1.eq_ignore_ascii_case(mkt.outcome_token);
-                let price = u256_to_f64(sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1)?);
+                let price = u256_to_f64(sqrt_price_x96_to_price_outcome(
+                    slot0.sqrt_price_x96,
+                    is_token1,
+                )?);
                 let pred = predictions.get(name).copied()?;
                 Some((price, pred))
             });

@@ -4972,8 +4972,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
     }
 
     // Collect indices to exclude as a set for O(1) lookup.
-    let mut excluded: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut excluded: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for step_group in step_groups.iter().rev() {
         // Tentatively add this group's indices to the excluded set.
         for &idx in &step_group.action_indices {
@@ -5650,8 +5649,8 @@ fn run_no_arb_rebalance_plan_from_state(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
 ) -> Option<PlanResult> {
-    let allow_common_shift = force_mint_available
-        .unwrap_or(state.slot0_results.len() == expected_outcome_count);
+    let allow_common_shift =
+        force_mint_available.unwrap_or(state.slot0_results.len() == expected_outcome_count);
     let mut ctx = build_rebalance_context_with_options(
         &state.holdings,
         state.cash,
@@ -6384,12 +6383,11 @@ fn enumerate_exact_no_arb_candidates_with_options(
                 .collect();
         proposal_seeds.sort_by(|a, b| plan_result_cmp(&a.2, &b.2));
         let proposal_k = seed_shortlist_k(num_proposal_tasks);
-        let proposal_shortlist: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> =
-            proposal_seeds
-                .into_iter()
-                .take(proposal_k)
-                .map(|(ff, pm, _)| (ff, pm))
-                .collect();
+        let proposal_shortlist: Vec<(Option<BundleRouteKind>, Vec<&'static str>)> = proposal_seeds
+            .into_iter()
+            .take(proposal_k)
+            .map(|(ff, pm, _)| (ff, pm))
+            .collect();
         let mut proposal_candidates: Vec<PlanResult> = proposal_shortlist
             .into_par_iter()
             .filter_map(|(frontier_family, preserve_markets)| {
@@ -7352,6 +7350,16 @@ fn rebalance_full_ultimate_with_predictions_and_stats(
         forecastflows_solve_tuning = stats
             .forecastflows_telemetry
             .solve_tuning
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_backend = stats
+            .forecastflows_telemetry
+            .forecastflows_backend
+            .as_deref()
+            .unwrap_or("none"),
+        forecastflows_worker_version = stats
+            .forecastflows_telemetry
+            .forecastflows_worker_version
             .as_deref()
             .unwrap_or("none"),
         forecastflows_winning_variant = stats
@@ -10930,6 +10938,38 @@ pub fn rebalance_with_solver_and_gas_pricing_and_flags_and_decision(
         cost_config,
         flags,
     )
+}
+
+pub fn rebalance_with_custom_predictions_and_solver_and_gas_pricing_and_flags_and_decision(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    solver: RebalanceSolver,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+    flags: RebalanceFlags,
+    force_mint_available: bool,
+) -> RebalancePlanDecision {
+    let n_sims = slot0_results.len();
+    let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
+    let cost_config =
+        planner_cost_config_with_pricing(gas, gas_price_eth, eth_usd, "explicit_gas_pricing");
+    let (plan, stats) = rebalance_full_ultimate_with_predictions_and_stats(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        slot0_results.len(),
+        route_gates,
+        cost_config,
+        solver,
+        flags,
+        Some(force_mint_available),
+        false,
+    );
+    decision_from_plan_result(plan, &stats)
 }
 
 pub fn warm_forecastflows_worker() -> Result<(), String> {
