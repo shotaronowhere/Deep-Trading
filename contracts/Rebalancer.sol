@@ -21,7 +21,8 @@ contract Rebalancer {
     ICTFRouter public immutable ctfRouter;
     uint256 constant Q96 = 1 << 96;
     uint256 constant FEE_UNITS = 1e6;
-    uint256 constant MAX_WATERFALL_PASSES = 6;
+    uint256 constant MAX_LEGACY_WATERFALL_PASSES = 6;
+    uint256 constant EXACT_COST_TOL = 1e16;
     uint256 constant PSI_WAD = 1e18;
 
     struct RebalanceParams {
@@ -80,7 +81,7 @@ contract Rebalancer {
     /// @notice Full rebalance + pre-buy arb + recycle.
     ///         1. Pull tokens, sell overpriced
     ///         2. Complete-set arb (before waterfall consumes cash)
-    ///         3. Waterfall buy (bounded iterative refinement)
+    ///         3. Waterfall buy (constant-L)
     ///         4. Recycle: sell below-frontier holdings, re-waterfall
     ///         5. Return all holdings to caller
     function rebalanceAndArb(
@@ -89,16 +90,37 @@ contract Rebalancer {
         uint256 maxArbRounds,
         uint256 maxRecycleRounds
     ) external returns (uint256 totalProceeds, uint256 totalSpent, uint256 arbProfit) {
+        return rebalanceAndArbWithFloors(params, market, maxArbRounds, maxRecycleRounds, 0, 0);
+    }
+
+    /// @notice Full rebalance + arb + recycle with coarse collateral profit floors for churn-heavy rounds.
+    function rebalanceAndArbWithFloors(
+        RebalanceParams calldata params,
+        address market,
+        uint256 maxArbRounds,
+        uint256 maxRecycleRounds,
+        uint256 minArbProfitCollateral,
+        uint256 minRecycleProfitCollateral
+    ) public returns (uint256 totalProceeds, uint256 totalSpent, uint256 arbProfit) {
         totalProceeds = _pullAndSell(params);
 
         // Arb first so deterministic complete-set profit gets first access to cash.
-        arbProfit =
-            _arbLoop(params.tokens, params.pools, params.isToken1, params.collateral, market, params.fee, maxArbRounds);
+        arbProfit = _arbLoopWithFloor(
+            params.tokens,
+            params.pools,
+            params.isToken1,
+            params.collateral,
+            market,
+            params.fee,
+            maxArbRounds,
+            minArbProfitCollateral
+        );
 
         totalSpent = _readAndBuy(params);
 
-        // Recycle: sell below-frontier holdings, then re-run the bounded waterfall.
-        (uint256 recycleProceeds, uint256 recycleSpent) = _recycleSell(params, maxRecycleRounds);
+        // Recycle: sell below-frontier holdings, then re-run the constant-L waterfall.
+        (uint256 recycleProceeds, uint256 recycleSpent) =
+            _recycleSellWithFloor(params, maxRecycleRounds, minRecycleProfitCollateral);
         totalProceeds += recycleProceeds;
         totalSpent += recycleSpent;
 
@@ -114,15 +136,40 @@ contract Rebalancer {
         uint256 maxBisectionIterations,
         uint256 maxTickCrossingsPerPool
     ) external returns (uint256 totalProceeds, uint256 totalSpent, uint256 arbProfit) {
+        return rebalanceAndArbExactWithFloors(
+            params, market, maxArbRounds, maxRecycleRounds, maxBisectionIterations, maxTickCrossingsPerPool, 0, 0
+        );
+    }
+
+    /// @notice Full rebalance + arb + recycle using the explicit exact path and coarse profit floors.
+    function rebalanceAndArbExactWithFloors(
+        RebalanceParams calldata params,
+        address market,
+        uint256 maxArbRounds,
+        uint256 maxRecycleRounds,
+        uint256 maxBisectionIterations,
+        uint256 maxTickCrossingsPerPool,
+        uint256 minArbProfitCollateral,
+        uint256 minRecycleProfitCollateral
+    ) public returns (uint256 totalProceeds, uint256 totalSpent, uint256 arbProfit) {
         totalProceeds = _pullAndSell(params);
 
-        arbProfit =
-            _arbLoop(params.tokens, params.pools, params.isToken1, params.collateral, market, params.fee, maxArbRounds);
+        arbProfit = _arbLoopWithFloor(
+            params.tokens,
+            params.pools,
+            params.isToken1,
+            params.collateral,
+            market,
+            params.fee,
+            maxArbRounds,
+            minArbProfitCollateral
+        );
 
         totalSpent = _readAndBuyExact(params, maxBisectionIterations, maxTickCrossingsPerPool);
 
-        (uint256 recycleProceeds, uint256 recycleSpent) =
-            _recycleSellExact(params, maxRecycleRounds, maxBisectionIterations, maxTickCrossingsPerPool);
+        (uint256 recycleProceeds, uint256 recycleSpent) = _recycleSellExactWithFloor(
+            params, maxRecycleRounds, maxBisectionIterations, maxTickCrossingsPerPool, minRecycleProfitCollateral
+        );
         totalProceeds += recycleProceeds;
         totalSpent += recycleSpent;
 
@@ -137,12 +184,19 @@ contract Rebalancer {
         return _readAndBuyConstantL(params);
     }
 
-    function _readAndBuyConstantL(RebalanceParams calldata params) internal returns (uint256) {
-        uint256 totalSpent = 0;
+    function _readAndBuyConstantL(RebalanceParams calldata params) internal returns (uint256 totalSpent) {
+        for (uint256 pass = 0; pass < MAX_LEGACY_WATERFALL_PASSES;) {
+            uint256 budgetBefore = IERC20(params.collateral).balanceOf(address(this));
+            if (budgetBefore == 0) break;
 
-        for (uint256 pass = 0; pass < MAX_WATERFALL_PASSES;) {
-            (uint256 spent, uint256 budgetBefore) = _waterfallPass(params);
-            if (budgetBefore == 0 || spent == 0) break;
+            (uint160[] memory sqrtPrices, uint128[] memory liquidities) = _readPoolState(params);
+            (uint256[] memory order, uint160[] memory limits, uint256 count) = _buildConstantLBuyPlan(
+                sqrtPrices, liquidities, params.sqrtPredX96, params.isToken1, budgetBefore, params.fee
+            );
+            if (count == 0) break;
+
+            uint256 spent = _executeBuyPlan(params, order, limits, count, budgetBefore);
+            if (spent == 0) break;
             totalSpent += spent;
             if (spent == budgetBefore) break;
 
@@ -150,8 +204,6 @@ contract Rebalancer {
                 ++pass;
             }
         }
-
-        return totalSpent;
     }
 
     function _readAndBuyExact(
@@ -163,12 +215,14 @@ contract Rebalancer {
         if (budget == 0) return 0;
 
         (uint160[] memory sqrtPrices, int24[] memory ticks, uint128[] memory liquidities) = _readExactPoolState(params);
+        (uint256[] memory order, uint256 count) =
+            _sortedUnderpricedByPriority(sqrtPrices, liquidities, params.sqrtPredX96, params.isToken1);
         (ExactCostCurves memory curves, uint256 buyAllCost) =
-            _buildExactCostCurves(params, sqrtPrices, ticks, liquidities, maxTickCrossingsPerPool);
+            _buildExactCostCurves(params, sqrtPrices, ticks, liquidities, maxTickCrossingsPerPool, budget);
 
         PsiResult memory psi = _computePsiExact(params, sqrtPrices, curves, buyAllCost, budget, maxBisectionIterations);
 
-        return _waterfallBuy(params, sqrtPrices, psi);
+        return _waterfallBuyOrdered(params, sqrtPrices, order, count, psi);
     }
 
     function _computePsiExact(
@@ -193,6 +247,9 @@ contract Rebalancer {
             uint256 exactCost = _exactTotalCostFromCurves(params, sqrtPrices, curves, midPsi);
 
             if (exactCost <= budget) {
+                if (budget - exactCost <= _exactCostTolerance(budget)) {
+                    return midPsi;
+                }
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -211,7 +268,8 @@ contract Rebalancer {
         uint160[] memory sqrtPrices,
         int24[] memory ticks,
         uint128[] memory liquidities,
-        uint256 maxTickCrossingsPerPool
+        uint256 maxTickCrossingsPerPool,
+        uint256 costCap
     ) internal view returns (ExactCostCurves memory curves, uint256 totalCost) {
         uint256 n = params.tokens.length;
         uint256 activeCount = 0;
@@ -253,7 +311,8 @@ contract Rebalancer {
                     liquidities[i],
                     params.sqrtPredX96[i],
                     params.fee,
-                    maxTickCrossingsPerPool
+                    maxTickCrossingsPerPool,
+                    costCap
                 );
             } else {
                 (cursor, curves.totalCosts[i]) = _buildExactAscendingCurve(
@@ -265,7 +324,67 @@ contract Rebalancer {
                     liquidities[i],
                     params.sqrtPredX96[i],
                     params.fee,
-                    maxTickCrossingsPerPool
+                    maxTickCrossingsPerPool,
+                    costCap
+                );
+            }
+
+            curves.counts[i] = cursor - curves.offsets[i];
+            totalCost += curves.totalCosts[i];
+        }
+    }
+
+    function _buildExactCostCurvesForMask(
+        RebalanceParams calldata params,
+        uint160[] memory sqrtPrices,
+        int24[] memory ticks,
+        uint128[] memory liquidities,
+        bool[] memory exactMask,
+        uint256 maxTickCrossingsPerPool,
+        uint256 capacity,
+        uint256 costCap
+    ) internal view returns (ExactCostCurves memory curves, uint256 totalCost) {
+        uint256 n = params.tokens.length;
+        curves = ExactCostCurves({
+            offsets: new uint256[](n),
+            counts: new uint256[](n),
+            totalCosts: new uint256[](n),
+            segmentEnds: new uint160[](capacity),
+            segmentLiquidities: new uint128[](capacity),
+            segmentPrefixCosts: new uint256[](capacity)
+        });
+
+        uint256 cursor = 0;
+        for (uint256 i = 0; i < n; i++) {
+            if (!exactMask[i]) continue;
+
+            curves.offsets[i] = cursor;
+            IUniswapV3Pool v3Pool = IUniswapV3Pool(params.pools[i]);
+            if (params.isToken1[i]) {
+                (cursor, curves.totalCosts[i]) = _buildExactDescendingCurve(
+                    curves,
+                    cursor,
+                    v3Pool,
+                    sqrtPrices[i],
+                    ticks[i],
+                    liquidities[i],
+                    params.sqrtPredX96[i],
+                    params.fee,
+                    maxTickCrossingsPerPool,
+                    costCap
+                );
+            } else {
+                (cursor, curves.totalCosts[i]) = _buildExactAscendingCurve(
+                    curves,
+                    cursor,
+                    v3Pool,
+                    sqrtPrices[i],
+                    ticks[i],
+                    liquidities[i],
+                    params.sqrtPredX96[i],
+                    params.fee,
+                    maxTickCrossingsPerPool,
+                    costCap
                 );
             }
 
@@ -443,7 +562,8 @@ contract Rebalancer {
         uint128 liquidity,
         uint160 limit,
         uint24 fee,
-        uint256 maxTickCrossingsPerPool
+        uint256 maxTickCrossingsPerPool,
+        uint256 costCap
     ) internal view returns (uint256 nextCursor, uint256 totalCost) {
         int24 spacing = v3Pool.tickSpacing();
         int24 minTick = _minUsableTick(spacing);
@@ -453,16 +573,18 @@ contract Rebalancer {
         uint160 current = sqrtPrice;
         uint256 crossings = 0;
         nextCursor = cursor;
+        bool capped;
 
         uint160 segmentFloor = TickMath.getSqrtRatioAtTick(lowerTick);
         if (limit >= segmentFloor) {
-            nextCursor = _appendExactCurveSegment(curves, nextCursor, limit, liquidity, totalCost);
-            totalCost += _segmentCostToken1(current, limit, liquidity, fee);
+            (nextCursor, totalCost, capped) =
+                _appendExactToken1Segment(curves, nextCursor, current, limit, liquidity, fee, totalCost, costCap);
             return (nextCursor, totalCost);
         }
 
-        nextCursor = _appendExactCurveSegment(curves, nextCursor, segmentFloor, liquidity, totalCost);
-        totalCost += _segmentCostToken1(current, segmentFloor, liquidity, fee);
+        (nextCursor, totalCost, capped) =
+            _appendExactToken1Segment(curves, nextCursor, current, segmentFloor, liquidity, fee, totalCost, costCap);
+        if (capped) return (nextCursor, totalCost);
         if (maxTickCrossingsPerPool == 0) revert TickScanLimitExceeded();
 
         (, int128 lowerLiquidityNet,,,,,,) = v3Pool.ticks(lowerTick);
@@ -473,21 +595,22 @@ contract Rebalancer {
         int24 lowerBoundaryTick = lowerTick;
         while (true) {
             if (lowerBoundaryTick == minTick) {
-                nextCursor = _appendExactCurveSegment(curves, nextCursor, limit, liquidity, totalCost);
-                totalCost += _segmentCostToken1(current, limit, liquidity, fee);
+                (nextCursor, totalCost, capped) =
+                    _appendExactToken1Segment(curves, nextCursor, current, limit, liquidity, fee, totalCost, costCap);
                 break;
             }
 
             (int24 nextTick, bool initialized) = _nextInitializedTickBelow(v3Pool, lowerBoundaryTick, spacing, minTick);
             uint160 nextSqrt = TickMath.getSqrtRatioAtTick(nextTick);
             if (limit >= nextSqrt) {
-                nextCursor = _appendExactCurveSegment(curves, nextCursor, limit, liquidity, totalCost);
-                totalCost += _segmentCostToken1(current, limit, liquidity, fee);
+                (nextCursor, totalCost, capped) =
+                    _appendExactToken1Segment(curves, nextCursor, current, limit, liquidity, fee, totalCost, costCap);
                 break;
             }
 
-            nextCursor = _appendExactCurveSegment(curves, nextCursor, nextSqrt, liquidity, totalCost);
-            totalCost += _segmentCostToken1(current, nextSqrt, liquidity, fee);
+            (nextCursor, totalCost, capped) =
+                _appendExactToken1Segment(curves, nextCursor, current, nextSqrt, liquidity, fee, totalCost, costCap);
+            if (capped) break;
             crossings = _checkedAddCrossings(crossings, lowerBoundaryTick, nextTick, spacing, maxTickCrossingsPerPool);
 
             if (initialized) {
@@ -509,7 +632,8 @@ contract Rebalancer {
         uint128 liquidity,
         uint160 limit,
         uint24 fee,
-        uint256 maxTickCrossingsPerPool
+        uint256 maxTickCrossingsPerPool,
+        uint256 costCap
     ) internal view returns (uint256 nextCursor, uint256 totalCost) {
         int24 spacing = v3Pool.tickSpacing();
         int24 maxTick = _maxUsableTick(spacing);
@@ -519,16 +643,18 @@ contract Rebalancer {
         uint160 current = sqrtPrice;
         uint256 crossings = 0;
         nextCursor = cursor;
+        bool capped;
 
         uint160 segmentCeiling = TickMath.getSqrtRatioAtTick(upperTick);
         if (limit <= segmentCeiling) {
-            nextCursor = _appendExactCurveSegment(curves, nextCursor, limit, liquidity, totalCost);
-            totalCost += _segmentCostToken0(current, limit, liquidity, fee);
+            (nextCursor, totalCost, capped) =
+                _appendExactToken0Segment(curves, nextCursor, current, limit, liquidity, fee, totalCost, costCap);
             return (nextCursor, totalCost);
         }
 
-        nextCursor = _appendExactCurveSegment(curves, nextCursor, segmentCeiling, liquidity, totalCost);
-        totalCost += _segmentCostToken0(current, segmentCeiling, liquidity, fee);
+        (nextCursor, totalCost, capped) =
+            _appendExactToken0Segment(curves, nextCursor, current, segmentCeiling, liquidity, fee, totalCost, costCap);
+        if (capped) return (nextCursor, totalCost);
         if (maxTickCrossingsPerPool == 0) revert TickScanLimitExceeded();
 
         (, int128 upperLiquidityNet,,,,,,) = v3Pool.ticks(upperTick);
@@ -539,21 +665,22 @@ contract Rebalancer {
         int24 upperBoundaryTick = upperTick;
         while (true) {
             if (upperBoundaryTick == maxTick) {
-                nextCursor = _appendExactCurveSegment(curves, nextCursor, limit, liquidity, totalCost);
-                totalCost += _segmentCostToken0(current, limit, liquidity, fee);
+                (nextCursor, totalCost, capped) =
+                    _appendExactToken0Segment(curves, nextCursor, current, limit, liquidity, fee, totalCost, costCap);
                 break;
             }
 
             (int24 nextTick, bool initialized) = _nextInitializedTickAbove(v3Pool, upperBoundaryTick, spacing, maxTick);
             uint160 nextSqrt = TickMath.getSqrtRatioAtTick(nextTick);
             if (limit <= nextSqrt) {
-                nextCursor = _appendExactCurveSegment(curves, nextCursor, limit, liquidity, totalCost);
-                totalCost += _segmentCostToken0(current, limit, liquidity, fee);
+                (nextCursor, totalCost, capped) =
+                    _appendExactToken0Segment(curves, nextCursor, current, limit, liquidity, fee, totalCost, costCap);
                 break;
             }
 
-            nextCursor = _appendExactCurveSegment(curves, nextCursor, nextSqrt, liquidity, totalCost);
-            totalCost += _segmentCostToken0(current, nextSqrt, liquidity, fee);
+            (nextCursor, totalCost, capped) =
+                _appendExactToken0Segment(curves, nextCursor, current, nextSqrt, liquidity, fee, totalCost, costCap);
+            if (capped) break;
             crossings = _checkedAddCrossings(crossings, upperBoundaryTick, nextTick, spacing, maxTickCrossingsPerPool);
 
             if (initialized) {
@@ -577,6 +704,42 @@ contract Rebalancer {
         curves.segmentLiquidities[cursor] = segmentLiquidity;
         curves.segmentPrefixCosts[cursor] = prefixCost;
         nextCursor = cursor + 1;
+    }
+
+    function _appendExactToken1Segment(
+        ExactCostCurves memory curves,
+        uint256 cursor,
+        uint160 start,
+        uint160 end,
+        uint128 liquidity,
+        uint24 fee,
+        uint256 prefixCost,
+        uint256 costCap
+    ) internal pure returns (uint256 nextCursor, uint256 nextTotalCost, bool capped) {
+        nextCursor = _appendExactCurveSegment(curves, cursor, end, liquidity, prefixCost);
+        nextTotalCost = prefixCost + _segmentCostToken1(start, end, liquidity, fee);
+        if (nextTotalCost > costCap) {
+            nextTotalCost = _exactCostCapExceeded(costCap);
+            capped = true;
+        }
+    }
+
+    function _appendExactToken0Segment(
+        ExactCostCurves memory curves,
+        uint256 cursor,
+        uint160 start,
+        uint160 end,
+        uint128 liquidity,
+        uint24 fee,
+        uint256 prefixCost,
+        uint256 costCap
+    ) internal pure returns (uint256 nextCursor, uint256 nextTotalCost, bool capped) {
+        nextCursor = _appendExactCurveSegment(curves, cursor, end, liquidity, prefixCost);
+        nextTotalCost = prefixCost + _segmentCostToken0(start, end, liquidity, fee);
+        if (nextTotalCost > costCap) {
+            nextTotalCost = _exactCostCapExceeded(costCap);
+            capped = true;
+        }
     }
 
     function _nextInitializedTickBelow(IUniswapV3Pool pool, int24 currentTick, int24 spacing, int24 minTick)
@@ -796,18 +959,16 @@ contract Rebalancer {
         }
     }
 
-    /// @dev One constant-L waterfall pass: read pool state, solve ψ, execute the sorted buy plan.
-    function _waterfallPass(RebalanceParams calldata params) internal returns (uint256 spent, uint256 budgetBefore) {
-        budgetBefore = IERC20(params.collateral).balanceOf(address(this));
-        if (budgetBefore == 0) return (0, 0);
+    function _exactCostTolerance(uint256 budget) internal pure returns (uint256 tol) {
+        tol = budget / 100;
+        if (tol > EXACT_COST_TOL) {
+            tol = EXACT_COST_TOL;
+        }
+    }
 
-        (uint160[] memory sqrtPrices, uint128[] memory liquidities) = _readPoolState(params);
-        (uint256[] memory order, uint160[] memory limits, uint256 count) = _buildConstantLBuyPlan(
-            sqrtPrices, liquidities, params.sqrtPredX96, params.isToken1, budgetBefore, params.fee
-        );
-        if (count == 0) return (0, budgetBefore);
-
-        spent = _executeBuyPlan(params, order, limits, count, budgetBefore);
+    function _exactCostCapExceeded(uint256 costCap) internal pure returns (uint256 cappedCost) {
+        if (costCap == type(uint256).max) return costCap;
+        cappedCost = costCap + 1;
     }
 
     // ──────────────────────────────────────────────
@@ -1049,6 +1210,37 @@ contract Rebalancer {
         totalSpent = _executeBuyPlan(p, order, limits, count, budgetBefore);
     }
 
+    function _waterfallBuyOrdered(
+        RebalanceParams calldata p,
+        uint160[] memory sqrtPrices,
+        uint256[] memory order,
+        uint256 count,
+        PsiResult memory psi
+    ) internal returns (uint256 totalSpent) {
+        uint256 budgetBefore = IERC20(p.collateral).balanceOf(address(this));
+        if (budgetBefore == 0 || count == 0) return 0;
+        if (psi.buyAll) {
+            return _executeBuyAllToPrediction(p, sqrtPrices, budgetBefore);
+        }
+
+        uint160[] memory limits = new uint160[](sqrtPrices.length);
+        uint256 activeCount = 0;
+        for (uint256 k = 0; k < count;) {
+            uint256 i = order[k];
+            uint160 limit = _buyLimit(sqrtPrices[i], p.sqrtPredX96[i], p.isToken1[i], psi);
+            if (limit == 0) break;
+            limits[i] = limit;
+            activeCount++;
+
+            unchecked {
+                ++k;
+            }
+        }
+
+        if (activeCount == 0) return 0;
+        totalSpent = _executeBuyPlan(p, order, limits, activeCount, budgetBefore);
+    }
+
     function _executeBuyAllToPrediction(RebalanceParams calldata p, uint160[] memory sqrtPrices, uint256 budgetBefore)
         internal
         returns (uint256 totalSpent)
@@ -1200,8 +1392,25 @@ contract Rebalancer {
         uint24 fee,
         uint256 maxRounds
     ) internal returns (uint256 profit) {
+        return _arbLoopWithFloor(tokens, pools, isToken1, collateral, market, fee, maxRounds, 0);
+    }
+
+    function _arbLoopWithFloor(
+        address[] calldata tokens,
+        address[] calldata pools,
+        bool[] calldata isToken1,
+        address collateral,
+        address market,
+        uint24 fee,
+        uint256 maxRounds,
+        uint256 minProfitCollateral
+    ) internal returns (uint256 profit) {
         for (uint256 r = 0; r < maxRounds;) {
-            uint256 gained = _arbRound(tokens, pools, isToken1, collateral, market, fee);
+            (uint160[] memory sqrtPrices, uint256 priceSum) = _readArbState(pools, isToken1);
+            uint256 collateralBal = IERC20(collateral).balanceOf(address(this));
+            if (_arbPotentialProfit(collateralBal, priceSum, fee) < minProfitCollateral) break;
+
+            uint256 gained = _arbRoundWithState(tokens, isToken1, collateral, market, fee, sqrtPrices, priceSum);
             if (gained == 0) break;
             profit += gained;
 
@@ -1222,9 +1431,17 @@ contract Rebalancer {
         address market,
         uint24 fee
     ) internal returns (uint256 gained) {
+        (uint160[] memory sqrtPrices, uint256 priceSum) = _readArbState(pools, isToken1);
+        return _arbRoundWithState(tokens, isToken1, collateral, market, fee, sqrtPrices, priceSum);
+    }
+
+    function _readArbState(address[] calldata pools, bool[] calldata isToken1)
+        internal
+        view
+        returns (uint160[] memory sqrtPrices, uint256 priceSum)
+    {
         uint256 n = pools.length;
-        uint160[] memory sqrtPrices = new uint160[](n);
-        uint256 priceSum = 0;
+        sqrtPrices = new uint160[](n);
 
         for (uint256 i = 0; i < n;) {
             (sqrtPrices[i],,,,,,) = IUniswapV3Pool(pools[i]).slot0();
@@ -1242,7 +1459,17 @@ contract Rebalancer {
                 ++i;
             }
         }
+    }
 
+    function _arbRoundWithState(
+        address[] calldata tokens,
+        bool[] calldata isToken1,
+        address collateral,
+        address market,
+        uint24 fee,
+        uint160[] memory sqrtPrices,
+        uint256 priceSum
+    ) internal returns (uint256 gained) {
         // Fee-adjusted thresholds: arb only profitable beyond fee drag
         // mintThreshold = 1e18 * 1e6 / (1e6 - fee)  [sum > this → mint-sell]
         // buyThreshold  = 1e18 * (1e6 - fee) / 1e6   [sum < this → buy-merge]
@@ -1255,6 +1482,32 @@ contract Rebalancer {
         } else if (priceSum < buyThreshold) {
             gained = _tryBuyMerge(tokens, isToken1, collateral, market, fee, sqrtPrices, priceSum);
         }
+    }
+
+    function _arbPotentialProfit(uint256 collateralBalance, uint256 priceSum, uint24 fee)
+        internal
+        pure
+        returns (uint256 potential)
+    {
+        if (collateralBalance == 0) return 0;
+
+        uint256 feeComp = FEE_UNITS - uint256(fee);
+        if (feeComp == 0) return 0;
+
+        uint256 mintThreshold = FullMath.mulDiv(1e18, FEE_UNITS, feeComp);
+        uint256 buyThreshold = FullMath.mulDiv(1e18, feeComp, FEE_UNITS);
+
+        if (priceSum > mintThreshold) {
+            uint256 effectivePriceSum = FullMath.mulDiv(priceSum, feeComp, FEE_UNITS);
+            return FullMath.mulDiv(collateralBalance, effectivePriceSum - 1e18, 1e18);
+        }
+
+        if (priceSum < buyThreshold) {
+            uint256 grossCost = FullMath.mulDiv(priceSum, FEE_UNITS, feeComp);
+            return FullMath.mulDiv(collateralBalance, 1e18 - grossCost, 1e18);
+        }
+
+        return 0;
     }
 
     /// @dev Mint-sell arb with price limits.
@@ -1440,6 +1693,13 @@ contract Rebalancer {
         internal
         returns (uint256 totalRecycled, uint256 totalRedeployed)
     {
+        return _recycleSellWithFloor(p, maxRounds, 0);
+    }
+
+    function _recycleSellWithFloor(RebalanceParams calldata p, uint256 maxRounds, uint256 minRecycleProfitCollateral)
+        internal
+        returns (uint256 totalRecycled, uint256 totalRedeployed)
+    {
         for (uint256 r = 0; r < maxRounds;) {
             uint256 n = p.tokens.length;
             (uint160[] memory sqrtPrices, uint128[] memory liquidities) = _readPoolState(p);
@@ -1450,6 +1710,7 @@ contract Rebalancer {
             // If buyAll, every underpriced outcome is on the frontier — nothing to recycle
             if (psi.buyAll) break;
             if (psi.num == 0 && psi.den == 0) break; // no underpriced outcomes
+            if (_recyclePotentialGain(p, sqrtPrices, psi) < minRecycleProfitCollateral) break;
 
             // Reverse waterfall: sell below-frontier holdings with frontier price limits.
             // Frontier target is the same price as the forward waterfall's buy target:
@@ -1507,17 +1768,27 @@ contract Rebalancer {
         uint256 maxBisectionIterations,
         uint256 maxTickCrossingsPerPool
     ) internal returns (uint256 totalRecycled, uint256 totalRedeployed) {
+        return _recycleSellExactWithFloor(p, maxRounds, maxBisectionIterations, maxTickCrossingsPerPool, 0);
+    }
+
+    function _recycleSellExactWithFloor(
+        RebalanceParams calldata p,
+        uint256 maxRounds,
+        uint256 maxBisectionIterations,
+        uint256 maxTickCrossingsPerPool,
+        uint256 minRecycleProfitCollateral
+    ) internal returns (uint256 totalRecycled, uint256 totalRedeployed) {
         for (uint256 r = 0; r < maxRounds;) {
             uint256 n = p.tokens.length;
             (uint160[] memory sqrtPrices, int24[] memory ticks, uint128[] memory liquidities) = _readExactPoolState(p);
-            (ExactCostCurves memory curves, uint256 buyAllCost) =
-                _buildExactCostCurves(p, sqrtPrices, ticks, liquidities, maxTickCrossingsPerPool);
-
             uint256 budget = IERC20(p.collateral).balanceOf(address(this));
+            (ExactCostCurves memory curves, uint256 buyAllCost) =
+                _buildExactCostCurves(p, sqrtPrices, ticks, liquidities, maxTickCrossingsPerPool, budget);
             PsiResult memory psi = _computePsiExact(p, sqrtPrices, curves, buyAllCost, budget, maxBisectionIterations);
 
             if (psi.buyAll) break;
             if (psi.num == 0 && psi.den == 0) break;
+            if (_recyclePotentialGain(p, sqrtPrices, psi) < minRecycleProfitCollateral) break;
 
             uint256 sold = 0;
             for (uint256 i = 0; i < n; i++) {
@@ -1559,6 +1830,41 @@ contract Rebalancer {
         }
     }
 
+    function _recyclePotentialGain(RebalanceParams calldata p, uint160[] memory sqrtPrices, PsiResult memory psi)
+        internal
+        view
+        returns (uint256 potentialGain)
+    {
+        uint256 n = p.tokens.length;
+        for (uint256 i = 0; i < n;) {
+            uint256 bal = IERC20(p.tokens[i]).balanceOf(address(this));
+            if (bal == 0) {
+                unchecked {
+                    ++i;
+                }
+                continue;
+            }
+
+            uint160 frontier = _buyLimit(sqrtPrices[i], p.sqrtPredX96[i], p.isToken1[i], psi);
+            if (frontier == 0) {
+                unchecked {
+                    ++i;
+                }
+                continue;
+            }
+
+            uint256 currentPrice = _priceFromSqrt(sqrtPrices[i], p.isToken1[i]);
+            uint256 frontierPrice = _priceFromSqrt(frontier, p.isToken1[i]);
+            if (currentPrice > frontierPrice) {
+                potentialGain += FullMath.mulDiv(bal, currentPrice - frontierPrice, 1e18);
+            }
+
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
     // ──────────────────────────────────────────────
     // Return all holdings to caller
     // ──────────────────────────────────────────────
@@ -1595,6 +1901,14 @@ contract Rebalancer {
             z = y;
             y = (x / z + z) / 2;
         }
+    }
+
+    function _priceFromSqrt(uint160 sqrtPrice, bool isToken1) internal pure returns (uint256) {
+        if (isToken1) {
+            return FullMath.mulDiv(FullMath.mulDiv(1e18, Q96, uint256(sqrtPrice)), Q96, uint256(sqrtPrice));
+        }
+
+        return FullMath.mulDiv(FullMath.mulDiv(uint256(sqrtPrice), uint256(sqrtPrice), Q96), 1e18, Q96);
     }
 
     /// @dev Exact-input sells should stop at the fee-neutral fair-value boundary, not raw prediction.

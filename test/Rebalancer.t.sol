@@ -378,6 +378,24 @@ contract RebalancerHarness is Rebalancer {
     ) external view returns (uint256) {
         return _exactCostToLimit(pool, sqrtPrice, tick, liquidity, limit, isToken1, fee, maxTickCrossingsPerPool);
     }
+
+    function recyclePotentialGain(
+        RebalanceParams calldata params,
+        uint160[] calldata sqrtPrices,
+        uint256 num,
+        uint256 den
+    ) external view returns (uint256) {
+        uint160[] memory current = sqrtPrices;
+        PsiResult memory psi = PsiResult({num: num, den: den, buyAll: false});
+        return _recyclePotentialGain(params, current, psi);
+    }
+
+    function recycleWithFloor(RebalanceParams calldata params, uint256 maxRounds, uint256 minRecycleProfitCollateral)
+        external
+        returns (uint256 totalRecycled, uint256 totalRedeployed)
+    {
+        return _recycleSellWithFloor(params, maxRounds, minRecycleProfitCollateral);
+    }
 }
 
 contract RebalancerBuyAllHarness is Rebalancer {
@@ -968,6 +986,51 @@ contract RebalancerTest is Test {
         assertTrue(worthwhile);
     }
 
+    function testRecycleFloorSkipsBelowThresholdHoldings() public {
+        RebalancerHarness recycleHarness = new RebalancerHarness();
+        MockERC20 collateral = new MockERC20();
+        MockERC20 tokenA = new MockERC20();
+        MockERC20 tokenB = new MockERC20();
+        MockPool poolA = new MockPool(TEST_Q96, 100);
+        MockPool poolB = new MockPool(uint160(uint256(TEST_Q96) * 14 / 10), 100);
+
+        collateral.mint(address(recycleHarness), 10);
+        tokenB.mint(address(recycleHarness), 10);
+
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+
+        address[] memory pools = new address[](2);
+        pools[0] = address(poolA);
+        pools[1] = address(poolB);
+
+        bool[] memory isToken1 = new bool[](2);
+        uint256[] memory balances = new uint256[](2);
+        uint160[] memory sqrtPredX96 = new uint160[](2);
+        sqrtPredX96[0] = uint160(uint256(TEST_Q96) * 2);
+        sqrtPredX96[1] = uint160(uint256(TEST_Q96) * 15 / 10);
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: 0,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        (uint256 skippedRecycled, uint256 skippedRedeployed) =
+            recycleHarness.recycleWithFloor(params, 1, type(uint256).max);
+        assertEq(skippedRecycled, 0);
+        assertEq(skippedRedeployed, 0);
+
+        vm.expectRevert();
+        recycleHarness.recycleWithFloor(params, 1, 0);
+    }
+
     function testConstantLSolverExecutesStaleSecondLegWithinPass() public {
         MockERC20 collateral = new MockERC20();
         MockERC20 tokenA = new MockERC20();
@@ -1052,6 +1115,126 @@ contract RebalancerTest is Test {
         rebalancer.rebalanceExact(params, 16, 0);
 
         assertEq(collateral.balanceOf(address(this)), 90);
+    }
+
+    function testExactSolverSmokeExecutesArbEntryPointWithFloors() public {
+        MockERC20 collateral = new MockERC20();
+        MockERC20 tokenA = new MockERC20();
+        MockPool poolA = new MockPool(TEST_Q96, 100);
+        MockRouter router = new MockRouter();
+        MockCTFRouter ctfRouter = new MockCTFRouter();
+        Rebalancer rebalancer = new Rebalancer(address(router), address(ctfRouter));
+
+        router.configure(address(tokenA), 10, 0, address(0), 0);
+        _fundCallerCollateral(collateral, address(rebalancer), 100);
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(tokenA);
+
+        address[] memory pools = new address[](1);
+        pools[0] = address(poolA);
+
+        bool[] memory isToken1 = new bool[](1);
+        uint256[] memory balances = new uint256[](1);
+        uint160[] memory sqrtPredX96 = new uint160[](1);
+        sqrtPredX96[0] = uint160(uint256(TEST_Q96) * 2);
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: 100,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        rebalancer.rebalanceAndArbExactWithFloors(params, address(0), 0, 0, 24, 8, 0, 0);
+
+        assertEq(collateral.balanceOf(address(this)), 90);
+    }
+
+    function testRebalanceAndArbWithFloorsSkipsSubThresholdArb() public {
+        MockERC20 collateral = new MockERC20();
+        MockERC20 tokenA = new MockERC20();
+        MockERC20 tokenB = new MockERC20();
+        MockPool poolA = new MockPool(TEST_Q96, 100);
+        MockPool poolB = new MockPool(TEST_Q96, 100);
+        MockRouter router = new MockRouter();
+        MockCTFRouter ctfRouter = new MockCTFRouter();
+        Rebalancer rebalancer = new Rebalancer(address(router), address(ctfRouter));
+
+        _fundCallerCollateral(collateral, address(rebalancer), 100);
+
+        address[] memory tokens = new address[](2);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+
+        address[] memory pools = new address[](2);
+        pools[0] = address(poolA);
+        pools[1] = address(poolB);
+
+        bool[] memory isToken1 = new bool[](2);
+        uint256[] memory balances = new uint256[](2);
+        uint160[] memory sqrtPredX96 = new uint160[](2);
+        sqrtPredX96[0] = TEST_Q96;
+        sqrtPredX96[1] = TEST_Q96;
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: 100,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        rebalancer.rebalanceAndArbWithFloors(params, address(0), 1, 0, 101, 0);
+
+        assertEq(collateral.balanceOf(address(this)), 100);
+        assertEq(tokenA.balanceOf(address(this)), 0);
+        assertEq(tokenB.balanceOf(address(this)), 0);
+    }
+
+    function testRebalanceNoOpWhenPredictionInsideCurrentTick() public {
+        MockERC20 collateral = new MockERC20();
+        MockERC20 token = new MockERC20();
+        MockPool pool = new MockPool(TEST_Q96, 100);
+        MockRouter router = new MockRouter();
+        MockCTFRouter ctfRouter = new MockCTFRouter();
+        Rebalancer rebalancer = new Rebalancer(address(router), address(ctfRouter));
+
+        pool.setTick(0);
+        pool.setTickSpacing(10);
+        router.configure(address(token), 1, 0, address(0), 0);
+        _fundCallerCollateral(collateral, address(rebalancer), 1);
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = address(token);
+        address[] memory pools = new address[](1);
+        pools[0] = address(pool);
+        bool[] memory isToken1 = new bool[](1);
+        uint256[] memory balances = new uint256[](1);
+        uint160[] memory sqrtPredX96 = new uint160[](1);
+        sqrtPredX96[0] = TickMath.getSqrtRatioAtTick(5);
+
+        Rebalancer.RebalanceParams memory params = Rebalancer.RebalanceParams({
+            tokens: tokens,
+            pools: pools,
+            isToken1: isToken1,
+            balances: balances,
+            collateralAmount: 1,
+            sqrtPredX96: sqrtPredX96,
+            collateral: address(collateral),
+            fee: 0
+        });
+
+        rebalancer.rebalance(params);
+
+        assertEq(collateral.balanceOf(address(this)), 0);
     }
 
     function testExactSolverUsesLiquidityNetAcrossInitializedTick() public {

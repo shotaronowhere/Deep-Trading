@@ -39,6 +39,7 @@ If documents conflict, follow this precedence:
 ## Mechanism and design context
 
 - `docs/rebalancing_mechanism_design_review.md`: mechanism-design critique and improvement hypotheses.
+- `docs/rebalancer_solver_postmortem_2026-03-07.md`: why the bounded/adaptive on-chain direct routes were removed.
 
 ## Research and future design
 

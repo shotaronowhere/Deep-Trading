@@ -1,332 +1,166 @@
-# Rebalancer Approaches Playbook (Canonical)
+# Rebalancer Approaches Playbook
 
-## Purpose
+This is the canonical strategy-selection document for rebalancer approaches in
+this repo.
 
-This is the canonical strategy document for choosing and improving rebalancer approaches in this repo.
+Companion references:
 
-Companion deep-dive:
-
-- [rebalancing_mechanism_design_review.md](rebalancing_mechanism_design_review.md) provides a longer-form mechanism-design critique and hypothesis set.
-- This playbook remains the operational source of truth for policy thresholds and execution protocol.
-
-It unifies:
-
-1. Off-chain planning and execution behavior (`src/portfolio/core/*`, `src/execution/*`)
-2. On-chain direct solver behavior (`contracts/Rebalancer.sol`)
-3. On-chain mixed solver behavior (`contracts/RebalancerMixed.sol`)
-4. Slippage, staleness, and churn controls
-5. Production strategy selection policy with concrete thresholds
-6. Live-L1 validation protocol for calibrating and revising thresholds
+- [rebalancer.md](rebalancer.md): current on-chain direct solver behavior.
+- [rebalancer_solver_postmortem_2026-03-07.md](rebalancer_solver_postmortem_2026-03-07.md): why the bounded/adaptive direct routes were removed.
+- [rebalancer_mixed.md](rebalancer_mixed.md): current mixed-route experiment.
+- [rebalancing_mechanism_design_review.md](rebalancing_mechanism_design_review.md): broader mechanism-design critique and research ideas.
 
 ## Current implementation map
 
-## Off-chain planner + strict executor
+### Off-chain planner + strict executor
 
-Core files:
+Core Rust files:
 
 - `src/portfolio/core/rebalancer.rs`
 - `src/portfolio/core/waterfall.rs`
 - `src/portfolio/core/planning.rs`
-- `src/portfolio/core/bundle.rs`
-- `src/portfolio/core/solver.rs`
 - `src/execution/bounds.rs`
 - `src/execution/grouping.rs`
 - `src/execution/tx_builder.rs`
-- `src/bin/execute.rs`
 
 Properties:
 
-- multi-phase optimization (arb, sell, waterfall, recycle, polish, cleanup)
-- richer route surface (`DirectBuy`, `DirectSell`, `MintSell`, `BuyMerge`, `DirectMerge`)
-- strict execution unit is one subgroup per transaction, then replan
-- conservative short-horizon repricing and per-leg `sqrtPriceLimitX96`
-- stale/deadline/bounds/shape failures are fail-closed
+- rich objective surface
+- strict submission bounds and stale-plan failure
+- subgroup execution with replanning between transactions
+- still exposed to latency and inclusion risk
 
-## On-chain direct solver (`Rebalancer.sol`)
+### On-chain direct solver
 
 Entrypoints:
 
-- `rebalance` (constant-`L`)
-- `rebalanceExact` (tick-aware exact)
-- `rebalanceAndArb` and `rebalanceAndArbExact`
+- `rebalance`
+- `rebalanceExact`
+- `rebalanceAndArb`
+- `rebalanceAndArbWithFloors`
+- `rebalanceAndArbExact`
+- `rebalanceAndArbExactWithFloors`
 
 Properties:
 
-- atomic solve + execute inside one transaction
-- per-pool price limits for buys/sells
-- bounded constant-`L` refinement loop (`MAX_WATERFALL_PASSES = 6`)
-- exact mode solves on tick-scanned cost curves
+- atomic solve + execute
+- per-pool price limits on every swap
+- default direct route is simple multi-pass constant-`L`
+- exact route keeps fully explicit multi-tick semantics
+- caller-supplied collateral floors remain as the coarse churn gate for arb and recycle
 
-## On-chain mixed solver (`RebalancerMixed.sol`)
+### On-chain mixed solver
 
 Entrypoints:
 
-- `rebalanceMixed` (legacy heuristic)
-- `rebalanceMixedConstantL` (mixed attempt + fail-closed direct fallback)
+- `rebalanceMixed`
+- `rebalanceMixedConstantL`
 
 Properties:
 
-- deterministic fallback with `MixedSolveFallback(reasonCode)`
-- currently useful as conditional EV extractor, not default path
-- material gas premium in benchmark fixtures
+- still experimental
+- deterministic fallback via `MixedSolveFallback(reasonCode)`
+- materially higher gas in committed benchmarks
 
-## Approach strengths and weaknesses
+## Design rules from the March 7, 2026 cleanup
 
-| Approach | Strengths | Weaknesses | Best Use |
+These are the rules that came out of the bounded/adaptive solver experiment and
+should be treated as hard-earned design constraints:
+
+1. Do not add an intermediate on-chain direct solver unless it materially beats
+   `rebalance` on realistic 98-market crossing fixtures.
+2. Fractions of a percent of EV are not enough to justify a much more complex
+   on-chain planner.
+3. If `rebalanceExact` already fits under the gas cap on the relevant state
+   family, optimize exact before inventing a new approximate route.
+4. No new solver should ship without a benchmark table for:
+   - a deep-crossing two-pool fixture,
+   - the synthetic 98-outcome crossing fixture,
+   - the realistic seeded 98-outcome crossing fixture.
+5. A new approximate route must not introduce catastrophic EV regressions on any
+   realistic crossing benchmark, even if its median gas number looks good.
+
+The detailed evidence is recorded in
+[rebalancer_solver_postmortem_2026-03-07.md](rebalancer_solver_postmortem_2026-03-07.md).
+
+## Current frontier
+
+| Approach | Strengths | Weaknesses | Current role |
 |---|---|---|---|
-| Off-chain full solver + strict executor | Richest objective surface, can outperform direct-only on frozen states, already has conservative execution controls | Inclusion-latency exposure, more moving parts, local heuristics still present | Lower contention windows, large mixed-route opportunities |
-| On-chain constant-`L` (`rebalance`) | Lowest operational complexity, atomic state consistency, robust baseline for single-tick-heavy markets | Approximation across initialized tick crossings | Default production mode |
-| On-chain exact (`rebalanceExact`) | Best direct-route fidelity under multi-tick complexity | Higher planning gas | Crossing-heavy states where extra fidelity pays for itself |
-| On-chain mixed (`rebalanceMixedConstantL`) | Captures mixed-route EV in favorable states, deterministic failover | High gas overhead, feasibility/fallback sensitivity | Conditional use only when uplift clears risk-adjusted gas hurdle |
+| Off-chain strict executor | Richest route surface, can exploit mixed opportunities, good when submission risk is low | Sensitive to staleness, more moving parts, needs conservative bounds | Conditional use when latency/slippage regime is acceptable |
+| On-chain direct baseline (`rebalance`) | Simple, atomic, predictable, low enough gas for 98-market production use | Constant-`L` is only an approximation across tick crossings | Default production direct route |
+| On-chain exact (`rebalanceExact`) | Best on-chain EV fidelity, exact multi-tick pricing, still under 40M gas on current 98-market realistic benchmark | Highest planning gas, explicit revert-on-cap behavior | High-value direct route and benchmark ceiling |
+| On-chain mixed (`rebalanceMixedConstantL`) | Can capture mixed-route EV in favorable states | High gas premium, fallback sensitivity, state-dependent value | Experimental only |
 
-## Route mechanics and practical implications
+## Route policy
 
-## Direct route
-
-- Stable and predictable.
-- Closest apples-to-apples parity between off-chain direct and on-chain constant-`L` in committed fixtures.
-- Best first-line route in high-competition conditions.
-
-## Mixed route
-
-- Can add EV when non-active complements are sellable at favorable frontier economics.
-- Value is state-dependent and can be outweighed by gas.
-- Must be gated by incremental EV-net, not enabled blindly.
-
-## Complete-set arb timing
-
-- Phase-0 positioning changes downstream portfolio shape.
-- Benchmarks must compare identical strategy sequences (for example, `rebalance` vs `rebalance`, or `arb+rebalance` vs `arb+rebalance`).
-- Sequence mismatch can create false conclusions.
-
-Historical benchmark context:
-
-- `docs/archive/rebalancer/rebalancer_ab.md`
-- `docs/archive/rebalancer/rebalancer_ab_mixed_gap_investigation_2026-03-03.md`
-
-## Slippage, staleness, and churn
-
-## Slippage and staleness
-
-- Historical static-tolerance hybrid is intentionally deprecated (legacy write-up is archived at `docs/archive/slippage_guard_sprint_spec_legacy.md`).
-- Current off-chain execution now uses:
-  - strict subgroup receding horizon
-  - conservative quote widening from short-horizon adverse move assumptions
-  - explicit per-leg price limits
-  - stale/deadline fail-closed submission checks
-- On-chain solver remains strongest against staleness because solve and execute are atomic.
-
-## Churn
-
-- Off-chain has optional EV-guarded greedy preserve selection (`RebalanceFlags.enable_ev_guarded_greedy_churn_pruning`).
-- This is a local non-regressive selector, not a global optimum solver.
-- Keep optional and measurable.
-
-## Production strategy policy (v1 thresholds)
-
-These thresholds are concrete starting values. They are not permanent constants; they are designed to be validated and tuned by the experiment protocol below.
-
-## Policy A: On-chain constant-`L` vs on-chain exact
+### Direct on-chain policy
 
 Default:
 
-- Use `Rebalancer.rebalance` (constant-`L`).
+- Use `rebalance`.
 
 Escalate to `rebalanceExact` only when both conditions hold:
 
-1. Expected uplift hurdle:
-   - `EV_gain_exact_vs_constant_susd >= max(0.10, 3.0 * extra_gas_exact_vs_constant_susd)`
-2. Consistency hurdle over window:
-   - In the latest 20 live-L1 snapshots, at least 6 satisfy condition 1.
+1. The benchmarked state family shows a material EV gain over `rebalance`.
+2. `rebalanceExact` remains below the 40M gas limit on that state family.
 
-Demote back to constant-`L` when:
+Practical interpretation:
 
-1. Median `EV_gain_exact_vs_constant_susd < 2.0 * extra_gas_exact_vs_constant_susd` over latest 20 snapshots.
-2. Any hard negative outlier appears below `-0.02 sUSD` in that window.
+- Basis-point or low-tenths-of-a-percent gains do not justify a new direct route.
+- Large gains on realistic crossing-heavy states do justify exact.
+- The current data supports a two-route direct frontier, not a three- or four-route one.
 
-## Policy B: On-chain mixed activation
+### Mixed-route policy
 
 Default:
 
 - Do not run mixed on-chain by default.
 
-Enable mixed only when all conditions hold:
+Enable mixed only when:
 
-1. Uplift hurdle:
-   - `EV_gain_mixed_vs_direct_susd >= max(0.20, 5.0 * extra_gas_mixed_vs_direct_susd)`
-2. Reliability hurdle:
-   - `MixedSolveFallback` rate <= 20% over the latest 100 attempts.
-3. Adverse-selection hurdle:
-   - If one fallback reason exceeds 60% of fallbacks, disable mixed until root-caused.
+1. its incremental EV over direct is clearly positive after gas, and
+2. fallback behavior is stable across recent attempts.
 
-Disable mixed immediately when either condition holds:
-
-1. Rolling median `EV_gain_mixed_vs_direct_susd <= 0`.
-2. Rolling p10 `EV_gain_mixed_vs_direct_susd < -0.05 sUSD`.
-
-## Policy C: Off-chain execution vs on-chain execution
+### Off-chain execution policy
 
 Default:
 
-- Prefer on-chain direct solver during competitive hours.
+- Prefer on-chain direct execution in competitive or adversarial windows.
 
-Permit off-chain strict execution when all conditions hold:
+Permit off-chain strict execution only when:
 
-1. Conservative move regime:
-   - `execution_quote_latency_blocks * execution_adverse_move_bps_per_block <= 20 bps`
-2. Margin regime:
-   - first strict subgroup `guaranteed_profit_floor_susd >= 2.0 * estimated_gas_total_susd`
-3. Freshness regime:
-   - no stale-plan aborts in last 50 execution attempts
+1. quote latency is short enough that conservative bounds still leave profit,
+2. the first executable subgroup has meaningful gas-adjusted margin, and
+3. recent stale-plan aborts are rare.
 
-Otherwise, route to on-chain atomic solving.
+## Validation protocol for new solver ideas
 
-## Minimal live-L1 threshold validation protocol
+Every new direct-solver idea must answer all of these questions before it is
+kept:
 
-Goal:
+1. Does it beat `rebalance` on realistic seeded 98-outcome multi-tick fixtures?
+2. Is the gain large enough to justify the added planner complexity?
+3. Does it stay under the 40M gas cap?
+4. Does it avoid severe EV regressions on any benchmark state?
+5. Does it beat simply putting the effort into `rebalanceExact` instead?
 
-- Validate and tune policies A, B, and C on real 98-outcome L1 state snapshots.
+Required output for any new solver proposal:
 
-Cadence:
+- gas and EV for the deep-crossing two-pool fixture
+- gas and EV for synthetic 98-outcome multi-tick
+- gas and EV for realistic seeded 98-outcome multi-tick
+- a one-paragraph complexity argument explaining why the added code is worth it
 
-- Daily for one week to bootstrap thresholds
-- Then every 3 days, plus after any major solver/execution change
+If the measured gain is only a small fraction of a percent, reject the new route
+unless it also reduces code size or meaningfully simplifies operations.
 
-## Step 1: Capture a fresh live-L1 frozen report
+## Current benchmark takeaway
 
-Run:
+After the cleanup, the surviving on-chain direct frontier is:
 
-```bash
-cargo test write_live_l1_single_tick_benchmark_report -- --ignored --nocapture --test-threads=1
-```
+- `rebalance`: simple constant-`L` baseline
+- `rebalanceExact`: expensive but genuinely higher-fidelity route
 
-Expected artifact:
-
-- `test/fixtures/rebalancer_ab_live_l1_snapshot_report.json`
-
-## Step 2: Compare on-chain constant vs exact on the same frozen report
-
-Run:
-
-```bash
-forge test --match-test test_rebalancer_ab_live_l1_snapshot_report -vv
-```
-
-Collect:
-
-- `EV_constant`
-- `EV_exact`
-- `Gas_constant`
-- `Gas_exact`
-- Any touched-pool or solve diagnostics printed by harness
-
-Compute:
-
-- `EV_gain_exact_vs_constant_susd = EV_exact - EV_constant`
-- `extra_gas_exact_vs_constant_susd = (Gas_exact - Gas_constant) * gas_price * ETHUSD`
-
-## Step 3: Compare on-chain direct vs on-chain mixed
-
-Run:
-
-```bash
-forge test --match-test test_rebalancer_vs_mixed_apples_to_apples_report -vv
-```
-
-Collect per case:
-
-- `EV_direct` (`Rebalancer.rebalance`)
-- `EV_mixed` (`RebalancerMixed.rebalanceMixedConstantL`)
-- `Gas_direct`
-- `Gas_mixed`
-- fallback reason traces
-
-Compute:
-
-- `EV_gain_mixed_vs_direct_susd = EV_mixed - EV_direct`
-- `extra_gas_mixed_vs_direct_susd = (Gas_mixed - Gas_direct) * gas_price * ETHUSD`
-- fallback-rate and dominant-reason metrics
-
-## Step 4: Validate off-chain robustness and sequence sensitivity
-
-Run:
-
-```bash
-cargo test benchmark_snapshot_matches_current_optimizer -- --nocapture
-cargo test print_phase0_arb_start_vs_end_cyclic_hypothesis -- --ignored --nocapture --test-threads=1
-```
-
-Optional wider sweep:
-
-```bash
-cargo test sweep_phase0_arb_start_vs_end_cyclic_hypothesis -- --ignored --nocapture --test-threads=1
-```
-
-Purpose:
-
-- confirm route-value and arb-timing assumptions used in policy C
-- avoid sequence-mismatch conclusions
-
-## Step 5: Update rolling threshold dashboard
-
-Schema and templates:
-
-- [rebalancer_policy_metrics_schema.md](rebalancer_policy_metrics_schema.md)
-- [rebalancer_policy_metrics_template.csv](rebalancer_policy_metrics_template.csv)
-- [rebalancer_policy_metrics_template.json](rebalancer_policy_metrics_template.json)
-
-Automation script:
-
-- `scripts/rebalancer_policy_metrics_from_logs.sh`
-
-Example:
-
-```bash
-scripts/rebalancer_policy_metrics_from_logs.sh \
-  --policy-a-log /tmp/ab_constant_exact.log \
-  --policy-b-log /tmp/ab_mixed.log \
-  --fallback-log /tmp/ab_mixed_trace.log \
-  --policy-a-case testBenchmarkABMultiTickSyntheticNinetyEightOutcomeConstantLVsExact \
-  --date 2026-03-03 \
-  --block 136002137 \
-  --gas-price-gwei 1.0 \
-  --eth-usd 3000.0 \
-  --out-json /tmp/rebalancer_policy_metrics_latest.json \
-  --append-csv docs/rebalancer_policy_metrics.csv
-```
-
-`--fallback-log` is required for a positive Policy-B enable/disable decision. Without it, the script still reports EV/gas aggregates but leaves fallback-rate fields empty and keeps `policy_b_enable_now=false`.
-
-For each run, append one row with:
-
-1. Date and block reference
-2. `EV_gain_exact_vs_constant_susd`
-3. `extra_gas_exact_vs_constant_susd`
-4. `EV_gain_mixed_vs_direct_susd`
-5. `extra_gas_mixed_vs_direct_susd`
-6. mixed fallback rate
-7. stale-plan abort count from off-chain strict runtime logs
-
-Decision updates:
-
-1. Apply policy A/B/C exactly.
-2. If policies flap for 3 consecutive runs, widen hysteresis multipliers by +0.5 on gas multiples.
-3. If realized post-trade EV consistently trails predicted floors, raise margin multipliers by 25%.
-
-## Initial recommendations
-
-1. Keep on-chain constant-`L` as production default now.
-2. Enable exact only when policy A triggers on live snapshots.
-3. Keep on-chain mixed disabled by default; enable only under policy B.
-4. Use off-chain strict execution as conditional mode under policy C, not as universal default.
-
-## References
-
-- `docs/README.md`
-- `docs/rebalancer.md`
-- `docs/rebalancer_mixed.md`
-- `docs/slippage.md`
-- `docs/archive/rebalancer/rebalancer_ab.md`
-- `docs/archive/rebalancer/rebalancer_mixed_constant_l_solver.md`
-- `docs/archive/rebalancer/rebalancer_vs_rebalancer_mixed_benchmark_2026-03-03.md`
-- `docs/archive/rebalancer/rebalancer_ab_mixed_gap_investigation_2026-03-03.md`
+That is the clean mechanism-design answer the benchmarks gave us. The middle
+layer of bounded/adaptive heuristics did not pay rent.
