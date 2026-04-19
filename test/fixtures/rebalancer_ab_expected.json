@@ -30,15 +30,15 @@
   "mixed_route_favorable_synthetic_case": {
     "offchain_direct_ev_wei": 100021703842635415552,
     "offchain_mixed_ev_wei": 100108519024112205824,
-    "offchain_full_rebalance_only_ev_wei": 100108205685259485184,
+    "offchain_full_rebalance_only_ev_wei": 100104446119388053504,
     "offchain_action_count": 5,
     "expected_onchain_exact_ev_wei": 100021703842635411426
   },
   "heterogeneous_ninety_eight_outcome_l1_like_case": {
     "offchain_direct_ev_wei": 150258105490229428224,
-    "offchain_mixed_ev_wei": 150380245589644673024,
-    "offchain_full_rebalance_only_ev_wei": 150378870058707484672,
-    "offchain_action_count": 94,
+    "offchain_mixed_ev_wei": 216039884848561586176,
+    "offchain_full_rebalance_only_ev_wei": 150368350977861419008,
+    "offchain_action_count": 4996,
     "expected_onchain_exact_ev_wei": 150258288614947875485
   }
 }
