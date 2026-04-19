@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
-#[cfg(test)]
+#[cfg(any(test, feature = "benchmark_synthetic_fixtures"))]
 use uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio;
 
 use crate::markets::MarketData;
@@ -1212,6 +1212,22 @@ fn derive_contiguous_liquidity_intervals(
     market: &'static MarketData,
     current_price: f64,
 ) -> Option<Vec<DerivedLiquidityInterval>> {
+    let primary = derive_contiguous_liquidity_intervals_primary(market, current_price);
+    if let Some(intervals) = primary {
+        return Some(intervals);
+    }
+    #[cfg(any(test, feature = "benchmark_synthetic_fixtures"))]
+    {
+        return fallback_single_tick_intervals(_slot0, market);
+    }
+    #[cfg(not(any(test, feature = "benchmark_synthetic_fixtures")))]
+    None
+}
+
+fn derive_contiguous_liquidity_intervals_primary(
+    market: &'static MarketData,
+    current_price: f64,
+) -> Option<Vec<DerivedLiquidityInterval>> {
     let pool = market.pool.as_ref()?;
     let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
     let mut collapsed_ticks = pool
@@ -1272,10 +1288,6 @@ fn derive_contiguous_liquidity_intervals(
     }
 
     if intervals.is_empty() || !current_price_is_covered {
-        #[cfg(test)]
-        if let Some(intervals) = fallback_single_tick_intervals(_slot0, market) {
-            return Some(intervals);
-        }
         return None;
     }
 
@@ -1319,11 +1331,13 @@ fn intervals_are_contiguous(intervals: &[DerivedLiquidityInterval]) -> bool {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "benchmark_synthetic_fixtures"))]
 fn fallback_single_tick_intervals(
     slot0: &Slot0Result,
     market: &'static MarketData,
 ) -> Option<Vec<DerivedLiquidityInterval>> {
+    const FALLBACK_PRICE_SPAN: f64 = 1.0e6;
+
     let pool = market.pool.as_ref()?;
     let liquidity = pool.liquidity.parse::<u128>().ok()?;
     let tick_lo = pool.ticks.iter().map(|tick| tick.tick_idx).min()?;
@@ -1333,7 +1347,17 @@ fn fallback_single_tick_intervals(
         return None;
     }
     let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
-    let (top_price, bottom_price) = interval_price_bounds(is_token1_outcome, tick_lo, tick_hi)?;
+    let current_price = sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)
+        .and_then(|value| u128::try_from(value).ok())
+        .map(|wad| wad as f64 / 1e18)?;
+    if !current_price.is_finite() || current_price <= 0.0 {
+        return None;
+    }
+    let top_price = current_price * FALLBACK_PRICE_SPAN;
+    let bottom_price = current_price / FALLBACK_PRICE_SPAN;
+    if !top_price.is_finite() || !bottom_price.is_finite() || bottom_price <= 0.0 {
+        return None;
+    }
     Some(vec![DerivedLiquidityInterval {
         top_price,
         bottom_price,

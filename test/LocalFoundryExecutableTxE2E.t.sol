@@ -278,6 +278,421 @@ contract LocalFoundryExecutableTxE2E is Test {
         _executeOnchainSolverScenario(scenario, 20_000e18, LARGE_TOLERANCE_WAD);
     }
 
+    struct BenchmarkLaneRow {
+        string caseId;
+        string topology;
+        string solver;
+        uint256 preRawEvWad;
+        uint256 postRawEvWad;
+        uint256 gasUsed;
+        uint256 calldataBytes;
+        uint256 modeledFeeWad;
+        int256 realizedNetEvWad;
+        uint256 actionCount;
+        uint256 chunkCount;
+        uint256 expectedRawEvWad;
+        uint256 estimatedFeeWad;
+        uint256 estimatedNetEvWad;
+        string skipReason;
+    }
+
+    function _initBenchmarkArtifacts(string memory jsonlPath, string memory mdPath) internal {
+        vm.writeFile(jsonlPath, "");
+        vm.writeFile(mdPath, "# Local Foundry E2E Benchmark Matrix\n\n");
+        vm.writeLine(mdPath, "All columns are measured from real local execution:");
+        vm.writeLine(
+            mdPath, "- `gas` / `calldata_bytes` come from Foundry `gasleft()` and abi-encoded `batchExecute` bytes"
+        );
+        vm.writeLine(mdPath, "- `net_ev = (post_raw_ev - pre_raw_ev) - modeled_fee`");
+        vm.writeLine(
+            mdPath, "- `modeled_fee = (gas * GAS_PRICE_WEI + calldata * L1_FEE_PER_BYTE_WEI) * ETH_USD` in WAD"
+        );
+        vm.writeLine(mdPath, "");
+        vm.writeLine(
+            mdPath,
+            "| case | topology | solver | pre_raw_ev | post_raw_ev | gas | calldata | modeled_fee (WAD) | realized_net_ev (WAD) | actions | chunks | skip |"
+        );
+        vm.writeLine(mdPath, "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+    }
+
+    function test_benchmark_matrix_single_market() external {
+        string memory jsonlPath = string.concat(
+            vm.projectRoot(), "/test/fixtures/local_foundry_e2e_benchmark_matrix_single_market.jsonl"
+        );
+        string memory mdPath =
+            string.concat(vm.projectRoot(), "/test/fixtures/local_foundry_e2e_benchmark_matrix_single_market.md");
+        _initBenchmarkArtifacts(jsonlPath, mdPath);
+        _runBenchmarkCaseSingleMarket98(jsonlPath, mdPath);
+    }
+
+    function test_benchmark_matrix_connected() external {
+        string memory jsonlPath =
+            string.concat(vm.projectRoot(), "/test/fixtures/local_foundry_e2e_benchmark_matrix_connected.jsonl");
+        string memory mdPath =
+            string.concat(vm.projectRoot(), "/test/fixtures/local_foundry_e2e_benchmark_matrix_connected.md");
+        _initBenchmarkArtifacts(jsonlPath, mdPath);
+        _runBenchmarkCaseConnected98(jsonlPath, mdPath);
+    }
+
+    function _runBenchmarkCaseSingleMarket98(string memory jsonlPath, string memory mdPath) internal {
+        uint256 n = 98;
+        uint256[] memory prices = new uint256[](n);
+        uint256[] memory predictions = new uint256[](n);
+        uint256[] memory holdings = new uint256[](n);
+        uint256 basePrediction = WAD / n;
+        for (uint256 i = 0; i < n; i++) {
+            predictions[i] = basePrediction;
+            prices[i] = i % 7 == 0 ? basePrediction * 60 / 100 : basePrediction * 120 / 100;
+            holdings[i] = i % 9 == 0 ? 10e18 : 0;
+        }
+        predictions[0] += WAD - basePrediction * n;
+        ConnectedScenario memory scenario =
+            _deployConnectedScenario("bench_single_market_98", 98, 0, prices, predictions, holdings);
+        _benchmarkSolversOnScenario(scenario, 20_000e18, "single_market", jsonlPath, mdPath);
+    }
+
+    function _runBenchmarkCaseConnected98(string memory jsonlPath, string memory mdPath) internal {
+        uint256 n = 98;
+        uint256[] memory prices = new uint256[](n);
+        uint256[] memory predictions = new uint256[](n);
+        uint256[] memory holdings = new uint256[](n);
+        uint256 basePrediction = WAD / n;
+        for (uint256 i = 0; i < n; i++) {
+            predictions[i] = basePrediction;
+            prices[i] = basePrediction;
+            if (i % 11 == 0) prices[i] = basePrediction * 55 / 100;
+            if (i % 13 == 0) prices[i] = basePrediction * 165 / 100;
+            if (i % 17 == 0) holdings[i] = 20e18;
+        }
+        predictions[0] += WAD - basePrediction * n;
+        ConnectedScenario memory scenario =
+            _deployConnectedScenario("bench_connected_98", 67, 32, prices, predictions, holdings);
+        _benchmarkSolversOnScenario(scenario, 25_000e18, "connected", jsonlPath, mdPath);
+    }
+
+    function _benchmarkSolversOnScenario(
+        ConnectedScenario memory scenario,
+        uint256 startingCashWad,
+        string memory topology,
+        string memory jsonlPath,
+        string memory mdPath
+    ) internal {
+        TradeExecutor executor = new TradeExecutor(address(this));
+        _fundExecutor(scenario, executor, startingCashWad, false);
+        _approveExecutor(executor, scenario.tradeables, scenario.connector);
+        Rebalancer rebalancer = new Rebalancer(swapRouter02, seerRouter);
+        RebalancerMixed mixed = new RebalancerMixed(swapRouter02, seerRouter);
+        _approveExecutorForSolver(executor, scenario.tradeables, address(rebalancer));
+        _approveExecutorForSolver(executor, scenario.tradeables, address(mixed));
+
+        uint256 snap = vm.snapshotState();
+
+        _runOffchainLane(scenario, executor, startingCashWad, "native", "offchain_waterfall", topology, jsonlPath, mdPath);
+        vm.revertToState(snap);
+
+        string memory workerBin = vm.envOr("FORECASTFLOWS_WORKER_BIN", string(""));
+        if (bytes(workerBin).length == 0) {
+            _emitSkipRow(scenario.id, topology, "offchain_forecastflows", "forecastflows_worker_bin_unset", jsonlPath, mdPath);
+        } else {
+            _runOffchainLane(
+                scenario, executor, startingCashWad, "forecastflows", "offchain_forecastflows", topology, jsonlPath, mdPath
+            );
+            vm.revertToState(snap);
+        }
+
+        bool onchainOk = keccak256(bytes(topology)) == keccak256(bytes("single_market"));
+        if (!onchainOk) {
+            _emitSkipRow(scenario.id, topology, "onchain_rebalance_exact", "onchain_single_market_only", jsonlPath, mdPath);
+            _emitSkipRow(scenario.id, topology, "onchain_rebalance_arb_direct", "onchain_single_market_only", jsonlPath, mdPath);
+            _emitSkipRow(
+                scenario.id, topology, "onchain_rebalance_mixed_constant_l", "onchain_single_market_only", jsonlPath, mdPath
+            );
+            return;
+        }
+
+        _runOnchainLane(
+            scenario,
+            executor,
+            rebalancer,
+            mixed,
+            OnchainLaneKind.RebalanceExact,
+            "onchain_rebalance_exact",
+            topology,
+            jsonlPath,
+            mdPath
+        );
+        vm.revertToState(snap);
+        _runOnchainLane(
+            scenario,
+            executor,
+            rebalancer,
+            mixed,
+            OnchainLaneKind.RebalanceArbDirect,
+            "onchain_rebalance_arb_direct",
+            topology,
+            jsonlPath,
+            mdPath
+        );
+        vm.revertToState(snap);
+        _runOnchainLane(
+            scenario,
+            executor,
+            rebalancer,
+            mixed,
+            OnchainLaneKind.RebalanceMixedConstantL,
+            "onchain_rebalance_mixed_constant_l",
+            topology,
+            jsonlPath,
+            mdPath
+        );
+        vm.revertToState(snap);
+    }
+
+    enum OnchainLaneKind {
+        RebalanceExact,
+        RebalanceArbDirect,
+        RebalanceMixedConstantL
+    }
+
+    function _runOffchainLane(
+        ConnectedScenario memory scenario,
+        TradeExecutor executor,
+        uint256 startingCashWad,
+        string memory solverName,
+        string memory laneLabel,
+        string memory topology,
+        string memory jsonlPath,
+        string memory mdPath
+    ) internal {
+        string memory json =
+            _fixtureInputJsonWithSolver(scenario, address(executor), startingCashWad, false, solverName);
+        // Only the forecastflows lane is allowed to downgrade to a skip row on FFI failure —
+        // the native waterfall lane is the baseline and must hard-fail so regressions in the
+        // fixture binary (compile break, malformed JSON, stale build) surface as test failures
+        // instead of zeroed rows.
+        bool laneAllowsSkip = keccak256(bytes(solverName)) == keccak256(bytes("forecastflows"));
+        LocalFixtureResult memory fixture;
+        if (laneAllowsSkip) {
+            bool ok;
+            (ok, fixture,) = _tryRunFixture(string.concat(scenario.id, "_", solverName), json);
+            if (!ok) {
+                _emitSkipRow(
+                    scenario.id, topology, laneLabel, "forecastflows_uncertified", jsonlPath, mdPath
+                );
+                return;
+            }
+        } else {
+            fixture = _runFixture(string.concat(scenario.id, "_", solverName), json);
+        }
+
+        uint256 preRaw = _portfolioRawEv(address(executor), scenario.tradeables);
+        uint256 totalGas;
+        uint256 totalCalldata;
+        for (uint256 i = 0; i < fixture.chunks.length; i++) {
+            TradeExecutor.Call[] memory calls = _toExecutorCalls(fixture.chunks[i].calls);
+            uint256 gasBefore = gasleft();
+            executor.batchExecute(calls);
+            uint256 gasUsed = gasBefore - gasleft();
+            uint256 calldataBytes = abi.encodeCall(TradeExecutor.batchExecute, (calls)).length;
+            assertLt(gasUsed, MAX_PACKED_TX_L2_GAS, "packed gas cap");
+            totalGas += gasUsed;
+            totalCalldata += calldataBytes;
+        }
+        uint256 postRaw = _portfolioRawEv(address(executor), scenario.tradeables);
+        uint256 fee = (totalGas * GAS_PRICE_WEI + totalCalldata * L1_FEE_PER_BYTE_WEI) * ETH_USD;
+        int256 realizedNet = int256(postRaw) - int256(preRaw) - int256(fee);
+
+        BenchmarkLaneRow memory row = BenchmarkLaneRow({
+            caseId: scenario.id,
+            topology: topology,
+            solver: laneLabel,
+            preRawEvWad: preRaw,
+            postRawEvWad: postRaw,
+            gasUsed: totalGas,
+            calldataBytes: totalCalldata,
+            modeledFeeWad: fee,
+            realizedNetEvWad: realizedNet,
+            actionCount: fixture.actionCount,
+            chunkCount: fixture.chunks.length,
+            expectedRawEvWad: fixture.expectedRawEvWad,
+            estimatedFeeWad: fixture.estimatedTotalFeeWad,
+            estimatedNetEvWad: fixture.estimatedNetEvWad,
+            skipReason: ""
+        });
+        _emitRow(row, jsonlPath, mdPath);
+    }
+
+    function _runOnchainLane(
+        ConnectedScenario memory scenario,
+        TradeExecutor executor,
+        Rebalancer rebalancer,
+        RebalancerMixed mixed,
+        OnchainLaneKind kind,
+        string memory laneLabel,
+        string memory topology,
+        string memory jsonlPath,
+        string memory mdPath
+    ) internal {
+        uint256 preRaw = _portfolioRawEv(address(executor), scenario.tradeables);
+        uint256 collateralAmount = IERC20(address(collateral)).balanceOf(address(executor));
+        Rebalancer.RebalanceParams memory params = _rebalanceParams(address(executor), scenario, collateralAmount);
+
+        address target;
+        bytes memory data;
+        if (kind == OnchainLaneKind.RebalanceExact) {
+            target = address(rebalancer);
+            data = abi.encodeCall(rebalancer.rebalanceExact, (params, 24, 256));
+        } else if (kind == OnchainLaneKind.RebalanceArbDirect) {
+            target = address(rebalancer);
+            data = abi.encodeCall(rebalancer.rebalance, (params));
+        } else {
+            target = address(mixed);
+            data = abi.encodeCall(mixed.rebalanceMixedConstantL, (params, scenario.rootMarket, 24, 24, 0));
+        }
+
+        TradeExecutor.Call[] memory calls = new TradeExecutor.Call[](1);
+        calls[0] = TradeExecutor.Call({to: target, data: data});
+        uint256 calldataBytes = abi.encodeCall(TradeExecutor.batchExecute, (calls)).length;
+        uint256 gasBefore = gasleft();
+        try executor.batchExecute(calls) {
+            uint256 gasUsed = gasBefore - gasleft();
+            assertLt(gasUsed, MAX_PACKED_TX_L2_GAS, "solver gas cap");
+            _emitOnchainRow(scenario, executor, laneLabel, topology, preRaw, gasUsed, calldataBytes, jsonlPath, mdPath);
+        } catch {
+            _emitSkipRow(
+                scenario.id, topology, laneLabel, "onchain_revert_full_range_tick_scan", jsonlPath, mdPath
+            );
+        }
+    }
+
+    function _emitOnchainRow(
+        ConnectedScenario memory scenario,
+        TradeExecutor executor,
+        string memory laneLabel,
+        string memory topology,
+        uint256 preRaw,
+        uint256 gasUsed,
+        uint256 calldataBytes,
+        string memory jsonlPath,
+        string memory mdPath
+    ) internal {
+
+        uint256 postRaw = _portfolioRawEv(address(executor), scenario.tradeables);
+        uint256 fee = (gasUsed * GAS_PRICE_WEI + calldataBytes * L1_FEE_PER_BYTE_WEI) * ETH_USD;
+        int256 realizedNet = int256(postRaw) - int256(preRaw) - int256(fee);
+
+        BenchmarkLaneRow memory row = BenchmarkLaneRow({
+            caseId: scenario.id,
+            topology: topology,
+            solver: laneLabel,
+            preRawEvWad: preRaw,
+            postRawEvWad: postRaw,
+            gasUsed: gasUsed,
+            calldataBytes: calldataBytes,
+            modeledFeeWad: fee,
+            realizedNetEvWad: realizedNet,
+            actionCount: 0,
+            chunkCount: 1,
+            expectedRawEvWad: 0,
+            estimatedFeeWad: 0,
+            estimatedNetEvWad: 0,
+            skipReason: ""
+        });
+        _emitRow(row, jsonlPath, mdPath);
+    }
+
+    function _emitSkipRow(
+        string memory caseId,
+        string memory topology,
+        string memory solver,
+        string memory reason,
+        string memory jsonlPath,
+        string memory mdPath
+    ) internal {
+        BenchmarkLaneRow memory row = BenchmarkLaneRow({
+            caseId: caseId,
+            topology: topology,
+            solver: solver,
+            preRawEvWad: 0,
+            postRawEvWad: 0,
+            gasUsed: 0,
+            calldataBytes: 0,
+            modeledFeeWad: 0,
+            realizedNetEvWad: 0,
+            actionCount: 0,
+            chunkCount: 0,
+            expectedRawEvWad: 0,
+            estimatedFeeWad: 0,
+            estimatedNetEvWad: 0,
+            skipReason: reason
+        });
+        _emitRow(row, jsonlPath, mdPath);
+    }
+
+    function _emitRow(BenchmarkLaneRow memory row, string memory jsonlPath, string memory mdPath) internal {
+        vm.writeLine(jsonlPath, _rowToJson(row));
+        vm.writeLine(mdPath, _rowToMarkdown(row));
+    }
+
+    function _rowToJson(BenchmarkLaneRow memory row) internal view returns (string memory) {
+        string memory header = string.concat(
+            "{",
+            '"case_id":"', row.caseId,
+            '","topology":"', row.topology,
+            '","solver":"', row.solver,
+            '","pre_raw_ev_wad":"', _u(row.preRawEvWad),
+            '","post_raw_ev_wad":"', _u(row.postRawEvWad),
+            '"'
+        );
+        string memory middle = string.concat(
+            ',"l2_gas_used":', _u(row.gasUsed),
+            ',"calldata_bytes":', _u(row.calldataBytes),
+            ',"modeled_fee_wad":"', _u(row.modeledFeeWad),
+            '","realized_net_ev_wad":"', _i(row.realizedNetEvWad),
+            '","action_count":', _u(row.actionCount),
+            ',"chunk_count":', _u(row.chunkCount)
+        );
+        string memory tail = string.concat(
+            ',"expected_raw_ev_wad":"', _u(row.expectedRawEvWad),
+            '","estimated_fee_wad":"', _u(row.estimatedFeeWad),
+            '","estimated_net_ev_wad":"', _u(row.estimatedNetEvWad),
+            '","skip_reason":"', row.skipReason,
+            '"}'
+        );
+        return string.concat(header, middle, tail);
+    }
+
+    function _rowToMarkdown(BenchmarkLaneRow memory row) internal view returns (string memory) {
+        string memory head = string.concat(
+            "| ", row.caseId,
+            " | ", row.topology,
+            " | ", row.solver,
+            " | ", _u(row.preRawEvWad),
+            " | ", _u(row.postRawEvWad)
+        );
+        string memory mid = string.concat(
+            " | ", _u(row.gasUsed),
+            " | ", _u(row.calldataBytes),
+            " | ", _u(row.modeledFeeWad),
+            " | ", _i(row.realizedNetEvWad),
+            " | ", _u(row.actionCount),
+            " | ", _u(row.chunkCount)
+        );
+        string memory tail = string.concat(
+            " | ", bytes(row.skipReason).length == 0 ? "-" : row.skipReason,
+            " |"
+        );
+        return string.concat(head, mid, tail);
+    }
+
+    function _u(uint256 v) internal view returns (string memory) {
+        return vm.toString(v);
+    }
+
+    function _i(int256 v) internal view returns (string memory) {
+        return vm.toString(v);
+    }
+
     function _deployConnectedScenario(
         string memory id,
         uint256 rootNamedOutcomes,
@@ -551,20 +966,59 @@ contract LocalFoundryExecutableTxE2E is Test {
         internal
         returns (LocalFixtureResult memory fixture)
     {
+        (bool ok, LocalFixtureResult memory result, string memory stderr) =
+            _tryRunFixtureInner(scenarioId, inputJson, false);
+        require(ok, stderr);
+        fixture = result;
+    }
+
+    function _tryRunFixture(string memory scenarioId, string memory inputJson)
+        internal
+        returns (bool ok, LocalFixtureResult memory fixture, string memory stderr)
+    {
+        return _tryRunFixtureInner(scenarioId, inputJson, true);
+    }
+
+    function _tryRunFixtureInner(string memory scenarioId, string memory inputJson, bool benchmark)
+        internal
+        returns (bool ok, LocalFixtureResult memory fixture, string memory stderr)
+    {
         string memory path = string.concat(
             vm.projectRoot(), "/test/fixtures/local_foundry_e2e_fixture_input_", scenarioId, ".json"
         );
         vm.writeFile(path, inputJson);
-        string[] memory cmd = new string[](6);
-        cmd[0] = "cargo";
-        cmd[1] = "run";
-        cmd[2] = "--quiet";
-        cmd[3] = "--bin";
-        cmd[4] = "local_foundry_e2e_fixture";
-        cmd[5] = path;
-        bytes memory output = vm.ffi(cmd);
-        bytes memory payload = vm.parseJsonBytes(string(output), ".abi");
+        // Only the benchmark matrix tests opt into the synthetic liquidity fallback feature.
+        // Pre-existing scenario tests run the production fixture binary so their assertions
+        // still exercise real pool geometry derivation.
+        string[] memory cmd;
+        if (benchmark) {
+            cmd = new string[](9);
+            cmd[0] = "cargo";
+            cmd[1] = "run";
+            cmd[2] = "--release";
+            cmd[3] = "--quiet";
+            cmd[4] = "--features";
+            cmd[5] = "benchmark_synthetic_fixtures";
+            cmd[6] = "--bin";
+            cmd[7] = "local_foundry_e2e_fixture";
+            cmd[8] = path;
+        } else {
+            cmd = new string[](7);
+            cmd[0] = "cargo";
+            cmd[1] = "run";
+            cmd[2] = "--release";
+            cmd[3] = "--quiet";
+            cmd[4] = "--bin";
+            cmd[5] = "local_foundry_e2e_fixture";
+            cmd[6] = path;
+        }
+        Vm.FfiResult memory result = vm.tryFfi(cmd);
+        if (result.exitCode != 0) {
+            return (false, fixture, string(result.stderr));
+        }
+        bytes memory payload = vm.parseJsonBytes(string(result.stdout), ".abi");
         fixture = abi.decode(payload, (LocalFixtureResult));
+        ok = true;
     }
 
     function _fixtureInputJson(
@@ -573,12 +1027,24 @@ contract LocalFoundryExecutableTxE2E is Test {
         uint256 startingCashWad,
         bool forceMintAvailable
     ) internal view returns (string memory) {
+        return _fixtureInputJsonWithSolver(scenario, executor, startingCashWad, forceMintAvailable, "native");
+    }
+
+    function _fixtureInputJsonWithSolver(
+        ConnectedScenario memory scenario,
+        address executor,
+        uint256 startingCashWad,
+        bool forceMintAvailable,
+        string memory solver
+    ) internal view returns (string memory) {
         return string.concat(
             "{",
             '"scenario_id":"',
             scenario.id,
             '",',
-            '"solver":"native",',
+            '"solver":"',
+            solver,
+            '",',
             '"executor":"',
             vm.toString(executor),
             '",',

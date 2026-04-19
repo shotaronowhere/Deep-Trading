@@ -3,6 +3,9 @@ name = "deep_trading_bot"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+benchmark_synthetic_fixtures = []
+
 [lints.rust]
 unsafe_code = "warn"
 

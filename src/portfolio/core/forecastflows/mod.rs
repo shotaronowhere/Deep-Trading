@@ -237,9 +237,15 @@ pub(super) fn solve_family_candidates(
     expected_outcome_count: usize,
     _cost_config: PlannerCostConfig,
 ) -> Result<ForecastFlowsSolveReport, ForecastFlowsSolveError> {
+    // Reserve a small capital buffer so the sum of f64 replay costs cannot exceed
+    // the real on-chain budget after Uniswap integer-ceiling rounding applies to
+    // each per-action amountIn. Per-action underestimate is bounded by a few f64
+    // ULPs (~1e-12 USDC); budgeting a flat 1e-8 USDC absorbs a full 100-outcome
+    // market without meaningfully reducing deployable capital.
+    let reserved_susds_balance = (susds_balance - 1e-8).max(0.0);
     let problem = translate::build_problem_request(
         balances,
-        susds_balance,
+        reserved_susds_balance,
         slot0_results,
         predictions,
         expected_outcome_count,
@@ -274,7 +280,7 @@ pub(super) fn solve_family_candidates(
     let translation_started = std::time::Instant::now();
     let report = translate::translate_compare_result_report(
         balances,
-        susds_balance,
+        reserved_susds_balance,
         slot0_results,
         predictions,
         compare_report.compare,
@@ -845,21 +851,24 @@ mod tests {
     fn forecastflows_solver_marks_pre_worker_request_construction_failure() {
         let (mut slot0_results, balances, predictions) = two_market_fixture();
         let liquidity = 1_000_000_000_000_000_000_000u128;
+        // Gap geometry placed entirely above the fixture's current tick (~23027 for price 0.1)
+        // so both the primary derivation (rejects via saw_zero_gap_after_positive) and the
+        // single-range fallback (rejects via current_tick < tick_lo) fail.
         let gap_ticks = Box::leak(Box::new([
             Tick {
-                tick_idx: -16_096,
+                tick_idx: 30_000,
                 liquidity_net: liquidity as i128,
             },
             Tick {
-                tick_idx: 92_108,
+                tick_idx: 50_000,
                 liquidity_net: -(liquidity as i128),
             },
             Tick {
-                tick_idx: 100_000,
+                tick_idx: 60_000,
                 liquidity_net: liquidity as i128,
             },
             Tick {
-                tick_idx: 110_000,
+                tick_idx: 70_000,
                 liquidity_net: -(liquidity as i128),
             },
         ]));

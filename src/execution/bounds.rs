@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use alloy::primitives::ruint::UintTryFrom;
 use alloy::primitives::{U160, U256};
 use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
 
@@ -350,6 +351,8 @@ struct MarketPriceState {
     buy_limit_price: f64,
     sell_limit_price: f64,
     liquidity_raw: f64,
+    sqrt_buy_limit: U256,
+    sqrt_sell_limit: U256,
 }
 
 fn market_price_state(
@@ -390,10 +393,10 @@ fn market_price_state(
         sqrt_sell_limit,
         is_token1_outcome,
     )?);
-    if !buy_limit_price.is_finite()
-        || !sell_limit_price.is_finite()
-        || buy_limit_price <= 0.0
-        || sell_limit_price <= 0.0
+    if buy_limit_price.is_nan()
+        || sell_limit_price.is_nan()
+        || buy_limit_price < 0.0
+        || sell_limit_price < 0.0
     {
         return None;
     }
@@ -404,6 +407,8 @@ fn market_price_state(
         buy_limit_price,
         sell_limit_price,
         liquidity_raw: (liquidity as f64) / 1e18,
+        sqrt_buy_limit,
+        sqrt_sell_limit,
     })
 }
 
@@ -424,6 +429,7 @@ fn conservative_sqrt_price_limit(
     move_frac: f64,
 ) -> Option<U160> {
     let state = market_price_state(slot0, market)?;
+    debug_assert!(state.sell_limit_price >= 0.0);
     let amount = action_amount_for_leg(actions, leg)?;
     if !amount.is_finite() || amount <= 0.0 || state.liquidity_raw <= 0.0 {
         return None;
@@ -465,7 +471,19 @@ fn conservative_sqrt_price_limit(
             (terminal_price * (1.0 - move_frac).max(EPSILON)).max(state.sell_limit_price)
         }
     };
-    outcome_price_to_sqrt_limit_x96(adverse_price, state.is_token1_outcome)
+    match outcome_price_to_sqrt_limit_x96(adverse_price, state.is_token1_outcome) {
+        Some(limit) => Some(limit),
+        None => {
+            let boundary = match leg.kind {
+                LegKind::Buy => state.sqrt_buy_limit,
+                LegKind::Sell => state.sqrt_sell_limit,
+            };
+            Some(
+                U160::uint_try_from(boundary)
+                    .expect("tick-derived sqrt boundary must fit in U160"),
+            )
+        }
+    }
 }
 
 const EPSILON: f64 = 1e-9;
@@ -1912,5 +1930,103 @@ mod tests {
             (limit_price - expected_limit_price).abs() <= tol,
             "buy-side limit should be based on the planned terminal price, not spot"
         );
+    }
+
+    fn full_range_overflow_slot0_result() -> Vec<(Slot0Result, &'static crate::markets::MarketData)>
+    {
+        use crate::markets::{MarketData, Pool, Tick};
+
+        let ticks: &'static [Tick] = Box::leak(Box::new([
+            Tick {
+                tick_idx: -887272,
+                liquidity_net: 1_000_000_000_000_000_000_000_000i128,
+            },
+            Tick {
+                tick_idx: 887272,
+                liquidity_net: -1_000_000_000_000_000_000_000_000i128,
+            },
+        ]));
+
+        let pool = Pool {
+            token0: "0x0000000000000000000000000000000000000a01",
+            token1: "0x0000000000000000000000000000000000000a02",
+            pool_id: "0x0000000000000000000000000000000000000a03",
+            liquidity: "1000000000000000000000000",
+            ticks,
+        };
+
+        let market: &'static MarketData = Box::leak(Box::new(MarketData {
+            name: "full_range_overflow_case",
+            market_id: "0x0000000000000000000000000000000000000a00",
+            outcome_token: "0x0000000000000000000000000000000000000a01",
+            pool: Some(pool),
+            quote_token: "0x0000000000000000000000000000000000000a02",
+        }));
+
+        let sqrt_price_x96 =
+            U256::from_str_radix("8767124396362831555064374262", 10).expect("valid sqrtPriceX96");
+        let slot0 = Slot0Result {
+            pool_id: Address::ZERO,
+            sqrt_price_x96,
+            tick: -44029,
+            observation_index: 0,
+            observation_cardinality: 0,
+            observation_cardinality_next: 0,
+            fee_protocol: 0,
+            unlocked: true,
+        };
+
+        vec![(slot0, market)]
+    }
+
+    #[test]
+    fn outcome_price_to_sqrt_limit_x96_is_orientation_dependent_at_full_range() {
+        let overflow_price = 3.4025678669876368e38_f64;
+        assert!(
+            outcome_price_to_sqrt_limit_x96(overflow_price, false).is_none(),
+            "token0-outcome full-range buy limit must overflow the sqrt conversion"
+        );
+        let inverse_limit = outcome_price_to_sqrt_limit_x96(overflow_price, true)
+            .expect("token1-outcome orientation should convert the inverse price");
+        assert_eq!(inverse_limit, U160::from(4_295_128_739u64));
+    }
+
+    #[test]
+    fn replay_builder_handles_full_range_overflow_with_tick_boundary_fallback() {
+        let slot0_results = full_range_overflow_slot0_result();
+        let actions = vec![buy("full_range_overflow_case", 1.0e7, 1.0)];
+        let gas = test_gas_assumptions();
+
+        let replay = build_group_plans_for_gas_replay_with_market_context(
+            &actions,
+            &slot0_results,
+            ConservativeExecutionConfig {
+                quote_latency_blocks: 1,
+                adverse_move_bps_per_block: 15,
+            },
+            &gas,
+            1e-9,
+            3000.0,
+        )
+        .expect("replay builder should not hard-fail on overflow fallback");
+
+        assert_eq!(replay.plans.len(), 1, "full-range buy should remain plannable");
+        assert!(
+            replay.skipped_groups.is_empty(),
+            "no groups should be skipped once the tick-boundary fallback covers the overflow"
+        );
+        let leg = replay.plans[0]
+            .legs
+            .first()
+            .expect("plan should carry exactly one buy leg");
+        let limit = leg
+            .sqrt_price_limit_x96
+            .expect("overflow fallback must still produce a concrete sqrt limit");
+        let expected = U256::from(
+            get_sqrt_ratio_at_tick(887272).expect("max-tick sqrt ratio must exist"),
+        );
+        let expected_u160 = U160::uint_try_from(expected)
+            .expect("tick-derived sqrt boundary must fit in U160");
+        assert_eq!(limit, expected_u160);
     }
 }

@@ -343,6 +343,12 @@ fn build_address_book(input: &FixtureInput) -> Result<ExecutionAddressBook, Box<
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let path = std::env::args()
         .nth(1)
         .ok_or("usage: local_foundry_e2e_fixture <input-json-path>")?;
@@ -421,6 +427,33 @@ fn main() -> Result<(), Box<dyn Error>> {
             RebalanceFlags::default(),
             input.force_mint_available.unwrap_or(true),
         );
+    if matches!(solver, RebalanceSolver::ForecastFlows) {
+        if let Some(reason) = decision
+            .summary
+            .forecastflows_telemetry
+            .fallback_reason
+            .as_deref()
+        {
+            let certified = decision
+                .summary
+                .forecastflows_telemetry
+                .certified_drop_reason
+                .as_deref()
+                .unwrap_or("-");
+            let replay = decision
+                .summary
+                .forecastflows_telemetry
+                .replay_drop_reason
+                .as_deref()
+                .unwrap_or("-");
+            return Err(format!(
+                "forecastflows fallback={reason}; benchmark refuses silent fallback. \
+                 certified_drop_reason={certified}; replay_drop_reason={replay}; \
+                 Set FORECASTFLOWS_WORKER_BIN to a built rust_worker binary."
+            )
+            .into());
+        }
+    }
     let mut actions = decision.actions.clone();
     let mut expected_raw_susd = decision.summary.raw_ev;
     if let Some((scripted_actions, scripted_raw)) = scripted_route_probe_actions(

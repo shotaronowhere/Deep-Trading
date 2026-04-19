@@ -16,7 +16,7 @@ See https://docs.uniswap.org/assets/files/llms-0535f49abd170e69dc72fdc37b81dff2.
 
 | Task | Tool | Pattern |
 | :--- | :--- | :--- |
-| Complex reasoning, security audits, refactoring | `claude` | `claude -p "PROMPT" [FILES] --model claude-opus-4-6` |
+| Complex reasoning, security audits, refactoring | `claude` | `claude -p "PROMPT" [FILES] --model claude-opus-4-7` |
 
 ---
 
@@ -29,7 +29,7 @@ See https://docs.uniswap.org/assets/files/llms-0535f49abd170e69dc72fdc37b81dff2.
 | Flag | Purpose |
 | :--- | :--- |
 | `-p "..."` | Non-interactive prompt (required) |
-| `--model claude-opus-4-6` | Use Opus 4.6 (latest, most capable) |
+| `--model claude-opus-4-7` | Use Opus 4.7 (latest, most capable) |
 | `--output-format json` | Machine-readable output for piping/parsing |
 
 ### Examples
@@ -38,16 +38,16 @@ don't run more than one claud invokation, if claude hangs for a very long time, 
 
 ```bash
 # Single file review
-claude -p "Review for logic errors, race conditions, and type safety." src/main.ts --model claude-opus-4-6
+claude -p "Review for logic errors, race conditions, and type safety." src/main.ts --model claude-opus-4-7
 
 # Multi-file refactor
-claude -p "Refactor to improve modularity and reduce duplication." src/lib/api.ts src/hooks/useApi.ts --model claude-opus-4-6
+claude -p "Refactor to improve modularity and reduce duplication." src/lib/api.ts src/hooks/useApi.ts --model claude-opus-4-7
 
 # Pipe content in
-cat src/lib/*.ts | claude -p "Identify shared patterns and suggest abstractions." --model claude-opus-4-6
+cat src/lib/*.ts | claude -p "Identify shared patterns and suggest abstractions." --model claude-opus-4-7
 
 # JSON output for downstream processing
-claude -p "List all exported functions with their signatures." src/index.ts --model claude-opus-4-6 --output-format json
+claude -p "List all exported functions with their signatures." src/index.ts --model claude-opus-4-7 --output-format json
 ```
 
 ### Prompt Guidelines

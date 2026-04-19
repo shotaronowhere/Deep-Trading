@@ -24,12 +24,14 @@ use crate::execution::grouping::{
     group_execution_actions, group_execution_actions_by_profitability_step,
 };
 use crate::execution::program::{
-    ExecutionProgramPlan, MAX_PACKED_TX_L2_GAS_UNITS, compile_execution_program_unchecked,
+    ExecutionProgramPlan, MAX_PACKED_TX_L2_GAS_UNITS,
+    compile_execution_program_unchecked_with_address_book,
 };
+use crate::execution::tx_builder::ExecutionAddressBook;
 use crate::execution::runtime::{
     DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK, DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
 };
-use crate::execution::{ExecutionMode, GroupKind};
+use crate::execution::{ExecutionMode, GroupKind, MARKET_2_ADDRESS, MARKET_2_COLLATERAL};
 use crate::pools::{Slot0Result, prediction_to_sqrt_price_x96};
 
 use super::Action;
@@ -119,6 +121,8 @@ pub(super) struct PlannerCostConfig {
     pub(super) gas_assumptions: GasAssumptions,
     pub(super) pricing: PlannerPricingSnapshot,
     pub(super) conservative_execution: ConservativeExecutionConfig,
+    pub(super) topology_market2: Address,
+    pub(super) topology_market2_collateral: Address,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +270,8 @@ pub struct ForecastFlowsRunTelemetry {
     pub solve_tuning: Option<String>,
     pub sysimage_status: Option<String>,
     pub fallback_reason: Option<String>,
+    pub certified_drop_reason: Option<String>,
+    pub replay_drop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -813,6 +819,8 @@ fn planner_cost_config_with_pricing(
             quote_latency_blocks: DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
             adverse_move_bps_per_block: DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK,
         },
+        topology_market2: MARKET_2_ADDRESS,
+        topology_market2_collateral: MARKET_2_COLLATERAL,
     }
 }
 
@@ -902,6 +910,22 @@ fn plan_cost_from_program(
     }
 }
 
+fn fee_estimation_address_book(
+    cost_config: PlannerCostConfig,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+) -> Option<ExecutionAddressBook> {
+    use std::str::FromStr;
+
+    let mut book = ExecutionAddressBook::default();
+    book.market2 = cost_config.topology_market2;
+    book.market2_collateral = cost_config.topology_market2_collateral;
+    for (_, market) in slot0_results {
+        let token = Address::from_str(market.outcome_token).ok()?;
+        book.outcome_tokens.insert(market.name.to_string(), token);
+    }
+    Some(book)
+}
+
 fn estimate_plan_cost_from_replay(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
@@ -932,7 +956,8 @@ fn estimate_plan_cost_from_replay(
     }
 
     let fee_inputs = planner_synthetic_fee_inputs(cost_config.pricing);
-    let strict_program = compile_execution_program_unchecked(
+    let fee_book = fee_estimation_address_book(cost_config, slot0_results)?;
+    let strict_program = compile_execution_program_unchecked_with_address_book(
         ExecutionMode::Strict,
         Address::ZERO,
         actions,
@@ -940,9 +965,10 @@ fn estimate_plan_cost_from_replay(
         fee_inputs,
         &cost_config.gas_assumptions,
         cost_config.pricing.eth_usd,
+        &fee_book,
     )
     .ok()?;
-    let packed_program = compile_execution_program_unchecked(
+    let packed_program = compile_execution_program_unchecked_with_address_book(
         ExecutionMode::Packed,
         Address::ZERO,
         actions,
@@ -950,6 +976,7 @@ fn estimate_plan_cost_from_replay(
         fee_inputs,
         &cost_config.gas_assumptions,
         cost_config.pricing.eth_usd,
+        &fee_book,
     )
     .ok()?;
 
@@ -5389,6 +5416,8 @@ fn public_forecastflows_run_telemetry(
         solve_tuning: telemetry.solve_tuning.clone(),
         sysimage_status: telemetry.sysimage_status.clone(),
         fallback_reason: fallback_reason.map(str::to_string),
+        certified_drop_reason: telemetry.certified_drop_reason.clone(),
+        replay_drop_reason: telemetry.replay_drop_reason.clone(),
     }
 }
 
@@ -6752,6 +6781,10 @@ fn evaluate_forecastflows_action_set(
         return cached.clone();
     }
 
+    // Benchmark-grade FF evaluation requires a real gas replay — the structural fallback in
+    // estimate_plan_cost masks unreplayable plans behind a fee estimate that never touched the
+    // pool state. Reject here so run_forecastflows_family_plan reports no_replayable_candidate
+    // and the fixture binary's fallback_reason gate refuses silent fallback.
     let evaluated =
         estimate_plan_cost_from_replay(&actions, &starting_state.slot0_results, cost_config)
             .and_then(|plan_cost| {
@@ -8706,6 +8739,8 @@ fn zero_cost_config_for_test() -> PlannerCostConfig {
             quote_latency_blocks: 0,
             adverse_move_bps_per_block: 0,
         },
+        topology_market2: MARKET_2_ADDRESS,
+        topology_market2_collateral: MARKET_2_COLLATERAL,
     }
 }
 
@@ -9030,7 +9065,8 @@ fn total_calldata_bytes_for_actions_for_test(
         return estimate_structural_packed_total_calldata_bytes(actions, cost_config);
     }
     let fee_inputs = planner_synthetic_fee_inputs(cost_config.pricing);
-    let strict_program = compile_execution_program_unchecked(
+    let fee_book = fee_estimation_address_book(cost_config, slot0_results)?;
+    let strict_program = compile_execution_program_unchecked_with_address_book(
         ExecutionMode::Strict,
         Address::ZERO,
         actions,
@@ -9038,9 +9074,10 @@ fn total_calldata_bytes_for_actions_for_test(
         fee_inputs,
         &cost_config.gas_assumptions,
         cost_config.pricing.eth_usd,
+        &fee_book,
     )
     .ok()?;
-    let packed_program = compile_execution_program_unchecked(
+    let packed_program = compile_execution_program_unchecked_with_address_book(
         ExecutionMode::Packed,
         Address::ZERO,
         actions,
@@ -9048,6 +9085,7 @@ fn total_calldata_bytes_for_actions_for_test(
         fee_inputs,
         &cost_config.gas_assumptions,
         cost_config.pricing.eth_usd,
+        &fee_book,
     )
     .ok()?;
     let program = if better_execution_program(&packed_program, &strict_program) {
@@ -10952,10 +10990,42 @@ pub fn rebalance_with_custom_predictions_and_solver_and_gas_pricing_and_flags_an
     flags: RebalanceFlags,
     force_mint_available: bool,
 ) -> RebalancePlanDecision {
+    rebalance_with_custom_predictions_and_solver_and_gas_pricing_and_flags_and_decision_with_topology(
+        balances,
+        susds_balance,
+        slot0_results,
+        predictions,
+        solver,
+        gas,
+        gas_price_eth,
+        eth_usd,
+        flags,
+        force_mint_available,
+        MARKET_2_ADDRESS,
+        MARKET_2_COLLATERAL,
+    )
+}
+
+pub fn rebalance_with_custom_predictions_and_solver_and_gas_pricing_and_flags_and_decision_with_topology(
+    balances: &HashMap<&str, f64>,
+    susds_balance: f64,
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    predictions: &HashMap<String, f64>,
+    solver: RebalanceSolver,
+    gas: &GasAssumptions,
+    gas_price_eth: f64,
+    eth_usd: f64,
+    flags: RebalanceFlags,
+    force_mint_available: bool,
+    topology_market2: Address,
+    topology_market2_collateral: Address,
+) -> RebalancePlanDecision {
     let n_sims = slot0_results.len();
     let route_gates = compute_gas_thresholds(gas, gas_price_eth, eth_usd, n_sims.saturating_sub(1));
-    let cost_config =
+    let mut cost_config =
         planner_cost_config_with_pricing(gas, gas_price_eth, eth_usd, "explicit_gas_pricing");
+    cost_config.topology_market2 = topology_market2;
+    cost_config.topology_market2_collateral = topology_market2_collateral;
     let (plan, stats) = rebalance_full_ultimate_with_predictions_and_stats(
         balances,
         susds_balance,
