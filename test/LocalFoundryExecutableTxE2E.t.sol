@@ -246,6 +246,28 @@ contract LocalFoundryExecutableTxE2E is Test {
         _executeRustFixtureScenario(scenario, 10_000e18, true, true, SMALL_TOLERANCE_WAD);
     }
 
+    // Hard-failing ForecastFlows executable E2E coverage. The benchmark matrix treats
+    // ForecastFlows failures as skip rows, which hides regressions. This test runs the
+    // production translator end-to-end through TradeExecutor and asserts the same invariants
+    // that the native solver tests rely on; a ForecastFlows regression now fails the suite
+    // instead of silently downgrading to a skip row.
+    function test_small_single_market_forecastflows_executable_rust_plan() external {
+        uint256 n = 20;
+        uint256[] memory prices = new uint256[](n);
+        uint256[] memory predictions = new uint256[](n);
+        uint256[] memory holdings = new uint256[](n);
+        uint256 basePrediction = WAD / n;
+        for (uint256 i = 0; i < n; i++) {
+            predictions[i] = basePrediction;
+            prices[i] = i % 5 == 0 ? basePrediction * 60 / 100 : basePrediction * 115 / 100;
+        }
+        predictions[0] += WAD - basePrediction * n;
+
+        ConnectedScenario memory scenario =
+            _deployConnectedScenario("small_single_market_ff", n, 0, prices, predictions, holdings, true);
+        _executeRustFixtureScenarioWithSolver(scenario, 10_000e18, false, false, SMALL_TOLERANCE_WAD, "forecastflows");
+    }
+
     function test_ninety_eight_outcome_connected_l1_like_executable_rust_plan() external {
         uint256 n = 98;
         uint256[] memory prices = new uint256[](n);
@@ -814,6 +836,19 @@ contract LocalFoundryExecutableTxE2E is Test {
         bool seedMergeInventory,
         uint256 toleranceWad
     ) internal {
+        _executeRustFixtureScenarioWithSolver(
+            scenario, startingCashWad, forceMintAvailable, seedMergeInventory, toleranceWad, "native"
+        );
+    }
+
+    function _executeRustFixtureScenarioWithSolver(
+        ConnectedScenario memory scenario,
+        uint256 startingCashWad,
+        bool forceMintAvailable,
+        bool seedMergeInventory,
+        uint256 toleranceWad,
+        string memory solver
+    ) internal {
         TradeExecutor executor = new TradeExecutor(address(this));
         _fundExecutor(scenario, executor, startingCashWad, seedMergeInventory);
         _approveExecutor(executor, scenario.tradeables, scenario.connector);
@@ -824,7 +859,8 @@ contract LocalFoundryExecutableTxE2E is Test {
             }
         }
 
-        string memory json = _fixtureInputJson(scenario, address(executor), startingCashWad, forceMintAvailable);
+        string memory json =
+            _fixtureInputJsonWithSolver(scenario, address(executor), startingCashWad, forceMintAvailable, solver);
         LocalFixtureResult memory fixture = _runFixture(scenario.id, json);
         assertGt(fixture.actionCount, 0, "fixture actions");
         assertGt(fixture.chunks.length, 0, "fixture chunks");
