@@ -129,7 +129,6 @@ pub(super) struct PlannerCostConfig {
 enum FeeEstimateSource {
     ZeroAction,
     ReplayPackedProgram,
-    ReplayStrictProgram,
     StructuralFallback,
     Unavailable,
 }
@@ -139,7 +138,6 @@ impl FeeEstimateSource {
         match self {
             Self::ZeroAction => "zero_action",
             Self::ReplayPackedProgram => "replay_packed_program",
-            Self::ReplayStrictProgram => "replay_strict_program",
             Self::StructuralFallback => "structural_fallback",
             Self::Unavailable => "unavailable",
         }
@@ -873,29 +871,6 @@ fn planner_synthetic_fee_inputs(pricing: PlannerPricingSnapshot) -> LiveOptimism
     }
 }
 
-fn better_execution_program(
-    candidate: &ExecutionProgramPlan,
-    incumbent: &ExecutionProgramPlan,
-) -> bool {
-    let fee_tol = raw_value_tol(candidate.total_fee_susd, incumbent.total_fee_susd);
-    if candidate.total_fee_susd + fee_tol < incumbent.total_fee_susd {
-        return true;
-    }
-    if incumbent.total_fee_susd + fee_tol < candidate.total_fee_susd {
-        return false;
-    }
-    if candidate.tx_count != incumbent.tx_count {
-        return candidate.tx_count < incumbent.tx_count;
-    }
-    if candidate.strict_subgroup_count != incumbent.strict_subgroup_count {
-        return candidate.strict_subgroup_count < incumbent.strict_subgroup_count;
-    }
-    matches!(
-        (candidate.mode, incumbent.mode),
-        (ExecutionMode::Packed, ExecutionMode::Strict)
-    )
-}
-
 fn plan_cost_from_program(
     program: &ExecutionProgramPlan,
     source: FeeEstimateSource,
@@ -957,17 +932,6 @@ fn estimate_plan_cost_from_replay(
 
     let fee_inputs = planner_synthetic_fee_inputs(cost_config.pricing);
     let fee_book = fee_estimation_address_book(cost_config, slot0_results)?;
-    let strict_program = compile_execution_program_unchecked_with_address_book(
-        ExecutionMode::Strict,
-        Address::ZERO,
-        actions,
-        &replay.plans,
-        fee_inputs,
-        &cost_config.gas_assumptions,
-        cost_config.pricing.eth_usd,
-        &fee_book,
-    )
-    .ok()?;
     let packed_program = compile_execution_program_unchecked_with_address_book(
         ExecutionMode::Packed,
         Address::ZERO,
@@ -979,13 +943,10 @@ fn estimate_plan_cost_from_replay(
         &fee_book,
     )
     .ok()?;
-
-    let (program, source) = if better_execution_program(&packed_program, &strict_program) {
-        (&packed_program, FeeEstimateSource::ReplayPackedProgram)
-    } else {
-        (&strict_program, FeeEstimateSource::ReplayStrictProgram)
-    };
-    Some(plan_cost_from_program(program, source))
+    Some(plan_cost_from_program(
+        &packed_program,
+        FeeEstimateSource::ReplayPackedProgram,
+    ))
 }
 
 fn estimate_plan_cost_structural(
@@ -1155,15 +1116,69 @@ fn estimate_structural_packed_total_calldata_bytes(
     total_bytes.try_into().ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanCostingMode {
+    ReplayPreferred,
+    StructuralOnly,
+}
+
+fn estimate_plan_cost_with_mode(
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    cost_config: PlannerCostConfig,
+    mode: PlanCostingMode,
+) -> Option<PlanCostEstimate> {
+    match mode {
+        PlanCostingMode::ReplayPreferred => {
+            estimate_plan_cost_from_replay(actions, slot0_results, cost_config)
+                .or_else(|| estimate_plan_cost_structural(actions, cost_config))
+        }
+        PlanCostingMode::StructuralOnly => estimate_plan_cost_structural(actions, cost_config),
+    }
+}
+
+// Retained for API stability per ff_native_replay_latency_fix_plan.md Step 1:
+// behavior preserved by delegating to ReplayPreferred. Currently unused since
+// the native funnel moved to explicit PlanCostingMode threading.
+#[allow(dead_code)]
 fn estimate_plan_cost(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
     cost_config: PlannerCostConfig,
 ) -> Option<PlanCostEstimate> {
-    estimate_plan_cost_from_replay(actions, slot0_results, cost_config)
-        .or_else(|| estimate_plan_cost_structural(actions, cost_config))
+    estimate_plan_cost_with_mode(
+        actions,
+        slot0_results,
+        cost_config,
+        PlanCostingMode::ReplayPreferred,
+    )
 }
 
+fn plan_cost_fields_with_mode(
+    raw_ev: f64,
+    actions: &[Action],
+    slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
+    cost_config: PlannerCostConfig,
+    mode: PlanCostingMode,
+) -> (
+    Option<f64>,
+    Option<f64>,
+    Option<usize>,
+    Option<usize>,
+    FeeEstimateSource,
+    bool,
+) {
+    if let Some(cost) = estimate_plan_cost_with_mode(actions, slot0_results, cost_config, mode) {
+        return plan_cost_fields_from_estimate(raw_ev, cost);
+    }
+
+    (None, None, None, None, FeeEstimateSource::Unavailable, true)
+}
+
+// Retained for API stability per ff_native_replay_latency_fix_plan.md Step 1:
+// behavior preserved by delegating to ReplayPreferred. Currently unused since
+// the native funnel moved to explicit PlanCostingMode threading.
+#[allow(dead_code)]
 fn plan_cost_fields(
     raw_ev: f64,
     actions: &[Action],
@@ -1177,11 +1192,13 @@ fn plan_cost_fields(
     FeeEstimateSource,
     bool,
 ) {
-    if let Some(cost) = estimate_plan_cost(actions, slot0_results, cost_config) {
-        return plan_cost_fields_from_estimate(raw_ev, cost);
-    }
-
-    (None, None, None, None, FeeEstimateSource::Unavailable, true)
+    plan_cost_fields_with_mode(
+        raw_ev,
+        actions,
+        slot0_results,
+        cost_config,
+        PlanCostingMode::ReplayPreferred,
+    )
 }
 
 fn plan_cost_fields_from_estimate(
@@ -2280,7 +2297,8 @@ fn build_rebalance_context_with_options(
     Ok(ctx)
 }
 
-fn build_plan_result(
+#[allow(clippy::too_many_arguments)]
+fn build_plan_result_with_costing_mode(
     starting_state: &SolverStateSnapshot,
     terminal_state: SolverStateSnapshot,
     actions: Vec<Action>,
@@ -2293,6 +2311,7 @@ fn build_plan_result(
     selected_common_shift: Option<f64>,
     selected_mixed_lambda: Option<f64>,
     selected_active_set_size: Option<usize>,
+    costing_mode: PlanCostingMode,
 ) -> PlanResult {
     let (
         estimated_total_fee_susd,
@@ -2301,7 +2320,13 @@ fn build_plan_result(
         estimated_tx_count,
         fee_estimate_source,
         _fee_estimate_unavailable,
-    ) = plan_cost_fields(raw_ev, &actions, &starting_state.slot0_results, cost_config);
+    ) = plan_cost_fields_with_mode(
+        raw_ev,
+        &actions,
+        &starting_state.slot0_results,
+        cost_config,
+        costing_mode,
+    );
     PlanResult {
         actions,
         terminal_state,
@@ -2322,6 +2347,65 @@ fn build_plan_result(
         selected_stage1_budget_fraction: None,
         mixed_certificates: Vec::new(),
     }
+}
+
+fn build_plan_result(
+    starting_state: &SolverStateSnapshot,
+    terminal_state: SolverStateSnapshot,
+    actions: Vec<Action>,
+    raw_ev: f64,
+    frontier_family: Option<BundleRouteKind>,
+    preserve_markets: Vec<&'static str>,
+    family: SolverFamily,
+    cost_config: PlannerCostConfig,
+    compiler_variant: PlanCompilerVariant,
+    selected_common_shift: Option<f64>,
+    selected_mixed_lambda: Option<f64>,
+    selected_active_set_size: Option<usize>,
+) -> PlanResult {
+    build_plan_result_with_costing_mode(
+        starting_state,
+        terminal_state,
+        actions,
+        raw_ev,
+        frontier_family,
+        preserve_markets,
+        family,
+        cost_config,
+        compiler_variant,
+        selected_common_shift,
+        selected_mixed_lambda,
+        selected_active_set_size,
+        PlanCostingMode::ReplayPreferred,
+    )
+}
+
+fn reprice_plan_result_with_replay(
+    starting_state: &SolverStateSnapshot,
+    mut plan: PlanResult,
+    cost_config: PlannerCostConfig,
+) -> PlanResult {
+    if let Some(cost) = estimate_plan_cost_with_mode(
+        &plan.actions,
+        &starting_state.slot0_results,
+        cost_config,
+        PlanCostingMode::ReplayPreferred,
+    ) {
+        let (
+            estimated_total_fee_susd,
+            estimated_net_ev,
+            estimated_group_count,
+            estimated_tx_count,
+            fee_estimate_source,
+            _fee_estimate_unavailable,
+        ) = plan_cost_fields_from_estimate(plan.raw_ev, cost);
+        plan.estimated_total_fee_susd = estimated_total_fee_susd;
+        plan.estimated_net_ev = estimated_net_ev;
+        plan.estimated_group_count = estimated_group_count;
+        plan.estimated_tx_count = estimated_tx_count;
+        plan.fee_estimate_source = fee_estimate_source;
+    }
+    plan
 }
 
 fn with_mixed_certificates(
@@ -3301,6 +3385,7 @@ fn compile_coupled_mixed_candidate_for_target_prof(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
     active_set_size: usize,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let (sims, entries, aggregates) = coupled_mixed_frontier_entries_for_target_prof(
         starting_state,
@@ -3332,7 +3417,7 @@ fn compile_coupled_mixed_candidate_for_target_prof(
     let candidate_terminal_state =
         apply_actions_to_solver_state(starting_state, &actions, predictions)?;
     let candidate_raw_ev = state_snapshot_expected_value(&candidate_terminal_state, predictions);
-    let candidate = build_plan_result(
+    let candidate = build_plan_result_with_costing_mode(
         starting_state,
         candidate_terminal_state,
         actions,
@@ -3345,6 +3430,7 @@ fn compile_coupled_mixed_candidate_for_target_prof(
         Some(common_shift),
         Some(target_prof),
         Some(active_set_size),
+        costing_mode,
     );
     Some(with_mixed_certificates(
         candidate,
@@ -3367,6 +3453,7 @@ fn compile_coupled_mixed_candidate_for_program_net_ev(
     predictions: &HashMap<String, f64>,
     family: SolverFamily,
     cost_config: PlannerCostConfig,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let profitable = sorted_profitable_direct_prefixes(starting_state, predictions)?;
     if profitable.is_empty() {
@@ -3400,6 +3487,7 @@ fn compile_coupled_mixed_candidate_for_program_net_ev(
             family,
             cost_config,
             active_set_size,
+            costing_mode,
         ) else {
             continue;
         };
@@ -3412,6 +3500,7 @@ fn compile_coupled_mixed_candidate_for_program_net_ev(
             family,
             cost_config,
             active_set_size,
+            costing_mode,
         ) {
             best_prefix = candidate_at_lo;
         } else {
@@ -3430,6 +3519,7 @@ fn compile_coupled_mixed_candidate_for_program_net_ev(
                     family,
                     cost_config,
                     active_set_size,
+                    costing_mode,
                 ) {
                     best_prefix = candidate_mid;
                     hi = mid;
@@ -3527,9 +3617,10 @@ fn build_plan_result_from_constant_l_fixed_active_solution(
     preserve_markets: Vec<&'static str>,
     family: SolverFamily,
     cost_config: PlannerCostConfig,
+    costing_mode: PlanCostingMode,
 ) -> PlanResult {
     let certificate = solution.certificate.clone();
-    let plan = build_plan_result(
+    let plan = build_plan_result_with_costing_mode(
         starting_state,
         solution.terminal_state,
         solution.actions,
@@ -3542,6 +3633,7 @@ fn build_plan_result_from_constant_l_fixed_active_solution(
         Some(certificate.mint_amount),
         Some(certificate.pi),
         Some(certificate.active_set_size),
+        costing_mode,
     );
     with_mixed_certificates(plan, vec![certificate])
 }
@@ -3751,6 +3843,7 @@ fn compile_constant_l_mixed_candidate_for_active_mask_with_budget_cap_cached(
     cost_config: PlannerCostConfig,
     budget_cap: f64,
     active_mask: &[bool],
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let budget_cap = budget_cap.max(0.0).min(starting_state.cash.max(0.0));
     let key = ConstantLMixedSolveKey {
@@ -3778,6 +3871,7 @@ fn compile_constant_l_mixed_candidate_for_active_mask_with_budget_cap_cached(
         preserve_markets,
         family,
         cost_config,
+        costing_mode,
     ))
 }
 
@@ -3830,6 +3924,7 @@ fn constant_l_seed_active_masks(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
     seed_mode: ConstantLSeedMode,
+    costing_mode: PlanCostingMode,
 ) -> Option<(Vec<usize>, Vec<Vec<bool>>)> {
     let cache_key = (
         solver_state_fingerprint(starting_state, predictions),
@@ -3885,6 +3980,7 @@ fn constant_l_seed_active_masks(
             PlanCompilerVariant::AnalyticMixed,
             true,
             true,
+            costing_mode,
         ) {
             seed_masks.push(active_mask_from_plan_result(
                 &analytic_seed,
@@ -3902,6 +3998,7 @@ fn constant_l_seed_active_masks(
             PlanCompilerVariant::DirectOnly,
             false,
             false,
+            costing_mode,
         ) {
             seed_masks.push(active_mask_from_plan_result(
                 &direct_only_seed,
@@ -3929,6 +4026,7 @@ fn improve_constant_l_candidate_with_local_search(
     budget_cap: f64,
     profitable_indices: &[usize],
     initial_best: PlanResult,
+    costing_mode: PlanCostingMode,
 ) -> PlanResult {
     let mut best = initial_best;
     let mut visited: HashSet<Vec<bool>> = HashSet::new();
@@ -3968,6 +4066,7 @@ fn improve_constant_l_candidate_with_local_search(
                     cost_config,
                     budget_cap,
                     &neighbor,
+                    costing_mode,
                 )
                 && best_neighbor
                     .as_ref()
@@ -3995,6 +4094,7 @@ fn improve_constant_l_candidate_with_local_search(
                         cost_config,
                         budget_cap,
                         &neighbor,
+                        costing_mode,
                     )
                     && best_neighbor
                         .as_ref()
@@ -4024,6 +4124,7 @@ fn improve_constant_l_candidate_with_local_search(
                         cost_config,
                         budget_cap,
                         &neighbor,
+                        costing_mode,
                     )
                     && best_neighbor
                         .as_ref()
@@ -4055,6 +4156,7 @@ fn compile_constant_l_mixed_candidate_for_program_net_ev_with_budget_cap_and_see
     cost_config: PlannerCostConfig,
     budget_cap: f64,
     seed_mode: ConstantLSeedMode,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let budget_cap = budget_cap.max(0.0).min(starting_state.cash.max(0.0));
     if budget_cap <= DUST {
@@ -4069,6 +4171,7 @@ fn compile_constant_l_mixed_candidate_for_program_net_ev_with_budget_cap_and_see
         family,
         cost_config,
         seed_mode,
+        costing_mode,
     )?;
     let mut best: Option<PlanResult> = None;
     for active_mask in seed_masks {
@@ -4083,6 +4186,7 @@ fn compile_constant_l_mixed_candidate_for_program_net_ev_with_budget_cap_and_see
                 cost_config,
                 budget_cap,
                 &active_mask,
+                costing_mode,
             )
         else {
             continue;
@@ -4116,6 +4220,7 @@ fn compile_constant_l_mixed_candidate_for_program_net_ev_with_budget_cap_and_see
                 budget_cap,
                 &profitable_indices,
                 seed_best,
+                costing_mode,
             )
         }
     })
@@ -4129,6 +4234,7 @@ fn compile_constant_l_mixed_candidate_for_program_net_ev_with_budget_cap(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
     budget_cap: f64,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     compile_constant_l_mixed_candidate_for_program_net_ev_with_budget_cap_and_seed_mode(
         starting_state,
@@ -4139,6 +4245,7 @@ fn compile_constant_l_mixed_candidate_for_program_net_ev_with_budget_cap(
         cost_config,
         budget_cap,
         ConstantLSeedMode::RuntimeCapped,
+        costing_mode,
     )
 }
 
@@ -4149,6 +4256,7 @@ fn compile_constant_l_mixed_candidate_for_program_net_ev(
     preserve_markets: Vec<&'static str>,
     family: SolverFamily,
     cost_config: PlannerCostConfig,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     compile_constant_l_mixed_candidate_for_program_net_ev_with_budget_cap(
         starting_state,
@@ -4158,6 +4266,7 @@ fn compile_constant_l_mixed_candidate_for_program_net_ev(
         family,
         cost_config,
         starting_state.cash.max(0.0),
+        costing_mode,
     )
 }
 
@@ -4177,6 +4286,7 @@ fn compile_constant_l_mixed_best_known_candidate_for_program_net_ev_with_budget_
         cost_config,
         budget_cap,
         ConstantLSeedMode::TeacherBestKnown,
+        PlanCostingMode::ReplayPreferred,
     )
 }
 
@@ -4199,6 +4309,7 @@ fn compose_staged_constant_l_plan(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
     stage_1_budget_fraction: f64,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let mut actions = stage_1.actions.clone();
     actions.extend(stage_2.actions.iter().cloned());
@@ -4216,7 +4327,7 @@ fn compose_staged_constant_l_plan(
     } else {
         stage_2.raw_ev
     };
-    let mut plan = build_plan_result(
+    let mut plan = build_plan_result_with_costing_mode(
         starting_state,
         terminal_state,
         actions,
@@ -4235,6 +4346,7 @@ fn compose_staged_constant_l_plan(
         stage_2
             .selected_active_set_size
             .or(stage_1.selected_active_set_size),
+        costing_mode,
     );
     plan.selected_stage_count = Some(staged_constant_l_stage_count(stage_1, stage_2));
     plan.selected_stage1_budget_fraction = Some(stage_1_budget_fraction);
@@ -4255,6 +4367,7 @@ fn compile_staged_constant_l_mixed_candidate_for_fraction(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
     stage_1_budget_fraction: f64,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let stage_1_budget_cap = starting_state.cash.max(0.0) * stage_1_budget_fraction;
     let stage_1_raw_ev = state_snapshot_expected_value(starting_state, predictions);
@@ -4266,6 +4379,7 @@ fn compile_staged_constant_l_mixed_candidate_for_fraction(
         family,
         cost_config,
         stage_1_budget_cap,
+        costing_mode,
     )
     .unwrap_or_else(|| solver_identity_plan(starting_state, family, stage_1_raw_ev, cost_config));
     let stage_2_state = if stage_1.actions.is_empty() {
@@ -4281,6 +4395,7 @@ fn compile_staged_constant_l_mixed_candidate_for_fraction(
         preserve_markets.clone(),
         family,
         cost_config,
+        costing_mode,
     )
     .unwrap_or_else(|| solver_identity_plan(&stage_2_state, family, stage_2_raw_ev, cost_config));
     compose_staged_constant_l_plan(
@@ -4292,6 +4407,7 @@ fn compile_staged_constant_l_mixed_candidate_for_fraction(
         family,
         cost_config,
         stage_1_budget_fraction,
+        costing_mode,
     )
 }
 
@@ -4306,6 +4422,7 @@ fn compile_staged_constant_l_mixed_candidate_for_program_net_ev(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
     constant_l_candidate: Option<&PlanResult>,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     if constant_l_candidate.is_none()
         || rich_raw_ev <= best_compact_candidate.raw_ev + STAGED_CONSTANT_L_RAW_EV_GAP_SUSD
@@ -4334,6 +4451,7 @@ fn compile_staged_constant_l_mixed_candidate_for_program_net_ev(
                 family,
                 cost_config,
                 fraction,
+                costing_mode,
             ) {
                 staged_candidates.push((fraction, candidate));
             }
@@ -4565,6 +4683,7 @@ fn compile_best_frontier_candidate_for_program_net_ev(
     compiler_variant: PlanCompilerVariant,
     allow_common_shift: bool,
     include_mint_profitability: bool,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let profitability_candidates =
         frontier_profitability_candidates(starting_state, predictions, include_mint_profitability)?;
@@ -4595,7 +4714,7 @@ fn compile_best_frontier_candidate_for_program_net_ev(
             };
             let candidate_raw_ev =
                 state_snapshot_expected_value(&candidate_terminal_state, predictions);
-            let mut candidate = build_plan_result(
+            let mut candidate = build_plan_result_with_costing_mode(
                 starting_state,
                 candidate_terminal_state.clone(),
                 actions,
@@ -4608,6 +4727,7 @@ fn compile_best_frontier_candidate_for_program_net_ev(
                 allow_common_shift.then_some(common_shift),
                 Some(target_prof),
                 None,
+                costing_mode,
             );
             if compiler_variant == PlanCompilerVariant::AnalyticMixed {
                 let start_sims = build_sims(&starting_state.slot0_results, predictions).ok()?;
@@ -4897,6 +5017,7 @@ fn compile_target_delta_candidate_for_program_net_ev(
     family: SolverFamily,
     cost_config: PlannerCostConfig,
     allow_common_shift: bool,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let deltas = sorted_market_deltas(starting_state, target_state);
     let common_shifts = if allow_common_shift {
@@ -4925,7 +5046,7 @@ fn compile_target_delta_candidate_for_program_net_ev(
         }
         let candidate_raw_ev =
             state_snapshot_expected_value(&candidate_terminal_state, predictions);
-        let candidate = build_plan_result(
+        let candidate = build_plan_result_with_costing_mode(
             starting_state,
             candidate_terminal_state,
             actions,
@@ -4938,6 +5059,7 @@ fn compile_target_delta_candidate_for_program_net_ev(
             allow_common_shift.then_some(common_shift),
             None,
             None,
+            costing_mode,
         );
         if best
             .as_ref()
@@ -4959,6 +5081,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
     cost_config: PlannerCostConfig,
     initial_actions: Vec<Action>,
     compiler_variant: PlanCompilerVariant,
+    costing_mode: PlanCostingMode,
 ) -> PlanResult {
     let Some((initial_terminal_state, initial_actions_updated)) =
         apply_actions_to_solver_state_consistent(starting_state, &initial_actions, predictions)
@@ -4972,7 +5095,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
         );
     };
     let initial_raw_ev = state_snapshot_expected_value(&initial_terminal_state, predictions);
-    let mut best = build_plan_result(
+    let mut best = build_plan_result_with_costing_mode(
         starting_state,
         initial_terminal_state,
         initial_actions_updated,
@@ -4985,6 +5108,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
         None,
         None,
         None,
+        costing_mode,
     );
 
     // Single-pass reverse prune: try dropping each step group from lowest
@@ -5030,7 +5154,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
         }
         let candidate_raw_ev =
             state_snapshot_expected_value(&candidate_terminal_state, predictions);
-        let candidate = build_plan_result(
+        let candidate = build_plan_result_with_costing_mode(
             starting_state,
             candidate_terminal_state,
             keep_actions,
@@ -5043,6 +5167,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
             None,
             None,
             None,
+            costing_mode,
         );
         if plan_result_is_better(&candidate, &best) {
             best = candidate;
@@ -5068,6 +5193,7 @@ fn route_group_prune_candidate_for_program_net_ev(
     cost_config: PlannerCostConfig,
     initial_actions: Vec<Action>,
     compiler_variant: PlanCompilerVariant,
+    costing_mode: PlanCostingMode,
 ) -> PlanResult {
     let Some((initial_terminal_state, initial_actions_updated)) =
         apply_actions_to_solver_state_consistent(starting_state, &initial_actions, predictions)
@@ -5081,7 +5207,7 @@ fn route_group_prune_candidate_for_program_net_ev(
         );
     };
     let initial_raw_ev = state_snapshot_expected_value(&initial_terminal_state, predictions);
-    let mut best = build_plan_result(
+    let mut best = build_plan_result_with_costing_mode(
         starting_state,
         initial_terminal_state,
         initial_actions_updated,
@@ -5094,6 +5220,7 @@ fn route_group_prune_candidate_for_program_net_ev(
         None,
         None,
         None,
+        costing_mode,
     );
 
     loop {
@@ -5123,7 +5250,7 @@ fn route_group_prune_candidate_for_program_net_ev(
             };
             let candidate_raw_ev =
                 state_snapshot_expected_value(&candidate_terminal_state, predictions);
-            let candidate = build_plan_result(
+            let candidate = build_plan_result_with_costing_mode(
                 starting_state,
                 candidate_terminal_state,
                 candidate_actions,
@@ -5136,6 +5263,7 @@ fn route_group_prune_candidate_for_program_net_ev(
                 None,
                 None,
                 None,
+                costing_mode,
             );
             if plan_result_is_better(&candidate, &best) {
                 best = candidate;
@@ -5161,6 +5289,7 @@ fn compact_raw_no_arb_plan_for_program_net_ev(
     cost_config: PlannerCostConfig,
     initial_actions: Vec<Action>,
     allow_common_shift: bool,
+    costing_mode: PlanCostingMode,
 ) -> PlanResult {
     let starting_raw_ev = state_snapshot_expected_value(starting_state, predictions);
     let Some((rich_terminal_state, _initial_actions_updated)) =
@@ -5178,6 +5307,7 @@ fn compact_raw_no_arb_plan_for_program_net_ev(
         cost_config,
         initial_actions.clone(),
         PlanCompilerVariant::BaselineStepPrune,
+        costing_mode,
     );
     let mut best = baseline;
     let constant_l_candidate = allow_common_shift
@@ -5189,6 +5319,7 @@ fn compact_raw_no_arb_plan_for_program_net_ev(
                 preserve_markets.clone(),
                 family,
                 cost_config,
+                costing_mode,
             )
         })
         .flatten();
@@ -5206,6 +5337,7 @@ fn compact_raw_no_arb_plan_for_program_net_ev(
         family,
         cost_config,
         allow_common_shift,
+        costing_mode,
     ) && plan_result_is_better(&target_delta, &best)
     {
         best = target_delta;
@@ -5221,6 +5353,7 @@ fn compact_raw_no_arb_plan_for_program_net_ev(
         family,
         cost_config,
         constant_l_candidate.as_ref(),
+        costing_mode,
     ) && plan_result_is_better(&staged_constant_l, &best)
     {
         best = staged_constant_l;
@@ -5552,10 +5685,11 @@ fn compose_rebalance_step(
     rebalance: &PlanResult,
     family: SolverFamily,
     cost_config: PlannerCostConfig,
+    costing_mode: PlanCostingMode,
 ) -> PlanResult {
     let mut actions = prefix_actions.to_vec();
     actions.extend(rebalance.actions.iter().cloned());
-    let mut plan = build_plan_result(
+    let mut plan = build_plan_result_with_costing_mode(
         starting_state,
         rebalance.terminal_state.clone(),
         actions,
@@ -5568,6 +5702,7 @@ fn compose_rebalance_step(
         rebalance.selected_common_shift,
         rebalance.selected_mixed_lambda,
         rebalance.selected_active_set_size,
+        costing_mode,
     );
     plan.selected_stage_count = rebalance.selected_stage_count;
     plan.selected_stage1_budget_fraction = rebalance.selected_stage1_budget_fraction;
@@ -5588,6 +5723,7 @@ fn seed_no_arb_plan_from_state(
     force_mint_available: Option<bool>,
     family: SolverFamily,
     cost_config: PlannerCostConfig,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let mut ctx = build_rebalance_context_with_options(
         &state.holdings,
@@ -5649,7 +5785,7 @@ fn seed_no_arb_plan_from_state(
         let raw_ev = state_snapshot_expected_value(&terminal, predictions);
         (terminal, raw_ev)
     };
-    Some(build_plan_result(
+    Some(build_plan_result_with_costing_mode(
         state,
         terminal_state,
         ctx.actions,
@@ -5662,6 +5798,7 @@ fn seed_no_arb_plan_from_state(
         None,
         None,
         None,
+        costing_mode,
     ))
 }
 
@@ -5677,6 +5814,7 @@ fn run_no_arb_rebalance_plan_from_state(
     run_phase0_in_polish: bool,
     family: SolverFamily,
     cost_config: PlannerCostConfig,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     let allow_common_shift =
         force_mint_available.unwrap_or(state.slot0_results.len() == expected_outcome_count);
@@ -5711,6 +5849,7 @@ fn run_no_arb_rebalance_plan_from_state(
         cost_config,
         actions,
         allow_common_shift,
+        costing_mode,
     ))
 }
 
@@ -5723,6 +5862,7 @@ fn run_positive_arb_plan_from_state(
     family: SolverFamily,
     stats: &mut SolverRunStats,
     cost_config: PlannerCostConfig,
+    costing_mode: PlanCostingMode,
 ) -> Option<PlanResult> {
     stats.arb_operator_evals += 1;
     let mut ctx = build_rebalance_context_with_options(
@@ -5748,7 +5888,7 @@ fn run_positive_arb_plan_from_state(
         return None;
     }
 
-    Some(build_plan_result(
+    Some(build_plan_result_with_costing_mode(
         state,
         terminal_state,
         ctx.actions,
@@ -5761,6 +5901,7 @@ fn run_positive_arb_plan_from_state(
         None,
         None,
         None,
+        costing_mode,
     ))
 }
 
@@ -6162,6 +6303,12 @@ fn seed_shortlist_k(candidate_count: usize) -> usize {
     SEED_SHORTLIST_MIN_K.max(candidate_count / 4).min(8)
 }
 
+/// Conservative shortlist size for final replay-backed revalidation.
+const FINAL_REPLAY_VALIDATION_MAX_K: usize = 8;
+fn final_replay_validation_k(candidate_count: usize) -> usize {
+    candidate_count.min(FINAL_REPLAY_VALIDATION_MAX_K)
+}
+
 fn enumerate_exact_no_arb_candidates_over_preserve_universe(
     mut candidates: Vec<PlanResult>,
     state: &SolverStateSnapshot,
@@ -6210,6 +6357,7 @@ fn enumerate_exact_no_arb_candidates_over_preserve_universe(
                 force_mint_available,
                 family,
                 cost_config,
+                PlanCostingMode::StructuralOnly,
             )?;
             Some((frontier_family, preserve_markets, seed))
         })
@@ -6239,6 +6387,7 @@ fn enumerate_exact_no_arb_candidates_over_preserve_universe(
                 run_phase0_in_polish,
                 family,
                 cost_config,
+                PlanCostingMode::StructuralOnly,
             )
         })
         .collect();
@@ -6274,6 +6423,7 @@ fn collect_no_preserve_frontier_seed_plans(
             run_phase0_in_polish,
             family,
             cost_config,
+            PlanCostingMode::StructuralOnly,
         ) else {
             continue;
         };
@@ -6356,6 +6506,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
                     force_mint_available,
                     family,
                     cost_config,
+                    PlanCostingMode::StructuralOnly,
                 )
             })
             .collect();
@@ -6406,6 +6557,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
                         force_mint_available,
                         family,
                         cost_config,
+                        PlanCostingMode::StructuralOnly,
                     )?;
                     Some((frontier_family, preserve_markets, seed))
                 })
@@ -6432,6 +6584,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
                     run_phase0_in_polish,
                     family,
                     cost_config,
+                    PlanCostingMode::StructuralOnly,
                 )
             })
             .collect();
@@ -6453,6 +6606,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
             PlanCompilerVariant::AnalyticMixed,
             true,
             true,
+            PlanCostingMode::StructuralOnly,
         ) {
             candidates.push(analytic_mixed);
         }
@@ -6461,6 +6615,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
             predictions,
             family,
             cost_config,
+            PlanCostingMode::StructuralOnly,
         ) {
             candidates.push(coupled_mixed);
         }
@@ -6475,10 +6630,21 @@ fn enumerate_exact_no_arb_candidates_with_options(
         PlanCompilerVariant::DirectOnly,
         false,
         false,
+        PlanCostingMode::StructuralOnly,
     ) {
         candidates.push(direct_only);
     }
     candidates.sort_by(plan_result_cmp);
+
+    let shortlist_k = final_replay_validation_k(candidates.len());
+    let dropped_tail_count = candidates.len().saturating_sub(shortlist_k);
+    candidates.truncate(shortlist_k);
+    let mut repriced: Vec<PlanResult> = candidates
+        .into_par_iter()
+        .map(|plan| reprice_plan_result_with_replay(state, plan, cost_config))
+        .collect();
+    repriced.sort_by(plan_result_cmp);
+    candidates = repriced;
 
     tracing::debug!(
         family = family.as_str(),
@@ -6486,6 +6652,8 @@ fn enumerate_exact_no_arb_candidates_with_options(
         exact_rebalance_candidate_evals = stats.exact_rebalance_candidate_evals,
         preserve_universe_size = preserve_universe.len(),
         candidate_count = candidates.len(),
+        shortlist_k,
+        dropped_tail_count,
         run_phase0_in_polish,
         "ultimate solver exact no-arb candidates"
     );
@@ -6676,6 +6844,7 @@ fn run_arb_primed_family_plan(
         SolverFamily::ArbPrimed,
         stats,
         cost_config,
+        PlanCostingMode::ReplayPreferred,
     )?;
     stats.arb_primed_root_taken = true;
 
@@ -6702,6 +6871,7 @@ fn run_arb_primed_family_plan(
                 &exact_rebalance,
                 SolverFamily::ArbPrimed,
                 cost_config,
+                PlanCostingMode::ReplayPreferred,
             )
         };
         if plan_result_is_better(&base, &best) {
@@ -9066,17 +9236,6 @@ fn total_calldata_bytes_for_actions_for_test(
     }
     let fee_inputs = planner_synthetic_fee_inputs(cost_config.pricing);
     let fee_book = fee_estimation_address_book(cost_config, slot0_results)?;
-    let strict_program = compile_execution_program_unchecked_with_address_book(
-        ExecutionMode::Strict,
-        Address::ZERO,
-        actions,
-        &replay.plans,
-        fee_inputs,
-        &cost_config.gas_assumptions,
-        cost_config.pricing.eth_usd,
-        &fee_book,
-    )
-    .ok()?;
     let packed_program = compile_execution_program_unchecked_with_address_book(
         ExecutionMode::Packed,
         Address::ZERO,
@@ -9088,13 +9247,8 @@ fn total_calldata_bytes_for_actions_for_test(
         &fee_book,
     )
     .ok()?;
-    let program = if better_execution_program(&packed_program, &strict_program) {
-        packed_program
-    } else {
-        strict_program
-    };
     Some(
-        program
+        packed_program
             .chunks
             .iter()
             .map(|chunk| chunk.unsigned_tx_bytes_len)
@@ -9305,6 +9459,7 @@ pub(super) fn compile_constant_l_mixed_selected_plan_for_test(
         SolverFamily::Plain,
         cost_config,
         budget_cap,
+        PlanCostingMode::ReplayPreferred,
     )
     .map(|plan| selected_plan_summary_from_plan_for_test(&plan, cost_config))
 }
@@ -9360,6 +9515,7 @@ fn enumerate_constant_l_mixed_oracle_candidates_for_test(
                 cost_config,
                 budget_cap,
                 &active_mask,
+                PlanCostingMode::ReplayPreferred,
             )
         else {
             continue;
@@ -9463,6 +9619,7 @@ fn compare_constant_l_runtime_vs_oracle_with_limit_for_test(
         SolverFamily::Plain,
         cost_config,
         budget_cap,
+        PlanCostingMode::ReplayPreferred,
     )?;
     let oracle_best = compile_constant_l_mixed_oracle_plan_for_test_with_limit(
         &starting_state,
@@ -9513,6 +9670,7 @@ pub(super) fn compare_constant_l_runtime_vs_best_known_for_test(
         SolverFamily::Plain,
         cost_config,
         budget_cap,
+        PlanCostingMode::ReplayPreferred,
     )?;
     let best_known_best =
         compile_constant_l_mixed_best_known_candidate_for_program_net_ev_with_budget_cap(
@@ -9553,6 +9711,7 @@ pub(super) fn compare_constant_l_runtime_vs_k2_oracle_for_test(
         SolverFamily::Plain,
         cost_config,
         budget_cap,
+        PlanCostingMode::ReplayPreferred,
     )?;
     let k1_oracle_best = compile_constant_l_mixed_oracle_plan_for_test_with_limit(
         &starting_state,
@@ -9607,6 +9766,7 @@ pub(super) fn compare_constant_l_runtime_vs_k2_oracle_for_test(
             SolverFamily::Plain,
             cost_config,
             stage_1_budget_fraction,
+            PlanCostingMode::ReplayPreferred,
         ) else {
             continue;
         };
@@ -9838,6 +9998,7 @@ pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_explicit_choic
         false,
         SolverFamily::Plain,
         cost_config,
+        PlanCostingMode::ReplayPreferred,
     )
     .map(|plan| plan.actions)
     .unwrap_or_default()
@@ -9866,6 +10027,7 @@ pub(super) fn rebalance_with_custom_predictions_exact_no_arb_with_search_config_
             SolverFamily::Plain,
             &mut stats,
             cost_config,
+            PlanCostingMode::ReplayPreferred,
         )
         .map(|plan| vec![plan.terminal_state])
         .unwrap_or_default()
