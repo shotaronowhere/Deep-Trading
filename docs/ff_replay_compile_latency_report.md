@@ -158,11 +158,9 @@ behavior) were also verified.
 
 ### Shortlist size
 
-`FINAL_REPLAY_VALIDATION_MAX_K = 8`. Chosen conservatively per the plan. No
-fixture snapshot had to change and the heterogeneous floor on
-`analytic_mixed_selection_improves_realistic_heterogeneous_case_net_ev` still
-clears `PREVIOUS_ANALYTIC_MIXED_NET_EV_FLOOR = 150.36371245961456`, so the
-shortlist size was not widened to 16.
+`FINAL_REPLAY_VALIDATION_MAX_K = 16` (raised from initial `8` — see
+"K=8 → K=16 fix" below). The unignored bench suite still passes and no fixture
+snapshot had to change.
 
 ### Regression test
 
@@ -173,3 +171,110 @@ plan on the heterogeneous 98-outcome case still carries
 `fee_estimate_source == "replay_packed_program"`, still clears the previously
 committed net-EV floor, and still comes from a compact mixed compiler family
 (or a materially better baseline_step_prune plan).
+
+## 2026-04-20 Follow-up: K=8 → K=16 fix and ignored-test audit
+
+After the two-stage pipeline landed, we audited every Category D ignored
+assertion test (the long-running solver guards) at the new
+`FINAL_REPLAY_VALIDATION_MAX_K`. One of them — the existing
+`distilled_exact_no_arb_is_non_regressive_vs_baseline_k4_search` —
+caught a real regression that the unignored bench suite did not.
+
+### What the ignored test caught
+
+`distilled_exact_no_arb_is_non_regressive_vs_baseline_k4_search` asserts
+strict `distilled_ev >= baseline_k4_ev` on the heterogeneous 98-outcome case.
+At K=8 the test failed:
+
+- distilled_ev   = 216_039_884_848_561_586_176
+- baseline_k4_ev = 216_039_884_848_561_618_944
+- delta          = -32_768 wei (= 2^15 wei)
+
+Both helpers route through `run_exact_no_arb_plan_with_options`, so the only
+asymmetric pressure between them is the truncate-to-K step in
+`enumerate_exact_no_arb_candidates_with_options`. Bisecting K confirmed it:
+K=1024 passes, K=16 passes, K=8 fails. The structural ranking surfaces a
+near-tie pair on this case where the `distilled` branch's structurally-best K
+candidates do not include the actual replay-priced winner that the `baseline_k4`
+branch keeps. K=16 widens the validation window enough to capture the winner
+in both branches; the unignored bench suite never exercised this near-tie.
+
+### Fix
+
+[src/portfolio/core/rebalancer.rs:6307](../src/portfolio/core/rebalancer.rs#L6307):
+`const FINAL_REPLAY_VALIDATION_MAX_K: usize = 16;` (was `8`).
+
+Verified after the bump:
+
+- `distilled_exact_no_arb_is_non_regressive_vs_baseline_k4_search` — passes
+  (~46 s).
+- `analytic_mixed_selection_improves_realistic_heterogeneous_case_net_ev` —
+  20.02 s (no regression).
+- `benchmark_snapshot_matches_current_optimizer` — 20.85 s (no regression).
+- `benchmark_ev_non_decreasing_vs_fixture` — 19.65 s (no regression).
+
+All three unignored bench tests stay well under the 120 s success criterion.
+
+### Ignored-test audit findings
+
+We classified each Category D ignored test by status at K=16.
+
+**Pre-existing failures surfaced (not caused by the latency work; tracked
+separately):**
+
+1. **Stale `src/portfolio/tests/ev_snapshots.json`.** The fixture was last
+   updated on 2026-02-24 (commit `002d269`) and predates several solver
+   changes. Two ignored tests now fail with EV deltas that exceed the
+   snapshot floor tolerance:
+   - `test_fuzz_rebalance_ev_regression_fast_suite` — case 0 (full)
+     got=327.66, expected=366.58, delta=-38.92, floor_tol=0.18.
+   - `test_fuzz_rebalance_end_to_end_full_l1_invariants` — same case-0 EV
+     mismatch.
+
+   Both reproduce at K=1024, so this is independent of the K change. Fix
+   path: regenerate the snapshot once the planner side is settled.
+
+2. **Planner over-sell bug in `test_monte_carlo_ev_full_profitability_groups`.**
+   Fails with "sell over-consumed holdings for argotorg/solidity:
+   -716.7713258457056" — `replay_actions_to_state` invariant
+   ([src/portfolio/tests.rs:1201](../src/portfolio/tests.rs#L1201)) catches
+   that the planner emitted a sell larger than the holding. Reproduces at
+   K=1024, so this is a pre-existing planner correctness bug independent
+   of the two-stage work.
+
+**Long-running by design (kept `#[ignore]`):**
+
+3. **`test_random_group_search_vs_waterfall_complex_fuzz_cases`**
+   ([src/portfolio/tests/monte_carlo.rs:1338-1429](../src/portfolio/tests/monte_carlo.rs#L1338-L1429)).
+   Wall time 1201.77 s (~20 min). PASSES. This is an
+   independent-random-group-search **oracle** that asserts the algorithm is
+   never beaten by a randomized baseline across the four hardest fuzz cases.
+
+   Why it stays `#[ignore]`:
+   - Wall time exceeds the 5-minute test cap by design — it is a stress
+     oracle, not a unit test.
+   - Knobs (`max_rollouts`, `groups_per_rollout`, `min_runtime_secs`) are
+     env-driven via `RandomSearchConfig::from_env()`
+     ([src/portfolio/tests/monte_carlo.rs:660](../src/portfolio/tests/monte_carlo.rs#L660)),
+     so CI/local runs can dial it down without touching code.
+   - Kept in the suite because it remains the most aggressive
+     algorithm-vs-oracle check we have for the rebalancer. Run manually
+     before solver changes that could plausibly affect the four hardest
+     cases.
+
+   Recommended invocation when running it:
+
+   ```
+   cargo test --release \
+     'portfolio::core::tests::monte_carlo::test_random_group_search_vs_waterfall_complex_fuzz_cases' \
+     -- --ignored --exact --nocapture --test-threads=1
+   ```
+
+### Summary
+
+- The K=8 → K=16 bump is the only behavioral change required by this audit.
+- The two pre-existing failures (stale snapshot, planner over-sell) are
+  unrelated to the latency work and need separate fixes.
+- `test_random_group_search_vs_waterfall_complex_fuzz_cases` is a
+  legitimate stress oracle and stays `#[ignore]`. Documented above so future
+  maintainers do not mistake its runtime for a regression.

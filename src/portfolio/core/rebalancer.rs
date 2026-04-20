@@ -6304,7 +6304,7 @@ fn seed_shortlist_k(candidate_count: usize) -> usize {
 }
 
 /// Conservative shortlist size for final replay-backed revalidation.
-const FINAL_REPLAY_VALIDATION_MAX_K: usize = 8;
+const FINAL_REPLAY_VALIDATION_MAX_K: usize = 16;
 fn final_replay_validation_k(candidate_count: usize) -> usize {
     candidate_count.min(FINAL_REPLAY_VALIDATION_MAX_K)
 }
