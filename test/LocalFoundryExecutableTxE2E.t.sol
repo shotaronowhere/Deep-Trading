@@ -119,6 +119,12 @@ contract LocalFoundryExecutableTxE2E is Test {
     uint128 constant DEFAULT_LIQUIDITY = 1_000_000e18;
     uint256 constant LP_SEED = 1_000_000_000e18;
     uint256 constant MERGE_SEED = 100_000e18;
+    // Half-width (in ticks) of the benchmark-only narrow ladder centered on the
+    // active tick. At spacing=1 and ±100 000 ticks the price range is roughly
+    // 1/22000x..22000x current, which keeps the derived f64 price within u128
+    // (see `src/portfolio/core/forecastflows/translate.rs::interval_price_bounds`)
+    // so the production translator accepts the pool without the synthetic fallback.
+    int24 constant BENCHMARK_TICK_HALF_RANGE = 100_000;
 
     struct TradeablePool {
         string name;
@@ -218,7 +224,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         uint256[] memory predictions = _smallArray(0.3e18, 0.2e18, 0.25e18, 0.25e18);
         uint256[] memory holdings = _smallArray(0, 25e18, 0, 0);
         ConnectedScenario memory scenario =
-            _deployConnectedScenario("small_direct", 3, 2, prices, predictions, holdings);
+            _deployConnectedScenario("small_direct", 3, 2, prices, predictions, holdings, false);
         _executeRustFixtureScenario(scenario, 1_000e18, false, false, SMALL_TOLERANCE_WAD);
     }
 
@@ -227,7 +233,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         uint256[] memory predictions = _smallArray(0.25e18, 0.25e18, 0.25e18, 0.25e18);
         uint256[] memory holdings = _smallArray(0, 0, 0, 0);
         ConnectedScenario memory scenario =
-            _deployConnectedScenario("small_mint_sell", 4, 0, prices, predictions, holdings);
+            _deployConnectedScenario("small_mint_sell", 4, 0, prices, predictions, holdings, false);
         _executeRustFixtureScenario(scenario, 500e18, true, false, SMALL_TOLERANCE_WAD);
     }
 
@@ -236,7 +242,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         uint256[] memory predictions = _smallArray(0.25e18, 0.25e18, 0.25e18, 0.25e18);
         uint256[] memory holdings = _smallArray(0, 0, 0, 0);
         ConnectedScenario memory scenario =
-            _deployConnectedScenario("small_buy_merge", 4, 0, prices, predictions, holdings);
+            _deployConnectedScenario("small_buy_merge", 4, 0, prices, predictions, holdings, false);
         _executeRustFixtureScenario(scenario, 10_000e18, true, true, SMALL_TOLERANCE_WAD);
     }
 
@@ -256,7 +262,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         predictions[0] += WAD - basePrediction * n;
 
         ConnectedScenario memory scenario =
-            _deployConnectedScenario("l1_like_98", 67, 32, prices, predictions, holdings);
+            _deployConnectedScenario("l1_like_98", 67, 32, prices, predictions, holdings, false);
         _executeRustFixtureScenario(scenario, 25_000e18, false, false, LARGE_TOLERANCE_WAD);
     }
 
@@ -274,7 +280,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         predictions[0] += WAD - basePrediction * n;
 
         ConnectedScenario memory scenario =
-            _deployConnectedScenario("synthetic_onchain_98", 98, 0, prices, predictions, holdings);
+            _deployConnectedScenario("synthetic_onchain_98", 98, 0, prices, predictions, holdings, false);
         _executeOnchainSolverScenario(scenario, 20_000e18, LARGE_TOLERANCE_WAD);
     }
 
@@ -347,7 +353,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         }
         predictions[0] += WAD - basePrediction * n;
         ConnectedScenario memory scenario =
-            _deployConnectedScenario("bench_single_market_98", 98, 0, prices, predictions, holdings);
+            _deployConnectedScenario("bench_single_market_98", 98, 0, prices, predictions, holdings, true);
         _benchmarkSolversOnScenario(scenario, 20_000e18, "single_market", jsonlPath, mdPath);
     }
 
@@ -366,7 +372,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         }
         predictions[0] += WAD - basePrediction * n;
         ConnectedScenario memory scenario =
-            _deployConnectedScenario("bench_connected_98", 67, 32, prices, predictions, holdings);
+            _deployConnectedScenario("bench_connected_98", 67, 32, prices, predictions, holdings, true);
         _benchmarkSolversOnScenario(scenario, 25_000e18, "connected", jsonlPath, mdPath);
     }
 
@@ -699,7 +705,8 @@ contract LocalFoundryExecutableTxE2E is Test {
         uint256 childNamedOutcomes,
         uint256[] memory prices,
         uint256[] memory predictions,
-        uint256[] memory holdings
+        uint256[] memory holdings,
+        bool useBenchmarkLadder
     ) internal returns (ConnectedScenario memory scenario) {
         scenario.id = id;
         bool hasChild = childNamedOutcomes > 0;
@@ -730,7 +737,8 @@ contract LocalFoundryExecutableTxE2E is Test {
                 i,
                 prices[cursor],
                 predictions[cursor],
-                holdings.length > cursor ? holdings[cursor] : 0
+                holdings.length > cursor ? holdings[cursor] : 0,
+                useBenchmarkLadder
             );
             cursor++;
         }
@@ -741,7 +749,8 @@ contract LocalFoundryExecutableTxE2E is Test {
                 i,
                 prices[cursor],
                 predictions[cursor],
-                holdings.length > cursor ? holdings[cursor] : 0
+                holdings.length > cursor ? holdings[cursor] : 0,
+                useBenchmarkLadder
             );
             cursor++;
         }
@@ -754,7 +763,8 @@ contract LocalFoundryExecutableTxE2E is Test {
         uint256 outcomeIndex,
         uint256 priceWad,
         uint256 predictionWad,
-        uint256 initialBalanceWad
+        uint256 initialBalanceWad,
+        bool useBenchmarkLadder
     ) internal returns (TradeablePool memory tradeable) {
         address token = _wrappedOutcome(market, outcomeIndex);
         bool isToken1 = address(collateral) < token;
@@ -764,8 +774,15 @@ contract LocalFoundryExecutableTxE2E is Test {
         address pool = uniFactory.createPool(token0, token1, FEE);
         ILocalUniswapV3Pool(pool).initialize(sqrtStart);
         int24 spacing = ILocalUniswapV3Pool(pool).tickSpacing();
-        int24 tickLower = _minUsableTick(spacing);
-        int24 tickUpper = _maxUsableTick(spacing);
+        (, int24 activeTick,,,,,) = ILocalUniswapV3Pool(pool).slot0();
+        int24 tickLower;
+        int24 tickUpper;
+        if (useBenchmarkLadder) {
+            (tickLower, tickUpper) = _benchmarkLadderBounds(activeTick, spacing);
+        } else {
+            tickLower = _minUsableTick(spacing);
+            tickUpper = _maxUsableTick(spacing);
+        }
         uint256 localBalance = IERC20(token).balanceOf(address(this));
         if (localBalance > 0) IERC20(token).transfer(address(mintHelper), localBalance);
         if (IERC20(token).balanceOf(address(mintHelper)) == 0) deal(token, address(mintHelper), LP_SEED);
@@ -966,8 +983,7 @@ contract LocalFoundryExecutableTxE2E is Test {
         internal
         returns (LocalFixtureResult memory fixture)
     {
-        (bool ok, LocalFixtureResult memory result, string memory stderr) =
-            _tryRunFixtureInner(scenarioId, inputJson, false);
+        (bool ok, LocalFixtureResult memory result, string memory stderr) = _tryRunFixture(scenarioId, inputJson);
         require(ok, stderr);
         fixture = result;
     }
@@ -976,42 +992,18 @@ contract LocalFoundryExecutableTxE2E is Test {
         internal
         returns (bool ok, LocalFixtureResult memory fixture, string memory stderr)
     {
-        return _tryRunFixtureInner(scenarioId, inputJson, true);
-    }
-
-    function _tryRunFixtureInner(string memory scenarioId, string memory inputJson, bool benchmark)
-        internal
-        returns (bool ok, LocalFixtureResult memory fixture, string memory stderr)
-    {
         string memory path = string.concat(
             vm.projectRoot(), "/test/fixtures/local_foundry_e2e_fixture_input_", scenarioId, ".json"
         );
         vm.writeFile(path, inputJson);
-        // Only the benchmark matrix tests opt into the synthetic liquidity fallback feature.
-        // Pre-existing scenario tests run the production fixture binary so their assertions
-        // still exercise real pool geometry derivation.
-        string[] memory cmd;
-        if (benchmark) {
-            cmd = new string[](9);
-            cmd[0] = "cargo";
-            cmd[1] = "run";
-            cmd[2] = "--release";
-            cmd[3] = "--quiet";
-            cmd[4] = "--features";
-            cmd[5] = "benchmark_synthetic_fixtures";
-            cmd[6] = "--bin";
-            cmd[7] = "local_foundry_e2e_fixture";
-            cmd[8] = path;
-        } else {
-            cmd = new string[](7);
-            cmd[0] = "cargo";
-            cmd[1] = "run";
-            cmd[2] = "--release";
-            cmd[3] = "--quiet";
-            cmd[4] = "--bin";
-            cmd[5] = "local_foundry_e2e_fixture";
-            cmd[6] = path;
-        }
+        string[] memory cmd = new string[](7);
+        cmd[0] = "cargo";
+        cmd[1] = "run";
+        cmd[2] = "--release";
+        cmd[3] = "--quiet";
+        cmd[4] = "--bin";
+        cmd[5] = "local_foundry_e2e_fixture";
+        cmd[6] = path;
         Vm.FfiResult memory result = vm.tryFfi(cmd);
         if (result.exitCode != 0) {
             return (false, fixture, string(result.stderr));
@@ -1361,6 +1353,29 @@ contract LocalFoundryExecutableTxE2E is Test {
 
     function _maxUsableTick(int24 spacing) internal pure returns (int24) {
         return (TickMath.MAX_TICK / spacing) * spacing;
+    }
+
+    // Returns spacing-aligned bounds covering `[activeTick - BENCHMARK_TICK_HALF_RANGE,
+    // activeTick + BENCHMARK_TICK_HALF_RANGE]`, clamped to usable tick bounds. Used for the
+    // benchmark matrix only so the production ForecastFlows translator accepts the derived
+    // pool geometry without relying on the synthetic single-band fallback.
+    function _benchmarkLadderBounds(int24 activeTick, int24 spacing)
+        internal
+        pure
+        returns (int24 tickLower, int24 tickUpper)
+    {
+        int24 minTick = _minUsableTick(spacing);
+        int24 maxTick = _maxUsableTick(spacing);
+        int24 lo = activeTick - BENCHMARK_TICK_HALF_RANGE;
+        int24 hi = activeTick + BENCHMARK_TICK_HALF_RANGE;
+        if (lo < minTick) lo = minTick;
+        if (hi > maxTick) hi = maxTick;
+        tickLower = (lo / spacing) * spacing;
+        tickUpper = (hi / spacing) * spacing;
+        if (tickLower >= tickUpper) {
+            tickLower = minTick;
+            tickUpper = maxTick;
+        }
     }
 
     function _positiveInt(int256 value) internal pure returns (uint256) {

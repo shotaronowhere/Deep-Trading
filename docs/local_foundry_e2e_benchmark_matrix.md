@@ -83,7 +83,14 @@ the fixture binary (`src/bin/local_foundry_e2e_fixture.rs`) and propagates `<rea
 ## Running the Benchmark
 
 Use release builds for the fixture binary; the harness compiles the fixture with
-`--release --features benchmark_synthetic_fixtures`.
+`--release` and runs the production translator, matching the binary path used in
+non-benchmark scenarios.
+
+The benchmark scenarios (`bench_single_market_98`, `bench_connected_98`) deploy Uniswap V3
+pools with ticks narrowed to ±100,000 around the active tick rather than the full usable
+range. That keeps the WAD-scaled sqrt-price bounds within `u128`, so the production
+translator's `interval_price_bounds` / `build_univ3_liquidity_bands` path accepts the
+geometry without the `benchmark_synthetic_fixtures` fallback.
 
 ```bash
 # Single-market benchmark (no FF worker required)
