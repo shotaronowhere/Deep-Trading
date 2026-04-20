@@ -33,7 +33,7 @@ skip row with a machine-readable `skip_reason` so the matrix remains shape-stabl
 | lane | source | single_market | connected |
 |---|---|---|---|
 | `offchain_waterfall` | Rust native waterfall solver via FFI fixture | run | run |
-| `offchain_forecastflows` | Rust FF worker (`FORECASTFLOWS_WORKER_BIN`) via FFI fixture | run | run; may skip with `forecastflows_uncertified` when FF worker returns uncertified for both direct and mixed families |
+| `offchain_forecastflows` | Rust FF worker (`FORECASTFLOWS_WORKER_BIN`) via FFI fixture | run | run; may skip with the fixture-binary fallback reason (e.g. `no_certified_candidate`) when the FF worker cannot produce a certified plan for the topology |
 | `onchain_rebalance_exact` | `Rebalancer.rebalanceExact` | run (may skip `onchain_revert_full_range_tick_scan` against full-range synthetic pools) | skip `onchain_single_market_only` |
 | `onchain_rebalance_arb_direct` | `Rebalancer.rebalance` | run | skip `onchain_single_market_only` |
 | `onchain_rebalance_mixed_constant_l` | `RebalancerMixed.rebalanceMixedConstantL` | run | skip `onchain_single_market_only` |
@@ -43,7 +43,8 @@ skip row with a machine-readable `skip_reason` so the matrix remains shape-stabl
 | reason | meaning |
 |---|---|
 | `forecastflows_worker_bin_unset` | `FORECASTFLOWS_WORKER_BIN` env var not provided; FF lane cannot be exercised |
-| `forecastflows_uncertified` | FF worker returned `direct_status="uncertified"` and `mixed_status="uncertified"`; the fixture binary refuses silent fallback, so the Solidity harness catches the non-zero FFI exit via `vm.tryFfi` and emits this skip instead of aborting the matrix |
+| `no_certified_candidate` (or another `ForecastFlowsError::fallback_reason` token) | The fixture binary refuses silent fallback and exits with `forecastflows fallback=<reason>; ...` on stderr. The harness extracts `<reason>` and emits it verbatim as `skip_reason`, so downstream readers see the real underlying reason (e.g. `no_certified_candidate`, `worker_closed`, `worker_cooldown`) instead of a flattened label |
+| `forecastflows_fixture_exit` | The fixture binary exited non-zero but stderr did not contain a `fallback=<reason>;` token. This is a neutral fallback for compile breaks, malformed JSON, or other unexpected failures surfaced by `vm.tryFfi` |
 | `onchain_single_market_only` | On-chain `Rebalancer` / `RebalancerMixed` APIs accept one Seer market; connected topology is out of scope for these contracts (tracked in `docs/local_foundry_e2e_harness_next_steps.md` §2) |
 | `onchain_revert_full_range_tick_scan` | On-chain tick scan reverts against the synthetic full-range `[MIN_TICK, MAX_TICK]` pools used in the benchmark; scenario-specific limitation of the benchmark pool construction |
 
@@ -73,6 +74,11 @@ balances/approvals are observable across all lanes for the same scenario.
 `_tryRunFixture` wraps `vm.tryFfi` and returns `(ok, fixture, stderr)`. The off-chain runner
 calls the try variant so the FF lane can degrade to a skip row instead of aborting the suite when
 the FF worker returns uncertified for a topology it cannot solve today.
+
+When the FF lane fails, `_runOffchainLane` parses the captured `stderr` via
+`_extractForecastflowsFallbackReason`, which extracts the `fallback=<reason>;` token emitted by
+the fixture binary (`src/bin/local_foundry_e2e_fixture.rs`) and propagates `<reason>` as
+`skip_reason`. If no token is present, the row falls back to `forecastflows_fixture_exit`.
 
 ## Running the Benchmark
 

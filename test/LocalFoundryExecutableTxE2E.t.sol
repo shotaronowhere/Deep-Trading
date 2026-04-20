@@ -474,11 +474,11 @@ contract LocalFoundryExecutableTxE2E is Test {
         LocalFixtureResult memory fixture;
         if (laneAllowsSkip) {
             bool ok;
-            (ok, fixture,) = _tryRunFixture(string.concat(scenario.id, "_", solverName), json);
+            string memory stderr;
+            (ok, fixture, stderr) = _tryRunFixture(string.concat(scenario.id, "_", solverName), json);
             if (!ok) {
-                _emitSkipRow(
-                    scenario.id, topology, laneLabel, "forecastflows_uncertified", jsonlPath, mdPath
-                );
+                string memory reason = _extractForecastflowsFallbackReason(stderr);
+                _emitSkipRow(scenario.id, topology, laneLabel, reason, jsonlPath, mdPath);
                 return;
             }
         } else {
@@ -1019,6 +1019,44 @@ contract LocalFoundryExecutableTxE2E is Test {
         bytes memory payload = vm.parseJsonBytes(string(result.stdout), ".abi");
         fixture = abi.decode(payload, (LocalFixtureResult));
         ok = true;
+    }
+
+    // Extract the `fallback=<reason>;` token emitted by the fixture binary when it refuses silent
+    // fallback. The reason tokens are static strings from ForecastFlowsError::fallback_reason (e.g.
+    // `no_certified_candidate`, `worker_closed`) and contain no whitespace, commas, or semicolons,
+    // so terminating on `;` or any ASCII whitespace is safe.
+    function _extractForecastflowsFallbackReason(string memory stderr) internal pure returns (string memory) {
+        bytes memory haystack = bytes(stderr);
+        bytes memory needle = bytes("fallback=");
+        if (haystack.length < needle.length) return "forecastflows_fixture_exit";
+        uint256 start = type(uint256).max;
+        uint256 limit = haystack.length - needle.length;
+        for (uint256 i = 0; i <= limit; i++) {
+            bool matched = true;
+            for (uint256 j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) {
+                start = i + needle.length;
+                break;
+            }
+        }
+        if (start == type(uint256).max) return "forecastflows_fixture_exit";
+        uint256 end = start;
+        while (end < haystack.length) {
+            bytes1 c = haystack[end];
+            if (c == ";" || c == " " || c == "\n" || c == "\r" || c == "\t") break;
+            end++;
+        }
+        if (end == start) return "forecastflows_fixture_exit";
+        bytes memory out = new bytes(end - start);
+        for (uint256 i = 0; i < end - start; i++) {
+            out[i] = haystack[start + i];
+        }
+        return string(out);
     }
 
     function _fixtureInputJson(
