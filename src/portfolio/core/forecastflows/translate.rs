@@ -15,13 +15,14 @@ use super::protocol::{
 use super::{ForecastFlowsCandidateVariant, ForecastFlowsFamilyCandidate};
 use crate::portfolio::Action;
 
-use super::super::merge::action_contract_pair;
-use super::super::sim::{DUST, EPS, build_sims};
+use super::super::sim::{DUST, EPS, FEE_FACTOR};
 use super::super::types::{BalanceMap, lookup_balance};
 
 const REPLAY_AMOUNT_REL_TOL: f64 = 1e-6;
 const REPLAY_AMOUNT_ABS_TOL: f64 = 1e-9;
 const MAX_ROUTE_REPLAY_ROUNDS: usize = 256;
+const MINT_CASH_ROUNDING_BUFFER: f64 = 1e-6;
+const REPLAY_SELL_PROCEEDS_HAIRCUT_BPS: f64 = 1.0;
 
 #[derive(Debug)]
 pub(super) enum ForecastFlowsTranslationError {
@@ -325,7 +326,7 @@ fn translate_solve_result(
     balances: &HashMap<&str, f64>,
     susds_balance: f64,
     slot0_results: &[(Slot0Result, &'static MarketData)],
-    predictions: &HashMap<String, f64>,
+    _predictions: &HashMap<String, f64>,
     result: &PredictionMarketSolveResult,
     variant: ForecastFlowsCandidateVariant,
     replay_tolerance_clamp_used: &mut bool,
@@ -359,11 +360,7 @@ fn translate_solve_result(
         ));
     }
 
-    let mut sims = build_sims(slot0_results, predictions).map_err(|err| {
-        ForecastFlowsTranslationError::UnsupportedSnapshot(format!(
-            "failed to build PoolSim replay state: {err}"
-        ))
-    })?;
+    let mut sims = build_replay_markets(slot0_results)?;
     let mut sim_idx_by_market: HashMap<&'static str, usize> = HashMap::new();
     for (index, sim) in sims.iter().enumerate() {
         sim_idx_by_market.insert(sim.market_name, index);
@@ -376,7 +373,7 @@ fn translate_solve_result(
                 "cannot choose a representative complete-set market".to_string(),
             )
         })?;
-    let (contract_1, contract_2) = action_contract_pair(&sims);
+    let (contract_1, contract_2) = action_contract_pair_for_replay(&sims);
     let mut actions = Vec::new();
 
     let mut ordered_route = ordered_trade_route(slot0_results, &net_trades);
@@ -498,7 +495,7 @@ fn ordered_trade_route(
 }
 
 fn replay_direct_sells(
-    sims: &mut [super::super::sim::PoolSim],
+    sims: &mut [ReplayMarketSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &mut BalanceMap,
     cash: &mut f64,
@@ -596,7 +593,7 @@ fn replay_direct_merges(
 
 fn replay_mint_rounds(
     slot0_results: &[(Slot0Result, &'static MarketData)],
-    sims: &mut [super::super::sim::PoolSim],
+    sims: &mut [ReplayMarketSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &mut BalanceMap,
     cash: &mut f64,
@@ -616,7 +613,8 @@ fn replay_mint_rounds(
         {
             return Ok(());
         }
-        let round_amount = mint_remaining.min((*cash).max(0.0));
+        let cash_budget = (*cash - MINT_CASH_ROUNDING_BUFFER).max(0.0);
+        let round_amount = mint_remaining.min(cash_budget);
         if round_amount <= DUST || amounts_match_within_replay_tolerance(round_amount, 0.0) {
             return Ok(());
         }
@@ -679,7 +677,7 @@ fn replay_mint_rounds(
 }
 
 fn replay_buy_merge_rounds(
-    sims: &mut [super::super::sim::PoolSim],
+    sims: &mut [ReplayMarketSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &mut BalanceMap,
     cash: &mut f64,
@@ -748,7 +746,7 @@ fn replay_buy_merge_rounds(
 }
 
 fn replay_remaining_buys(
-    sims: &mut [super::super::sim::PoolSim],
+    sims: &mut [ReplayMarketSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &mut BalanceMap,
     cash: &mut f64,
@@ -850,7 +848,7 @@ fn replay_merge(
     Ok(())
 }
 
-fn affordable_buy_amount(sim: &super::super::sim::PoolSim, desired: f64, cash: f64) -> f64 {
+fn affordable_buy_amount(sim: &ReplayMarketSim, desired: f64, cash: f64) -> f64 {
     let upper = desired.min(sim.max_buy_tokens().max(0.0));
     if upper <= DUST || amounts_match_within_replay_tolerance(upper, 0.0) {
         return 0.0;
@@ -883,7 +881,7 @@ fn affordable_buy_amount(sim: &super::super::sim::PoolSim, desired: f64, cash: f
 /// This ensures algorithmic symmetry: the binary search predicate and the
 /// execution path agree at every floating-point bit.
 fn simulate_merge_round_affordable(
-    sims: &[super::super::sim::PoolSim],
+    sims: &[ReplayMarketSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &BalanceMap,
     ordered_route: &[OrderedTradeRoute],
@@ -924,7 +922,7 @@ fn simulate_merge_round_affordable(
 }
 
 fn affordable_merge_round(
-    sims: &[super::super::sim::PoolSim],
+    sims: &[ReplayMarketSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &BalanceMap,
     ordered_route: &[OrderedTradeRoute],
@@ -1054,7 +1052,7 @@ fn build_initial_holdings(
 }
 
 fn replay_buy(
-    sims: &mut [super::super::sim::PoolSim],
+    sims: &mut [ReplayMarketSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &mut BalanceMap,
     cash: &mut f64,
@@ -1101,7 +1099,7 @@ fn replay_buy(
 }
 
 fn replay_sell(
-    sims: &mut [super::super::sim::PoolSim],
+    sims: &mut [ReplayMarketSim],
     sim_idx_by_market: &HashMap<&'static str, usize>,
     sim_balances: &mut BalanceMap,
     cash: &mut f64,
@@ -1160,13 +1158,14 @@ fn replay_sell(
         )));
     }
     sims[idx].set_price(new_price);
-    *cash += proceeds;
+    let conservative_proceeds = proceeds * (1.0 - REPLAY_SELL_PROCEEDS_HAIRCUT_BPS / 10_000.0);
+    *cash += conservative_proceeds;
     let entry = sim_balances.entry(market_name).or_insert(0.0);
     *entry = (*entry - sold).max(0.0);
     actions.push(Action::Sell {
         market_name,
         amount: sold,
-        proceeds,
+        proceeds: conservative_proceeds,
     });
     Ok(())
 }
@@ -1204,11 +1203,290 @@ fn representative_complete_set_market(
     markets.first().copied()
 }
 
+fn build_replay_markets(
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+) -> Result<Vec<ReplayMarketSim>, ForecastFlowsTranslationError> {
+    let mut sims = Vec::with_capacity(slot0_results.len());
+    for (slot0, market) in slot0_results {
+        let sim = ReplayMarketSim::from_slot0(slot0, market).ok_or_else(|| {
+            ForecastFlowsTranslationError::UnsupportedSnapshot(format!(
+                "failed to build replay market state for {}",
+                market.name
+            ))
+        })?;
+        sims.push(sim);
+    }
+    Ok(sims)
+}
+
+fn action_contract_pair_for_replay(sims: &[ReplayMarketSim]) -> (&'static str, &'static str) {
+    if sims.is_empty() {
+        return ("", "");
+    }
+    let mut c1 = sims[0].market_id;
+    let mut c2 = c1;
+    for sim in sims.iter().skip(1) {
+        let c = sim.market_id;
+        if c < c1 {
+            c2 = c1;
+            c1 = c;
+        } else if c != c1 && (c2 == c1 || c < c2) {
+            c2 = c;
+        }
+    }
+    (c1, c2)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DerivedLiquidityInterval {
     top_price: f64,
     bottom_price: f64,
     liquidity: u128,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayMarketSim {
+    market_name: &'static str,
+    market_id: &'static str,
+    current_price: f64,
+    intervals: Vec<DerivedLiquidityInterval>,
+}
+
+impl ReplayMarketSim {
+    fn from_slot0(slot0: &Slot0Result, market: &'static MarketData) -> Option<Self> {
+        let pool = market.pool.as_ref()?;
+        let is_token1_outcome = pool.token1.eq_ignore_ascii_case(market.outcome_token);
+        let current_price = sqrt_price_x96_to_price_outcome(slot0.sqrt_price_x96, is_token1_outcome)
+            .and_then(|value| u128::try_from(value).ok())
+            .map(|wad| wad as f64 / 1e18)?;
+        let intervals = derive_contiguous_liquidity_intervals(slot0, market, current_price)?;
+        Some(Self {
+            market_name: market.name,
+            market_id: market.market_id,
+            current_price,
+            intervals,
+        })
+    }
+
+    fn set_price(&mut self, new_price: f64) {
+        self.current_price = new_price;
+    }
+
+    fn max_sell_tokens(&self) -> f64 {
+        let Some(start_idx) = self.interval_index_for_sell() else {
+            return 0.0;
+        };
+        let mut price = self.current_price;
+        let mut total = 0.0;
+        for interval in self.intervals.iter().skip(start_idx) {
+            let Some(tokens) = band_sell_capacity(price, interval) else {
+                return 0.0;
+            };
+            total += tokens;
+            price = interval.bottom_price;
+        }
+        total
+    }
+
+    fn max_buy_tokens(&self) -> f64 {
+        let Some(start_idx) = self.interval_index_for_buy() else {
+            return 0.0;
+        };
+        let mut price = self.current_price;
+        let mut total = 0.0;
+        for interval in self.intervals[..=start_idx].iter().rev() {
+            let Some(tokens) = band_buy_capacity(price, interval) else {
+                return 0.0;
+            };
+            total += tokens;
+            price = interval.top_price;
+        }
+        total
+    }
+
+    fn sell_exact(&self, amount: f64) -> Option<(f64, f64, f64)> {
+        if amount <= 0.0 {
+            return Some((0.0, 0.0, self.current_price));
+        }
+        let start_idx = self.interval_index_for_sell()?;
+        let mut remaining = amount;
+        let mut sold = 0.0;
+        let mut proceeds = 0.0;
+        let mut price = self.current_price;
+
+        for interval in self.intervals.iter().skip(start_idx) {
+            let capacity = band_sell_capacity(price, interval)?;
+            if capacity <= DUST {
+                price = interval.bottom_price;
+                continue;
+            }
+            if remaining <= capacity + EPS {
+                let (actual, leg_proceeds, new_price) = band_sell_exact(price, remaining, interval)?;
+                sold += actual;
+                proceeds += leg_proceeds;
+                return Some((sold, proceeds, new_price));
+            }
+
+            let (actual, leg_proceeds, new_price) = band_sell_exact(price, capacity, interval)?;
+            sold += actual;
+            proceeds += leg_proceeds;
+            remaining = (remaining - actual).max(0.0);
+            price = new_price;
+            if remaining <= DUST {
+                return Some((sold, proceeds, price));
+            }
+        }
+
+        Some((sold, proceeds, price))
+    }
+
+    fn buy_exact(&self, amount: f64) -> Option<(f64, f64, f64)> {
+        if amount <= 0.0 {
+            return Some((0.0, 0.0, self.current_price));
+        }
+        let start_idx = self.interval_index_for_buy()?;
+        let mut remaining = amount;
+        let mut bought = 0.0;
+        let mut cost = 0.0;
+        let mut price = self.current_price;
+
+        for interval in self.intervals[..=start_idx].iter().rev() {
+            let capacity = band_buy_capacity(price, interval)?;
+            if capacity <= DUST {
+                price = interval.top_price;
+                continue;
+            }
+            if remaining <= capacity + EPS {
+                let (actual, leg_cost, new_price) = band_buy_exact(price, remaining, interval)?;
+                bought += actual;
+                cost += leg_cost;
+                return Some((bought, cost, new_price));
+            }
+
+            let (actual, leg_cost, new_price) = band_buy_exact(price, capacity, interval)?;
+            bought += actual;
+            cost += leg_cost;
+            remaining = (remaining - actual).max(0.0);
+            price = new_price;
+            if remaining <= DUST {
+                return Some((bought, cost, price));
+            }
+        }
+
+        Some((bought, cost, price))
+    }
+
+    fn interval_index_for_sell(&self) -> Option<usize> {
+        for (idx, interval) in self.intervals.iter().enumerate() {
+            if price_strictly_inside_interval(self.current_price, interval) {
+                return Some(idx);
+            }
+        }
+        for (idx, interval) in self.intervals.iter().enumerate() {
+            if price_matches_boundary(self.current_price, interval.top_price) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn interval_index_for_buy(&self) -> Option<usize> {
+        for (idx, interval) in self.intervals.iter().enumerate() {
+            if price_strictly_inside_interval(self.current_price, interval) {
+                return Some(idx);
+            }
+        }
+        for (idx, interval) in self.intervals.iter().enumerate() {
+            if price_matches_boundary(self.current_price, interval.bottom_price) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+}
+
+fn price_boundary_tolerance(lhs: f64, rhs: f64) -> f64 {
+    1e-9 * (1.0 + lhs.abs().max(rhs.abs()).max(1.0))
+}
+
+fn price_matches_boundary(price: f64, boundary: f64) -> bool {
+    (price - boundary).abs() <= price_boundary_tolerance(price, boundary)
+}
+
+fn price_strictly_inside_interval(price: f64, interval: &DerivedLiquidityInterval) -> bool {
+    let top_tol = price_boundary_tolerance(price, interval.top_price);
+    let bottom_tol = price_boundary_tolerance(price, interval.bottom_price);
+    price <= interval.top_price + top_tol && price > interval.bottom_price + bottom_tol
+}
+
+fn band_liquidity_raw(interval: &DerivedLiquidityInterval) -> Option<f64> {
+    if interval.liquidity == 0 {
+        return None;
+    }
+    let liquidity = interval.liquidity as f64 / 1e18;
+    if liquidity.is_finite() && liquidity > 0.0 {
+        Some(liquidity)
+    } else {
+        None
+    }
+}
+
+fn band_sell_capacity(current_price: f64, interval: &DerivedLiquidityInterval) -> Option<f64> {
+    let liquidity = band_liquidity_raw(interval)?;
+    if current_price <= interval.bottom_price {
+        return Some(0.0);
+    }
+    Some(
+        liquidity * (1.0 / interval.bottom_price.sqrt() - 1.0 / current_price.sqrt()) / FEE_FACTOR,
+    )
+}
+
+fn band_buy_capacity(current_price: f64, interval: &DerivedLiquidityInterval) -> Option<f64> {
+    let liquidity = band_liquidity_raw(interval)?;
+    if current_price >= interval.top_price {
+        return Some(0.0);
+    }
+    Some(liquidity * (1.0 / current_price.sqrt() - 1.0 / interval.top_price.sqrt()))
+}
+
+fn band_sell_exact(
+    current_price: f64,
+    amount: f64,
+    interval: &DerivedLiquidityInterval,
+) -> Option<(f64, f64, f64)> {
+    let liquidity = band_liquidity_raw(interval)?;
+    let kappa = FEE_FACTOR * current_price.sqrt() / liquidity;
+    if kappa <= 0.0 {
+        return None;
+    }
+    let actual = amount.max(0.0);
+    let d = 1.0 + actual * kappa;
+    if d <= 0.0 {
+        return None;
+    }
+    let new_price = current_price / (d * d);
+    let proceeds = current_price * actual * FEE_FACTOR / d;
+    Some((actual, proceeds, new_price.max(interval.bottom_price)))
+}
+
+fn band_buy_exact(
+    current_price: f64,
+    amount: f64,
+    interval: &DerivedLiquidityInterval,
+) -> Option<(f64, f64, f64)> {
+    let liquidity = band_liquidity_raw(interval)?;
+    let lambda = current_price.sqrt() / liquidity;
+    if lambda <= 0.0 {
+        return None;
+    }
+    let actual = amount.max(0.0);
+    let d = 1.0 - actual * lambda;
+    if d <= 0.0 {
+        return None;
+    }
+    let new_price = current_price / (d * d);
+    let cost = actual * current_price / (FEE_FACTOR * d);
+    Some((actual, cost, new_price.min(interval.top_price)))
 }
 
 fn build_univ3_liquidity_bands(

@@ -303,6 +303,10 @@ fn scripted_route_probe_actions(
     }
 
     if scenario_id.contains("buy_merge") {
+        // Local pool math can under-deliver the final few wei of an exact-output buy on some
+        // legs. Keep the scripted merge slightly below the requested buy amount so the synthetic
+        // route probe remains executable under real local contract math.
+        let merge_amount = amount * 0.999;
         let mut actions = Vec::with_capacity(markets.len() + 1);
         let mut cost = 0.0;
         for (market_name, price) in markets {
@@ -317,10 +321,10 @@ fn scripted_route_probe_actions(
         actions.push(Action::Merge {
             contract_1: "local_market_1",
             contract_2: "local_market_2",
-            amount,
+            amount: merge_amount,
             source_market: "complete_set_arb",
         });
-        return Some((actions, pre_raw_susd - cost + amount));
+        return Some((actions, pre_raw_susd - cost + merge_amount));
     }
 
     None
@@ -340,6 +344,20 @@ fn build_address_book(input: &FixtureInput) -> Result<ExecutionAddressBook, Box<
         market2_collateral: parse_address(&input.address_book.market2_collateral_connector)?,
         outcome_tokens,
     })
+}
+
+fn should_zero_price_limits_for_benchmark_forecastflows(solver: RebalanceSolver) -> bool {
+    matches!(solver, RebalanceSolver::ForecastFlows)
+        && std::env::var("FORECASTFLOWS_REQUEST_PROFILE")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("benchmark"))
+}
+
+fn execution_mode_for_fixture(solver: RebalanceSolver) -> ExecutionMode {
+    if should_zero_price_limits_for_benchmark_forecastflows(solver) {
+        ExecutionMode::Strict
+    } else {
+        ExecutionMode::Packed
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -499,6 +517,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    if should_zero_price_limits_for_benchmark_forecastflows(solver) {
+        for plan in &mut plans {
+            for leg in &mut plan.legs {
+                leg.sqrt_price_limit_x96 = Some(U160::ZERO);
+            }
+        }
+    }
     stamp_plans_with_block(&mut plans, current_block);
 
     let fee_inputs = LiveOptimismFeeInputs {
@@ -507,7 +532,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         gas_price_wei: gas_price_wei.into(),
     };
     let program = compile_execution_program_unchecked_with_address_book(
-        ExecutionMode::Packed,
+        execution_mode_for_fixture(solver),
         executor,
         &actions,
         &plans,

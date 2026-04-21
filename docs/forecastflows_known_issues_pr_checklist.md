@@ -2,6 +2,10 @@
 
 Status: all six PRs completed as of 2026-04-21.
 
+This document now serves as a historical execution record. The detailed
+checkboxes below are preserved as the original working plan; the authoritative
+completion state is the `Execution Status` section above.
+
 ## Execution Status
 
 - [x] PR 1: Skip-reason propagation and doc sync
@@ -10,6 +14,10 @@ Status: all six PRs completed as of 2026-04-21.
 - [x] PR 4: Triage and fix the connected 67+32 `no_certified_candidate` path
 - [x] PR 5: Fix the planner over-sell bug
 - [x] PR 6: Regenerate stale snapshots and document the refresh workflow
+
+Final state:
+- the single-market and connected 98-outcome ForecastFlows benchmark rows both execute
+- the Local Foundry executable harness is green end-to-end on current `master`
 
 Snapshot refresh procedure:
 - [docs/ev_snapshot_regeneration.md](ev_snapshot_regeneration.md)

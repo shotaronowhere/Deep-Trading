@@ -90,8 +90,8 @@ pick before proceeding.
 - Solver correctness: Packed dominance was proven on 8107+ candidates.
 - Production submission path: on-chain replay still runs the same Packed
   compile it would have picked anyway.
-- Foundry E2E validation: not yet re-run post-change (Phase 4 pending a
-  scope decision on the options above).
+- Local Foundry E2E validation was later re-run and is summarized in the
+  2026-04-21 follow-up below.
 
 ## 2026-04-20 Follow-up: Two-Stage Structural-First Ranking (Option 1 landed)
 
@@ -218,6 +218,56 @@ All three unignored bench tests stay well under the 120 s success criterion.
 ### Ignored-test audit findings
 
 We classified each Category D ignored test by status at K=16.
+
+## 2026-04-21 Follow-up: Phase 4 Local Foundry validation rerun
+
+We completed the deferred Local Foundry rerun after the later ForecastFlows
+E2E harness fixes merged.
+
+### What changed in the harness
+
+- Benchmark tests now pause Foundry gas metering around scenario setup,
+  snapshot/revert, and artifact writes, then resume it only for the actual
+  lane execution calls. This keeps the benchmark row gas numbers honest while
+  avoiding the whole-test gas ceiling.
+- The scripted `buy_merge` route-probe case now merges `0.999x` of the bought
+  amount so the seeded-invalid sanity test remains executable under real local
+  pool math.
+
+### Verification run
+
+```bash
+FORECASTFLOWS_WORKER_BIN=$(realpath ../ForecastFlows.rs/target/release/forecast-flows-worker) \
+  forge test --ffi --match-test test_benchmark_matrix_single_market -vv
+
+FORECASTFLOWS_WORKER_BIN=$(realpath ../ForecastFlows.rs/target/release/forecast-flows-worker) \
+  forge test --ffi --match-test test_benchmark_matrix_connected -vv
+
+FORECASTFLOWS_WORKER_BIN=$(realpath ../ForecastFlows.rs/target/release/forecast-flows-worker) \
+  forge test --ffi --match-path test/LocalFoundryExecutableTxE2E.t.sol -vv
+```
+
+### Outcome
+
+- `test_benchmark_matrix_single_market` passes and writes a full five-row
+  artifact again.
+- `test_benchmark_matrix_connected` passes and writes a full five-row artifact
+  again.
+- The full
+  [test/LocalFoundryExecutableTxE2E.t.sol](../test/LocalFoundryExecutableTxE2E.t.sol)
+  harness is green end-to-end.
+
+Success criterion 6 from the original plan is now met on current `master`:
+
+- both benchmark matrix tests pass
+- the connected FF lane executes rather than skipping
+- the single-market 98 FF benchmark lane also executes again via the benchmark
+  decoded-call path with strict chunking
+- the full Local Foundry executable harness is green
+
+The benchmark artifacts and
+[docs/local_foundry_e2e_benchmark_matrix.md](local_foundry_e2e_benchmark_matrix.md)
+are the current source of truth for Local Foundry FF behavior.
 
 **Pre-existing failures surfaced (not caused by the latency work; tracked
 separately):**

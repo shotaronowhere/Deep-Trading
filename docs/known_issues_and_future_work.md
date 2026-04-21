@@ -86,6 +86,33 @@ MC_REQUIRE_FAMILY_COVERAGE=0 MC_START_TRIAL_INDEX=4 MC_TRIALS=20 \
 original failure reproducer directly and then reran bounded sweeps around the
 previously failing region after the fix.
 
+### 3. ForecastFlows Local Foundry E2E harness gaps
+
+**Status.** Resolved.
+
+**What changed.**
+
+- The benchmark harness now propagates real ForecastFlows fallback reasons
+  instead of flattening them into one generic label.
+- The single-market and connected 98-outcome ForecastFlows benchmark lanes both
+  execute again under full local contract deployment.
+- The single-market ForecastFlows benchmark now uses strict chunking plus
+  benchmark-only zeroed price limits so the local harness measures realized EV
+  on executable sub-batches instead of failing on benchmark slippage-limit
+  artifacts.
+- The suite now includes a hard-failing executable ForecastFlows test, so a
+  broken FF path can no longer hide behind a green benchmark-only lane.
+
+**Verification.**
+
+```bash
+FORECASTFLOWS_WORKER_BIN=/Users/shotaro/proj/ForecastFlows.rs/target/release/forecast-flows-worker \
+  forge test --ffi --match-path test/LocalFoundryExecutableTxE2E.t.sol -vv
+```
+
+**Notes.** The current benchmark artifacts and harness behavior are documented
+in [docs/local_foundry_e2e_benchmark_matrix.md](local_foundry_e2e_benchmark_matrix.md).
+
 ## Still Open
 
 ### 1. `test_random_group_search_vs_waterfall_complex_fuzz_cases` runtime

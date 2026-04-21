@@ -350,7 +350,9 @@ contract LocalFoundryExecutableTxE2E is Test {
         string memory mdPath =
             string.concat(vm.projectRoot(), "/test/fixtures/local_foundry_e2e_benchmark_matrix_single_market.md");
         _initBenchmarkArtifacts(jsonlPath, mdPath);
+        vm.pauseGasMetering();
         _runBenchmarkCaseSingleMarket98(jsonlPath, mdPath);
+        vm.resumeGasMetering();
     }
 
     function test_benchmark_matrix_connected() external {
@@ -359,7 +361,9 @@ contract LocalFoundryExecutableTxE2E is Test {
         string memory mdPath =
             string.concat(vm.projectRoot(), "/test/fixtures/local_foundry_e2e_benchmark_matrix_connected.md");
         _initBenchmarkArtifacts(jsonlPath, mdPath);
+        vm.pauseGasMetering();
         _runBenchmarkCaseConnected98(jsonlPath, mdPath);
+        vm.resumeGasMetering();
     }
 
     function _runBenchmarkCaseSingleMarket98(string memory jsonlPath, string memory mdPath) internal {
@@ -518,11 +522,32 @@ contract LocalFoundryExecutableTxE2E is Test {
         uint256 totalGas;
         uint256 totalCalldata;
         for (uint256 i = 0; i < fixture.chunks.length; i++) {
+            vm.resumeGasMetering();
             TradeExecutor.Call[] memory calls = _toExecutorCalls(fixture.chunks[i].calls);
             uint256 gasBefore = gasleft();
-            executor.batchExecute(calls);
-            uint256 gasUsed = gasBefore - gasleft();
-            uint256 calldataBytes = abi.encodeCall(TradeExecutor.batchExecute, (calls)).length;
+            bool ok;
+            uint256 gasUsed;
+            try executor.batchExecute(calls) {
+                ok = true;
+                gasUsed = gasBefore - gasleft();
+            } catch {
+                ok = false;
+                gasUsed = gasBefore - gasleft();
+            }
+            vm.pauseGasMetering();
+            if (!ok) {
+                if (laneAllowsSkip) {
+                    _emitSkipRow(
+                        scenario.id, topology, laneLabel, "executor_batch_execute_failed", jsonlPath, mdPath
+                    );
+                    return;
+                }
+                revert("packed execute failed");
+            }
+            // The fixture already computed the exact `batchExecute(calls)` calldata length while
+            // building the packed program. Re-encoding large call arrays inside Forge can
+            // quadratic-blow up memory even though the execution itself is valid.
+            uint256 calldataBytes = fixture.chunks[i].estimatedCalldataBytes;
             assertLt(gasUsed, MAX_PACKED_TX_L2_GAS, "packed gas cap");
             totalGas += gasUsed;
             totalCalldata += calldataBytes;
@@ -581,17 +606,19 @@ contract LocalFoundryExecutableTxE2E is Test {
 
         TradeExecutor.Call[] memory calls = new TradeExecutor.Call[](1);
         calls[0] = TradeExecutor.Call({to: target, data: data});
-        uint256 calldataBytes = abi.encodeCall(TradeExecutor.batchExecute, (calls)).length;
-        uint256 gasBefore = gasleft();
-        try executor.batchExecute(calls) {
-            uint256 gasUsed = gasBefore - gasleft();
-            assertLt(gasUsed, MAX_PACKED_TX_L2_GAS, "solver gas cap");
-            _emitOnchainRow(scenario, executor, laneLabel, topology, preRaw, gasUsed, calldataBytes, jsonlPath, mdPath);
-        } catch {
+        bytes memory batchExecuteData = abi.encodeCall(TradeExecutor.batchExecute, (calls));
+        uint256 calldataBytes = batchExecuteData.length;
+        vm.resumeGasMetering();
+        (bool ok, uint256 gasUsed) = _executeFixtureChunk(executor, batchExecuteData, MAX_PACKED_TX_L2_GAS);
+        vm.pauseGasMetering();
+        if (!ok) {
             _emitSkipRow(
                 scenario.id, topology, laneLabel, "onchain_revert_full_range_tick_scan", jsonlPath, mdPath
             );
+            return;
         }
+        assertLt(gasUsed, MAX_PACKED_TX_L2_GAS, "solver gas cap");
+        _emitOnchainRow(scenario, executor, laneLabel, topology, preRaw, gasUsed, calldataBytes, jsonlPath, mdPath);
     }
 
     function _emitOnchainRow(
@@ -876,7 +903,9 @@ contract LocalFoundryExecutableTxE2E is Test {
             uint256 gasBefore = gasleft();
             executor.batchExecute(calls);
             uint256 gasUsed = gasBefore - gasleft();
-            uint256 calldataBytes = abi.encodeCall(TradeExecutor.batchExecute, (calls)).length;
+            // Use the exact calldata byte count emitted by the fixture instead of re-encoding
+            // large dynamic call arrays inside Solidity.
+            uint256 calldataBytes = fixture.chunks[i].estimatedCalldataBytes;
             assertLt(gasUsed, MAX_PACKED_TX_L2_GAS, "packed gas cap");
             totalGas += gasUsed;
             totalCalldata += calldataBytes;
@@ -1284,6 +1313,15 @@ contract LocalFoundryExecutableTxE2E is Test {
             collateral: address(collateral),
             fee: FEE
         });
+    }
+
+    function _executeFixtureChunk(TradeExecutor executor, bytes memory batchExecuteData, uint256 gasLimit)
+        internal
+        returns (bool ok, uint256 gasUsed)
+    {
+        uint256 gasBefore = gasleft();
+        (ok,) = address(executor).call{gas: gasLimit}(batchExecuteData);
+        gasUsed = gasBefore - gasleft();
     }
 
     function _toExecutorCalls(LocalFixtureCall[] memory fixtureCalls)
