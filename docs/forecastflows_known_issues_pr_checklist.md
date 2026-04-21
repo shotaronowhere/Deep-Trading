@@ -1,6 +1,18 @@
 # ForecastFlows And Known Issues PR Checklist
 
-Status: proposed as of 2026-04-20.
+Status: all six PRs completed as of 2026-04-21.
+
+## Execution Status
+
+- [x] PR 1: Skip-reason propagation and doc sync
+- [x] PR 2: Remove the benchmark-vs-production ForecastFlows mismatch
+- [x] PR 3: Add a hard-failing ForecastFlows executable E2E test
+- [x] PR 4: Triage and fix the connected 67+32 `no_certified_candidate` path
+- [x] PR 5: Fix the planner over-sell bug
+- [x] PR 6: Regenerate stale snapshots and document the refresh workflow
+
+Snapshot refresh procedure:
+- [docs/ev_snapshot_regeneration.md](ev_snapshot_regeneration.md)
 
 ## Purpose
 

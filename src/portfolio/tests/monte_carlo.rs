@@ -389,6 +389,24 @@ fn build_scenario_case(template: ScenarioTemplate, rng: &mut TestRng) -> Scenari
     }
 }
 
+fn build_monte_carlo_trial_case(seed: u64, trial_index: usize) -> (ScenarioTemplate, ScenarioCase) {
+    let mut rng = TestRng::new(seed);
+    for skipped_trial_index in 0..trial_index {
+        match scenario_template_for_trial(skipped_trial_index) {
+            ScenarioTemplate::FuzzFull => {
+                let _ = build_rebalance_fuzz_case(&mut rng, false);
+            }
+            ScenarioTemplate::FuzzPartial => {
+                let _ = build_rebalance_fuzz_case(&mut rng, true);
+            }
+            ScenarioTemplate::FullUnderpricedBaseline | ScenarioTemplate::DirectOnlyBaseline => {}
+        }
+    }
+
+    let template = scenario_template_for_trial(trial_index);
+    (template, build_scenario_case(template, &mut rng))
+}
+
 fn initial_holdings_from_case(case: &ScenarioCase) -> HashMap<&'static str, f64> {
     let mut holdings = HashMap::new();
     for (_, market) in &case.slot0_results {
@@ -1333,6 +1351,76 @@ fn test_monte_carlo_ev_full_profitability_groups() {
     if config.require_family_coverage {
         assert_coverage(&stats);
     }
+}
+
+#[test]
+fn test_full_underpriced_baseline_replays_without_sell_overshoot() {
+    let case = build_full_underpriced_baseline();
+    let balances = balances_as_str_map(&case.balances);
+    let actions = rebalance(&balances, case.susd_balance, &case.slot0_results);
+
+    assert_rebalance_action_invariants(&actions, &case.slot0_results, &balances, case.susd_balance);
+
+    let grouped = group_execution_actions_by_profitability_step(&actions)
+        .expect("baseline actions should remain profitability-step groupable");
+    assert!(
+        !grouped.is_empty(),
+        "baseline scenario should produce at least one profitability step"
+    );
+
+    let _ = replay_actions_to_state(&actions, &case.slot0_results, &balances, case.susd_balance);
+}
+
+#[test]
+fn test_fuzz_full_trial_four_layers_replay_without_sell_overshoot() {
+    let (template, case) = build_monte_carlo_trial_case(0xC0DE_1BAD_5EED_u64, 4);
+    assert!(
+        matches!(template, ScenarioTemplate::FuzzFull),
+        "trial 4 should stay on the fuzz-full template"
+    );
+
+    let balances = balances_as_str_map(&case.balances);
+    let predictions = crate::pools::prediction_map();
+    let force_mint_available = case.slot0_results.len() == crate::predictions::PREDICTIONS_L1.len();
+    let mut failing_labels = Vec::new();
+    let mut layers = seeded_hard_case_layer_actions(
+        &balances,
+        case.susd_balance,
+        &case.slot0_results,
+        &predictions,
+        force_mint_available,
+    );
+    layers.push((
+        "selected",
+        rebalance(&balances, case.susd_balance, &case.slot0_results),
+    ));
+
+    for (label, actions) in layers {
+        let replayable = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_rebalance_action_invariants(
+                &actions,
+                &case.slot0_results,
+                &balances,
+                case.susd_balance,
+            );
+            let _ = replay_actions_to_state(
+                &actions,
+                &case.slot0_results,
+                &balances,
+                case.susd_balance,
+            );
+        }))
+        .is_ok();
+        if !replayable {
+            failing_labels.push(label);
+        }
+    }
+
+    assert!(
+        failing_labels.is_empty(),
+        "trial 4 produced non-replayable action sets: {:?}",
+        failing_labels
+    );
 }
 
 #[test]

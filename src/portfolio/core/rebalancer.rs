@@ -27,10 +27,10 @@ use crate::execution::program::{
     ExecutionProgramPlan, MAX_PACKED_TX_L2_GAS_UNITS,
     compile_execution_program_unchecked_with_address_book,
 };
-use crate::execution::tx_builder::ExecutionAddressBook;
 use crate::execution::runtime::{
     DEFAULT_EXECUTION_ADVERSE_MOVE_BPS_PER_BLOCK, DEFAULT_EXECUTION_QUOTE_LATENCY_BLOCKS,
 };
+use crate::execution::tx_builder::ExecutionAddressBook;
 use crate::execution::{ExecutionMode, GroupKind, MARKET_2_ADDRESS, MARKET_2_COLLATERAL};
 use crate::pools::{Slot0Result, prediction_to_sqrt_price_x96};
 
@@ -2383,8 +2383,16 @@ fn build_plan_result(
 fn reprice_plan_result_with_replay(
     starting_state: &SolverStateSnapshot,
     mut plan: PlanResult,
+    predictions: &HashMap<String, f64>,
     cost_config: PlannerCostConfig,
 ) -> PlanResult {
+    if let Some((terminal_state, updated_actions)) =
+        apply_actions_to_solver_state_consistent(starting_state, &plan.actions, predictions)
+    {
+        plan.terminal_state = terminal_state;
+        plan.actions = updated_actions;
+        plan.raw_ev = state_snapshot_expected_value(&plan.terminal_state, predictions);
+    }
     if let Some(cost) = estimate_plan_cost_with_mode(
         &plan.actions,
         &starting_state.slot0_results,
@@ -2655,6 +2663,7 @@ fn state_snapshot_expected_value(
     }
 }
 
+#[allow(dead_code)]
 fn apply_actions_to_solver_state(
     state: &SolverStateSnapshot,
     actions: &[Action],
@@ -2686,7 +2695,8 @@ fn apply_actions_to_solver_state(
 ///
 /// Returns both the terminal state AND updated actions with recomputed
 /// costs/proceeds, so downstream code that re-replays the actions gets
-/// results consistent with the terminal state.
+/// results consistent with the terminal state. Returns `None` if the action
+/// stream would over-spend cash or over-consume holdings.
 fn apply_actions_to_solver_state_consistent(
     state: &SolverStateSnapshot,
     actions: &[Action],
@@ -2734,6 +2744,9 @@ fn apply_actions_to_solver_state_consistent(
                 if let Some(&idx) = idx_by_market.get(market_name) {
                     if let Some((bought, cost, new_price)) = sims[idx].buy_exact(*amount) {
                         if bought > 0.0 {
+                            if cost > cash + EPS {
+                                return None;
+                            }
                             *holdings.entry(*market_name).or_insert(0.0) += bought;
                             cash -= cost;
                             sims[idx].set_price(new_price);
@@ -2752,9 +2765,20 @@ fn apply_actions_to_solver_state_consistent(
                 ..
             } => {
                 if let Some(&idx) = idx_by_market.get(market_name) {
+                    let held = holdings.get(market_name).copied().unwrap_or(0.0).max(0.0);
+                    if held + EPS < *amount {
+                        return None;
+                    }
                     if let Some((sold, proceeds, new_price)) = sims[idx].sell_exact(*amount) {
                         if sold > 0.0 {
-                            *holdings.entry(*market_name).or_insert(0.0) -= sold;
+                            let balance = holdings.entry(*market_name).or_insert(0.0);
+                            *balance -= sold;
+                            if *balance < -EPS {
+                                return None;
+                            }
+                            if *balance < 0.0 {
+                                *balance = 0.0;
+                            }
                             cash += proceeds;
                             sims[idx].set_price(new_price);
                             updated_actions.push(Action::Sell {
@@ -2772,6 +2796,9 @@ fn apply_actions_to_solver_state_consistent(
                 amount,
                 target_market,
             } => {
+                if *amount > cash + EPS {
+                    return None;
+                }
                 for (_, market) in &state.slot0_results {
                     *holdings.entry(market.name).or_insert(0.0) += *amount;
                 }
@@ -2789,8 +2816,23 @@ fn apply_actions_to_solver_state_consistent(
                 amount,
                 source_market,
             } => {
+                let available_complete_sets = state
+                    .slot0_results
+                    .iter()
+                    .map(|(_, market)| holdings.get(market.name).copied().unwrap_or(0.0).max(0.0))
+                    .fold(f64::INFINITY, f64::min);
+                if available_complete_sets + EPS < *amount {
+                    return None;
+                }
                 for (_, market) in &state.slot0_results {
-                    *holdings.entry(market.name).or_insert(0.0) -= *amount;
+                    let balance = holdings.entry(market.name).or_insert(0.0);
+                    *balance -= *amount;
+                    if *balance < -EPS {
+                        return None;
+                    }
+                    if *balance < 0.0 {
+                        *balance = 0.0;
+                    }
                 }
                 cash += *amount;
                 updated_actions.push(Action::Merge {
@@ -3414,13 +3456,13 @@ fn compile_coupled_mixed_candidate_for_target_prof(
         &entries,
         common_shift,
     )?;
-    let candidate_terminal_state =
-        apply_actions_to_solver_state(starting_state, &actions, predictions)?;
+    let (candidate_terminal_state, candidate_actions) =
+        apply_actions_to_solver_state_consistent(starting_state, &actions, predictions)?;
     let candidate_raw_ev = state_snapshot_expected_value(&candidate_terminal_state, predictions);
     let candidate = build_plan_result_with_costing_mode(
         starting_state,
         candidate_terminal_state,
-        actions,
+        candidate_actions,
         candidate_raw_ev,
         None,
         Vec::new(),
@@ -3669,11 +3711,11 @@ fn compile_constant_l_mixed_fixed_active_solution_for_target_prof(
         &entries,
         evaluation.mint_amount,
     )?;
-    let candidate_terminal_state =
-        apply_actions_to_solver_state(starting_state, &actions, predictions)?;
+    let (candidate_terminal_state, candidate_actions) =
+        apply_actions_to_solver_state_consistent(starting_state, &actions, predictions)?;
     let candidate_raw_ev = state_snapshot_expected_value(&candidate_terminal_state, predictions);
     Some(ConstantLMixedFixedActiveSolution {
-        actions,
+        actions: candidate_actions,
         terminal_state: candidate_terminal_state,
         raw_ev: candidate_raw_ev,
         certificate: build_mixed_certificate(
@@ -4707,8 +4749,8 @@ fn compile_best_frontier_candidate_for_program_net_ev(
             ) else {
                 continue;
             };
-            let Some(candidate_terminal_state) =
-                apply_actions_to_solver_state(starting_state, &actions, predictions)
+            let Some((candidate_terminal_state, candidate_actions)) =
+                apply_actions_to_solver_state_consistent(starting_state, &actions, predictions)
             else {
                 continue;
             };
@@ -4717,7 +4759,7 @@ fn compile_best_frontier_candidate_for_program_net_ev(
             let mut candidate = build_plan_result_with_costing_mode(
                 starting_state,
                 candidate_terminal_state.clone(),
-                actions,
+                candidate_actions,
                 candidate_raw_ev,
                 frontier_family,
                 preserve_markets.clone(),
@@ -5036,8 +5078,8 @@ fn compile_target_delta_candidate_for_program_net_ev(
         ) else {
             continue;
         };
-        let Some(candidate_terminal_state) =
-            apply_actions_to_solver_state(starting_state, &actions, predictions)
+        let Some((candidate_terminal_state, candidate_actions)) =
+            apply_actions_to_solver_state_consistent(starting_state, &actions, predictions)
         else {
             continue;
         };
@@ -5049,7 +5091,7 @@ fn compile_target_delta_candidate_for_program_net_ev(
         let candidate = build_plan_result_with_costing_mode(
             starting_state,
             candidate_terminal_state,
-            actions,
+            candidate_actions,
             candidate_raw_ev,
             frontier_family,
             preserve_markets.clone(),
@@ -5095,6 +5137,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
         );
     };
     let initial_raw_ev = state_snapshot_expected_value(&initial_terminal_state, predictions);
+    let base_actions = initial_actions_updated.clone();
     let mut best = build_plan_result_with_costing_mode(
         starting_state,
         initial_terminal_state,
@@ -5115,29 +5158,31 @@ fn baseline_step_prune_candidate_for_program_net_ev(
     // profitability upward. Because reverse iteration monotonically frees
     // cash, restarting the loop provides near-zero additional compaction
     // at massive cost. A single pass is sufficient.
-    let Ok(step_groups) = group_execution_actions_by_profitability_step(&best.actions) else {
+    let Ok(step_groups) = group_execution_actions_by_profitability_step(&base_actions) else {
         return best;
     };
     if step_groups.is_empty() {
         return best;
     }
 
-    // Collect indices to exclude as a set for O(1) lookup.
+    // Collect indices to exclude as a set for O(1) lookup. These indices are
+    // anchored to the original consistent baseline action list; filtering
+    // against the evolving `best.actions` would let indices drift after an
+    // accepted prune and could drop the wrong sub-actions on later iterations.
     let mut excluded: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for step_group in step_groups.iter().rev() {
         // Tentatively add this group's indices to the excluded set.
         for &idx in &step_group.action_indices {
             excluded.insert(idx);
         }
-        let keep_actions: Vec<Action> = best
-            .actions
+        let keep_actions: Vec<Action> = base_actions
             .iter()
             .enumerate()
             .filter(|(i, _)| !excluded.contains(i))
             .map(|(_, a)| a.clone())
             .collect();
-        let Some(candidate_terminal_state) =
-            apply_actions_to_solver_state(starting_state, &keep_actions, predictions)
+        let Some((candidate_terminal_state, candidate_actions)) =
+            apply_actions_to_solver_state_consistent(starting_state, &keep_actions, predictions)
         else {
             // Can't drop this group — remove from excluded and continue.
             for &idx in &step_group.action_indices {
@@ -5157,7 +5202,7 @@ fn baseline_step_prune_candidate_for_program_net_ev(
         let candidate = build_plan_result_with_costing_mode(
             starting_state,
             candidate_terminal_state,
-            keep_actions,
+            candidate_actions,
             candidate_raw_ev,
             frontier_family,
             best.preserve_markets.clone(),
@@ -5771,24 +5816,25 @@ fn seed_no_arb_plan_from_state(
         );
     }
 
-    let (terminal_state, raw_ev) = if ctx.actions.is_empty() {
+    let (terminal_state, actions, raw_ev) = if ctx.actions.is_empty() {
         // No phase 1/2 actions, but phase 3+ in the full solver might still produce value
         // (e.g. legacy negative-alpha recycling). Keep as a zero-delta candidate so it
         // can still make the shortlist and get full-solved.
         let raw_ev = state_snapshot_expected_value(state, predictions);
-        (state.clone(), raw_ev)
+        (state.clone(), Vec::new(), raw_ev)
     } else {
-        let terminal = match apply_actions_to_solver_state(state, &ctx.actions, predictions) {
-            Some(t) => t,
-            None => return None,
-        };
+        let (terminal, updated_actions) =
+            match apply_actions_to_solver_state_consistent(state, &ctx.actions, predictions) {
+                Some(result) => result,
+                None => return None,
+            };
         let raw_ev = state_snapshot_expected_value(&terminal, predictions);
-        (terminal, raw_ev)
+        (terminal, updated_actions, raw_ev)
     };
     Some(build_plan_result_with_costing_mode(
         state,
         terminal_state,
-        ctx.actions,
+        actions,
         raw_ev,
         frontier_family,
         sorted_preserve_markets(preserve_markets),
@@ -5880,7 +5926,8 @@ fn run_positive_arb_plan_from_state(
         return None;
     }
 
-    let terminal_state = apply_actions_to_solver_state(state, &ctx.actions, predictions)?;
+    let (terminal_state, actions) =
+        apply_actions_to_solver_state_consistent(state, &ctx.actions, predictions)?;
     let ev_before = state_snapshot_expected_value(state, predictions);
     let ev_after = state_snapshot_expected_value(&terminal_state, predictions);
     let ev_tol = ARB_OPERATOR_EV_REL_TOL * (1.0 + ev_before.abs() + ev_after.abs());
@@ -5891,7 +5938,7 @@ fn run_positive_arb_plan_from_state(
     Some(build_plan_result_with_costing_mode(
         state,
         terminal_state,
-        ctx.actions,
+        actions,
         ev_after,
         None,
         Vec::new(),
@@ -6641,7 +6688,7 @@ fn enumerate_exact_no_arb_candidates_with_options(
     candidates.truncate(shortlist_k);
     let mut repriced: Vec<PlanResult> = candidates
         .into_par_iter()
-        .map(|plan| reprice_plan_result_with_replay(state, plan, cost_config))
+        .map(|plan| reprice_plan_result_with_replay(state, plan, predictions, cost_config))
         .collect();
     repriced.sort_by(plan_result_cmp);
     candidates = repriced;
@@ -8112,6 +8159,7 @@ fn run_arb_only_candidate(
     Some(ctx.actions)
 }
 
+#[allow(dead_code)]
 fn replay_actions_to_market_state_with_predictions(
     actions: &[Action],
     slot0_results: &[(Slot0Result, &'static crate::markets::MarketData)],
