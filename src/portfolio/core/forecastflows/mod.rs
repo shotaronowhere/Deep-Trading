@@ -255,6 +255,12 @@ pub(super) fn solve_family_candidates(
         request_count: 0,
         telemetry: ForecastFlowsTelemetry::default(),
     })?;
+    if std::env::var("LOCAL_FOUNDRY_E2E_DUMP_PROBLEM").is_ok_and(|v| v == "1" || v == "true") {
+        match serde_json::to_string(&problem) {
+            Ok(json) => eprintln!("local_foundry_e2e_dump_problem {json}"),
+            Err(err) => eprintln!("local_foundry_e2e_dump_problem_serialize_error {err}"),
+        }
+    }
     let compare_report = client::compare_prediction_market_families(problem)?;
     let direct_solver_time_ms = solver_time_ms(compare_report.compare.direct_only.solver_time_sec);
     let mixed_solver_time_ms = solver_time_ms(compare_report.compare.mixed_enabled.solver_time_sec);

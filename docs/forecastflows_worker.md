@@ -195,13 +195,22 @@ Problem construction:
 - `fair_value` from the Rust prediction map
 - `initial_holding` from current Rust balances
 - `collateral_balance` from current sUSD cash
-- `split_bound` omitted so ForecastFlows uses its documented auto-bound / doubling behavior
+- `split_bound` is omitted for single-market families so ForecastFlows uses its
+  documented auto-bound / doubling behavior
+- connected multi-market families send an explicit conservative `split_bound`
+  equal to whole-sUSDS-truncated base collateral because the flattened request
+  omits connector / invalid inventory and the worker's `cash + holdings`
+  auto-bound can overstate feasible split / merge budget for that shape
 
 Live compare request mapping is:
 
 - Compare requests send only the translated problem and solve options.
 - Execution-gas-aware Julia request shaping is no longer part of the live
   protocol. Exact executable economics remain a Rust-owned validation step.
+- The Local Foundry benchmark harness launches the fixture binary with
+  `FORECASTFLOWS_REQUEST_PROFILE=benchmark`, so benchmark rows use baseline
+  ForecastFlows tuning and the longer benchmark timeout. Production executables
+  still default to the low-latency production profile.
 
 Markets are encoded as contiguous multi-band `UniV3` venues with a trailing zero-liquidity terminal band:
 

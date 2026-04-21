@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick;
@@ -121,12 +121,43 @@ pub(super) fn build_problem_request(
         });
     }
 
+    let collateral_balance = susds_balance.max(0.0);
+
     Ok(PredictionMarketProblemRequest {
         outcomes,
-        collateral_balance: susds_balance.max(0.0),
+        collateral_balance,
         markets,
-        split_bound: None,
+        split_bound: conservative_split_bound(collateral_balance, slot0_results),
     })
+}
+
+fn conservative_split_bound(
+    collateral_balance: f64,
+    slot0_results: &[(Slot0Result, &'static MarketData)],
+) -> Option<f64> {
+    let distinct_market_count = slot0_results
+        .iter()
+        .map(|(_, market)| market.market_id)
+        .collect::<HashSet<_>>()
+        .len();
+    if distinct_market_count <= 1 {
+        return None;
+    }
+
+    // Connected Seer families flatten multiple underlying markets into one
+    // ForecastFlows split/merge edge, but the request omits connector / invalid
+    // inventory. Letting the worker auto-bound from cash + all tradeable
+    // holdings therefore overstates the feasible split/merge budget for the
+    // flattened problem and can push the mixed solve into the non-finite
+    // never-certified path. Cap the bound to spendable base collateral and
+    // quantize down to a whole sUSDS so the worker starts from a stable,
+    // conservative budget.
+    let quantized = if collateral_balance >= 1.0 {
+        collateral_balance.floor()
+    } else {
+        collateral_balance
+    };
+    Some(quantized.max(f64::EPSILON))
 }
 
 #[cfg(test)]
@@ -1501,6 +1532,42 @@ mod tests {
         (slot0_results, balances, predictions)
     }
 
+    fn two_underlying_market_fixture() -> (
+        Vec<(Slot0Result, &'static MarketData)>,
+        HashMap<&'static str, f64>,
+        HashMap<String, f64>,
+    ) {
+        let (slot0_a, market_a) = mock_slot0_market_with_liquidity_and_ticks(
+            "RootA",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0.3,
+            1_000_000_000_000_000_000_000u128,
+            -16_096,
+            92_108,
+        );
+        let market_a = leak_market(MarketData {
+            market_id: "0xroot-market",
+            ..*market_a
+        });
+        let (slot0_b, market_b) = mock_slot0_market_with_liquidity_and_ticks(
+            "ChildB",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            0.2,
+            1_000_000_000_000_000_000_000u128,
+            -16_096,
+            92_108,
+        );
+        let market_b = leak_market(MarketData {
+            market_id: "0xchild-market",
+            ..*market_b
+        });
+        let slot0_results = vec![(slot0_a, market_a), (slot0_b, market_b)];
+        let balances = HashMap::from([("RootA", 2.0), ("ChildB", 3.0)]);
+        let predictions =
+            HashMap::from([("roota".to_string(), 0.55), ("childb".to_string(), 0.45)]);
+        (slot0_results, balances, predictions)
+    }
+
     fn certified_direct_result(trades: Vec<PredictionMarketTrade>) -> CompareResult {
         CompareResult {
             direct_only: PredictionMarketSolveResult {
@@ -1537,6 +1604,7 @@ mod tests {
 
         assert_eq!(problem.outcomes.len(), 2);
         assert_eq!(problem.markets.len(), 2);
+        assert_eq!(problem.split_bound, None);
         let MarketSpecRequest::UniV3 {
             market_id,
             current_price,
@@ -1598,6 +1666,16 @@ mod tests {
         let MarketSpecRequest::UniV3 { bands, .. } = &problem.markets[0];
         assert_eq!(bands.len(), 2);
         assert!(bands[0].liquidity_l > 0.0);
+    }
+
+    #[test]
+    fn build_problem_request_sets_conservative_split_bound_for_multi_market_family() {
+        let (slot0_results, balances, predictions) = two_underlying_market_fixture();
+        let problem = build_problem_request(&balances, 10.7, &slot0_results, &predictions, 2)
+            .expect("multi-market problem request should build");
+
+        assert_eq!(problem.collateral_balance, 10.7);
+        assert_eq!(problem.split_bound, Some(10.0));
     }
 
     #[test]

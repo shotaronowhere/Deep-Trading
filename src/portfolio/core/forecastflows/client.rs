@@ -177,6 +177,16 @@ impl ForecastFlowsRequestProfile {
     fn allows_plain_julia_without_escape_hatch(self) -> bool {
         !matches!(self, Self::Production)
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "production" => Some(Self::Production),
+            "benchmark" => Some(Self::Benchmark),
+            "doctor_warmup" => Some(Self::DoctorWarmup),
+            "doctor_representative" => Some(Self::DoctorRepresentative),
+            _ => None,
+        }
+    }
 }
 
 fn worker_execution_model_supported(execution_model: &str) -> bool {
@@ -1950,6 +1960,11 @@ fn request_profile() -> ForecastFlowsRequestProfile {
     if let Some(profile) = test_request_profile() {
         return profile;
     }
+    if let Ok(value) = std::env::var("FORECASTFLOWS_REQUEST_PROFILE")
+        && let Some(profile) = ForecastFlowsRequestProfile::parse(&value)
+    {
+        return profile;
+    }
     ForecastFlowsRequestProfile::Production
 }
 
@@ -2295,6 +2310,27 @@ mod tests {
             ForecastFlowsRequestProfile::DoctorRepresentative.request_timeout(),
             Duration::from_secs(WARMUP_REQUEST_TIMEOUT_SECS)
         );
+    }
+
+    #[test]
+    fn request_profile_parse_accepts_supported_env_values() {
+        assert_eq!(
+            ForecastFlowsRequestProfile::parse("production"),
+            Some(ForecastFlowsRequestProfile::Production)
+        );
+        assert_eq!(
+            ForecastFlowsRequestProfile::parse("benchmark"),
+            Some(ForecastFlowsRequestProfile::Benchmark)
+        );
+        assert_eq!(
+            ForecastFlowsRequestProfile::parse("doctor_warmup"),
+            Some(ForecastFlowsRequestProfile::DoctorWarmup)
+        );
+        assert_eq!(
+            ForecastFlowsRequestProfile::parse("doctor_representative"),
+            Some(ForecastFlowsRequestProfile::DoctorRepresentative)
+        );
+        assert_eq!(ForecastFlowsRequestProfile::parse("wat"), None);
     }
 
     #[test]

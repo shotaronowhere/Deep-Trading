@@ -503,7 +503,8 @@ contract LocalFoundryExecutableTxE2E is Test {
         if (laneAllowsSkip) {
             bool ok;
             string memory stderr;
-            (ok, fixture, stderr) = _tryRunFixture(string.concat(scenario.id, "_", solverName), json);
+            (ok, fixture, stderr) =
+                _tryRunFixtureWithBenchmarkForecastflowsProfile(string.concat(scenario.id, "_", solverName), json);
             if (!ok) {
                 string memory reason = _extractForecastflowsFallbackReason(stderr);
                 _emitSkipRow(scenario.id, topology, laneLabel, reason, jsonlPath, mdPath);
@@ -1040,6 +1041,33 @@ contract LocalFoundryExecutableTxE2E is Test {
         cmd[4] = "--bin";
         cmd[5] = "local_foundry_e2e_fixture";
         cmd[6] = path;
+        Vm.FfiResult memory result = vm.tryFfi(cmd);
+        if (result.exitCode != 0) {
+            return (false, fixture, string(result.stderr));
+        }
+        bytes memory payload = vm.parseJsonBytes(string(result.stdout), ".abi");
+        fixture = abi.decode(payload, (LocalFixtureResult));
+        ok = true;
+    }
+
+    function _tryRunFixtureWithBenchmarkForecastflowsProfile(string memory scenarioId, string memory inputJson)
+        internal
+        returns (bool ok, LocalFixtureResult memory fixture, string memory stderr)
+    {
+        string memory path = string.concat(
+            vm.projectRoot(), "/test/fixtures/local_foundry_e2e_fixture_input_", scenarioId, ".json"
+        );
+        vm.writeFile(path, inputJson);
+        string[] memory cmd = new string[](9);
+        cmd[0] = "env";
+        cmd[1] = "FORECASTFLOWS_REQUEST_PROFILE=benchmark";
+        cmd[2] = "cargo";
+        cmd[3] = "run";
+        cmd[4] = "--release";
+        cmd[5] = "--quiet";
+        cmd[6] = "--bin";
+        cmd[7] = "local_foundry_e2e_fixture";
+        cmd[8] = path;
         Vm.FfiResult memory result = vm.tryFfi(cmd);
         if (result.exitCode != 0) {
             return (false, fixture, string(result.stderr));

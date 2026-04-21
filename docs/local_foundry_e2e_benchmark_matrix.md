@@ -33,7 +33,7 @@ skip row with a machine-readable `skip_reason` so the matrix remains shape-stabl
 | lane | source | single_market | connected |
 |---|---|---|---|
 | `offchain_waterfall` | Rust native waterfall solver via FFI fixture | run | run |
-| `offchain_forecastflows` | Rust FF worker (`FORECASTFLOWS_WORKER_BIN`) via FFI fixture | run | run; may skip with the fixture-binary fallback reason (e.g. `no_certified_candidate`) when the FF worker cannot produce a certified plan for the topology |
+| `offchain_forecastflows` | Rust FF worker (`FORECASTFLOWS_WORKER_BIN`) via FFI fixture | run | run; the benchmark harness launches this lane with `FORECASTFLOWS_REQUEST_PROFILE=benchmark` so the worker uses baseline tuning instead of the production low-latency profile |
 | `onchain_rebalance_exact` | `Rebalancer.rebalanceExact` | run (may skip `onchain_revert_full_range_tick_scan` against full-range synthetic pools) | skip `onchain_single_market_only` |
 | `onchain_rebalance_arb_direct` | `Rebalancer.rebalance` | run | skip `onchain_single_market_only` |
 | `onchain_rebalance_mixed_constant_l` | `RebalancerMixed.rebalanceMixedConstantL` | run | skip `onchain_single_market_only` |
@@ -75,6 +75,16 @@ balances/approvals are observable across all lanes for the same scenario.
 calls the try variant so the FF lane can degrade to a skip row instead of aborting the suite when
 the FF worker returns uncertified for a topology it cannot solve today.
 
+For the benchmark FF lane, the harness invokes the fixture binary through:
+
+```bash
+env FORECASTFLOWS_REQUEST_PROFILE=benchmark cargo run --release --quiet --bin local_foundry_e2e_fixture ...
+```
+
+That forces the fixture's ForecastFlows call onto the benchmark profile
+(`baseline` solve tuning plus the warmup-style timeout) while leaving the
+non-benchmark executable FF tests on the production low-latency profile.
+
 When the FF lane fails, `_runOffchainLane` parses the captured `stderr` via
 `_extractForecastflowsFallbackReason`, which extracts the `fallback=<reason>;` token emitted by
 the fixture binary (`src/bin/local_foundry_e2e_fixture.rs`) and propagates `<reason>` as
@@ -103,6 +113,12 @@ FORECASTFLOWS_WORKER_BIN=/absolute/path/to/forecast-flows-worker \
 # Connected topology
 FORECASTFLOWS_WORKER_BIN=/absolute/path/to/forecast-flows-worker \
   forge test --ffi --match-test test_benchmark_matrix_connected -vv
+
+# Direct connected FF fixture repro under the same benchmark profile
+FORECASTFLOWS_REQUEST_PROFILE=benchmark \
+FORECASTFLOWS_WORKER_BIN=/absolute/path/to/forecast-flows-worker \
+  cargo run --release --quiet --bin local_foundry_e2e_fixture \
+  test/fixtures/local_foundry_e2e_fixture_input_bench_connected_98_forecastflows.json
 ```
 
 When `FORECASTFLOWS_WORKER_BIN` is not set the `offchain_forecastflows` lane is emitted as a
@@ -117,9 +133,15 @@ scenario.
 - The connected topology is currently only exercised on off-chain lanes because the deployed
   `Rebalancer` / `RebalancerMixed` APIs are single-market. A connected on-chain benchmark is
   tracked in `docs/local_foundry_e2e_harness_next_steps.md` §2.
-- The FF worker running with `low_latency` tuning can return uncertified on the connected 67+32
-  topology. The harness records this as a skip row rather than a fatal error; widening FF
-  coverage for large connected cases is worker-side work.
+- Connected FF requests send an explicit conservative `split_bound` based on
+  base collateral because the flattened benchmark problem omits connector /
+  invalid inventory. Without that override, the worker's auto-bound can drive
+  the mixed solve into the non-finite never-certified path on this topology.
+- The benchmark harness deliberately uses the `benchmark` ForecastFlows profile
+  for this lane. The production `low_latency` profile can still downgrade the
+  connected 67+32 request to uncertified after `max_doublings=0`; the
+  hard-failing executable FF tests remain the place where production-profile
+  behavior is exercised.
 
 ## Verification
 
